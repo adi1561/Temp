@@ -1,1 +1,134 @@
 
+
+// Add these imports if they are missing at the top
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.math.BigDecimal;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+
+// ... inside JournalRequestServiceImpl class ...
+
+    @Autowired
+    private ObjectMapper objectMapper; // Ensure this is injected
+
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        // 1. Generate Batch ID
+        String batchId = sequenceService.getNextBatchId();
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal totalDebit = BigDecimal.ZERO;
+        BigDecimal totalCredit = BigDecimal.ZERO;
+        int rowIndex = 1;
+
+        // 2. Map DTO to Entities
+        for (BatchRequestDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            
+            // A. Standard Fields
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setChangeType(dto.getRows().get(0).getChangeType()); // Assuming uniform change type or per row
+            entity.setRequestDate(LocalDateTime.now());
+            entity.setCreatorId(creatorId);
+            entity.setCreatorRole(creatorRole);
+            entity.setBatchId(batchId);
+            entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
+            
+            // B. Generate Journal ID (BatchId-Index)
+            String journalId = batchId + "-" + rowIndex;
+            entity.setJournalId(journalId);
+            
+            // C. Optimized Columns (For High Performance PL/SQL compatibility)
+            entity.setBranchCode(row.getBranch());
+            entity.setCurrency(row.getCurrency());
+            entity.setCgl(row.getCgl());
+            
+            // Handle Debit/Credit logic for Amount
+            BigDecimal amount = row.getAmount();
+            // Frontend sends absolute amount usually, checking logic:
+            if ("Credit".equalsIgnoreCase(row.getArFlag()) || amount.compareTo(BigDecimal.ZERO) < 0) { 
+                 // Note: Your DTO doesn't explicitly have "txnType", it implies via sign or ArFlag.
+                 // Based on your Frontend code, it sends "Credit" as negative or positive based on selection.
+                 // Let's assume the DTO coming in has the correct signed amount or we trust the input.
+                 // However, your entity usually expects Signed Amount.
+            }
+            entity.setAmount(amount);
+            
+            entity.setCsvDate(row.getCsvDate() != null ? row.getCsvDate() : LocalDate.now());
+            entity.setNarration(row.getRemarks());
+            entity.setProductCode(row.getProductType());
+
+            // D. Legacy JSON Payload (Required for View Modal & Audit)
+            // We reconstruct a CreateJournalRequestDto-like structure map for the JSON
+            // to match what buildJsonPayloadFast does.
+            Map<String, Object> payloadMap = new HashMap<>();
+            payloadMap.put("changeType", "ADD");
+            payloadMap.put("csvDate", entity.getCsvDate().toString());
+            payloadMap.put("branch", row.getBranch());
+            payloadMap.put("currency", row.getCurrency());
+            payloadMap.put("cgl", row.getCgl());
+            payloadMap.put("amount", amount);
+            payloadMap.put("productType", row.getProductType());
+            payloadMap.put("remarks", row.getRemarks());
+            payloadMap.put("arFlag", "A"); // Default
+            payloadMap.put("acClassification", "A"); // Default
+            payloadMap.put("batchId", batchId);
+            payloadMap.put("journalId", journalId);
+            payloadMap.put("commonBatchRemarks", dto.getCommonBatchRemarks());
+            payloadMap.put("transactionCount", rowIndex);
+            
+            entity.setPayload(objectMapper.writeValueAsString(payloadMap));
+
+            // Calc Totals
+            if (amount.compareTo(BigDecimal.ZERO) < 0) {
+                totalCredit = totalCredit.add(amount.abs());
+            } else {
+                totalDebit = totalDebit.add(amount.abs());
+            }
+
+            entities.add(entity);
+            rowIndex++;
+        }
+
+        // 3. Save to JOURNAL_REQUEST (Details)
+        // Using saveAll for manual batch is fine (usually small size)
+        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+
+        // 4. Save to JOURNAL_BATCH_MASTER (Summary) - CRITICAL STEP
+        // Without this, the batch exists in tables but won't show in the "Pending" list.
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        
+        jdbcTemplate.update(sumSql, 
+            batchId, 
+            creatorId, 
+            ts, 
+            dto.getCommonBatchRemarks(), 
+            entities.size(),
+            totalDebit, 
+            totalCredit, 
+            "PENDING"
+        );
+
+        // 5. Notifications & Audit
+        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Created Batch " + batchId);
+        
+        // Notify Executors (using your existing logic)
+        try {
+             NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+             if (config != null) {
+                 String msg = String.format("New Manual Batch %s by %s requires approval.", batchId, creatorId);
+                 // Using the helper method if accessible, or direct call
+                 // sendNotification(creatorId, config.getTargetRoles(), msg, batchId); 
+                 // Re-implementing simplified notification call here to avoid access issues:
+                 notificationWriterService.createNotification(null, config.getTargetRoles(), msg, "/journal-view/" + batchId, batchId, "JournalService");
+             }
+        } catch (Exception e) {
+            log.warn("Notification failed for manual batch", e);
+        }
+
+        return savedEntities;
+    }
