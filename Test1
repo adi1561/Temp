@@ -24,6 +24,7 @@ import {
   Paper,
   Checkbox,
   TablePagination,
+  Alert, // <--- Added Alert Import
 } from "@mui/material";
 import { DataGrid } from "@mui/x-data-grid";
 import {
@@ -165,11 +166,15 @@ export default function JournalRequestApproval() {
     };
   }, []);
 
+  // Check if current user is the creator (Self-Approval restriction)
   const isViewingSelfCreated =
     currentUserId &&
     viewingBatchCreatorId &&
     String(currentUserId).trim().toUpperCase() ===
       String(viewingBatchCreatorId).trim().toUpperCase();
+
+  // --- NEW LOGIC: Check if batch is too large for partial approval ---
+  const isLargeBatch = detailTotalCount > 2000;
 
   const fetchPendingBatches = useCallback(async () => {
     setLoading(true);
@@ -201,7 +206,7 @@ export default function JournalRequestApproval() {
         "GET"
       );
       if (res && res.content && isMounted.current) {
-        setDetailTotalCount(res.totalElements);
+        setDetailTotalCount(res.totalElements); // This updates the count used for logic
         const journalGroups = new Map();
         res.content.forEach((req) => {
           try {
@@ -269,7 +274,6 @@ export default function JournalRequestApproval() {
     setSelectedBatch(null);
   };
 
-  // 1. MAIN APPROVAL (Grid Actions)
   const handleSubmitAction = async () => {
     if (modalMode === "REJECTED" && !executorRemarks.trim()) {
       showSnackBar("Remarks required.", "warning");
@@ -303,7 +307,6 @@ export default function JournalRequestApproval() {
     }
   };
 
-  // 2. PARTIAL APPROVAL (View Modal Selection) - FIX APPLIED HERE
   const handleSubmitPartialAction = async (mode) => {
     if (mode === "REJECTED" && !partialExecutorRemarks.trim()) {
       showSnackBar("Remarks required.", "warning");
@@ -313,11 +316,9 @@ export default function JournalRequestApproval() {
       showSnackBar("Select at least one.", "warning");
       return;
     }
-    
-    // --- SAFETY CHECK ---
     if (!viewingBatchId) {
-        showSnackBar("Batch ID is missing!", "error");
-        return;
+      showSnackBar("Batch ID is missing!", "error");
+      return;
     }
 
     setIsPartialSubmitting(true);
@@ -325,7 +326,7 @@ export default function JournalRequestApproval() {
       await callApi(
         "/JS/journals/process-bulk",
         {
-          batchId: viewingBatchId, // <--- ADDED: Crucial Fix for "Batch null" error
+          batchId: viewingBatchId,
           journalIdPrefixes: selectedJournalPrefixes,
           status: mode,
           remarks:
@@ -533,6 +534,8 @@ export default function JournalRequestApproval() {
         slots={{ noRowsOverlay: CustomNoRowsOverlay }}
         sx={styles.dataGridContainer}
       />
+      
+      {/* --- Main Grid Approve/Reject Dialog --- */}
       <Dialog
         open={isModalOpen}
         onClose={handleCloseModal}
@@ -576,6 +579,8 @@ export default function JournalRequestApproval() {
           </Button>{" "}
         </DialogActions>{" "}
       </Dialog>
+      
+      {/* --- View Details Modal --- */}
       <Dialog
         open={isViewModalOpen}
         onClose={handleCloseViewModal}
@@ -595,7 +600,14 @@ export default function JournalRequestApproval() {
         <DialogContent dividers sx={{ p: 0 }}>
           {" "}
           <Box sx={styles.fixedContentBox}>
-            {" "}
+            {/* --- ADDED WARNING ALERT FOR LARGE BATCHES --- */}
+            {isLargeBatch && (
+              <Alert severity="info" sx={{ m: 1 }}>
+                Batch contains {detailTotalCount} entries. Partial approval is disabled for large batches (>2000). 
+                Please close this view and Accept/Reject the entire batch from the main list.
+              </Alert>
+            )}
+
             {detailLoading ? (
               <Box sx={styles.loadingContainer}>
                 <CircularProgress />
@@ -628,7 +640,8 @@ export default function JournalRequestApproval() {
                                 batchDetails.length
                             }
                             onChange={handleSelectAllClick}
-                            disabled={isViewingSelfCreated}
+                            // --- DISABLED IF SELF OR LARGE BATCH ---
+                            disabled={isViewingSelfCreated || isLargeBatch}
                           />
                         </TableCell>{" "}
                         <TableCell
@@ -663,14 +676,16 @@ export default function JournalRequestApproval() {
                         return group.map((row, rowIndex) => (
                           <TableRow
                             key={row.id}
-                            hover={!isViewingSelfCreated}
+                            hover={!isViewingSelfCreated && !isLargeBatch} // Disable hover effect
+                            // --- CLICK HANDLER DISABLED IF LARGE BATCH ---
                             onClick={() =>
                               !isViewingSelfCreated &&
+                              !isLargeBatch && 
                               handleRowCheckboxClick(null, row.journalPrefix)
                             }
                             selected={isSelected}
                             sx={{
-                              cursor: isViewingSelfCreated
+                              cursor: (isViewingSelfCreated || isLargeBatch)
                                 ? "not-allowed"
                                 : "pointer",
                               ...(rowIndex === 0 &&
@@ -691,7 +706,8 @@ export default function JournalRequestApproval() {
                                   <Checkbox
                                     color="primary"
                                     checked={isSelected}
-                                    disabled={isViewingSelfCreated}
+                                    // --- CHECKBOX DISABLED IF LARGE BATCH ---
+                                    disabled={isViewingSelfCreated || isLargeBatch}
                                     onClick={(e) =>
                                       handleRowCheckboxClick(
                                         e,
