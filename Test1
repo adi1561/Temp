@@ -12,6 +12,7 @@ import com.fincore.JournalService.Repository.JournalRequestRepository;
 import com.fincore.JournalService.Service.JournalBulkValidationService.ExcelRowData;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC; // <--- ADDED FOR TRACING
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Lazy;
@@ -110,6 +111,11 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Async("bulkExecutor")
     @Transactional
     public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", creatorId);
+        MDC.put("action", "CREATE");
+
         log.info("ASYNC CREATE: Starting Batch {} (Source: {})", batchId, requestId);
         long start = System.currentTimeMillis();
 
@@ -181,7 +187,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
             }
 
-//            createNotification(batchId, creatorId, totalRows);
             log.info(" Batch {} Created. Rows: {}. Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
 
         } catch (Exception e) {
@@ -191,6 +196,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             cleanupFailedBatch(batchId);
             progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Creation Error: " + e.getMessage());
 
+        } finally {
+            MDC.clear(); // --- MDC CLEANUP ---
         }
     }
 
@@ -302,6 +309,11 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         String batchId = dto.getBatchId();
         long start = System.currentTimeMillis();
 
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", executorId);
+        MDC.put("action", dto.getStatus().name());
+
         try {
             // Fetch Creator ID to notify them later
             String creatorId = jdbcTemplate.queryForObject("SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
@@ -394,6 +406,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             // No rollback here for Java exceptions if PL/SQL succeeded,
             // but PL/SQL handles its own rollback on error.
             progressService.sendProgress(batchId, executorId, 0, "FAILED", "Error: " + e.getMessage());
+        } finally {
+            MDC.clear(); // --- MDC CLEANUP ---
         }
     }
 
@@ -421,6 +435,12 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Async("bulkExecutor")
     public void executeAsyncBatchCancellation(String batchId, String userId) {
         long start = System.currentTimeMillis();
+
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", userId);
+        MDC.put("action", "DELETE");
+
         try {
             progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Data...");
             log.info("Calling PURGE_JOURNAL_BATCH for {}", batchId);
@@ -448,6 +468,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             // VISIBILITY : Set to ERROR so it reappears in list
             jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", "Delete Failed: " + e.getMessage(), batchId);
             progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: " + e.getMessage());
+        } finally {
+            MDC.clear(); // --- MDC CLEANUP ---
         }
     }
 
@@ -525,17 +547,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     // ==================================================================================
     // 5. HELPERS
     // ==================================================================================
-
-//    private String buildJsonPayloadFast(ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
-//        return "{\"changeType\":\"ADD\",\"masterJournalId\":null,\"csvDate\":\"" + pDate.format(fmt) + "\"," +
-//                "\"branch\":\"" + row.branch + "\",\"currency\":\"" + row.currency + "\"," +
-//                "\"cgl\":\"" + row.cgl + "\",\"amount\":" + amount + "," +
-//                "\"productType\":\"" + (row.productCode == null ? "" : row.productCode) + "\"," +
-//                "\"remarks\":\"" + (row.remarks == null ? "" : escapeJson(row.remarks)) + "\"," +
-//                "\"arFlag\":\"A\",\"acClassification\":\"A\",\"batchId\":\"" + batchId + "\"," +
-//                "\"journalId\":\"" + jId + "\",\"commonBatchRemarks\":\"" + escapeJson(rem) + "\"," +
-//                "\"transactionCount\":" + count + "}";
-//    }
 
     // ---------------------------------------------------------
     // OPTIMIZED PAYLOAD GENERATION (Bulk)
@@ -796,6 +807,3 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return Collections.emptyList();
     }
 }
-
-
-
