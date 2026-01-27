@@ -1,17 +1,203 @@
-46224625	11-11-25	05999	INR	2041030698	3140.7772	
-46224626	11-11-25	06000	INR	2041030698	3793.895	
-46224627	11-11-25	06025	INR	2041030698	144.1266	
-46224628	11-11-25	06026	INR	2041030698	194.1568	
-46224629	11-11-25	06034	INR	2041030698	527.2384	
-46224630	11-11-25	06038	INR	2041030698	1357.3956	
-46224631	11-11-25	06042	INR	2041030698	19.8813	
-46224632	11-11-25	06043	INR	2041030698	1301.9835	
-46224633	11-11-25	06046	INR	2041030698	3623.9073	
-46224634	11-11-25	06055	INR	2041030698	735.8286	
-46224635	11-11-25	06056	INR	2041030698	1462.8417	
-46224636	11-11-25	06083	INR	2041030698	2.4399	
-46224637	11-11-25	06085	INR	2041030698	3714.2739	
-46224638	11-11-25	06097	INR	2041030698	31.4688	
-46224639	11-11-25	10998	INR	7051030601	1590.9408	
-46224640	11-11-25	11000	INR	7051030601	1127.1581	
+Here is the Final Updated Code.
+I have removed all sequence generation logic to ensure your application never conflicts with other systems using this table. I have also configured the application to strictly Read-Only mode at the database schema level so it cannot modify your table structure.
+1. application.properties (The Safety Lock)
+Purpose: Sets ddl-auto to none. This guarantees Hibernate will never try to create, update, or delete your table or sequences.
+# DATABASE CONNECTION
+spring.datasource.url=jdbc:oracle:thin:@//YOUR_DB_HOST:1521/YOUR_SERVICE_NAME
+spring.datasource.username=FINCORE
+spring.datasource.password=YOUR_PASSWORD
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+
+# CRITICAL SAFETY SETTING
+# 'none' = Hibernate will do absolutely nothing to your database structure.
+spring.jpa.hibernate.ddl-auto=none
+
+# LOGGING (Optional: Helps you see the exact SQL running)
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+
+2. GlBalance.java (The Entity)
+Purpose: Maps the columns. I removed @GeneratedValue. This is now a "Passive" entity—it reads what exists but doesn't try to generate IDs.
+package com.fincore.entity;
+
+import jakarta.persistence.*;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Entity
+@Table(name = "GL_BALANCE", schema = "FINCORE")
+@Data
+@NoArgsConstructor
+public class GlBalance {
+
+    @Id
+    @Column(name = "ID")
+    // No generation strategy defined. 
+    // This is safe because we are only reading, not inserting.
+    private Long id;
+
+    @Column(name = "BALANCE_DATE")
+    private LocalDate balanceDate;
+
+    @Column(name = "BRANCH_CODE")
+    private String branchCode;
+
+    @Column(name = "CURRENCY")
+    private String currency;
+
+    @Column(name = "CGL")
+    private String cgl;
+
+    @Column(name = "BALANCE")
+    private BigDecimal balance;
+
+    @Column(name = "INR_BALANCE")
+    private BigDecimal inrBalance;
+}
+
+3. GlBalanceDTO.java (The Projection)
+Purpose: Hides the ID and holds the specific data format you requested.
+package com.fincore.dto;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class GlBalanceDTO {
+    private LocalDate balanceDate;
+    private String branchCode;
+    private String currency;
+    private String cgl;
+    private BigDecimal balance;
+    private BigDecimal inrBalance;
+}
+
+4. GlBalanceRepository.java (The Speed Optimization)
+Purpose: Uses a constructor expression to fetch DTOs directly, skipping the heavy Entity loading process.
+package com.fincore.repository;
+
+import com.fincore.dto.GlBalanceDTO;
+import com.fincore.entity.GlBalance;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface GlBalanceRepository extends JpaRepository<GlBalance, Long> {
+
+    @Query("""
+        SELECT new com.fincore.dto.GlBalanceDTO(
+            b.balanceDate, 
+            b.branchCode, 
+            b.currency, 
+            b.cgl, 
+            b.balance, 
+            b.inrBalance
+        ) 
+        FROM GlBalance b
+    """)
+    Page<GlBalanceDTO> findAllAsDto(Pageable pageable);
+}
+
+5. GlBalanceService.java
+Purpose: Handles the transaction.
+package com.fincore.service;
+
+import com.fincore.dto.GlBalanceDTO;
+import com.fincore.repository.GlBalanceRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class GlBalanceService {
+
+    @Autowired
+    private GlBalanceRepository repository;
+
+    @Transactional(readOnly = true)
+    public Page<GlBalanceDTO> getAllBalances(int page, int size) {
+        PageRequest pageRequest = PageRequest.of(page, size);
+        return repository.findAllAsDto(pageRequest);
+    }
+}
+
+6. GlBalanceController.java (The API Endpoint)
+package com.fincore.controller;
+
+import com.fincore.dto.GlBalanceDTO;
+import com.fincore.service.GlBalanceService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/balances")
+public class GlBalanceController {
+
+    @Autowired
+    private GlBalanceService service;
+
+    @GetMapping
+    public ResponseEntity<Page<GlBalanceDTO>> getBalances(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size
+    ) {
+        return ResponseEntity.ok(service.getAllBalances(page, size));
+    }
+}
+
+7. How to Test (The Payload)
+Since this is a GET API (fetching data), there is no JSON Body payload. The "payload" is passed inside the URL as parameters.
+Option A: CURL Command (For Terminal/Cmd)
+Copy and paste this into your terminal to get the first 10 records:
+curl -X GET "http://localhost:8080/api/v1/balances?page=0&size=10"
+
+Option B: Postman Configuration
+If you are using Postman to test, configure it exactly like this:
+ * Method: GET
+ * URL: http://localhost:8080/api/v1/balances
+ * Params (Query Params tab):
+   * Key: page | Value: 0
+   * Key: size | Value: 10
+Expected Response (JSON)
+You will receive this clean JSON. Note that ID is missing (as requested) and the data matches your table columns.
+{
+    "content": [
+        {
+            "balanceDate": "2025-11-11",
+            "branchCode": "05999",
+            "currency": "INR",
+            "cgl": "2041030698",
+            "balance": 3140.7772,
+            "inrBalance": null
+        },
+        {
+            "balanceDate": "2025-11-11",
+            "branchCode": "06000",
+            "currency": "INR",
+            "cgl": "2041030698",
+            "balance": 3793.8950,
+            "inrBalance": null
+        }
+    ],
+    "pageable": {
+        "pageNumber": 0,
+        "pageSize": 10
+    },
+    "totalElements": 462246,
+    "totalPages": 46224
+}
 
