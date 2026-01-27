@@ -1,11 +1,184 @@
-ID	NUMBER(19,0)	Yes	"FINCORE"."GL_TRANSACTIONS_SEQ"."NEXTVAL"	1	
-RECON_RUN_DATE	DATE	Yes	NULL 	2	
-BRANCH_CODE	VARCHAR2(5 BYTE)	Yes		3	
-CURRENCY	VARCHAR2(3 BYTE)	Yes		4	
-CGL	VARCHAR2(10 BYTE)	Yes		5	
-CBS_BALANCE	NUMBER(25,4)	Yes		6	
-GL_BALANCE	NUMBER(25,4)	Yes		7	
-DIFFERENCE_AMOUNT	NUMBER(25,4)	Yes		8	
-DIFF_BW_YESTERDAY	NUMBER(25,4)	Yes		9	
-TYPE	VARCHAR2(40 BYTE)	Yes		10	
-HEAD	VARCHAR2(30 BYTE)	Yes		11	
+This is a significant change in the schema (structure). It looks like a Reconciliation Table now (comparing CBS vs. GL).
+Here is the complete, updated code for the new table structure.
+1. application.properties (Safety First)
+Ensure this is set to none so we don't accidentally drop your new table.
+spring.datasource.url=jdbc:oracle:thin:@//YOUR_DB_HOST:1521/YOUR_SERVICE_NAME
+spring.datasource.username=FINCORE
+spring.datasource.password=YOUR_PASSWORD
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+
+# SAFETY: This prevents Hibernate from altering your table
+spring.jpa.hibernate.ddl-auto=none
+
+# Display SQL for debugging
+spring.jpa.show-sql=true
+
+2. The DTO (GlTransactionDTO.java)
+Updated: Contains Recon Run Date, CBS Balance, Difference, etc. ID is excluded.
+package com.fincore.dto;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class GlTransactionDTO {
+    private LocalDate reconRunDate;
+    private String branchCode;
+    private String currency;
+    private String cgl;
+    private BigDecimal cbsBalance;
+    private BigDecimal glBalance;
+    private BigDecimal differenceAmount;
+    private BigDecimal diffBwYesterday;
+    private String type;
+    private String head;
+}
+
+3. The Entity (GlTransaction.java)
+Updated: Maps to the new columns. I have assumed the table name is GL_TRANSACTIONS based on the sequence you shared (GL_TRANSACTIONS_SEQ). If the table name is different, change @Table(name = "...").
+package com.fincore.entity;
+
+import jakarta.persistence.*;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Entity
+@Table(name = "GL_TRANSACTIONS", schema = "FINCORE") // Check if table name is correct
+@Data
+@NoArgsConstructor
+public class GlTransaction {
+
+    @Id
+    @Column(name = "ID")
+    private Long id;
+
+    @Column(name = "RECON_RUN_DATE")
+    private LocalDate reconRunDate;
+
+    @Column(name = "BRANCH_CODE", length = 5)
+    private String branchCode;
+
+    @Column(name = "CURRENCY", length = 3)
+    private String currency;
+
+    @Column(name = "CGL", length = 10)
+    private String cgl;
+
+    @Column(name = "CBS_BALANCE", precision = 25, scale = 4)
+    private BigDecimal cbsBalance;
+
+    @Column(name = "GL_BALANCE", precision = 25, scale = 4)
+    private BigDecimal glBalance;
+
+    @Column(name = "DIFFERENCE_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal differenceAmount;
+
+    @Column(name = "DIFF_BW_YESTERDAY", precision = 25, scale = 4)
+    private BigDecimal diffBwYesterday;
+
+    @Column(name = "TYPE", length = 40)
+    private String type;
+
+    @Column(name = "HEAD", length = 30)
+    private String head;
+}
+
+4. The Repository (GlTransactionRepository.java)
+Updated: The JPQL query now selects the new fields in the exact order of the DTO constructor.
+package com.fincore.repository;
+
+import com.fincore.dto.GlTransactionDTO;
+import com.fincore.entity.GlTransaction;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface GlTransactionRepository extends JpaRepository<GlTransaction, Long> {
+
+    // IMPORTANT: The order of fields inside 'new DTO(...)' must match 
+    // the order in GlTransactionDTO.java exactly.
+    @Query("""
+        SELECT new com.fincore.dto.GlTransactionDTO(
+            t.reconRunDate,
+            t.branchCode,
+            t.currency,
+            t.cgl,
+            t.cbsBalance,
+            t.glBalance,
+            t.differenceAmount,
+            t.diffBwYesterday,
+            t.type,
+            t.head
+        )
+        FROM GlTransaction t
+    """)
+    Page<GlTransactionDTO> findAllAsDto(Pageable pageable);
+}
+
+5. The Service (GlTransactionService.java)
+Updated: Uses the new Repository and DTO.
+package com.fincore.service;
+
+import com.fincore.dto.GlTransactionDTO;
+import com.fincore.repository.GlTransactionRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class GlTransactionService {
+
+    @Autowired
+    private GlTransactionRepository repository;
+
+    @Transactional(readOnly = true)
+    public Page<GlTransactionDTO> getAllTransactions(int page, int size) {
+        // Sort by Recon Run Date descending (latest first)
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("reconRunDate").descending());
+        return repository.findAllAsDto(pageRequest);
+    }
+}
+
+6. The Controller (GlTransactionController.java)
+Updated: Endpoint to fetch the new data.
+package com.fincore.controller;
+
+import com.fincore.dto.GlTransactionDTO;
+import com.fincore.service.GlTransactionService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/transactions")
+public class GlTransactionController {
+
+    @Autowired
+    private GlTransactionService service;
+
+    @GetMapping
+    public ResponseEntity<Page<GlTransactionDTO>> getTransactions(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size
+    ) {
+        return ResponseEntity.ok(service.getAllTransactions(page, size));
+    }
+}
+
+How to Verify the Path
+Since you had an issue with the path before (com.fincore.ReportService.dto...), please ensure that in GlTransactionRepository.java, the string inside @Query matches exactly where you put the DTO file.
+If you put the DTO in src/main/java/com/fincore/dto/GlTransactionDTO.java, then the query new com.fincore.dto.GlTransactionDTO(...) is correct.
