@@ -1,26 +1,264 @@
-SELECT
-    RECON_RUN_DATE, 
-    BRANCH_CODE,
-    CURRENCY,
-    CGL,
-    CBS_BALANCE,
-    GL_BALANCE,
-    DIFFERENCE_AMOUNT,
-    DIFF_BW_YESTERDAY,
-    TYPE,
-    HEAD,
-    
-    /* ERROR_DATE CALCULATION */
-    CASE 
-        WHEN TYPE = 'New Entry' THEN 
-            $P{date}
-        ELSE 
-            TO_CHAR(TO_DATE($P{date}, 'dd/MM/yyyy') - TRUNC(DBMS_RANDOM.VALUE(1, 8)), 'dd/MM/yyyy')
-    END AS ERROR_DATE
+This is a comprehensive Exception Handling Strategy designed specifically for your JournalService architecture.
+Based on my analysis, your application has a robust "Happy Path" and performance optimizations (Async, Redis, Oracle Parallelism), but it lacks a unified strategy to handle failures gracefully. The current approach relies heavily on generic try-catch (Exception e) blocks or raw framework exceptions, which can lead to inconsistent API responses and silent failures in Async threads.
+Here is the complete implementation plan.
+Part 1: The Core Infrastructure
+First, we need a standardized response structure. This ensures that whether a validation fails, a DB locks, or a file is corrupt, the frontend always receives the same JSON format.
+1. Standard Error Response DTO
+Create this in com.fincore.JournalService.Dto.Error:
+package com.fincore.JournalService.Dto.Error;
 
-FROM
-    DIFFERENCE
-WHERE
-    RECON_RUN_DATE = TO_DATE($P{date}, 'dd/MM/yyyy') 
-    AND DIFFERENCE_AMOUNT != 0
-    AND ROWNUM <= 1000  -- Limits the result to 1000 rows
+import lombok.Builder;
+import lombok.Data;
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Data
+@Builder
+public class ApiErrorResponse {
+    private LocalDateTime timestamp;
+    private int status;
+    private String error;
+    private String message;
+    private String path;
+    private List<ValidationError> validationErrors; // Only for 400 Bad Request
+
+    @Data
+    @Builder
+    public static class ValidationError {
+        private String field;
+        private String message;
+    }
+}
+
+2. Semantic Custom Exceptions
+Do not use generic RuntimeException. Create these in com.fincore.JournalService.Exception to represent specific domain failures.
+package com.fincore.JournalService.Exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+// 1. For File I/O, Parsing, or Corrupt Excel/CSV data
+@ResponseStatus(HttpStatus.BAD_REQUEST)
+public class FileProcessingException extends RuntimeException {
+    public FileProcessingException(String message, Throwable cause) { super(message, cause); }
+    public FileProcessingException(String message) { super(message); }
+}
+
+// 2. For Redis Cache Misses or expired tokens
+@ResponseStatus(HttpStatus.GONE)
+public class CacheExpiredException extends RuntimeException {
+    public CacheExpiredException(String message) { super(message); }
+}
+
+// 3. For Race Conditions (e.g., Double click on Batch Creation)
+@ResponseStatus(HttpStatus.CONFLICT)
+public class ConcurrencyLockException extends RuntimeException {
+    public ConcurrencyLockException(String message) { super(message); }
+}
+
+// 4. For Database integrity issues (Foreign keys, Data truncation)
+@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+public class DatabaseOperationException extends RuntimeException {
+    public DatabaseOperationException(String message, Throwable cause) { super(message, cause); }
+}
+
+// 5. For External Service failures (HDFS/Hive)
+@ResponseStatus(HttpStatus.BAD_GATEWAY)
+public class ExternalServiceException extends RuntimeException {
+    public ExternalServiceException(String message) { super(message); }
+}
+
+Part 2: The Global Exception Handler
+This is the "Brain" of your error handling. It intercepts exceptions from all Controllers and formats them into your ApiErrorResponse.
+Create com.fincore.JournalService.Exception.GlobalExceptionHandler:
+package com.fincore.JournalService.Exception;
+
+import com.fincore.JournalService.Dto.Error.ApiErrorResponse;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    // --- 1. VALIDATION ERRORS (@Valid) ---
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiErrorResponse> handleValidation(MethodArgumentNotValidException ex, HttpServletRequest request) {
+        List<ApiErrorResponse.ValidationError> errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(err -> ApiErrorResponse.ValidationError.builder()
+                        .field(err.getField())
+                        .message(err.getDefaultMessage())
+                        .build())
+                .collect(Collectors.toList());
+
+        return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed", "Input validation error", request.getRequestURI(), errors);
+    }
+
+    // --- 2. FILE UPLOAD ERRORS ---
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ApiErrorResponse> handleMaxSize(MaxUploadSizeExceededException ex, HttpServletRequest request) {
+        return buildResponse(HttpStatus.PAYLOAD_TOO_LARGE, "File Too Large", "Maximum upload size exceeded", request.getRequestURI(), null);
+    }
+
+    @ExceptionHandler(FileProcessingException.class)
+    public ResponseEntity<ApiErrorResponse> handleFileProcessing(FileProcessingException ex, HttpServletRequest request) {
+        log.error("File Processing Error: {}", ex.getMessage());
+        return buildResponse(HttpStatus.BAD_REQUEST, "File Error", ex.getMessage(), request.getRequestURI(), null);
+    }
+
+    // --- 3. CONCURRENCY & LOCKS ---
+    @ExceptionHandler({ConcurrencyLockException.class, IllegalStateException.class}) // Catching IllegalStateException as you used it for locks
+    public ResponseEntity<ApiErrorResponse> handleConcurrency(RuntimeException ex, HttpServletRequest request) {
+        log.warn("Concurrency Conflict: {}", ex.getMessage());
+        return buildResponse(HttpStatus.CONFLICT, "Operation Conflict", ex.getMessage(), request.getRequestURI(), null);
+    }
+
+    // --- 4. RESOURCE NOT FOUND ---
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiErrorResponse> handleNotFound(ResourceNotFoundException ex, HttpServletRequest request) {
+        return buildResponse(HttpStatus.NOT_FOUND, "Not Found", ex.getMessage(), request.getRequestURI(), null);
+    }
+
+    // --- 5. CACHE / EXPIRED DATA ---
+    @ExceptionHandler(CacheExpiredException.class)
+    public ResponseEntity<ApiErrorResponse> handleCacheExpired(CacheExpiredException ex, HttpServletRequest request) {
+        return buildResponse(HttpStatus.GONE, "Session Expired", ex.getMessage(), request.getRequestURI(), null);
+    }
+
+    // --- 6. DATABASE ERRORS ---
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiErrorResponse> handleSqlIntegrity(DataIntegrityViolationException ex, HttpServletRequest request) {
+        log.error("DB Integrity Error: ", ex);
+        return buildResponse(HttpStatus.CONFLICT, "Data Integrity Error", "Constraint violation or duplicate entry.", request.getRequestURI(), null);
+    }
+    
+    @ExceptionHandler(DataAccessException.class)
+    public ResponseEntity<ApiErrorResponse> handleDbError(DataAccessException ex, HttpServletRequest request) {
+        log.error("Database Error: ", ex);
+        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Database Error", "A database error occurred. Please contact support.", request.getRequestURI(), null);
+    }
+
+    // --- 7. CATCH-ALL ---
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiErrorResponse> handleGeneral(Exception ex, HttpServletRequest request) {
+        log.error("Unhandled Exception: ", ex);
+        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Internal Server Error", "An unexpected error occurred.", request.getRequestURI(), null);
+    }
+
+    private ResponseEntity<ApiErrorResponse> buildResponse(HttpStatus status, String error, String message, String path, List<ApiErrorResponse.ValidationError> validationErrors) {
+        ApiErrorResponse response = ApiErrorResponse.builder()
+                .timestamp(LocalDateTime.now())
+                .status(status.value())
+                .error(error)
+                .message(message)
+                .path(path)
+                .validationErrors(validationErrors)
+                .build();
+        return new ResponseEntity<>(response, status);
+    }
+}
+
+Part 3: Handling Async Exceptions
+Your code heavily relies on @Async. CRITICAL WARNING: Exceptions thrown in @Async void methods do not go to the GlobalExceptionHandler. They are swallowed by the thread unless handled.
+You must create an AsyncConfig extension to catch these.
+Modify com.fincore.JournalService.config.AsyncConfig:
+// Add imports
+import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
+import org.springframework.scheduling.annotation.AsyncConfigurer;
+import lombok.extern.slf4j.Slf4j;
+import java.lang.reflect.Method;
+
+@Configuration
+@EnableAsync
+@Slf4j
+public class AsyncConfig implements AsyncConfigurer { // Implements AsyncConfigurer
+
+    // ... existing bulkExecutor bean ...
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (Throwable ex, Method method, Object... params) -> {
+            log.error("CRITICAL ASYNC FAILURE in method: {}", method.getName(), ex);
+            // Optional: Send alert to monitoring system here
+        };
+    }
+}
+
+Part 4: Targeted Code Enhancements
+Now we apply the custom exceptions to your services. I will point out exactly where to replace generic exceptions with specific ones.
+1. JournalRequestServiceImpl.java
+Location: createBatchFromCacheAsync
+Change: Catch the IllegalStateException for locks and verify it propagates to the Controller (where the Global Handler will catch it and return 409).
+Location: executeAsyncBatchCreation (Async Method)
+Current: Catches Exception, logs it, cleans up.
+Gap: If journalBulkValidationService.getValidRowsFromCache returns null, you log "Cache Expired".
+Fix: Explicitly handle the "Not Found" case in the synchronous part if possible, or ensure the error status is descriptive.
+Refinement for processChunkRaw (JDBC Batching):
+Currently, you throw RuntimeException("DB Error", e).
+Improvement: Throw DatabaseOperationException to differentiate DB errors from logic errors.
+// In processChunkRaw method:
+catch (SQLException e) {
+    log.error("Raw JDBC Batch Insert Failed for chunk starting at " + globalOffset, e);
+    // Use the custom exception
+    throw new DatabaseOperationException("Failed to persist batch chunk due to SQL error", e);
+}
+
+2. JournalBulkValidationService.java
+This service does heavy I/O.
+Location: initiateValidation
+Current: Throws IOException.
+Change: Wrap Files.copy in a try-catch and throw FileProcessingException.
+// In initiateValidation:
+try {
+    Files.copy(fileStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
+} catch (IOException e) {
+    throw new FileProcessingException("Failed to save uploaded file to temporary storage", e);
+}
+
+Location: getValidRowsFromCache
+Current: Returns Collections.emptyList() on error.
+Risk: The caller (JournalRequestService) sees an empty list and might just do nothing or fail silently.
+Fix: Throw CacheExpiredException if data is missing, so the UI gets a clear "Session Expired" error instead of a generic failure.
+// In getValidRowsFromCache:
+byte[] compressed = redisTemplate.opsForValue().get("DATA_" + requestId);
+if (compressed == null) {
+    throw new CacheExpiredException("Validation data not found. The cache may have expired (TTL 1 Hour). Please re-upload.");
+}
+
+3. JournalRequestController.java
+Location: createBatchFromCache
+Current: Manually catches IllegalStateException and returns 409.
+Change: Remove the try-catch block entirely. Let the exception propagate to the GlobalExceptionHandler. This reduces code duplication in controllers.
+Before:
+} catch (IllegalStateException e) {
+    return ResponseEntity.status(HttpStatus.CONFLICT).body(...);
+}
+
+After:
+// The GlobalExceptionHandler will now handle ConcurrencyLockException / IllegalStateException
+// and return the standardized 409 response automatically.
+String batchId = journalRequestService.createBatchFromCacheAsync(...);
+return ResponseEntity.status(HttpStatus.ACCEPTED).body(...);
+
+4. HdfsSyncService.java
+Location: syncToDataLake
+Current: Catches Exception and logs "HDFS SYNC FAILED".
+Fix: This is correct for background tasks, but ensure you differentiate between DataAccessException (retryable) and logic errors.
+Summary of Benefits
+ * Consistency: Every error (validation, DB, logic) returns the exact same JSON structure (ApiErrorResponse), making Frontend integration trivial.
+ * Visibility: The AsyncConfig change ensures that if a background thread dies, it is logged loudly as "CRITICAL ASYNC FAILURE" rather than vanishing.
+ * Clarity: Replacing RuntimeException with ConcurrencyLockException or CacheExpiredException makes the logs and the HTTP status codes immediately understandable (409 vs 410 vs 500).
+ * Resilience: By catching specific IO exceptions in the Validation service, you prevent file system issues from masquerading as application bugs.
