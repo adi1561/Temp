@@ -303,6 +303,9 @@ public class SecurityConfig {
 }
 
 
+controllers
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 package com.fincore.JournalService.Controllers;
 
 import com.fincore.JournalService.Dto.BranchDto;
@@ -997,6 +1000,22 @@ public class TaskProgressDto implements Serializable {
     private int percentage;     // 0-100
     private String status;      // PROCESSING, COMPLETED, FAILED
     private String message;     // User-facing update (e.g., "Row 500/1000...")
+}
+
+this is importtant for next 
+
+after this i have folder called as Exceptions in which i have this file only
+package com.fincore.JournalService.Exception;
+
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
 }
 
 
@@ -2147,8 +2166,6 @@ public class HdfsSyncService {
     }
 }
 
-
-
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
@@ -2163,6 +2180,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.slf4j.MDC;
+
+
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Lazy;
@@ -2174,6 +2194,9 @@ import java.io.*;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -2184,7 +2207,6 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
-
 
 @Service
 @RequiredArgsConstructor
@@ -2199,25 +2221,45 @@ public class JournalBulkValidationService {
 
     private final ValidationMasterService validationMasterService;
     private final ObjectMapper objectMapper;
-    // Status is lightweight, keep in memory for speed
-    private final Map<String, BulkUploadStateDto> statusCache = new ConcurrentHashMap<>();
+
+    // --- REDIS CONFIGURATION ---
     @Autowired
     @Qualifier("byteArrayRedisTemplate")
     private RedisTemplate<String, byte[]> redisTemplate;
+
     @Autowired
     @Lazy
     private JournalBulkValidationService self;
 
-    public BulkUploadStateDto getState(String reqId) {
-        return statusCache.get(reqId);
+    // --- REDIS STATE MANAGEMENT ---
+    private void saveStatusToRedis(String reqId, BulkUploadStateDto state) {
+        try {
+            byte[] json = objectMapper.writeValueAsBytes(state);
+            redisTemplate.opsForValue().set("BULK_STATUS_" + reqId, json, 2, TimeUnit.HOURS);
+        } catch (Exception e) {
+            log.error("Failed to save status to Redis for {}", reqId, e);
+        }
     }
 
+    private BulkUploadStateDto getStatusFromRedis(String reqId) {
+        try {
+            byte[] json = redisTemplate.opsForValue().get("BULK_STATUS_" + reqId);
+            if (json == null) return null;
+            return objectMapper.readValue(json, BulkUploadStateDto.class);
+        } catch (Exception e) {
+            log.error("Failed to read status from Redis for {}", reqId, e);
+            return null;
+        }
+    }
+
+    public BulkUploadStateDto getState(String reqId) {
+        return getStatusFromRedis(reqId);
+    }
 
     public byte[] getFileBytes(String reqId, String type) {
         return redisTemplate.opsForValue().get("FILE_" + reqId + "_" + type);
     }
 
-    // --- REDIS COMPRESSION (Fixes OOM) ---
     public List<ExcelRowData> getValidRowsFromCache(String requestId) {
         long start = System.currentTimeMillis();
         byte[] compressed = redisTemplate.opsForValue().get("DATA_" + requestId);
@@ -2226,121 +2268,146 @@ public class JournalBulkValidationService {
         try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressed))) {
             List<ExcelRowData> rows = objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {
             });
-            log.info("Decompressed {} rows from Redis in {}ms", rows.size(), System.currentTimeMillis() - start);
+            log.info("Decompressed {} rows from Redis in {}ms [ReqID: {}]", rows.size(), System.currentTimeMillis() - start, requestId);
             return rows;
         } catch (IOException e) {
-            log.error("Failed to decompress rows from Redis", e);
+            log.error("Failed to decompress rows from Redis [ReqID: {}]", requestId, e);
             return Collections.emptyList();
         }
     }
 
-    private void saveRowsToRedis(String requestId, List<ExcelRowData> rows) {
-        long start = System.currentTimeMillis();
-        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-             GZIPOutputStream gos = new GZIPOutputStream(baos)) {
-            objectMapper.writeValue(gos, rows);
-            gos.finish();
-            byte[] compressed = baos.toByteArray();
-            redisTemplate.opsForValue().set("DATA_" + requestId, compressed, 1, TimeUnit.HOURS);
-            log.info("Compressed and saved {} rows to Redis in {}ms (Size: {} bytes)", rows.size(), System.currentTimeMillis() - start, compressed.length);
-        } catch (IOException e) {
-            log.error("Failed to save rows to Redis", e);
-        }
-    }
-
-
-    public String initiateValidation(byte[] fileBytes, String filename, LocalDate postingDate) throws IOException {
+    // --- STREAMING INIT ---
+    public String initiateValidation(InputStream fileStream, String filename, LocalDate postingDate) throws IOException {
         String requestId = UUID.randomUUID().toString();
+
+        // 1. Create Temp File on Disk
+        Path tempFile = Files.createTempFile("UPLOAD_" + requestId, ".tmp");
+        Files.copy(fileStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
+
+        // 2. Init Status in Redis
         BulkUploadStateDto state = new BulkUploadStateDto();
         state.setRequestId(requestId);
         state.setStatus("PROCESSING");
         state.setCurrentStage(1);
         state.setMessage("Initializing Upload...");
         state.setTotalRows(0);
-        statusCache.put(requestId, state);
+        saveStatusToRedis(requestId, state);
 
-        self.processAsync(requestId, fileBytes, filename, postingDate);
+        log.info("Validation Initiated. ReqID: {}, File: {}, Date: {}", requestId, filename, postingDate);
+
+        // 3. Pass File Path to Async Method
+        self.processAsync(requestId, tempFile.toString(), filename, postingDate);
         return requestId;
     }
 
     @Async("bulkExecutor")
-    public void processAsync(String requestId, byte[] fileBytes, String filename, LocalDate postingDate) {
-        log.info("Starting Async Validation for ReqID: {}", requestId);
+    public void processAsync(String requestId, String tempFilePath, String filename, LocalDate postingDate) {
+
+        MDC.put("requestId", requestId);
+
+
+        long startTime = System.currentTimeMillis();
+
+        log.info("Starting Async Validation. TempFile: {}", tempFilePath);
+        File tempFile = new File(tempFilePath);
+
         try {
             updateState(requestId, s -> s.setMessage("Parsing File..."));
-            List<ExcelRowData> parsedRows;
+
+            ParsingResult parsingResult;
             boolean isCsv = filename != null && (filename.toLowerCase().endsWith(".csv") || filename.toLowerCase().endsWith(".txt"));
 
-            if (isCsv) parsedRows = parseCsvBytes(fileBytes, postingDate);
-            else parsedRows = parseExcelBytes(fileBytes, postingDate);
+            long parseStart = System.currentTimeMillis();
+            try (InputStream is = new FileInputStream(tempFile)) {
+                if (isCsv) parsingResult = parseCsvStream(is, postingDate);
+                else parsingResult = parseExcelStream(is, postingDate);
+            }
+            log.info("Parsing Completed in {}ms. Total Rows Found: {}", (System.currentTimeMillis() - parseStart), parsingResult.rows.size());
+
+            List<ExcelRowData> parsedRows = parsingResult.rows;
 
             updateState(requestId, s -> {
                 s.setTotalRows(parsedRows.size());
                 s.setMessage("Validating Formats...");
             });
 
-            if (runFormatCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Format Validation Failed", 1);
+            // --- STAGE 1: FORMAT CHECK ---
+            log.info("Starting Stage 1: Format Validation...");
+            long s1Start = System.currentTimeMillis();
+            runFormatCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                log.warn("Stage 1 Failed. Format errors found in {}ms.", (System.currentTimeMillis() - s1Start));
+                failRequest(requestId, parsedRows, "Format Validation Failed", 1, parsingResult.hasProductColumn);
                 return;
             }
+            log.info("Stage 1 Passed.");
 
+            // --- STAGE 2: DATABASE CHECK ---
             updateState(requestId, s -> {
                 s.setCurrentStage(2);
                 s.setMessage("Checking Database...");
             });
-
-            if (runDbCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Database Validation Failed", 2);
+            log.info("Starting Stage 2: Database Validation...");
+            long s2Start = System.currentTimeMillis();
+            runDbCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                log.warn("Stage 2 Failed. Database errors found in {}ms.", (System.currentTimeMillis() - s2Start));
+                failRequest(requestId, parsedRows, "Database Validation Failed", 2, parsingResult.hasProductColumn);
                 return;
             }
+            log.info("Stage 2 Passed.");
 
+            // --- STAGE 3: BALANCE CHECK ---
             updateState(requestId, s -> {
                 s.setCurrentStage(3);
                 s.setMessage("Checking Balances...");
             });
-
-            if (runBalanceCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3);
+            log.info("Starting Stage 3: Balance Validation...");
+            long s3Start = System.currentTimeMillis();
+            runBalanceCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                log.warn("Stage 3 Failed. Balance mismatches found in {}ms.", (System.currentTimeMillis() - s3Start));
+                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3, parsingResult.hasProductColumn);
                 return;
             }
+            log.info("Stage 3 Passed.");
 
+            // --- SUCCESS ---
+            long totalTime = System.currentTimeMillis() - startTime;
+            log.info("Validation SUCCESS. Total Time: {}ms. Proceeding to save data.", totalTime);
             completeRequest(requestId, parsedRows, postingDate, isCsv);
 
         } catch (Exception e) {
-            log.error("Async Validation Error", e);
+            log.error("CRITICAL: Async Validation Crashed.", e);
             updateState(requestId, s -> {
                 s.setStatus("ERROR");
                 s.setMessage("System Error: " + e.getMessage());
                 s.setHasErrorFile(false);
             });
+        } finally {
+            if (tempFile.exists()) {
+                boolean deleted = tempFile.delete();
+                if(!deleted) log.warn("Failed to delete temp file: {}", tempFilePath);
+            }
+
+            MDC.clear();
         }
     }
 
-    private boolean runDbCheck(List<ExcelRowData> rows) {
-        // FAST: Load Sets only ONCE
-        Set<String> validBranches = validationMasterService.getAllActiveBranches();
-        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
-        Set<String> validCgls = validationMasterService.getAllActiveCgls();
+    // --- PARSING UTILS ---
 
-        rows.parallelStream().forEach(d -> {
-            if (!validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found/Inactive: " + d.branch);
-            if (!validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found/Inactive: " + d.currency);
-            if (!validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found/Inactive: " + d.cgl);
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-
-    // --- STANDARD UTILS ---
-
-    private List<ExcelRowData> parseCsvBytes(byte[] bytes, LocalDate postingDate) throws IOException {
+    private ParsingResult parseCsvStream(InputStream is, LocalDate postingDate) throws IOException {
         List<ExcelRowData> list = new ArrayList<>();
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
+        boolean hasProductCol = false;
+
+
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
             String line;
             int i = 0;
             while ((line = br.readLine()) != null) {
                 if (line.trim().isEmpty()) continue;
                 String[] c = line.split(",", -1);
+
                 if (i == 0) {
                     String h = c.length > 0 ? c[0].trim().toLowerCase() : "";
                     if ((h.contains("branch") || h.contains("batch")) && !h.equals("01")) {
@@ -2348,49 +2415,88 @@ public class JournalBulkValidationService {
                         continue;
                     }
                 }
+
                 ExcelRowData d = new ExcelRowData();
                 d.rowIndex = i++;
-                if (c.length > 0) d.sysSite = c[0].trim();
-                if (c.length > 1) d.sysDate = c[1].trim();
-                if (c.length > 2) d.sysYear = c[2].trim();
-                if (c.length > 3) d.sysPeriod = c[3].trim();
-                if (c.length > 4) d.branch = c[4].trim();
-                if (c.length > 5) d.currency = c[5].trim().toUpperCase();
-                if (c.length > 6) d.cgl = c[6].trim();
-                String amtRaw = (c.length > 7) ? c[7].trim() : "";
-                String txnRaw = (c.length > 8) ? c[8].trim() : "";
-                parseAmount(d, amtRaw, txnRaw);
-                if (c.length > 9) d.remarks = c[9].trim();
-                String rawProd = (c.length > 10) ? c[10].trim() : "";
-                d.productCode = rawProd.isEmpty() ? "A" : rawProd;
-                if (c.length != 14)
-                    d.formatErrors.add("Invalid CSV Format: Row has " + c.length + " columns. Expected 14.");
-                else {
-                    d.isSystemFormat = true;
-                    if (d.sysSite.isEmpty()) d.formatErrors.add("Batch ID is Mandatory");
-                    if (d.branch.isEmpty()) d.formatErrors.add("Branch is Mandatory");
-                    if (d.currency.isEmpty()) d.formatErrors.add("Currency is Mandatory");
-                    if (d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
-                    if (amtRaw.isEmpty()) d.formatErrors.add("Amount is Mandatory");
-                    validateSystemColumns(d, d.sysSite, d.sysDate, d.sysYear, d.sysPeriod, c[11], c[12], c[13], postingDate);
+
+                String col0Clean = "";
+                if (c.length > 0) {
+                    col0Clean = c[0].replace("\uFEFF", "").trim();
+                    d.sysSite = col0Clean;
                 }
+
+                boolean isSys = "01".equals(col0Clean);
+
+                if (isSys) {
+                    d.isSystemFormat = true;
+                    if (c.length > 1) d.sysDate = c[1].trim();
+                    if (c.length > 2) d.sysYear = c[2].trim();
+                    if (c.length > 3) d.sysPeriod = c[3].trim();
+                    if (c.length > 4) d.branch = c[4].trim();
+                    if (c.length > 5) d.currency = c[5].trim().toUpperCase();
+                    if (c.length > 6) d.cgl = c[6].trim();
+                    String amtRaw = (c.length > 7) ? c[7].trim() : "";
+                    String txnRaw = (c.length > 8) ? c[8].trim() : "";
+                    parseAmount(d, amtRaw, txnRaw);
+                    if (c.length > 9) d.remarks = c[9].trim();
+
+                    if (c.length > 10) {
+                        d.productCode = c[10].trim();
+                        hasProductCol = true;
+                    } else {
+                        d.productCode = "A";
+                    }
+
+                    if (c.length != 14)
+                        d.formatErrors.add("Invalid CSV Format: Row has " + c.length + " columns. Expected 14.");
+                    else {
+                        if (d.sysSite.isEmpty()) d.formatErrors.add("Batch ID is Mandatory");
+                        if (d.branch.isEmpty()) d.formatErrors.add("Branch is Mandatory");
+                        if (d.currency.isEmpty()) d.formatErrors.add("Currency is Mandatory");
+                        if (d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
+                        if (amtRaw.isEmpty()) d.formatErrors.add("Amount is Mandatory");
+                        validateSystemColumns(d, d.sysSite, d.sysDate, d.sysYear, d.sysPeriod, c[11].trim(), c[12].trim(), c[13].trim(), postingDate);
+                    }
+                } else {
+                    if (c.length > 0) d.branch = c[0].trim();
+                    if (c.length > 1) d.currency = c[1].trim().toUpperCase();
+                    if (c.length > 2) d.cgl = c[2].trim();
+                    String amtRaw = (c.length > 3) ? c[3].trim() : "";
+                    String txnRaw = (c.length > 4) ? c[4].trim() : "";
+                    parseAmount(d, amtRaw, txnRaw);
+                    if (c.length > 5) d.remarks = c[5].trim();
+
+                    if (c.length > 6) {
+                        d.productCode = c[6].trim();
+                        hasProductCol = true;
+                    } else {
+                        d.productCode = "A";
+                    }
+
+                    if (d.branch.isEmpty()) d.formatErrors.add("Branch is Mandatory");
+                }
+
+                if (d.productCode.isEmpty()) d.productCode = "A";
                 list.add(d);
             }
         }
-        return list;
+        return new ParsingResult(list, hasProductCol);
     }
 
-    private List<ExcelRowData> parseExcelBytes(byte[] bytes, LocalDate postingDate) throws IOException {
-        try (Workbook wb = new XSSFWorkbook(new ByteArrayInputStream(bytes))) {
+    private ParsingResult parseExcelStream(InputStream is, LocalDate postingDate) throws IOException {
+        try (Workbook wb = new XSSFWorkbook(is)) {
             return parseSheet(wb.getSheetAt(0), postingDate);
         }
     }
 
-    private List<ExcelRowData> parseSheet(Sheet sheet, LocalDate postingDate) {
+    private ParsingResult parseSheet(Sheet sheet, LocalDate postingDate) {
         List<ExcelRowData> list = new ArrayList<>();
         DataFormatter fmt = new DataFormatter();
+        boolean hasProductCol = false;
+
         for (Row r : sheet) {
             if (isRowEmpty(r)) continue;
+
             if (r.getRowNum() == 0) {
                 String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
                 if ((h.contains("branch") || h.contains("batch")) && !h.equals("01")) continue;
@@ -2398,7 +2504,8 @@ public class JournalBulkValidationService {
             ExcelRowData d = new ExcelRowData();
             d.rowIndex = r.getRowNum();
             String col0 = parseCode(r.getCell(0), fmt);
-            if (col0.equals("01")) {
+
+            if ("01".equals(col0) || "1".equals(col0)) {
                 d.isSystemFormat = true;
                 d.sysSite = col0;
                 d.sysDate = parseCode(r.getCell(1), fmt);
@@ -2408,10 +2515,14 @@ public class JournalBulkValidationService {
                 d.currency = fmt.formatCellValue(r.getCell(5)).trim().toUpperCase();
                 d.cgl = parseCode(r.getCell(6), fmt);
                 parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
-                d.remarks = fmt.formatCellValue(r.getCell(9));
-                String rawProd = parseCode(r.getCell(10), fmt);
-                d.productCode = rawProd.isEmpty() ? "A" : rawProd;
-                if (isCellEmpty(r.getCell(0))) d.formatErrors.add("Batch ID is Mandatory");
+                d.remarks = fmt.formatCellValue(r.getCell(9)).trim();
+
+                Cell prodCell = r.getCell(10);
+                if (prodCell != null || r.getLastCellNum() > 10) {
+                    d.productCode = parseCode(prodCell, fmt);
+                    hasProductCol = true;
+                }
+
                 validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod,
                         parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
             } else {
@@ -2419,19 +2530,27 @@ public class JournalBulkValidationService {
                 d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
                 d.cgl = parseCode(r.getCell(2), fmt);
                 parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
-                d.remarks = fmt.formatCellValue(r.getCell(5));
-                String rawProd = parseCode(r.getCell(6), fmt);
-                d.productCode = rawProd.isEmpty() ? "A" : rawProd;
+                d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
+
+                Cell prodCell = r.getCell(6);
+                if (prodCell != null || r.getLastCellNum() > 6) {
+                    d.productCode = parseCode(prodCell, fmt);
+                    hasProductCol = true;
+                }
             }
+            if (d.productCode == null || d.productCode.isEmpty()) d.productCode = "A";
             list.add(d);
         }
-        return list;
+        return new ParsingResult(list, hasProductCol);
     }
 
     private void parseAmount(ExcelRowData d, String amountRaw, String typeRaw) {
         try {
             if (amountRaw == null) amountRaw = "";
             if (typeRaw == null) typeRaw = "";
+            amountRaw = amountRaw.trim();
+            typeRaw = typeRaw.trim();
+
             if (amountRaw.contains("-") || amountRaw.contains("(") || amountRaw.contains(")"))
                 d.formatErrors.add("Amount cannot be negative");
             String clean = CLEAN_AMOUNT_REGEX.matcher(amountRaw).replaceAll("");
@@ -2449,7 +2568,7 @@ public class JournalBulkValidationService {
         }
     }
 
-    private boolean runFormatCheck(List<ExcelRowData> rows) {
+    private void runFormatCheck(List<ExcelRowData> rows) {
         rows.parallelStream().forEach(d -> {
             if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0)
                 d.formatErrors.add("Amount cannot be Zero or Null");
@@ -2470,7 +2589,46 @@ public class JournalBulkValidationService {
             else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("CGL must be exactly 10 digits");
             if (d.branch == null || d.branch.trim().isEmpty()) d.formatErrors.add("Branch is Mandatory");
         });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
+    }
+
+    private void runDbCheck(List<ExcelRowData> rows) {
+        Set<String> validBranches = validationMasterService.getAllActiveBranches();
+        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
+        Set<String> validCgls = validationMasterService.getAllActiveCgls();
+
+        rows.parallelStream().forEach(d -> {
+            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
+                d.dbErrors.add("Branch Not Found/Inactive: " + d.branch);
+            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
+                d.dbErrors.add("Currency Not Found/Inactive: " + d.currency);
+            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
+                d.dbErrors.add("CGL Not Found/Inactive: " + d.cgl);
+        });
+    }
+
+    private void runBalanceCheck(List<ExcelRowData> rows) {
+        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
+        rows.parallelStream().forEach(d -> {
+            if (d.amount != null) {
+                BigDecimal val = d.amount;
+                if ("Credit".equals(d.txnType)) val = val.negate();
+                String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
+                String key = d.branch + "_" + d.currency + "_" + type;
+                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val.multiply(new BigDecimal("10000")).longValue());
+            }
+        });
+        rows.parallelStream().forEach(d -> {
+            String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
+            String key = d.branch + "_" + d.currency + "_" + type;
+            LongAdder adder = balanceMap.get(key);
+            if (adder != null && adder.sum() != 0) {
+                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
+                synchronized (d.balErrors) {
+                    if (d.balErrors.isEmpty())
+                        d.balErrors.add(type + " Balance Mismatch: Total " + diff.toPlainString());
+                }
+            }
+        });
     }
 
     private void validateSystemColumns(ExcelRowData d, String c0, String cDate, String cYear, String cMonth, String c11, String c12, String c13, LocalDate postingDate) {
@@ -2499,34 +2657,9 @@ public class JournalBulkValidationService {
         if (c13 == null || !"D".equalsIgnoreCase(c13.trim())) d.formatErrors.add("Col 14 must be 'D'");
     }
 
-    private boolean runBalanceCheck(List<ExcelRowData> rows) {
-        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
-        rows.parallelStream().forEach(d -> {
-            if (d.amount != null) {
-                BigDecimal val = d.amount;
-                if ("Credit".equals(d.txnType)) val = val.negate();
-                String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
-                String key = d.branch + "_" + d.currency + "_" + type;
-                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val.multiply(new BigDecimal("10000")).longValue());
-            }
-        });
-        rows.parallelStream().forEach(d -> {
-            String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
-            String key = d.branch + "_" + d.currency + "_" + type;
-            LongAdder adder = balanceMap.get(key);
-            if (adder != null && adder.sum() != 0) {
-                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
-                synchronized (d.balErrors) {
-                    if (d.balErrors.isEmpty())
-                        d.balErrors.add(type + " Balance Mismatch: Total " + diff.toPlainString());
-                }
-            }
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage) throws IOException {
-        byte[] excel = generateErrorExcelFast(rows);
+    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage, boolean hasProductColumn) throws IOException {
+        log.warn("Validation Failed: {} [ReqID: {}]", msg, reqId); // <--- LOG FAILURE
+        byte[] excel = generateErrorExcelFast(rows, hasProductColumn);
         redisTemplate.opsForValue().set("FILE_" + reqId + "_ERROR", excel, 30, TimeUnit.MINUTES);
         updateState(reqId, s -> {
             s.setStatus("ERROR");
@@ -2557,9 +2690,24 @@ public class JournalBulkValidationService {
     }
 
     private void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) {
-        BulkUploadStateDto state = statusCache.getOrDefault(requestId, new BulkUploadStateDto());
+        BulkUploadStateDto state = getStatusFromRedis(requestId);
+        if (state == null) state = new BulkUploadStateDto();
         updater.accept(state);
-        statusCache.put(requestId, state);
+        saveStatusToRedis(requestId, state);
+    }
+
+    private void saveRowsToRedis(String requestId, List<ExcelRowData> rows) {
+        long start = System.currentTimeMillis();
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             GZIPOutputStream gos = new GZIPOutputStream(baos)) {
+            objectMapper.writeValue(gos, rows);
+            gos.finish();
+            byte[] compressed = baos.toByteArray();
+            redisTemplate.opsForValue().set("DATA_" + requestId, compressed, 1, TimeUnit.HOURS);
+            log.info("Compressed and saved {} rows to Redis in {}ms [ReqID: {}]", rows.size(), System.currentTimeMillis() - start, requestId); // <--- LOG REDIS SAVE
+        } catch (IOException e) {
+            log.error("Failed to save rows to Redis [ReqID: {}]", requestId, e);
+        }
     }
 
     private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
@@ -2589,7 +2737,7 @@ public class JournalBulkValidationService {
         return csv.toString().getBytes(StandardCharsets.UTF_8);
     }
 
-    private byte[] generateErrorExcelFast(List<ExcelRowData> rows) throws IOException {
+    private byte[] generateErrorExcelFast(List<ExcelRowData> rows, boolean includeProduct) throws IOException {
         try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
             Sheet sheet = workbook.createSheet("Error Report");
             CellStyle errStyle = workbook.createCellStyle();
@@ -2597,28 +2745,36 @@ public class JournalBulkValidationService {
             f.setColor(IndexedColors.RED.getIndex());
             errStyle.setFont(f);
             Row h = sheet.createRow(0);
-            List<String> headerList = new ArrayList<>(Arrays.asList("Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product", "ERRORS"));
+
+            List<String> headerList = new ArrayList<>(Arrays.asList("Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks"));
+            if (includeProduct) headerList.add("Product");
+            headerList.add("ERRORS");
+
             if (rows.stream().anyMatch(r -> r.isSystemFormat))
                 headerList.addAll(0, Arrays.asList("Site", "Date", "Year", "Month"));
+
             for (int i = 0; i < headerList.size(); i++) h.createCell(i).setCellValue(headerList.get(i));
+
             int idx = 1;
             boolean isSystem = rows.stream().anyMatch(r -> r.isSystemFormat);
             for (ExcelRowData d : rows) {
                 Row r = sheet.createRow(idx++);
                 int col = 0;
                 if (isSystem) {
-                    r.createCell(col++).setCellValue(d.sysSite);
-                    r.createCell(col++).setCellValue(d.sysDate);
-                    r.createCell(col++).setCellValue(d.sysYear);
-                    r.createCell(col++).setCellValue(d.sysPeriod);
+                    r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.sysSite));
+                    r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.sysDate));
+                    r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.sysYear));
+                    r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.sysPeriod));
                 }
-                r.createCell(col++).setCellValue(d.branch);
-                r.createCell(col++).setCellValue(d.currency);
-                r.createCell(col++).setCellValue(d.cgl);
+                r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.branch));
+                r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.currency));
+                r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.cgl));
                 r.createCell(col++).setCellValue(d.amount != null ? d.amount.toString() : "");
-                r.createCell(col++).setCellValue(d.txnType);
-                r.createCell(col++).setCellValue(d.remarks);
-                r.createCell(col++).setCellValue(d.productCode);
+                r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.txnType));
+                r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.remarks));
+
+                if (includeProduct) r.createCell(col++).setCellValue(sanitizeForCsvInjection(d.productCode));
+
                 Cell c = r.createCell(col);
                 if (d.hasErrors()) {
                     c.setCellValue(d.getAllErrors());
@@ -2629,6 +2785,14 @@ public class JournalBulkValidationService {
             workbook.write(out);
             return out.toByteArray();
         }
+    }
+
+    private String sanitizeForCsvInjection(String value) {
+        if (value == null) return "";
+        if (value.startsWith("=") || value.startsWith("+") || value.startsWith("-") || value.startsWith("@")) {
+            return "'" + value;
+        }
+        return value;
     }
 
     public byte[] generateTemplateBytes() throws IOException {
@@ -2679,10 +2843,18 @@ public class JournalBulkValidationService {
         return m;
     }
 
+    private static class ParsingResult {
+        List<ExcelRowData> rows;
+        boolean hasProductColumn;
 
-    // --- DTO: OPTIMIZED FOR REDIS ---
+        public ParsingResult(List<ExcelRowData> rows, boolean hasProductColumn) {
+            this.rows = rows;
+            this.hasProductColumn = hasProductColumn;
+        }
+    }
+
     @JsonIgnoreProperties(ignoreUnknown = true)
-    @JsonFormat(shape = JsonFormat.Shape.ARRAY) // CRITICAL: This reduces JSON size by 50%
+    @JsonFormat(shape = JsonFormat.Shape.ARRAY)
     @JsonPropertyOrder({"rowIndex", "branch", "currency", "cgl", "txnType", "remarks", "productCode", "amount", "isSystemFormat", "sysSite", "sysDate", "sysYear", "sysPeriod", "formatErrors", "dbErrors", "balErrors"})
     public static class ExcelRowData {
         public int rowIndex;
@@ -2709,8 +2881,9 @@ public class JournalBulkValidationService {
             return String.join("; ", all);
         }
     }
-
 }
+
+
 
 package com.fincore.JournalService.Service;
 
@@ -2790,7 +2963,6 @@ public interface JournalRequestService {
 }
 
 
-
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -2805,6 +2977,7 @@ import com.fincore.JournalService.Repository.JournalRequestRepository;
 import com.fincore.JournalService.Service.JournalBulkValidationService.ExcelRowData;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Lazy;
@@ -2903,7 +3076,13 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Async("bulkExecutor")
     @Transactional
     public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", creatorId);
+        MDC.put("action", "CREATE");
+
         log.info("ASYNC CREATE: Starting Batch {} (Source: {})", batchId, requestId);
+
         long start = System.currentTimeMillis();
 
         try {
@@ -2974,7 +3153,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
             }
 
-//            createNotification(batchId, creatorId, totalRows);
             log.info(" Batch {} Created. Rows: {}. Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
 
         } catch (Exception e) {
@@ -2984,6 +3162,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             cleanupFailedBatch(batchId);
             progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Creation Error: " + e.getMessage());
 
+        } finally {
+            MDC.clear();
         }
     }
 
@@ -3095,6 +3275,11 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         String batchId = dto.getBatchId();
         long start = System.currentTimeMillis();
 
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", executorId);
+        MDC.put("action", dto.getStatus().name());
+
         try {
             // Fetch Creator ID to notify them later
             String creatorId = jdbcTemplate.queryForObject("SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
@@ -3187,6 +3372,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             // No rollback here for Java exceptions if PL/SQL succeeded,
             // but PL/SQL handles its own rollback on error.
             progressService.sendProgress(batchId, executorId, 0, "FAILED", "Error: " + e.getMessage());
+        } finally {
+            MDC.clear(); // --- MDC CLEANUP ---
         }
     }
 
@@ -3214,6 +3401,12 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Async("bulkExecutor")
     public void executeAsyncBatchCancellation(String batchId, String userId) {
         long start = System.currentTimeMillis();
+
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", userId);
+        MDC.put("action", "DELETE");
+
         try {
             progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Data...");
             log.info("Calling PURGE_JOURNAL_BATCH for {}", batchId);
@@ -3241,6 +3434,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             // VISIBILITY : Set to ERROR so it reappears in list
             jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", "Delete Failed: " + e.getMessage(), batchId);
             progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: " + e.getMessage());
+        } finally {
+            MDC.clear(); // --- MDC CLEANUP ---
         }
     }
 
@@ -3318,17 +3513,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     // ==================================================================================
     // 5. HELPERS
     // ==================================================================================
-
-//    private String buildJsonPayloadFast(ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
-//        return "{\"changeType\":\"ADD\",\"masterJournalId\":null,\"csvDate\":\"" + pDate.format(fmt) + "\"," +
-//                "\"branch\":\"" + row.branch + "\",\"currency\":\"" + row.currency + "\"," +
-//                "\"cgl\":\"" + row.cgl + "\",\"amount\":" + amount + "," +
-//                "\"productType\":\"" + (row.productCode == null ? "" : row.productCode) + "\"," +
-//                "\"remarks\":\"" + (row.remarks == null ? "" : escapeJson(row.remarks)) + "\"," +
-//                "\"arFlag\":\"A\",\"acClassification\":\"A\",\"batchId\":\"" + batchId + "\"," +
-//                "\"journalId\":\"" + jId + "\",\"commonBatchRemarks\":\"" + escapeJson(rem) + "\"," +
-//                "\"transactionCount\":" + count + "}";
-//    }
 
     // ---------------------------------------------------------
     // OPTIMIZED PAYLOAD GENERATION (Bulk)
@@ -3589,8 +3773,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return Collections.emptyList();
     }
 }
-
-
 
 
 
@@ -3899,88 +4081,3 @@ import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
 	}
 
 }
-
-
-Db tables with sample date and columns
-REQ_ID	NUMBER	No		1	
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	
-CHANGE_TYPE	VARCHAR2(10 CHAR)	No		3	
-REQ_DATE	DATE	No	SYSDATE 	4	
-CREATOR_ID	VARCHAR2(12 CHAR)	No		5	
-EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		6	
-EXECUTION_DATE	DATE	Yes		7	
-EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		8	
-PAYLOAD	CLOB	Yes		9	
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		10	
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		11	
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		12	
-CREATOR_ROLE	NUMBER(10,0)	Yes		13	
-REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		14	
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		15	
-REQ_CGL	VARCHAR2(50 BYTE)	Yes		16	
-REQ_AMOUNT	NUMBER(25,4)	Yes		17	
-REQ_CSV_DATE	DATE	Yes		18	
-REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		19	
-REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		20	
-
-1986197	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000001	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"32115","currency":"USD","cgl":"2080500503","amount":6763.38,"productType":"12345678","remarks":"Balanced_Txn_1_Dr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000001","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":1}	Bulk Upload - 2025-12-17	11	32115	USD	2080500503	6763.38	17-12-25	Balanced_Txn_1_Dr	12345678
-1986198	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000002	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"32115","currency":"USD","cgl":"2080500503","amount":-6763.38,"productType":"12345678","remarks":"Balanced_Txn_1_Cr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000002","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":2}	Bulk Upload - 2025-12-17	11	32115	USD	2080500503	-6763.38	17-12-25	Balanced_Txn_1_Cr	12345678
-1986199	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000003	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"61607","currency":"USD","cgl":"2011500105","amount":488.48,"productType":"12345678","remarks":"Balanced_Txn_2_Dr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000003","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":3}	Bulk Upload - 2025-12-17	11	61607	USD	2011500105	488.48	17-12-25	Balanced_Txn_2_Dr	12345678
-1986200	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000004	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"61607","currency":"USD","cgl":"2011500105","amount":-488.48,"productType":"12345678","remarks":"Balanced_Txn_2_Cr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000004","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":4}	Bulk Upload - 2025-12-17	11	61607	USD	2011500105	-488.48	17-12-25	Balanced_Txn_2_Cr	12345678
-1986201	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000005	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"51425","currency":"USD","cgl":"5051030601","amount":3231.96,"productType":"12345678","remarks":"Balanced_Txn_3_Dr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000005","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":5}	Bulk Upload - 2025-12-17	11	51425	USD	5051030601	3231.96	17-12-25	Balanced_Txn_3_Dr	12345678
-1986202	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000006	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"51425","currency":"USD","cgl":"5051030601","amount":-3231.96,"productType":"12345678","remarks":"Balanced_Txn_3_Cr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000006","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":6}	Bulk Upload - 2025-12-17	11	51425	USD	5051030601	-3231.96	17-12-25	Balanced_Txn_3_Cr	12345678
-1986203	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000007	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"32095","currency":"USD","cgl":"2080505003","amount":9592.14,"productType":"12345678","remarks":"Balanced_Txn_4_Dr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000007","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":7}	Bulk Upload - 2025-12-17	11	32095	USD	2080505003	9592.14	17-12-25	Balanced_Txn_4_Dr	12345678
-1986204	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000008	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"32095","currency":"USD","cgl":"2080505003","amount":-9592.14,"productType":"12345678","remarks":"Balanced_Txn_4_Cr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000008","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":8}	Bulk Upload - 2025-12-17	11	32095	USD	2080505003	-9592.14	17-12-25	Balanced_Txn_4_Cr	12345678
-1986213	A	ADD	07-01-26	3333333	2488766	07-01-26	Test 1500m accept	0001210	0001210-000017	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"17052","currency":"USD","cgl":"5051500101","amount":6876.21,"productType":"12345678","remarks":"Balanced_Txn_9_Dr","arFlag":"A","acClassification":"A","batchId":"0001210","journalId":"0001210-000017","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":17}	Bulk Upload - 2025-12-17	11	17052	USD	5051500101	6876.21	17-12-25	Balanced_Txn_9_Dr	12345678
-
-
-
-
-
-JOurnal batch master 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	
-REQ_DATE	TIMESTAMP(6)	Yes		3	
-BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	
-TOTAL_ROWS	NUMBER	Yes	0	5	
-TOTAL_DEBIT	NUMBER(25,4)	Yes	0	6	
-TOTAL_CREDIT	NUMBER(25,4)	Yes	0	7	
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	
-EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	
-EXECUTION_DATE	TIMESTAMP(6)	Yes		10	
-EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	
-
-
-
-0001355	1015698	09-01-26 07:24:09.466297000 PM	Bulk Upload - 2025-12-02	575700	287850000	287850000	ACCEPTED	3333333	13-01-26 04:28:27.081073000 PM	pass 50000000000000000
-0001388	1021256	14-01-26 11:36:26.311825000 AM	23	2	12	12	ACCEPTED	3333333	14-01-26 12:25:20.175688000 PM	sd
-0001483	1021256	20-01-26 05:18:25.440773000 PM	testing	2	222	222	PENDING			
-
-
-
-1) 
-i am giving u all the files which is required for the this backend to be work and theere is issue which i am giving u as below 
-
-step 1 validation error
-when i upload excel in the output i am just getting one error from that pertular row i want all the error (just all the validations error for that row) which are there for the validation for that error 
-
-2)
-output error file in this out put error file product should should be there only if product column it there at the time of upload
-if product column is not there there is not need to show the product column in the out put error file for the excel
-
-example 
-
-Branch	Currency	CGL 	Amount	TxnType	Remarks	Product	ERRORS
-3430	INR	    1002500701	236	   Credit	Remark	A	    Branch Not Found/Inactive: 3430
-3430	INR	   1111111111	118	   Debit	Remark	A	    Branch Not Found/Inactive: 3430
-
-
-it should be like this only
-Branch	Currency	CGL 	Amount	TxnType	Remarks		ERRORS
-3430	INR	    1002500701	236	   Credit	Remark	    Branch Not Found/Inactive: 3430
-3430	INR	   1111111111	118	   Debit	Remark	    Branch Not Found/Inactive: 3430
-
-
-3) 
-give mi list of all validations which is used in this project for excel also and for csv also saparalty
-
