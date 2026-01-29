@@ -1,149 +1,121 @@
-Here are the exact packages and files you need to create to implement the strategy.
-1. Create Package: com.fincore.JournalService.Dto.Error
-Create this new package to hold your standardized error response structure.
-File: ApiErrorResponse.java
-package com.fincore.JournalService.Dto.Error;
-
-import lombok.Builder;
-import lombok.Data;
-import java.time.LocalDateTime;
-import java.util.List;
-
-@Data
-@Builder
-public class ApiErrorResponse {
-    private LocalDateTime timestamp;
-    private int status;
-    private String error;
-    private String message;
-    private String path;
-    private List<ValidationError> validationErrors;
-
-    @Data
-    @Builder
-    public static class ValidationError {
-        private String field;
-        private String message;
-    }
-}
-
-2. Update Package: com.fincore.JournalService.Exception
-You already have this package. Add these specific files to it.
-File: GlobalExceptionHandler.java
-package com.fincore.JournalService.Exception;
-
-import com.fincore.JournalService.Dto.Error.ApiErrorResponse;
-import jakarta.servlet.http.HttpServletRequest;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataAccessException;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.multipart.MaxUploadSizeExceededException;
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.stream.Collectors;
-
-@RestControllerAdvice
-@Slf4j
-public class GlobalExceptionHandler {
-
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<ApiErrorResponse> handleValidation(MethodArgumentNotValidException ex, HttpServletRequest request) {
-        List<ApiErrorResponse.ValidationError> errors = ex.getBindingResult().getFieldErrors().stream()
-                .map(err -> ApiErrorResponse.ValidationError.builder()
-                        .field(err.getField())
-                        .message(err.getDefaultMessage())
-                        .build())
-                .collect(Collectors.toList());
-        return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed", "Input validation error", request.getRequestURI(), errors);
-    }
-
-    @ExceptionHandler(MaxUploadSizeExceededException.class)
-    public ResponseEntity<ApiErrorResponse> handleMaxSize(MaxUploadSizeExceededException ex, HttpServletRequest request) {
-        return buildResponse(HttpStatus.PAYLOAD_TOO_LARGE, "File Too Large", "Maximum upload size exceeded", request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(FileProcessingException.class)
-    public ResponseEntity<ApiErrorResponse> handleFileProcessing(FileProcessingException ex, HttpServletRequest request) {
-        log.error("File Processing Error: {}", ex.getMessage());
-        return buildResponse(HttpStatus.BAD_REQUEST, "File Error", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler({ConcurrencyLockException.class, IllegalStateException.class})
-    public ResponseEntity<ApiErrorResponse> handleConcurrency(RuntimeException ex, HttpServletRequest request) {
-        log.warn("Concurrency Conflict: {}", ex.getMessage());
-        return buildResponse(HttpStatus.CONFLICT, "Operation Conflict", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(ResourceNotFoundException.class)
-    public ResponseEntity<ApiErrorResponse> handleNotFound(ResourceNotFoundException ex, HttpServletRequest request) {
-        return buildResponse(HttpStatus.NOT_FOUND, "Not Found", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(CacheExpiredException.class)
-    public ResponseEntity<ApiErrorResponse> handleCacheExpired(CacheExpiredException ex, HttpServletRequest request) {
-        return buildResponse(HttpStatus.GONE, "Session Expired", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(DataIntegrityViolationException.class)
-    public ResponseEntity<ApiErrorResponse> handleSqlIntegrity(DataIntegrityViolationException ex, HttpServletRequest request) {
-        log.error("DB Integrity Error: ", ex);
-        return buildResponse(HttpStatus.CONFLICT, "Data Integrity Error", "Constraint violation or duplicate entry.", request.getRequestURI(), null);
+No, creating the exception files is NOT enough.
+You MUST change your existing Service and Controller files.
+Here is why:
+Your GlobalExceptionHandler is like a catcher's mitt. It is waiting to catch specific errors.
+Your Service code is the pitcher. Right now, your service code is either:
+ * Holding the ball: Swallowing exceptions with try { ... } catch (Exception e) { log.error(...) } (The handler never sees it).
+ * Throwing a different ball: Throwing generic RuntimeException or IOException (The handler catches it as a generic "Internal Server Error" instead of the specific error you defined).
+To make this work, you must modify your code to throw the specific exceptions you just created.
+Here are the 4 exact locations you must change to activate your new strategy.
+1. Modify JournalBulkValidationService.java
+You need to stop returning empty lists or throwing generic IOExceptions.
+Find this method: getValidRowsFromCache
+Current Logic: Returns empty list if data is missing.
+Change To: Throw CacheExpiredException.
+public List<ExcelRowData> getValidRowsFromCache(String requestId) {
+    long start = System.currentTimeMillis();
+    byte[] compressed = redisTemplate.opsForValue().get("DATA_" + requestId);
+    
+    // CHANGE HERE: Don't return empty list. Throw exception.
+    if (compressed == null) { 
+        throw new CacheExpiredException("Validation data not found. The cache may have expired (TTL 1 Hour). Please re-upload.");
     }
     
-    @ExceptionHandler(DataAccessException.class)
-    public ResponseEntity<ApiErrorResponse> handleDbError(DataAccessException ex, HttpServletRequest request) {
-        log.error("Database Error: ", ex);
-        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Database Error", "A database error occurred.", request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ApiErrorResponse> handleGeneral(Exception ex, HttpServletRequest request) {
-        log.error("Unhandled Exception: ", ex);
-        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Internal Server Error", "An unexpected error occurred.", request.getRequestURI(), null);
-    }
-
-    private ResponseEntity<ApiErrorResponse> buildResponse(HttpStatus status, String error, String message, String path, List<ApiErrorResponse.ValidationError> validationErrors) {
-        ApiErrorResponse response = ApiErrorResponse.builder()
-                .timestamp(LocalDateTime.now())
-                .status(status.value())
-                .error(error)
-                .message(message)
-                .path(path)
-                .validationErrors(validationErrors)
-                .build();
-        return new ResponseEntity<>(response, status);
+    try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressed))) {
+        // ... existing decompression logic ...
+    } catch (IOException e) {
+        log.error("Failed to decompress...", e);
+        // CHANGE HERE: Wrap generic IO error
+        throw new FileProcessingException("Failed to decompress cached data", e);
     }
 }
 
-File: CustomExceptions.java (Or individual files if preferred)
-package com.fincore.JournalService.Exception;
-
-import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.ResponseStatus;
-
-@ResponseStatus(HttpStatus.BAD_REQUEST)
-public class FileProcessingException extends RuntimeException {
-    public FileProcessingException(String message, Throwable cause) { super(message, cause); }
-    public FileProcessingException(String message) { super(message); }
+Find this method: initiateValidation
+Change To: Wrap the file copy logic.
+public String initiateValidation(InputStream fileStream, String filename, LocalDate postingDate) {
+    // ... setup ...
+    try {
+        Files.copy(fileStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
+    } catch (IOException e) {
+        // CHANGE HERE: Throw custom exception
+        throw new FileProcessingException("Failed to save uploaded file to temporary storage", e);
+    }
+    // ... rest of logic ...
 }
 
-@ResponseStatus(HttpStatus.GONE)
-public class CacheExpiredException extends RuntimeException {
-    public CacheExpiredException(String message) { super(message); }
+2. Modify JournalRequestServiceImpl.java
+You need to handle DB errors and Locks using your new classes.
+Find this method: createBatchFromCacheAsync
+Current Logic: Throws IllegalStateException.
+Change To: Throw ConcurrencyLockException.
+Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
+
+if (Boolean.FALSE.equals(acquired)) {
+    log.warn("Duplicate creation attempt blocked for ReqID: {}", requestId);
+    // CHANGE HERE: Use the specific exception for 409 Conflict
+    throw new ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
 }
 
-@ResponseStatus(HttpStatus.CONFLICT)
-public class ConcurrencyLockException extends RuntimeException {
-    public ConcurrencyLockException(String message) { super(message); }
+Find this method: processChunkRaw
+Current Logic: Catches SQLException and throws RuntimeException.
+Change To: Throw DatabaseOperationException.
+} catch (SQLException e) {
+    log.error("Raw JDBC Batch Insert Failed...", e);
+    // CHANGE HERE: Distinguish DB error from logic error
+    throw new DatabaseOperationException("Failed to persist batch chunk due to SQL error", e);
 }
 
-@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
-public class DatabaseOperationException extends RuntimeException {
-    public DatabaseOperationException(String message, Throwable cause) { super(message, cause); }
+3. Modify JournalRequestController.java
+You must remove local try-catch blocks so the exceptions can bubble up to your Global Handler.
+Find this method: createBatchFromCache
+Current Logic: Catches IllegalStateException and manually returns ResponseEntity.status(HttpStatus.CONFLICT).
+Change To: Remove the catch block.
+@PostMapping("/create-batch-from-cache")
+public ResponseEntity<Map<String, Object>> createBatchFromCache(...) {
+    // REMOVE TRY-CATCH BLOCK
+    // Just call the service. If it throws ConcurrencyLockException, 
+    // the GlobalExceptionHandler will automatically return 409 Conflict.
+    
+    String userId = jwtUtil.getUserIdFromToken(token);
+    Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+    String batchId = journalRequestService.createBatchFromCacheAsync(
+            payload.get("requestId"),
+            payload.get("commonBatchRemarks"),
+            userId,
+            userRole
+    );
+    
+    return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+            "status", "PROCESSING",
+            "message", "Batch creation initiated in background.",
+            "batchId", batchId
+    ));
 }
 
+4. Modify AsyncConfig.java
+You MUST implement AsyncConfigurer here.
+If an exception occurs in a @Async method (like executeAsyncBatchCreation), it happens in a separate thread. The Controller never sees it, and the GlobalExceptionHandler never sees it. It just disappears into the logs.
+Change To:
+@Configuration
+@EnableAsync
+@Slf4j
+public class AsyncConfig implements AsyncConfigurer { // 1. Implement this interface
+
+    // ... your existing bean definition for bulkExecutor ...
+
+    // 2. Add this method to catch Async failures
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (Throwable ex, Method method, Object... params) -> {
+            log.error("CRITICAL ASYNC FAILURE in method: {}", method.getName(), ex);
+            // Ideally, you would update the Batch Status to 'ERROR' in the DB here
+            // so the user knows it failed.
+        };
+    }
+}
+
+Summary of Necessary Changes
+ * Service Layer: Change throw new RuntimeException() to throw new [YourCustomException]().
+ * Controller Layer: Delete try-catch blocks and let exceptions float up.
+ * Config Layer: Add AsyncUncaughtExceptionHandler so background threads don't fail silently.
