@@ -1,71 +1,252 @@
-package com.fincore.JournalService.config;
+package com.fincore.JournalService.Controllers;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.FileProcessingException; // Import added
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Service.JournalBulkValidationService;
+import com.fincore.JournalService.Service.JournalRequestService;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.scheduling.annotation.AsyncConfigurer;
-import org.springframework.scheduling.annotation.EnableAsync;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
-import java.lang.reflect.Method;
-import java.util.concurrent.Executor;
+import java.io.IOException;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 
-import static org.joni.Config.log;
-
-@Configuration
-@EnableAsync
+/**
+ * Controller for Journal Request Management.
+ * Implements High-Performance Async Endpoints for Bulk Operations.
+ */
+@RestController
+@RequestMapping("/api/journals")
+@RequiredArgsConstructor
 @Slf4j
-public class AsyncConfig implements AsyncConfigurer {
+public class JournalRequestController {
 
-    @Bean(name = "bulkExecutor")
-    public Executor bulkExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(5);   // Steady state
-        executor.setMaxPoolSize(20);   // Burst capability
-        executor.setQueueCapacity(500); // Holds 500 batches in memory if DB is slow
-        executor.setThreadNamePrefix("JournalAsync-");
-        executor.initialize();
-        return executor;
+    private final JournalRequestService journalRequestService;
+    private final JournalBulkValidationService journalBulkValidationService;
+    private final JwtUtil jwtUtil;
+
+    // ==================================================================================
+    // 1. ASYNC BULK OPERATIONS (Fire-and-Forget)
+    // ==================================================================================
+
+    /**
+     * Create Bulk Batch from Cached Validation Data.
+     * Response: Immediate (HTTP 202) with Batch ID. Processing happens in background.
+     */
+    @PostMapping("/create-batch-from-cache")
+    public ResponseEntity<Map<String, Object>> createBatchFromCache(
+            @RequestBody Map<String, String> payload,
+            @RequestHeader("Authorization") String token) throws IOException { // Exceptions bubble up to GlobalHandler
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        // If this throws ConcurrencyLockException, GlobalHandler returns 409
+        String batchId = journalRequestService.createBatchFromCacheAsync(
+                payload.get("requestId"),
+                payload.get("commonBatchRemarks"),
+                userId,
+                userRole
+        );
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING",
+                "message", "Batch creation initiated in background.",
+                "batchId", batchId
+        ));
     }
-    // 2. Add this method to catch Async failures
-    @Override
-    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
-        return (Throwable ex, Method method, Object... params) -> {
-            log.error("CRITICAL ASYNC FAILURE in method: {}", method.getName(), ex);
-            // Ideally, you would update the Batch Status to 'ERROR' in the DB here
-            // so the user knows it failed.
-        };
+
+    /**
+     * Process (Approve/Reject) Bulk Batch.
+     * Response: Immediate (HTTP 202). Uses Oracle Parallel execution in background.
+     */
+    @PostMapping("/process-bulk")
+    public ResponseEntity<?> processBulkRequests(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody BulkProcessJournalRequestDto dto) {
+        
+        // Exceptions bubble up to GlobalHandler
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        journalRequestService.processBulkRequestsAsync(dto, userId, userRole);
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING",
+                "message", "Approval process started. Notifications will be sent upon completion."
+        ));
     }
 
+    /**
+     * Delete/Cancel Batch Asynchronously.
+     * Prevents DB Timeouts on large batches by deleting in chunks.
+     */
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<?> cancelMyRequestsByBatch(
+            @RequestHeader("Authorization") String token,
+            @PathVariable String batchId) {
 
+        // Exceptions bubble up to GlobalHandler
+        String userId = jwtUtil.getUserIdFromToken(token);
+        journalRequestService.cancelMyRequestsByBatchIdAsync(batchId, userId);
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "DELETING",
+                "message", "Batch deletion queued. Status will update shortly."
+        ));
+    }
+
+    // ==================================================================================
+    // 2. SAFEGUARDED FETCH API
+    // ==================================================================================
+
+    /**
+     * Get All Requests for a Batch.
+     * SAFEGUARD: If batch > 2000 rows, forces Frontend to use Pagination to prevent Server OOM.
+     */
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchId(@PathVariable String batchId) {
+        long count = journalRequestService.getRequestCountByBatchId(batchId);
+        if (count > 2000) {
+            return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of(
+                    "error", "Batch too large (" + count + " rows). Please use Paginated API.",
+                    "suggestion", "/api/journals/by-batch-paginated/" + batchId
+            ));
+        }
+        return ResponseEntity.ok(journalRequestService.getRequestsByBatchId(batchId));
+    }
+
+    // ==================================================================================
+    // 3. VALIDATION & STATUS
+    // ==================================================================================
+
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> initiateValidation(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("postingDate") String date,
+            HttpServletRequest request) throws IOException { // Exceptions bubble up
+
+        if (file == null || file.isEmpty()) {
+            throw new FileProcessingException("File is missing or empty");
+        }
+        
+        // Uses getInputStream() now, handled by Service
+        String reqId = journalBulkValidationService.initiateValidation(
+                file.getInputStream(),
+                file.getOriginalFilename(),
+                LocalDate.parse(date)
+        );
+
+        return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
+    }
+
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
+        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
+        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
+    }
+
+    // ==================================================================================
+    // 4. UTILS & LEGACY SUPPORT
+    // ==================================================================================
+
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() {
+        return journalRequestService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
+    }
+
+    @GetMapping("/pending-requests-summary")
+    public ResponseEntity<?> getPendingBatchSummaries() {
+        return ResponseEntity.ok(journalRequestService.getPendingBatchSummaries());
+    }
+
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<?> getAllBatchSummaries() {
+        return ResponseEntity.ok(journalRequestService.getAllBatchSummaries());
+    }
+
+    @GetMapping("/by-batch-paginated/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchIdPaginated(
+            @PathVariable String batchId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        return ResponseEntity.ok(journalRequestService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
+    }
+
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
+        byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
+        if (data == null) return ResponseEntity.notFound().build();
+
+        String filename = type.equalsIgnoreCase("ERROR") ? "Error_Report.xlsx" : "Success.csv";
+        MediaType mediaType = type.equalsIgnoreCase("ERROR")
+                ? MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                : MediaType.TEXT_PLAIN;
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .contentType(mediaType)
+                .body(new ByteArrayResource(data));
+    }
+
+    @GetMapping("/download-template")
+    public ResponseEntity<Resource> downloadTemplate() throws IOException {
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Journal_Template.xlsx\"")
+                .body(new ByteArrayResource(journalBulkValidationService.generateTemplateBytes()));
+    }
+
+    // --- Manual/Small Batch Endpoints ---
+    @PostMapping("/create-batch")
+    public ResponseEntity<?> createBatchRequest(@Valid @RequestBody BatchRequestDto batchDto, @RequestHeader("Authorization") String token) throws JsonProcessingException {
+        return ResponseEntity.status(HttpStatus.CREATED).body(journalRequestService.createBatchRequest(batchDto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token)));
+    }
+
+    @GetMapping("/my-requests")
+    public List<JournalRequest> getMyRequests(@RequestHeader("Authorization") String token) {
+        return journalRequestService.getMyRequests(jwtUtil.getUserIdFromToken(token));
+    }
+
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        return journalRequestService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
+    }
+
+    @PatchMapping("/update-request")
+    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token, @RequestBody ProcessJournalRequestDto dto) throws JsonProcessingException {
+        return journalRequestService.updateRequestStatus(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token)).get();
+    }
+
+    @DeleteMapping("/my-request/{requestId}")
+    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
+        journalRequestService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/my-requests/by-journal-list")
+    public ResponseEntity<?> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @RequestBody List<String> list) {
+        journalRequestService.cancelMyRequestsByJournalPrefixes(list, jwtUtil.getUserIdFromToken(token));
+        return ResponseEntity.ok(Map.of("status", "SUCCESS"));
+    }
+
+    @GetMapping("/status")
+    public ResponseEntity<List<JournalRequestStatusDto>> getJournalStatusList() {
+        return ResponseEntity.ok(journalRequestService.getJournalRequestStatusList());
+    }
 }
-controller 
-@PostMapping("/create-batch-from-cache")
-public ResponseEntity<Map<String, Object>> createBatchFromCache(...) {
-    // REMOVE TRY-CATCH BLOCK
-    // Just call the service. If it throws ConcurrencyLockException, 
-    // the GlobalExceptionHandler will automatically return 409 Conflict.
-    
-    String userId = jwtUtil.getUserIdFromToken(token);
-    Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-    String batchId = journalRequestService.createBatchFromCacheAsync(
-            payload.get("requestId"),
-            payload.get("commonBatchRemarks"),
-            userId,
-            userRole
-    );
-    
-    return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-            "status", "PROCESSING",
-            "message", "Batch creation initiated in background.",
-            "batchId", batchId
-    ));
-}
-
-this i dont understand 
-what to change 
-here 
-can u cheak above AsyncConfig is correct and give mi full updated controller file without any other change
-
