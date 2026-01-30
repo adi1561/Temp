@@ -1,150 +1,160 @@
-Hello Architect. You are ready to issue the "Digital Wristbands" (JWTs).
-We are going to upgrade your AuthController.
- * Old Way: Returns string "Login Successful".
- * New Way: Returns JSON {"token": "eyJhbGciOi..."}.
-This involves 3 steps: Dependencies, The Integration, and The Response DTO.
-[1. Step 1: Add Dependencies]
-Your JwtService code uses the io.jsonwebtoken library. You MUST add these to your pom.xml or the code will not compile.
-<dependency>
-    <groupId>io.jsonwebtoken</groupId>
-    <artifactId>jjwt-api</artifactId>
-    <version>0.11.5</version>
-</dependency>
-<dependency>
-    <groupId>io.jsonwebtoken</groupId>
-    <artifactId>jjwt-impl</artifactId>
-    <version>0.11.5</version>
-    <scope>runtime</scope>
-</dependency>
-<dependency>
-    <groupId>io.jsonwebtoken</groupId>
-    <artifactId>jjwt-jackson</artifactId> // Needed for JSON conversion
-    <version>0.11.5</version>
-    <scope>runtime</scope>
-</dependency>
+Hello Architect. We have arrived at the final and most important component of the entire system.
+You have the Ticket Printer (Login). Now you need the Ticket Scanner at the door.
+[1. Complete Learning Roadmap]
+ * Foundations & Config ✅
+ * Password Encoding ✅
+ * UserDetailsService ✅
+ * Custom Login API (AuthenticationManager) ✅
+ * JWT Authentication Filter 📍 (We are here)
+ * Secure Endpoints (Testing)
+[2. Today’s Topic]
+The JwtAuthenticationFilter
+[3. Concept Explanation]
+Right now, if you try to access a protected page, Spring Security blocks you. It doesn't know you have a token in your pocket.
+We need to build a Filter.
+A Filter is a piece of code that runs before every single request hits your Controller.
+The Analogy: The Airport Security Checkpoint
+ * Login (AuthController): The Check-in Counter. You showed ID, they gave you a Boarding Pass (JWT).
+ * The Filter (JwtAuthenticationFilter): The TSA Officer standing before the gates.
+   * Step 1: You walk up. Officer says: "Show me your Boarding Pass." (Check Header).
+   * Step 2: Officer scans it. "Is this fake? Is it expired?" (Validate Token).
+   * Step 3: Officer looks at the name. "Okay, Adesh, go through." (Set SecurityContext).
+If you don't have this Filter, the Officer (Spring Security) will just ask for your password again, ignoring the pass in your hand.
+[4. The Code Implementation]
+Create a new class JwtAuthenticationFilter.java.
+Note: This code looks long, but it is just a simple "If-This-Then-That" checklist.
+package org.adesh.security1.Config; // Put this in Config or Filter package
 
-[2. Step 2: The Response DTO]
-We should not return a raw string. A professional API returns a JSON object. Create a class AuthResponse.java.
-package org.adesh.security1.Dto;
-
-public class AuthResponse {
-    private String token;
-
-    public AuthResponse(String token) {
-        this.token = token;
-    }
-
-    public String getToken() {
-        return token;
-    }
-}
-
-[3. Step 3: Update AuthController]
-Now we combine everything: AuthenticationManager (Verify) + JwtService (Generate).
-package org.adesh.security1.Controller;
-
-import org.adesh.security1.Dto.AuthResponse;
-import org.adesh.security1.Dto.LoginRequest;
-import org.adesh.security1.Entity.User;
-import org.adesh.security1.Repository.UserRepository;
-import org.adesh.security1.Service.JwtService; // Your Service
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.adesh.security1.Service.JwtService;
+import org.adesh.security1.Service.CustomUserDetailsService;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.ResponseEntity;
-import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.userdetails.UsernameNotFoundException;
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
 
-@RestController
-@RequestMapping("/api/auth")
-public class AuthController {
+import java.io.IOException;
 
-    @Autowired
-    private AuthenticationManager authenticationManager; // 1. The Boss (Verify)
-
-    @Autowired
-    private JwtService jwtService; // 2. The Machine (Generate Token)
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     @Autowired
-    private UserRepository userRepository;
+    private JwtService jwtService; // The Scanner Tool
 
     @Autowired
-    private PasswordEncoder passwordEncoder;
+    private CustomUserDetailsService userDetailsService; // To load full user data
 
-    // ==========================================
-    // 1. REGISTER (Standard - Create User)
-    // ==========================================
-    @PostMapping("/register")
-    public ResponseEntity<String> register(@RequestBody LoginRequest request) {
-        if (userRepository.findByUsername(request.getUsername()).isPresent()) {
-            return ResponseEntity.badRequest().body("Username taken!");
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                    HttpServletResponse response, 
+                                    FilterChain filterChain) throws ServletException, IOException {
+
+        // Step 1: Get the Token from the Header
+        // The client sends: "Authorization: Bearer eyJhbGci..."
+        final String authHeader = request.getHeader("Authorization");
+        final String jwt;
+        final String username;
+
+        // Check: Is header missing? Does it start with "Bearer "?
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response); // Pass the request to the next filter (Login page usually)
+            return;
         }
 
-        User user = new User();
-        user.setUsername(request.getUsername());
-        user.setPassword(passwordEncoder.encode(request.getPassword())); // Hash it!
-        user.setRole("ROLE_USER");
+        // Extract the token (Remove "Bearer " prefix)
+        jwt = authHeader.substring(7);
         
-        userRepository.save(user);
+        // Step 2: Extract Username from Token
+        username = jwtService.getUsernameFromToken(jwt); // "adesh"
 
-        return ResponseEntity.ok("User registered successfully!");
+        // Step 3: Check if user is not already logged in
+        // (SecurityContextHolder.getContext().getAuthentication() == null) means "No one is logged in yet"
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            
+            // Load the full user details from DB
+            UserDetails userDetails = this.userDetailsService.loadUserByUsername(username);
+
+            // Step 4: Validate the Token
+            if (jwtService.isTokenValid(jwt)) { // Check signature & expiration
+                
+                // Step 5: CREATE THE SECURITY BADGE
+                // We create a UsernamePasswordAuthenticationToken manually.
+                UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                        userDetails,
+                        null,
+                        userDetails.getAuthorities()
+                );
+
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+
+                // Step 6: UPDATE THE SECURITY CONTEXT
+                // This is the Magic Line. We tell Spring: "This user is verified. Let them pass."
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+        
+        // Step 7: Continue the journey
+        filterChain.doFilter(request, response);
     }
+}
 
-    // ==========================================
-    // 2. LOGIN (The Full Flow)
-    // ==========================================
-    @PostMapping("/login")
-    public ResponseEntity<AuthResponse> login(@RequestBody LoginRequest request) {
-        
-        // Step A: VERIFY Credentials (The Black Box)
-        // If this fails, it throws exception and stops here.
-        Authentication authentication = authenticationManager.authenticate(
-            new UsernamePasswordAuthenticationToken(
-                request.getUsername(), 
-                request.getPassword()
+[5. Line-by-Line Explanation]
+Line: extends OncePerRequestFilter
+ * Meaning: "Please run this code exactly one time for every request."
+Step 1 (The Header Check):
+ * request.getHeader("Authorization"): We look for the specific header where tokens live.
+ * !authHeader.startsWith("Bearer "): Standard convention. Tokens always start with the word "Bearer ". If it's missing, we ignore this request.
+Step 2 (Extraction):
+ * jwtService.getUsernameFromToken(jwt): We use the JwtService method you pasted earlier. It opens the token payload and reads "sub": "adesh".
+Step 6 (The Magic Line):
+ * SecurityContextHolder.getContext().setAuthentication(authToken):
+   * Before this line: Spring thinks you are an anonymous stranger.
+   * After this line: Spring knows you are "Adesh", and you are Authenticated.
+   * This effectively logs you in for the duration of this one request (milliseconds).
+[6. CRITICAL FINAL STEP: Register the Filter]
+You wrote the code, but you didn't plug it in. You must add this filter to your SecurityConfig.
+Update SecurityConfig.java:
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Autowired
+    private JwtAuthenticationFilter jwtAuthenticationFilter; // Inject your new filter
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/**").permitAll() // Login/Register is Open
+                .anyRequest().authenticated()                // Everything else is Locked
             )
-        );
+            .sessionManagement(sess -> sess.sessionCreationPolicy(SessionCreationPolicy.STATELESS)) // New! No Sessions.
+            .authenticationProvider(authenticationProvider()) // Your DaoAuth provider
+            
+            // PLUG IN THE FILTER HERE:
+            .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class); 
 
-        // Step B: RETRIEVE User
-        // If we reached here, password is correct. Get the user data.
-        // We query the DB again to get the full object for the Token generation.
-        User user = userRepository.findByUsername(request.getUsername())
-                .orElseThrow(() -> new UsernameNotFoundException("User not found"));
-
-        // Step C: GENERATE Token
-        String token = jwtService.generateJwtToken(user);
-
-        // Step D: RETURN Token
-        return ResponseEntity.ok(new AuthResponse(token));
+        return http.build();
     }
+    
+    // ... (Your other beans like passwordEncoder, authenticationManager remain here) ...
 }
 
-[4. Line-by-Line Code Explanation]
-Focus on /login:
- * authenticationManager.authenticate(...):
-   * Input: "adesh" / "12345"
-   * Action: Checks DB hash.
-   * Result: Passes (Go to next line) or Crashes (Return 403).
- * userRepository.findByUsername(...):
-   * Reason: The JwtService needs a User object to extract the id and role to put inside the token.
- * jwtService.generateJwtToken(user):
-   * Action: Takes the User ID (5), Name (adesh), Role (USER).
-   * Action: Signs it with your Secret Key.
-   * Result: Produces string eyJhbGci....
- * return ResponseEntity.ok(new AuthResponse(token)):
-   * Result: JSON {"token": "eyJhbGci..."}.
-[5. How to Test (The Moment of Truth)]
- * Postman POST /api/auth/register:
-   * Body: {"username": "test", "password": "123"}
-   * Response: "User registered..."
- * Postman POST /api/auth/login:
-   * Body: {"username": "test", "password": "123"}
-   * Response:
-     {
-    "token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwidXNlcm5hbWUiOiJ0ZXN0... (very long string)"
-}
-
- * Copy that Token! Go to jwt.io, paste it, and verify that you can see sub: "1" and username: "test" in the payload.
-Tell me when you see that Token string in Postman! That is your "Digital Passport".
+ * addFilterBefore(...): This tells Spring: "Run my JWT Filter BEFORE you run the standard Username/Password Filter." This gives our token a chance to work first.
+ * sessionCreationPolicy(SessionCreationPolicy.STATELESS): Tells Spring: "Do not create a server-side session (JSESSIONID). We are using tokens now."
+[7. Testing Flow]
+ * Login: Send POST /login. Copy the Token.
+ * Access: Create a new GET request to a secured endpoint (e.g., create a simple /api/demo controller).
+ * Header: In Postman, go to the Headers tab (or Auth tab -> Bearer Token).
+   * Key: Authorization
+   * Value: Bearer eyJhbGci... (Paste your token).
+ * Send: You should see 200 OK.
+ * Test Failure: Remove the last character of the token and send. You should get 403 Forbidden.
+Tell me when you have plugged the filter into the Config and successfully accessed a secured page! You are essentially a Spring Security Architect now.
