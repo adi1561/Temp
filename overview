@@ -1,208 +1,130 @@
-Here is your complete Verification Checklist. These are the specific functions across all your files that must be changed to implement the Exception Handling Strategy.
-You can compare these directly against your current code to verify the changes.
-1. File: JournalBulkValidationService.java
-Function 1: getValidRowsFromCache
- * Change: Throw CacheExpiredException if data is null. Wrap IO errors in FileProcessingException.
-<!-- end list -->
-public List<ExcelRowData> getValidRowsFromCache(String requestId) {
-    long start = System.currentTimeMillis();
-    byte[] compressed = redisTemplate.opsForValue().get("DATA_" + requestId);
+That is a perfect strategy. We will build the "Bare Bones" system first.
+We will implement two endpoints:
+ * POST /register: Takes a password, Encodes it (hashes it), and saves it to the DB.
+ * POST /login: Takes a password, compares it using the AuthenticationManager.
+Here is the complete, minimal code to make this work.
+[1. Prerequisites]
+Ensure you have these already (from previous steps):
+ * User Entity (Database Table).
+ * UserRepository (Interface extending JpaRepository).
+ * SecurityConfig (With PasswordEncoder bean and AuthenticationManager bean).
+[2. The Code: AuthController.java]
+This controller handles both Sign Up and Login.
+package org.adesh.security1.Controller;
 
-    // NEW: Explicitly fail if cache is gone
-    if (compressed == null) {
-        throw new CacheExpiredException("Validation data not found. The cache may have expired (TTL 1 Hour). Please re-upload.");
-    }
+import org.adesh.security1.Entity.User;
+import org.adesh.security1.Repository.UserRepository;
+import org.adesh.security1.Dto.LoginRequest; // Simple class with username/password
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
 
-    try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressed))) {
-        List<ExcelRowData> rows = objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {
-        });
-        log.info("Decompressed {} rows from Redis in {}ms [ReqID: {}]", rows.size(), System.currentTimeMillis() - start, requestId);
-        return rows;
-    } catch (IOException e) {
-        log.error("Failed to decompress rows from Redis [ReqID: {}]", requestId, e);
-        // NEW: Wrap generic IO error
-        throw new FileProcessingException("Failed to decompress cached data", e);
-    }
-}
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
 
-Function 2: initiateValidation
- * Change: Wrap file copy logic in try-catch to throw FileProcessingException.
-<!-- end list -->
-public String initiateValidation(InputStream fileStream, String filename, LocalDate postingDate) throws IOException {
-    String requestId = UUID.randomUUID().toString();
-    // 1. Create Temp File on Disk
-    Path tempFile = Files.createTempFile("UPLOAD_" + requestId, ".tmp");
-    
-    // NEW: Handle File IO errors specifically
-    try {
-        Files.copy(fileStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
-    } catch (IOException e) {
-        throw new FileProcessingException("Failed to save uploaded file to temporary storage", e);
-    }
+    @Autowired
+    private AuthenticationManager authenticationManager; // The "Boss" (For Login)
 
-    // 2. Init Status in Redis
-    BulkUploadStateDto state = new BulkUploadStateDto();
-    state.setRequestId(requestId);
-    state.setStatus("PROCESSING");
-    state.setCurrentStage(1);
-    state.setMessage("Initializing Upload...");
-    state.setTotalRows(0);
-    saveStatusToRedis(requestId, state);
+    @Autowired
+    private UserRepository userRepository; // The Database (For Sign Up)
 
-    log.info("Validation Initiated. ReqID: {}, File: {}, Date: {}", requestId, filename, postingDate);
-    // 3. Pass File Path to Async Method
-    self.processAsync(requestId, tempFile.toString(), filename, postingDate);
-    return requestId;
-}
+    @Autowired
+    private PasswordEncoder passwordEncoder; // The Blender (For Sign Up)
 
-2. File: JournalRequestServiceImpl.java
-Function 3: createBatchFromCacheAsync
- * Change: Throw ConcurrencyLockException (HTTP 409) instead of IllegalStateException.
-<!-- end list -->
-@Override
-@Transactional
-public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
-    String lockKey = "LOCK_REQ_" + requestId;
-    Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
-
-    if (Boolean.FALSE.equals(acquired)) {
-        log.warn("Duplicate creation attempt blocked for ReqID: {}", requestId);
-        // NEW: Specific exception for Global Handler
-        throw new ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
-    }
-
-    try {
-        String batchId = sequenceService.getNextBatchId();
-        // Start Progress
-        progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
-        self.executeAsyncBatchCreation(batchId, requestId, commonRemarks, creatorId, creatorRole);
-        return batchId;
-    } catch (Exception e) {
-        redisTemplate.delete(lockKey);
-        throw e;
-    }
-}
-
-Function 4: processChunkRaw
- * Change: Throw DatabaseOperationException inside the catch (SQLException e) block.
-<!-- end list -->
-private void processChunkRaw(List<ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
-    String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    try (Connection conn = dataSource.getConnection();
-         PreparedStatement ps = conn.prepareStatement(sql)) {
-
-        // ... [Existing Logic: setAutoCommit, Loop, PreparedStatement setters] ...
+    // ==========================================
+    // 1. SIGN UP (Register)
+    // ==========================================
+    @PostMapping("/register")
+    public ResponseEntity<String> registerUser(@RequestBody LoginRequest request) {
         
-        // ... [Inside loop logic remains exactly the same] ...
+        // Step 1: Check if user already exists
+        if (userRepository.findByUsername(request.getUsername()).isPresent()) {
+            return ResponseEntity.badRequest().body("Username is already taken!");
+        }
 
-        ps.executeBatch();
-        conn.commit(); 
+        // Step 2: Create the User Object
+        User newUser = new User();
+        newUser.setUsername(request.getUsername());
+        
+        // CRITICAL: Encode the password before saving!
+        // We never save plain text.
+        String encodedPassword = passwordEncoder.encode(request.getPassword());
+        newUser.setPassword(encodedPassword);
 
-    } catch (SQLException e) {
-        log.error("Raw JDBC Batch Insert Failed for chunk starting at " + globalOffset, e);
-        // NEW: Throw custom exception
-        throw new DatabaseOperationException("Failed to persist batch chunk due to SQL error", e);
+        newUser.setRole("ROLE_USER"); // Default role
+
+        // Step 3: Save to DB
+        userRepository.save(newUser);
+
+        return ResponseEntity.ok("User registered successfully!");
+    }
+
+    // ==========================================
+    // 2. LOGIN
+    // ==========================================
+    @PostMapping("/login")
+    public ResponseEntity<String> loginUser(@RequestBody LoginRequest request) {
+        
+        // Step 1: Create a container for the credentials
+        UsernamePasswordAuthenticationToken token = new UsernamePasswordAuthenticationToken(
+            request.getUsername(), 
+            request.getPassword()
+        );
+
+        // Step 2: Ask the AuthenticationManager to verify
+        // This automatically calls:
+        //  - CustomUserDetailsService (Load user from DB)
+        //  - PasswordEncoder (Match hash)
+        Authentication auth = authenticationManager.authenticate(token);
+
+        // Step 3: If valid, return success
+        // (If invalid, Spring throws an exception automatically)
+        return ResponseEntity.ok("Login Successful! Welcome " + auth.getName());
     }
 }
 
-3. File: AsyncConfig.java
-Function 5: getAsyncUncaughtExceptionHandler
- * Change: Add this new method to the class to catch background thread failures.
-<!-- end list -->
-@Override
-public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
-    return (Throwable ex, Method method, Object... params) -> {
-        log.error("CRITICAL ASYNC FAILURE in method: {}", method.getName(), ex);
-        // Optional: Add alert logic here
-    };
+[3. Line-by-Line Explanation]
+The Sign Up (/register) Logic:
+ * userRepository.findByUsername(...): We check if "adesh" already exists. We don't want duplicates.
+ * passwordEncoder.encode(...): This is the most important line.
+   * Input: "12345"
+   * Output: "$2a$10$dXj..." (The Hash)
+   * If you forget this and save "12345" directly, Login will fail because the Login process expects a hash.
+ * userRepository.save(...): Saves the user with the Hash to the database.
+The Login (/login) Logic:
+ * authenticationManager.authenticate(token): This single line does all the heavy lifting. It connects the components we built earlier.
+   * It grabs the user you just saved.
+   * It sees the hash $2a$10....
+   * It hashes the login password.
+   * It compares them.
+[4. How to Test (Postman)]
+Step 1: Register (Create User)
+ * Method: POST
+ * URL: http://localhost:8080/api/auth/register
+ * Body (JSON):
+   {
+    "username": "adesh",
+    "password": "mySuperSecretPassword"
 }
 
-4. File: JournalRequestController.java
-Function 6: createBatchFromCache
- * Change: Remove try-catch.
-<!-- end list -->
-@PostMapping("/create-batch-from-cache")
-public ResponseEntity<Map<String, Object>> createBatchFromCache(
-        @RequestBody Map<String, String> payload,
-        @RequestHeader("Authorization") String token) throws IOException { // Allow exceptions
-
-    String userId = jwtUtil.getUserIdFromToken(token);
-    Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-    // NEW: No try-catch. GlobalHandler catches ConcurrencyLockException
-    String batchId = journalRequestService.createBatchFromCacheAsync(
-            payload.get("requestId"),
-            payload.get("commonBatchRemarks"),
-            userId,
-            userRole
-    );
-
-    return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-            "status", "PROCESSING",
-            "message", "Batch creation initiated in background.",
-            "batchId", batchId
-    ));
+ * Result: 200 OK - "User registered successfully!"
+ * (Check your Database: You should see a row with a weird looking password starting with $2a$).
+Step 2: Login (Verify User)
+ * Method: POST
+ * URL: http://localhost:8080/api/auth/login
+ * Body (JSON):
+   {
+    "username": "adesh",
+    "password": "mySuperSecretPassword"
 }
 
-Function 7: processBulkRequests
- * Change: Remove try-catch.
-<!-- end list -->
-@PostMapping("/process-bulk")
-public ResponseEntity<?> processBulkRequests(
-        @RequestHeader("Authorization") String token,
-        @Valid @RequestBody BulkProcessJournalRequestDto dto) {
-    
-    // NEW: No try-catch.
-    String userId = jwtUtil.getUserIdFromToken(token);
-    Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-    journalRequestService.processBulkRequestsAsync(dto, userId, userRole);
-
-    return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-            "status", "PROCESSING",
-            "message", "Approval process started. Notifications will be sent upon completion."
-    ));
-}
-
-Function 8: cancelMyRequestsByBatchId
- * Change: Remove try-catch.
-<!-- end list -->
-@DeleteMapping("/my-requests/by-batch/{batchId}")
-public ResponseEntity<?> cancelMyRequestsByBatch(
-        @RequestHeader("Authorization") String token,
-        @PathVariable String batchId) {
-
-    // NEW: No try-catch.
-    String userId = jwtUtil.getUserIdFromToken(token);
-    journalRequestService.cancelMyRequestsByBatchIdAsync(batchId, userId);
-
-    return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-            "status", "DELETING",
-            "message", "Batch deletion queued. Status will update shortly."
-    ));
-}
-
-Function 9: initiateValidation
- * Change: Throw FileProcessingException instead of returning manual Map. Use getInputStream().
-<!-- end list -->
-@PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-public ResponseEntity<?> initiateValidation(
-        @RequestParam("file") MultipartFile file,
-        @RequestParam("postingDate") String date,
-        HttpServletRequest request) throws IOException {
-
-    // NEW: Throw exception for empty file
-    if (file == null || file.isEmpty()) {
-        throw new FileProcessingException("File is missing or empty");
-    }
-    
-    // NEW: Use getInputStream() to match Service
-    String reqId = journalBulkValidationService.initiateValidation(
-            file.getInputStream(),
-            file.getOriginalFilename(),
-            LocalDate.parse(date)
-    );
-
-    return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
-}
-
+ * Result: 200 OK - "Login Successful! Welcome adesh"
+Step 3: Test Failure
+ * Try logging in with password "wrongpassword".
+ * Result: 401 Unauthorized or 403 Forbidden.
+Implement this now. Once this works, you have a fully functional (stateless) authentication backend! The only thing missing is the "Ticket" (JWT) for future requests.
