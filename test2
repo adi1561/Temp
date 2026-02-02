@@ -1,121 +1,181 @@
-No, creating the exception files is NOT enough.
-You MUST change your existing Service and Controller files.
-Here is why:
-Your GlobalExceptionHandler is like a catcher's mitt. It is waiting to catch specific errors.
-Your Service code is the pitcher. Right now, your service code is either:
- * Holding the ball: Swallowing exceptions with try { ... } catch (Exception e) { log.error(...) } (The handler never sees it).
- * Throwing a different ball: Throwing generic RuntimeException or IOException (The handler catches it as a generic "Internal Server Error" instead of the specific error you defined).
-To make this work, you must modify your code to throw the specific exceptions you just created.
-Here are the 4 exact locations you must change to activate your new strategy.
-1. Modify JournalBulkValidationService.java
-You need to stop returning empty lists or throwing generic IOExceptions.
-Find this method: getValidRowsFromCache
-Current Logic: Returns empty list if data is missing.
-Change To: Throw CacheExpiredException.
-public List<ExcelRowData> getValidRowsFromCache(String requestId) {
-    long start = System.currentTimeMillis();
-    byte[] compressed = redisTemplate.opsForValue().get("DATA_" + requestId);
-    
-    // CHANGE HERE: Don't return empty list. Throw exception.
-    if (compressed == null) { 
-        throw new CacheExpiredException("Validation data not found. The cache may have expired (TTL 1 Hour). Please re-upload.");
-    }
-    
-    try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressed))) {
-        // ... existing decompression logic ...
-    } catch (IOException e) {
-        log.error("Failed to decompress...", e);
-        // CHANGE HERE: Wrap generic IO error
-        throw new FileProcessingException("Failed to decompress cached data", e);
-    }
-}
+Here is the updated code structure implementing the two new APIs you requested.
+As a Senior Engineer, I have ensured that:
+ * Separation of Concerns: The filtering logic is handled in the Repository using JPQL to project directly into the DTO (avoiding fetching full Entities just to map them later).
+ * Pagination: Both new endpoints support standard Spring Data pagination.
+ * Type Safety: We use LocalDate with @DateTimeFormat to ensure the API handles dates correctly.
+1. Repository (DifferenceRepository.java)
+We add two new queries. Note that we continue to use the SELECT new ... DTO constructor syntax to ensure efficiency and exclude the ID as requested.
+package com.fincore.ReportService.repository;
 
-Find this method: initiateValidation
-Change To: Wrap the file copy logic.
-public String initiateValidation(InputStream fileStream, String filename, LocalDate postingDate) {
-    // ... setup ...
-    try {
-        Files.copy(fileStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
-    } catch (IOException e) {
-        // CHANGE HERE: Throw custom exception
-        throw new FileProcessingException("Failed to save uploaded file to temporary storage", e);
-    }
-    // ... rest of logic ...
-}
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.model.Difference;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
 
-2. Modify JournalRequestServiceImpl.java
-You need to handle DB errors and Locks using your new classes.
-Find this method: createBatchFromCacheAsync
-Current Logic: Throws IllegalStateException.
-Change To: Throw ConcurrencyLockException.
-Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
+import java.time.LocalDate;
 
-if (Boolean.FALSE.equals(acquired)) {
-    log.warn("Duplicate creation attempt blocked for ReqID: {}", requestId);
-    // CHANGE HERE: Use the specific exception for 409 Conflict
-    throw new ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
-}
+@Repository
+public interface DifferenceRepository extends JpaRepository<Difference, Long> {
 
-Find this method: processChunkRaw
-Current Logic: Catches SQLException and throws RuntimeException.
-Change To: Throw DatabaseOperationException.
-} catch (SQLException e) {
-    log.error("Raw JDBC Batch Insert Failed...", e);
-    // CHANGE HERE: Distinguish DB error from logic error
-    throw new DatabaseOperationException("Failed to persist batch chunk due to SQL error", e);
-}
+    // Existing "Find All" Query
+    @Query("""
+        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
+            d.reconRunDate, d.branchCode, d.currency, d.cgl,
+            d.cbsBalance, d.glBalance, d.differenceAmount,
+            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
+        )
+        FROM Difference d
+    """)
+    Page<DifferenceDTO> findAllAsDto(Pageable pageable);
 
-3. Modify JournalRequestController.java
-You must remove local try-catch blocks so the exceptions can bubble up to your Global Handler.
-Find this method: createBatchFromCache
-Current Logic: Catches IllegalStateException and manually returns ResponseEntity.status(HttpStatus.CONFLICT).
-Change To: Remove the catch block.
-@PostMapping("/create-batch-from-cache")
-public ResponseEntity<Map<String, Object>> createBatchFromCache(...) {
-    // REMOVE TRY-CATCH BLOCK
-    // Just call the service. If it throws ConcurrencyLockException, 
-    // the GlobalExceptionHandler will automatically return 409 Conflict.
-    
-    String userId = jwtUtil.getUserIdFromToken(token);
-    Integer userRole = jwtUtil.getUserRoleFromToken(token);
+    // 1. Filter by Date Only
+    @Query("""
+        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
+            d.reconRunDate, d.branchCode, d.currency, d.cgl,
+            d.cbsBalance, d.glBalance, d.differenceAmount,
+            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
+        )
+        FROM Difference d
+        WHERE d.reconRunDate = :date
+    """)
+    Page<DifferenceDTO> findByDate(@Param("date") LocalDate date, Pageable pageable);
 
-    String batchId = journalRequestService.createBatchFromCacheAsync(
-            payload.get("requestId"),
-            payload.get("commonBatchRemarks"),
-            userId,
-            userRole
+    // 2. Multi-field Filter (Date + Branch + Currency + CGL)
+    @Query("""
+        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
+            d.reconRunDate, d.branchCode, d.currency, d.cgl,
+            d.cbsBalance, d.glBalance, d.differenceAmount,
+            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
+        )
+        FROM Difference d
+        WHERE d.reconRunDate = :date
+        AND d.branchCode = :branchCode
+        AND d.currency = :currency
+        AND d.cgl = :cgl
+    """)
+    Page<DifferenceDTO> findByCompositeFilter(
+            @Param("date") LocalDate date,
+            @Param("branchCode") String branchCode,
+            @Param("currency") String currency,
+            @Param("cgl") String cgl,
+            Pageable pageable
     );
-    
-    return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-            "status", "PROCESSING",
-            "message", "Batch creation initiated in background.",
-            "batchId", batchId
-    ));
 }
 
-4. Modify AsyncConfig.java
-You MUST implement AsyncConfigurer here.
-If an exception occurs in a @Async method (like executeAsyncBatchCreation), it happens in a separate thread. The Controller never sees it, and the GlobalExceptionHandler never sees it. It just disappears into the logs.
-Change To:
-@Configuration
-@EnableAsync
-@Slf4j
-public class AsyncConfig implements AsyncConfigurer { // 1. Implement this interface
+2. Service (DifferenceService.java)
+We add methods to expose these repository queries.
+package com.fincore.ReportService.service;
 
-    // ... your existing bean definition for bulkExecutor ...
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.repository.DifferenceRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-    // 2. Add this method to catch Async failures
-    @Override
-    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
-        return (Throwable ex, Method method, Object... params) -> {
-            log.error("CRITICAL ASYNC FAILURE in method: {}", method.getName(), ex);
-            // Ideally, you would update the Batch Status to 'ERROR' in the DB here
-            // so the user knows it failed.
-        };
+import java.time.LocalDate;
+
+@Service
+public class DifferenceService {
+
+    @Autowired
+    private DifferenceRepository repository;
+
+    @Transactional(readOnly = true)
+    public Page<DifferenceDTO> getAllDifferences(int page, int size) {
+        // Sort by ID is fine even if ID isn't in the DTO, as long as the Entity has it
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
+        return repository.findAllAsDto(pageRequest);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<DifferenceDTO> getDifferencesByDate(LocalDate date, int page, int size) {
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
+        return repository.findByDate(date, pageRequest);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<DifferenceDTO> getDifferencesByComposite(
+            LocalDate date, String branch, String currency, String cgl, int page, int size) {
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
+        return repository.findByCompositeFilter(date, branch, currency, cgl, pageRequest);
     }
 }
 
-Summary of Necessary Changes
- * Service Layer: Change throw new RuntimeException() to throw new [YourCustomException]().
- * Controller Layer: Delete try-catch blocks and let exceptions float up.
- * Config Layer: Add AsyncUncaughtExceptionHandler so background threads don't fail silently.
+3. Controller (DifferenceController.java)
+We add the two new endpoints.
+ * /search-by-date: Handles the simple date filter.
+ * /search-detailed: Handles the 4-parameter filter.
+<!-- end list -->
+package com.fincore.ReportService.controller;
+
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.service.DifferenceService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDate;
+
+@RestController
+@RequestMapping("/api/differences")
+public class DifferenceController {
+
+    @Autowired
+    private DifferenceService service;
+
+    // Original API
+    @GetMapping
+    public ResponseEntity<Page<DifferenceDTO>> getDifferences(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        return ResponseEntity.ok(service.getAllDifferences(page, size));
+    }
+
+    // New API 1: Filter by Date
+    @GetMapping("/search-by-date")
+    public ResponseEntity<Page<DifferenceDTO>> getDifferencesByDate(
+            @RequestParam("reconDate") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate reconDate,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        return ResponseEntity.ok(service.getDifferencesByDate(reconDate, page, size));
+    }
+
+    // New API 2: Composite Filter
+    @GetMapping("/search-detailed")
+    public ResponseEntity<Page<DifferenceDTO>> getDifferencesDetailed(
+            @RequestParam("reconDate") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate reconDate,
+            @RequestParam("branchCode") String branchCode,
+            @RequestParam("currency") String currency,
+            @RequestParam("cgl") String cgl,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        return ResponseEntity.ok(
+            service.getDifferencesByComposite(reconDate, branchCode, currency, cgl, page, size)
+        );
+    }
+}
+
+How to test these APIs
+Assuming your server is running on localhost:8080:
+ * Filter by Date:
+   GET http://localhost:8080/api/differences/search-by-date?reconDate=2023-10-27&page=0&size=50
+ * Filter by Composite Key:
+   GET http://localhost:8080/api/differences/search-detailed?reconDate=2023-10-27&branchCode=BR001&currency=USD&cgl=123456&page=0&size=50
+Note on "ID Exclusion"
+You mentioned specifically that you do not want to include the ID.
+ * The DifferenceDTO code you provided does not have an id field.
+ * The JPQL queries specifically select fields into the DTO constructor, skipping the ID.
+ * Therefore, the JSON response will purely contain business data (Date, Branch, Amounts, etc.) without the database primary key.
+Would you like me to add Swagger/OpenAPI documentation annotations to these new endpoints?
