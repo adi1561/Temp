@@ -1,129 +1,35 @@
-Here is the updated code structure implementing the two new APIs you requested.
-As a Senior Engineer, I have ensured that:
- * Separation of Concerns: The filtering logic is handled in the Repository using JPQL to project directly into the DTO (avoiding fetching full Entities just to map them later).
- * Pagination: Both new endpoints support standard Spring Data pagination.
- * Type Safety: We use LocalDate with @DateTimeFormat to ensure the API handles dates correctly.
-1. Repository (DifferenceRepository.java)
-We add two new queries. Note that we continue to use the SELECT new ... DTO constructor syntax to ensure efficiency and exclude the ID as requested.
-package com.fincore.ReportService.repository;
-
-import com.fincore.ReportService.dto.DifferenceDTO;
-import com.fincore.ReportService.model.Difference;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
+It is a very good practice to use POST with a JSON body for filtering, even if it's just a date. It keeps your URLs clean and allows you to easily expand the criteria later without breaking the API contract.
+Here is the complete implementation converting both APIs (Date-only and Composite) to POST methods using a JSON body.
+1. The Search DTO (DifferenceSearchCriteria.java)
+We will use one DTO for both endpoints. For the "Date Only" API, we just ignore the other fields.
+package com.fincore.ReportService.dto;
 
 import java.time.LocalDate;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
 
-@Repository
-public interface DifferenceRepository extends JpaRepository<Difference, Long> {
-
-    // Existing "Find All" Query
-    @Query("""
-        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
-            d.reconRunDate, d.branchCode, d.currency, d.cgl,
-            d.cbsBalance, d.glBalance, d.differenceAmount,
-            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
-        )
-        FROM Difference d
-    """)
-    Page<DifferenceDTO> findAllAsDto(Pageable pageable);
-
-    // 1. Filter by Date Only
-    @Query("""
-        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
-            d.reconRunDate, d.branchCode, d.currency, d.cgl,
-            d.cbsBalance, d.glBalance, d.differenceAmount,
-            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
-        )
-        FROM Difference d
-        WHERE d.reconRunDate = :date
-    """)
-    Page<DifferenceDTO> findByDate(@Param("date") LocalDate date, Pageable pageable);
-
-    // 2. Multi-field Filter (Date + Branch + Currency + CGL)
-    @Query("""
-        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
-            d.reconRunDate, d.branchCode, d.currency, d.cgl,
-            d.cbsBalance, d.glBalance, d.differenceAmount,
-            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
-        )
-        FROM Difference d
-        WHERE d.reconRunDate = :date
-        AND d.branchCode = :branchCode
-        AND d.currency = :currency
-        AND d.cgl = :cgl
-    """)
-    Page<DifferenceDTO> findByCompositeFilter(
-            @Param("date") LocalDate date,
-            @Param("branchCode") String branchCode,
-            @Param("currency") String currency,
-            @Param("cgl") String cgl,
-            Pageable pageable
-    );
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class DifferenceSearchCriteria {
+    private LocalDate reconRunDate;
+    private String branchCode;
+    private String currency;
+    private String cgl;
 }
 
-2. Service (DifferenceService.java)
-We add methods to expose these repository queries.
-package com.fincore.ReportService.service;
-
-import com.fincore.ReportService.dto.DifferenceDTO;
-import com.fincore.ReportService.repository.DifferenceRepository;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Sort;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.time.LocalDate;
-
-@Service
-public class DifferenceService {
-
-    @Autowired
-    private DifferenceRepository repository;
-
-    @Transactional(readOnly = true)
-    public Page<DifferenceDTO> getAllDifferences(int page, int size) {
-        // Sort by ID is fine even if ID isn't in the DTO, as long as the Entity has it
-        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
-        return repository.findAllAsDto(pageRequest);
-    }
-
-    @Transactional(readOnly = true)
-    public Page<DifferenceDTO> getDifferencesByDate(LocalDate date, int page, int size) {
-        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
-        return repository.findByDate(date, pageRequest);
-    }
-
-    @Transactional(readOnly = true)
-    public Page<DifferenceDTO> getDifferencesByComposite(
-            LocalDate date, String branch, String currency, String cgl, int page, int size) {
-        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
-        return repository.findByCompositeFilter(date, branch, currency, cgl, pageRequest);
-    }
-}
-
-3. Controller (DifferenceController.java)
-We add the two new endpoints.
- * /search-by-date: Handles the simple date filter.
- * /search-detailed: Handles the 4-parameter filter.
-<!-- end list -->
+2. The Controller (DifferenceController.java)
+I have updated the controller to have two POST mappings. I kept page and size as URL parameters because they are metadata about the response view, not the search criteria itself. This is standard Spring practice.
 package com.fincore.ReportService.controller;
 
 import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.dto.DifferenceSearchCriteria;
 import com.fincore.ReportService.service.DifferenceService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
-import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-
-import java.time.LocalDate;
 
 @RestController
 @RequestMapping("/api/differences")
@@ -132,7 +38,7 @@ public class DifferenceController {
     @Autowired
     private DifferenceService service;
 
-    // Original API
+    // 1. Original Get All (unchanged)
     @GetMapping
     public ResponseEntity<Page<DifferenceDTO>> getDifferences(
             @RequestParam(defaultValue = "0") int page,
@@ -141,41 +47,61 @@ public class DifferenceController {
         return ResponseEntity.ok(service.getAllDifferences(page, size));
     }
 
-    // New API 1: Filter by Date
-    @GetMapping("/search-by-date")
+    // 2. Filter by Date Only (POST)
+    @PostMapping("/filter/date")
     public ResponseEntity<Page<DifferenceDTO>> getDifferencesByDate(
-            @RequestParam("reconDate") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate reconDate,
+            @RequestBody DifferenceSearchCriteria criteria,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "100") int size
     ) {
-        return ResponseEntity.ok(service.getDifferencesByDate(reconDate, page, size));
+        // We only extract the date from the JSON body
+        return ResponseEntity.ok(service.getDifferencesByDate(criteria.getReconRunDate(), page, size));
     }
 
-    // New API 2: Composite Filter
-    @GetMapping("/search-detailed")
+    // 3. Detailed Filter (POST)
+    @PostMapping("/filter/detailed")
     public ResponseEntity<Page<DifferenceDTO>> getDifferencesDetailed(
-            @RequestParam("reconDate") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate reconDate,
-            @RequestParam("branchCode") String branchCode,
-            @RequestParam("currency") String currency,
-            @RequestParam("cgl") String cgl,
+            @RequestBody DifferenceSearchCriteria criteria,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "100") int size
     ) {
+        // We extract all fields from the JSON body
         return ResponseEntity.ok(
-            service.getDifferencesByComposite(reconDate, branchCode, currency, cgl, page, size)
+            service.getDifferencesByComposite(
+                criteria.getReconRunDate(),
+                criteria.getBranchCode(),
+                criteria.getCurrency(),
+                criteria.getCgl(),
+                page,
+                size
+            )
         );
     }
 }
 
-How to test these APIs
-Assuming your server is running on localhost:8080:
- * Filter by Date:
-   GET http://localhost:8080/api/differences/search-by-date?reconDate=2023-10-27&page=0&size=50
- * Filter by Composite Key:
-   GET http://localhost:8080/api/differences/search-detailed?reconDate=2023-10-27&branchCode=BR001&currency=USD&cgl=123456&page=0&size=50
-Note on "ID Exclusion"
-You mentioned specifically that you do not want to include the ID.
- * The DifferenceDTO code you provided does not have an id field.
- * The JPQL queries specifically select fields into the DTO constructor, skipping the ID.
- * Therefore, the JSON response will purely contain business data (Date, Branch, Amounts, etc.) without the database primary key.
-Would you like me to add Swagger/OpenAPI documentation annotations to these new endpoints?
+3. Verification (How to use these APIs)
+API 1: Filter by Date
+ * Method: POST
+ * URL: http://localhost:8080/api/differences/filter/date?page=0&size=50
+ * Body (JSON):
+   {
+    "reconRunDate": "2023-10-27"
+}
+
+   (Note: You can include the other fields in the JSON, but the code will ignore them for this specific endpoint.)
+API 2: Detailed Filter
+ * Method: POST
+ * URL: http://localhost:8080/api/differences/filter/detailed?page=0&size=50
+ * Body (JSON):
+   {
+    "reconRunDate": "2023-10-27",
+    "branchCode": "BR001",
+    "currency": "USD",
+    "cgl": "100200"
+}
+
+4. Service and Repository (No Changes Needed)
+Your Service and Repository layers do not need to change because they simply accept the raw Java types (LocalDate, String, etc.). The Controller is doing the work of "unwrapping" the JSON for them.
+ * Service: getDifferencesByDate(LocalDate date, ...)
+ * Service: getDifferencesByComposite(LocalDate date, String branch, ...)
+This keeps your Service clean and testable without coupling it to the JSON structure.
