@@ -1,14 +1,97 @@
-To make this Production Ready, Dynamic, and Kubernetes Friendly, we need to move away from writing many different @Query methods (which is messy) and switch to a Single Dynamic Query.
-We will use a technique where the database query checks: "Is this filter NULL? If yes, ignore it. If no, match it."
-Here are the complete, updated files.
-1. DTO: DifferenceSearchCriteria.java
-Changes:
- * Replaced reconRunDate with fromDate and toDate.
- * Added getEffectiveToDate() helper logic to handle the "Single Date" scenario automatically.
-<!-- end list -->
+package com.fincore.ReportService.controller;
+
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.dto.DifferenceSearchDto;
+import com.fincore.ReportService.service.DifferenceService;
+import jakarta.validation.Valid;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/differences")
+public class DifferenceController {
+
+    @Autowired
+    private DifferenceService service;
+
+    // Basic Get All
+    @GetMapping
+    public ResponseEntity<Page<DifferenceDTO>> getDifferences(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        return ResponseEntity.ok(service.getAllDifferences(page, size));
+    }
+
+    /**
+     * MASTER SEARCH ENDPOINT
+     * Handles: Date Range, Branch, Currency, CGL in any combination.
+     */
+    @PostMapping("/search")
+    public ResponseEntity<Page<DifferenceDTO>> searchDifferences(
+            @RequestBody getEffectiveToDate criteria,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        // Validation: Date is mandatory
+        if (criteria.getFromDate() == null) {
+            throw new IllegalArgumentException("fromDate is required");
+        }
+
+        Page<DifferenceDTO> result = service.searchDifferences(criteria, page, size);
+
+        if (result.isEmpty()) {
+            return ResponseEntity.noContent().build();
+        }
+        return ResponseEntity.ok(result);
+    }
+
+    // --- KUBERNETES HEALTH CHECKS (Optional if not using Actuator) ---
+    @GetMapping("/health/liveness")
+    public ResponseEntity<String> liveness() {
+        return ResponseEntity.ok("Alive");
+    }
+
+    @GetMapping("/health/readiness")
+    public ResponseEntity<String> readiness() {
+        // In real app, check DB connection here
+        return ResponseEntity.ok("Ready");
+    }
+}
+
+
+package com.fincore.ReportService.dto;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class DifferenceDTO {
+    private LocalDate reconRunDate;
+    private String branchCode;
+    private String currency;
+    private String cgl;
+    private BigDecimal cbsBalance;
+    private BigDecimal glBalance;
+    private BigDecimal differenceAmount;
+    private BigDecimal diffBwYesterday;
+    private String type;
+    private String head;
+    private LocalDate FIRST_ERROR_DATE;
+}
+
 package com.fincore.ReportService.dto;
 
+
 import java.time.LocalDate;
+
+import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.AllArgsConstructor;
@@ -16,7 +99,7 @@ import lombok.AllArgsConstructor;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class DifferenceSearchCriteria {
+public class DifferenceSearchDto {
 
     // Mandatory: The start date (or the specific single date)
     private LocalDate fromDate;
@@ -38,11 +121,161 @@ public class DifferenceSearchCriteria {
     }
 }
 
-2. Repository: DifferenceRepository.java
-Changes:
- * Replaced multiple queries with ONE Dynamic Query.
- * Uses (:param IS NULL OR field = :param) pattern. This is highly efficient and standard for SQL optimization.
-<!-- end list -->
+
+package com.fincore.ReportService.exception;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.ReportService.dto.ApiResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.context.request.WebRequest;
+
+import jakarta.validation.ConstraintViolationException;
+import java.util.stream.Collectors;
+
+@ControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Object>> handleResourceNotFoundException(ResourceNotFoundException ex, WebRequest request) {
+        log.error("Report not found: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error(ex.getMessage()), HttpStatus.NOT_FOUND);
+    }
+
+    @ExceptionHandler({JsonProcessingException.class, HttpMessageNotReadableException.class})
+    public ResponseEntity<ApiResponse<Object>> handleJsonProcessingException(Exception ex, WebRequest request) {
+        log.error("Error processing JSON payload: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error("Invalid request payload format. Please check the JSON structure and data types."), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiResponse<Object>> handleDataIntegrityViolationException(DataIntegrityViolationException ex, WebRequest request) {
+        log.error("Data integrity violation: {}", ex.getMessage());
+        if (ex.getMostSpecificCause().getMessage().contains("already exists")) {
+            return new ResponseEntity<>(ApiResponse.error("A resource with the provided identifier already exists."), HttpStatus.CONFLICT);
+        }
+        return new ResponseEntity<>(ApiResponse.error("Database constraint violation. A required field may be missing or a value is invalid."), HttpStatus.CONFLICT);
+    }
+
+    // This ALREADY handles IllegalArgumentException, so we don't need a new one
+    @ExceptionHandler({IllegalArgumentException.class, IllegalStateException.class})
+    public ResponseEntity<ApiResponse<Object>> handleArgumentAndStateExceptions(RuntimeException ex, WebRequest request) {
+        log.error("Illegal argument or state: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error(ex.getMessage()), HttpStatus.BAD_REQUEST);
+    }
+
+    // This ALREADY handles global Exception, so we don't need a new one
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Object>> handleGlobalException(Exception ex, WebRequest request) {
+        log.error("An unexpected error occurred: {}", ex.getMessage(), ex);
+        return new ResponseEntity<>(ApiResponse.error("An internal server error occurred."), HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+
+    /**
+     * Handles exceptions thrown when @Valid validation fails on a request body.
+     * Returns a 400 Bad Request with a list of validation errors.
+     */
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ResponseEntity<ApiResponse<Object>> handleValidationExceptions(MethodArgumentNotValidException ex) {
+        String errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                .collect(Collectors.joining(", "));
+
+        log.warn("Validation failed for incoming request: {}", errors);
+        return new ResponseEntity<>(ApiResponse.error("Validation Failed: " + errors), HttpStatus.BAD_REQUEST);
+    }
+
+    /**
+     * Handles exceptions thrown by the Jakarta Validator, for example,
+     * when we manually trigger validation in our strategies.
+     */
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ResponseEntity<ApiResponse<Object>> handleConstraintViolationException(ConstraintViolationException ex) {
+        String errors = ex.getConstraintViolations().stream()
+                .map(cv -> cv.getPropertyPath() + ": " + cv.getMessage())
+                .collect(Collectors.joining(", "));
+
+        log.warn("Constraint violation during processing: {}", errors);
+        return new ResponseEntity<>(ApiResponse.error("Validation Failed: " + errors), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ApiResponse<Object>> handleAccessDeniedException(AccessDeniedException ex, WebRequest request) {
+        log.error("Access Denied: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error("Report Not Found or You are not authorized to perform this action."), HttpStatus.NOT_FOUND);
+    }
+
+
+}
+
+
+package com.fincore.ReportService.model;
+
+import jakarta.persistence.*;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Entity
+@Data
+@NoArgsConstructor
+public class Difference {
+
+    @Id
+    @Column(name = "ID")
+    private Long id;
+
+    @Column(name = "RECON_RUN_DATE")
+    private LocalDate reconRunDate;
+
+    @Column(name = "BRANCH_CODE", length = 5)
+    private String branchCode;
+
+    @Column(name = "CURRENCY", length = 3)
+    private String currency;
+
+    @Column(name = "CGL", length = 10)
+    private String cgl;
+
+    @Column(name = "CBS_BALANCE", precision = 25, scale = 4)
+    private BigDecimal cbsBalance;
+
+    @Column(name = "GL_BALANCE", precision = 25, scale = 4)
+    private BigDecimal glBalance;
+
+    @Column(name = "DIFFERENCE_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal differenceAmount;
+
+    @Column(name = "DIFF_BW_YESTERDAY", precision = 25, scale = 4)
+    private BigDecimal diffBwYesterday;
+
+    @Column(name = "TYPE", length = 40)
+    private String type;
+
+    @Column(name = "HEAD", length = 30)
+    private String head;
+
+    @Column(name = "FIRST_ERROR_DATE")
+    private LocalDate FIRST_ERROR_DATE;
+}
+
 package com.fincore.ReportService.repository;
 
 import com.fincore.ReportService.dto.DifferenceDTO;
@@ -53,7 +286,6 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
-
 import java.time.LocalDate;
 
 @Repository
@@ -96,14 +328,10 @@ public interface DifferenceRepository extends JpaRepository<Difference, Long> {
     );
 }
 
-3. Service: DifferenceService.java
-Changes:
- * Added logic to handle "Empty Strings" (converting "" to null) so the dynamic query works even if the frontend sends empty text boxes.
-<!-- end list -->
 package com.fincore.ReportService.service;
 
 import com.fincore.ReportService.dto.DifferenceDTO;
-import com.fincore.ReportService.dto.DifferenceSearchCriteria;
+import com.fincore.ReportService.dto.ReportCreationDto;
 import com.fincore.ReportService.repository.DifferenceRepository;
 import io.micrometer.common.util.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -126,7 +354,7 @@ public class DifferenceService {
     }
 
     @Transactional(readOnly = true)
-    public Page<DifferenceDTO> searchDifferences(DifferenceSearchCriteria criteria, int page, int size) {
+    public Page<DifferenceDTO> searchDifferences(ReportCreationDto criteria, int page, int size) {
         PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
 
         // sanitize inputs: convert empty strings to null so SQL ignores them
@@ -145,104 +373,5 @@ public class DifferenceService {
     }
 }
 
-4. Controller: DifferenceController.java
-Changes:
- * Consolidated into ONE clean search endpoint.
- * Added Readiness and Liveness probes (simple health checks) to make it Kubernetes Friendly (though usually, you use Spring Actuator for this, these manual endpoints are good placeholders).
-<!-- end list -->
-package com.fincore.ReportService.controller;
 
-import com.fincore.ReportService.dto.DifferenceDTO;
-import com.fincore.ReportService.dto.DifferenceSearchCriteria;
-import com.fincore.ReportService.service.DifferenceService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.domain.Page;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import jakarta.validation.Valid;
-
-@RestController
-@RequestMapping("/api/differences")
-public class DifferenceController {
-
-    @Autowired
-    private DifferenceService service;
-
-    // Basic Get All
-    @GetMapping
-    public ResponseEntity<Page<DifferenceDTO>> getDifferences(
-            @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "100") int size
-    ) {
-        return ResponseEntity.ok(service.getAllDifferences(page, size));
-    }
-
-    /**
-     * MASTER SEARCH ENDPOINT
-     * Handles: Date Range, Branch, Currency, CGL in any combination.
-     */
-    @PostMapping("/search")
-    public ResponseEntity<Page<DifferenceDTO>> searchDifferences(
-            @RequestBody DifferenceSearchCriteria criteria,
-            @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "100") int size
-    ) {
-        // Validation: Date is mandatory
-        if (criteria.getFromDate() == null) {
-            throw new IllegalArgumentException("fromDate is required");
-        }
-
-        Page<DifferenceDTO> result = service.searchDifferences(criteria, page, size);
-
-        if (result.isEmpty()) {
-            return ResponseEntity.noContent().build();
-        }
-        return ResponseEntity.ok(result);
-    }
-
-    // --- KUBERNETES HEALTH CHECKS (Optional if not using Actuator) ---
-    @GetMapping("/health/liveness")
-    public ResponseEntity<String> liveness() {
-        return ResponseEntity.ok("Alive");
-    }
-
-    @GetMapping("/health/readiness")
-    public ResponseEntity<String> readiness() {
-        // In real app, check DB connection here
-        return ResponseEntity.ok("Ready");
-    }
-}
-
-5. How to Test (New Payloads)
-Use the endpoint: POST http://localhost:8080/api/differences/search
-Scenario A: Search by Single Date (No Range) + Branch + CGL
-(User provides only fromDate, so it searches that one day)
-{
-    "fromDate": "2025-12-21",
-    "branchCode": "00723",
-    "cgl": "6711500501"
-}
-
-Scenario B: Search by Date Range + Currency ONLY
-(User provides fromDate and toDate. Branch is missing, so it searches all branches)
-{
-    "fromDate": "2025-12-01",
-    "toDate": "2025-12-31",
-    "currency": "INR"
-}
-
-Scenario C: Search by Date Range + ALL Filters
-{
-    "fromDate": "2025-12-01",
-    "toDate": "2025-12-31",
-    "branchCode": "00723",
-    "currency": "INR",
-    "cgl": "6711500501"
-}
-
-Scenario D: Search ONLY by Date (Everything else null)
-{
-    "fromDate": "2025-12-21"
-}
 
