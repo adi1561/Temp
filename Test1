@@ -1,17 +1,248 @@
-{
-    "reconRunDate" : "2025-12-21",
-    "branchCode": "00723",
-    "currency" : "INR",
-    "cgl" : "6711500501"
+To make this Production Ready, Dynamic, and Kubernetes Friendly, we need to move away from writing many different @Query methods (which is messy) and switch to a Single Dynamic Query.
+We will use a technique where the database query checks: "Is this filter NULL? If yes, ignore it. If no, match it."
+Here are the complete, updated files.
+1. DTO: DifferenceSearchCriteria.java
+Changes:
+ * Replaced reconRunDate with fromDate and toDate.
+ * Added getEffectiveToDate() helper logic to handle the "Single Date" scenario automatically.
+<!-- end list -->
+package com.fincore.ReportService.dto;
 
+import java.time.LocalDate;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class DifferenceSearchCriteria {
+
+    // Mandatory: The start date (or the specific single date)
+    private LocalDate fromDate;
+
+    // Optional: If null, we assume the user wants data for ONLY the fromDate
+    private LocalDate toDate;
+
+    // Optional Filters (Send null or empty string to ignore)
+    private String branchCode;
+    private String currency;
+    private String cgl;
+
+    /**
+     * Helper method to standardize date range logic.
+     * If toDate is missing, we default it to fromDate (Single Day Search).
+     */
+    public LocalDate getEffectiveToDate() {
+        return (toDate == null) ? fromDate : toDate;
+    }
 }
 
-in this i want a change like i want one more reconRunDate which is also a date only but i want the data b/w this 2 dates
-reconRunDate1
-reconRunDate2
-i want dynamic suppose if i get the only one date in that case it will show all data related to that date
-if i not provide branch it should search on bases of curreny and cgl
-if i not provided currency it should search on the bases of branch code and cgl 
-i hope u understand 
-create and give mi updated files all 
-create production ready app
+2. Repository: DifferenceRepository.java
+Changes:
+ * Replaced multiple queries with ONE Dynamic Query.
+ * Uses (:param IS NULL OR field = :param) pattern. This is highly efficient and standard for SQL optimization.
+<!-- end list -->
+package com.fincore.ReportService.repository;
+
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.model.Difference;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDate;
+
+@Repository
+public interface DifferenceRepository extends JpaRepository<Difference, Long> {
+
+    // 1. Keep the original 'Find All' for basic listing
+    @Query("""
+        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
+            d.reconRunDate, d.branchCode, d.currency, d.cgl,
+            d.cbsBalance, d.glBalance, d.differenceAmount,
+            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
+        )
+        FROM Difference d
+    """)
+    Page<DifferenceDTO> findAllAsDto(Pageable pageable);
+
+    /**
+     * 2. MASTER DYNAMIC FILTER
+     * Handles: Date Range, Optional Branch, Optional Currency, Optional CGL
+     */
+    @Query("""
+        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
+            d.reconRunDate, d.branchCode, d.currency, d.cgl,
+            d.cbsBalance, d.glBalance, d.differenceAmount,
+            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
+        )
+        FROM Difference d
+        WHERE (d.reconRunDate BETWEEN :fromDate AND :toDate)
+        AND (:branchCode IS NULL OR d.branchCode = :branchCode)
+        AND (:currency IS NULL OR d.currency = :currency)
+        AND (:cgl IS NULL OR d.cgl = :cgl)
+    """)
+    Page<DifferenceDTO> searchDifferencesDynamic(
+            @Param("fromDate") LocalDate fromDate,
+            @Param("toDate") LocalDate toDate,
+            @Param("branchCode") String branchCode,
+            @Param("currency") String currency,
+            @Param("cgl") String cgl,
+            Pageable pageable
+    );
+}
+
+3. Service: DifferenceService.java
+Changes:
+ * Added logic to handle "Empty Strings" (converting "" to null) so the dynamic query works even if the frontend sends empty text boxes.
+<!-- end list -->
+package com.fincore.ReportService.service;
+
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.dto.DifferenceSearchCriteria;
+import com.fincore.ReportService.repository.DifferenceRepository;
+import io.micrometer.common.util.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class DifferenceService {
+
+    @Autowired
+    private DifferenceRepository repository;
+
+    @Transactional(readOnly = true)
+    public Page<DifferenceDTO> getAllDifferences(int page, int size) {
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
+        return repository.findAllAsDto(pageRequest);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<DifferenceDTO> searchDifferences(DifferenceSearchCriteria criteria, int page, int size) {
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
+
+        // sanitize inputs: convert empty strings to null so SQL ignores them
+        String branch = StringUtils.isBlank(criteria.getBranchCode()) ? null : criteria.getBranchCode();
+        String curr = StringUtils.isBlank(criteria.getCurrency()) ? null : criteria.getCurrency();
+        String cgl = StringUtils.isBlank(criteria.getCgl()) ? null : criteria.getCgl();
+
+        return repository.searchDifferencesDynamic(
+                criteria.getFromDate(),
+                criteria.getEffectiveToDate(), // Handles the "Single Date vs Range" logic
+                branch,
+                curr,
+                cgl,
+                pageRequest
+        );
+    }
+}
+
+4. Controller: DifferenceController.java
+Changes:
+ * Consolidated into ONE clean search endpoint.
+ * Added Readiness and Liveness probes (simple health checks) to make it Kubernetes Friendly (though usually, you use Spring Actuator for this, these manual endpoints are good placeholders).
+<!-- end list -->
+package com.fincore.ReportService.controller;
+
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.dto.DifferenceSearchCriteria;
+import com.fincore.ReportService.service.DifferenceService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import jakarta.validation.Valid;
+
+@RestController
+@RequestMapping("/api/differences")
+public class DifferenceController {
+
+    @Autowired
+    private DifferenceService service;
+
+    // Basic Get All
+    @GetMapping
+    public ResponseEntity<Page<DifferenceDTO>> getDifferences(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        return ResponseEntity.ok(service.getAllDifferences(page, size));
+    }
+
+    /**
+     * MASTER SEARCH ENDPOINT
+     * Handles: Date Range, Branch, Currency, CGL in any combination.
+     */
+    @PostMapping("/search")
+    public ResponseEntity<Page<DifferenceDTO>> searchDifferences(
+            @RequestBody DifferenceSearchCriteria criteria,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        // Validation: Date is mandatory
+        if (criteria.getFromDate() == null) {
+            throw new IllegalArgumentException("fromDate is required");
+        }
+
+        Page<DifferenceDTO> result = service.searchDifferences(criteria, page, size);
+
+        if (result.isEmpty()) {
+            return ResponseEntity.noContent().build();
+        }
+        return ResponseEntity.ok(result);
+    }
+
+    // --- KUBERNETES HEALTH CHECKS (Optional if not using Actuator) ---
+    @GetMapping("/health/liveness")
+    public ResponseEntity<String> liveness() {
+        return ResponseEntity.ok("Alive");
+    }
+
+    @GetMapping("/health/readiness")
+    public ResponseEntity<String> readiness() {
+        // In real app, check DB connection here
+        return ResponseEntity.ok("Ready");
+    }
+}
+
+5. How to Test (New Payloads)
+Use the endpoint: POST http://localhost:8080/api/differences/search
+Scenario A: Search by Single Date (No Range) + Branch + CGL
+(User provides only fromDate, so it searches that one day)
+{
+    "fromDate": "2025-12-21",
+    "branchCode": "00723",
+    "cgl": "6711500501"
+}
+
+Scenario B: Search by Date Range + Currency ONLY
+(User provides fromDate and toDate. Branch is missing, so it searches all branches)
+{
+    "fromDate": "2025-12-01",
+    "toDate": "2025-12-31",
+    "currency": "INR"
+}
+
+Scenario C: Search by Date Range + ALL Filters
+{
+    "fromDate": "2025-12-01",
+    "toDate": "2025-12-31",
+    "branchCode": "00723",
+    "currency": "INR",
+    "cgl": "6711500501"
+}
+
+Scenario D: Search ONLY by Date (Everything else null)
+{
+    "fromDate": "2025-12-21"
+}
+
