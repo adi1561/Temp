@@ -1,75 +1,254 @@
----OLD---
+This is a complex file transformation task. As a Technical Lead, I have designed a solution that separates the Parsing Logic, Business Rules (CompCode < 10000), and File I/O.
+Here are the updated files. We will use java.math.BigDecimal for precise financial calculations and java.time for the date in the header.
+1. Configuration (No changes, ensuring it exists)
+File: src/main/java/com/tcs/fincore/AsciiGenerationService/Config/AsciiPathConfig.java
+package com.tcs.fincore.AsciiGenerationService.Config;
 
-====================================================================================================================================
-       YSA       BS SCH  NOMENCLATURE IN QUARTERLY STATEMENT ABSTRACT              COMP         (Inner Column)          (Outer Column)
-       CODE      NO                                                             CODE
-====================================================================================================================================
-      C 25                       CAPITAL
-      C 25 001   SCH.1  CAPITAL ACCOUNT                                        01001        923,06,17,586.00        923,06,17,586.00
-      C 26                 RESERVE FUNDS & OTHER RESER
-      C 26 003   SCH.2  GENERAL RESERVE ACCOUNT                                01011      39122,90,99,944.91
-      C 26 004   SCH.2  CAPITAL RESERVE ACCOUNT                                01012      18490,56,94,063.32
-      C 26 005   SCH.2  SHARE PREMIUM ACCOUNT                                  01013     104079,53,85,042.00
-      C 26 006   SCH.2  INVESTEMENT FLUCTUATION RESERV ACCOUNT                 01014      11522,30,12,226.37
-      C 26 002   SCH.2  INTEGRATION & DEVELOPMENT FUNDCCOUNT u/s 36 OF SBI ACT 01015          5,00,00,000.00
-      C 26 008   SCH.2  DEVELOPMENT REBATE RESERVE ACC2                        01016          5,00,00,000.00
-      C 26 009   SCH.2  DEVELOPMENT FUNDS ACCOUNT                              01017        100,38,95,250.00
-      C 26 260   SCH.2  SPECIAL RESERVE U/S 36(I)(VILLACCOUNT[B]               01018      21064,32,75,849.00
-      C 26 261   SCH.2  RESERVE FUNDS ACCOUNT                                  01019     140230,93,13,673.85 
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
 
-   
-   
-otntapp2:/ftparea/sbi/F1/locations/00000/cglreports/20260131:-)cat 00000.YSA.20260131|head
-BYEP10000031012026F
-01001000000923061758600-
-01011000039122909994491-
-01012000018490569406332-
-01013000104079538504200-
-01014000011522301222637-
-01015000000005000000000-
-01016000000005000000000-
-01017000000100389525000-
-01018000021064327584900-
+@Configuration
+public class AsciiPathConfig {
 
+    @Value("${source.file.path}")
+    private String sourceFilePath;
 
-Line no-1---BYEP10000031012026F
-BYEP1----Fixed
-  00000-- Branch Code
-       31012026---Date-ETL/EOD
-      F- Fixed
+    public String getSourceFilePath() {
+        return sourceFilePath;
+    }
+}
 
-Other lines---01001000000923061758600-
-01001--Comp code (Colum-4)
-     00000923061758600----Amount 15,2 (2 decimal if 0 then 00) 923,06,17,586.00 
-                      -(Sign)     
-      
-****************Laibilities (Comp code<10000)*******
-Printed in report * -1      (923,06,17,586.00)*-1
-######
-prepare 1st line
-identify comp code-col-4 
-amount col-4/col-5(if Comp code<10000 then amount*-1)
-##########
+2. The Service (Core Logic)
+This service handles reading, parsing, validating, and writing the file.
+File: src/main/java/com/tcs/fincore/AsciiGenerationService/Service/YsaGenerationService.java
+package com.tcs.fincore.AsciiGenerationService.Service;
 
-----New YSA REPORT-----txt report for input
-C 03 001||SAVINGS BANK DEPOSITS|||
-C 03 001D|SCH.3|SAVINGS BANK A/C|01036|2191,90,83,156.87|
-|A|TOTAL SAVING BANK ACCOUNT|01039||2191,90,83,156.87
-C 03 002||CURRENT ACCOUNT CR BALANCE|||
-||(Excluding Bankers Cheques, credit balance of Office A/C maintained by Administrative offices)|||
-C 03 002A|SCH.3|CURRENT A/C:ASSOCIATE BANKS/EN|01042||
-C 03 002B|SCH.3|CURRENT A/C:OTHER BANKS|01043|57,18,26,778.47|
-C 03 002C|SCH.3|META FUNDING POOL  CONTROL (INTERNET) A/C|02723|0.00|
-C 03 002F|SCH.3|FOREIGN CURRENCY A/C|01044||
-C 03 002D|SCH.3|CURRENT A/C: OTHERS|01045|8615,47,08,249.50|
-C 03 002H|SCH.3|META FUNDING POOL CONTROL A/C|01046|0.00|
-|B|TOTAL CURRENT A/C(EXC BANKERS CHEQUE)|01059||8672,65,35,027.97
+import com.tcs.fincore.AsciiGenerationService.Config.AsciiPathConfig;
+import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Pattern;
 
-If delimated by |, column 4 is having value between [0-9] Should be taken from ASCII generation
-Amount 
-if in inner(Col-5) column then inner
-if not in inner column check  for outer column (Col-6)else 000000000000000000+ (17 digit)
- this are the main thing which u need to create i want to create a controller and all of that on hit of this partular controller YSA create this and give mi all updated files i want to geneate the output file in the same path where from u are taking the input file
-what u did in validation write above the line what u are doing for this i dont think we need to model we just need to convert give mi updated files
-and also for this write a test case one 
+@Service
+public class YsaGenerationService {
+
+    private final AsciiPathConfig asciiConfig;
+    // Regex to verify if a string is a valid number (Comp Code)
+    private final Pattern numericPattern = Pattern.compile("-?\\d+(\\.\\d+)?");
+
+    public YsaGenerationService(AsciiPathConfig asciiConfig) {
+        this.asciiConfig = asciiConfig;
+    }
+
+    public String processYsaReport() throws IOException {
+        String inputPathStr = asciiConfig.getSourceFilePath();
+        Path inputPath = Paths.get(inputPathStr);
+
+        if (!Files.exists(inputPath)) {
+            throw new IOException("Input file not found at: " + inputPathStr);
+        }
+
+        // 1. Read Input File
+        List<String> lines = Files.readAllLines(inputPath);
+        List<String> outputLines = new ArrayList<>();
+
+        // 2. Generate Header Line
+        // Format: BYEP1 + Branch(00000) + Date(DDMMYYYY) + F
+        String dateStr = LocalDate.now().format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+        String header = "BYEP100000" + dateStr + "F";
+        outputLines.add(header);
+
+        // 3. Process Data Lines
+        for (String line : lines) {
+            String processedLine = convertLineToYsaFormat(line);
+            if (processedLine != null) {
+                outputLines.add(processedLine);
+            }
+        }
+
+        // 4. Write Output File
+        // Creates a new file with .generated suffix in the SAME folder
+        String fileName = inputPath.getFileName().toString();
+        Path outputPath = inputPath.getParent().resolve("GENERATED_" + fileName);
+        
+        Files.write(outputPath, outputLines);
+
+        return outputPath.toAbsolutePath().toString();
+    }
+
+    private String convertLineToYsaFormat(String rawLine) {
+        if (rawLine == null || rawLine.trim().isEmpty()) return null;
+
+        String[] columns = rawLine.split("\\|", -1); // -1 keeps empty trailing strings
+
+        // VALIDATION: Check if we have enough columns and if Col 3 is Comp Code
+        // Index 3 is the Comp Code in your "New YSA Report" format
+        if (columns.length < 4) return null;
+
+        String compCodeStr = columns[3].trim();
+
+        // VALIDATION: Comp Code must be numeric [0-9]
+        if (!isNumeric(compCodeStr)) {
+            return null; // Skip lines that are headers or don't have a comp code
+        }
+
+        // PARSING AMOUNT
+        // Logic: Try Inner Col (4), if empty, try Outer Col (5), else 0
+        String amountStr = "";
+        if (columns.length > 4 && !columns[4].trim().isEmpty()) {
+            amountStr = columns[4].trim();
+        } else if (columns.length > 5 && !columns[5].trim().isEmpty()) {
+            amountStr = columns[5].trim();
+        } else {
+            amountStr = "0.00";
+        }
+
+        // CLEANING: Remove commas for calculation
+        amountStr = amountStr.replace(",", "");
+
+        // LOGIC: Formatting to 15 integer + 2 decimal
+        BigDecimal amount = new BigDecimal(amountStr);
+        long plainAmount = amount.multiply(new BigDecimal(100)).longValue(); // Remove decimal point
+        String formattedAmount = String.format("%017d", Math.abs(plainAmount)); // Pad with zeros to 17 chars
+
+        // LOGIC: Sign Calculation
+        // If CompCode < 10000 -> Liability -> Sign is "-"
+        // Else -> Sign is "+"
+        int compCode = Integer.parseInt(compCodeStr);
+        String sign = (compCode < 10000) ? "-" : "+";
+
+        // Construct Final Line: CompCode (5 digits) + Amount (17 digits) + Sign
+        // CompCode needs to be padded to 5 digits? Assuming input is already compliant or we pad it.
+        // The example input has "01036", so it's already 5 digits.
+        return compCodeStr + formattedAmount + sign;
+    }
+
+    private boolean isNumeric(String str) {
+        if (str == null || str.isEmpty()) return false;
+        return numericPattern.matcher(str).matches();
+    }
+}
+
+3. The Controller (The Trigger)
+This exposes the endpoint to trigger the job manually.
+File: src/main/java/com/tcs/fincore/AsciiGenerationService/Controller/YsaController.java
+package com.tcs.fincore.AsciiGenerationService.Controller;
+
+import com.tcs.fincore.AsciiGenerationService.Service.YsaGenerationService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/ysa")
+public class YsaController {
+
+    private final YsaGenerationService ysaService;
+
+    public YsaController(YsaGenerationService ysaService) {
+        this.ysaService = ysaService;
+    }
+
+    @PostMapping("/generate")
+    public ResponseEntity<String> generateReport() {
+        try {
+            // Trigger the service logic
+            String outputPath = ysaService.processYsaReport();
+            return ResponseEntity.ok("✅ Success! File generated at: " + outputPath);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.internalServerError().body("❌ Error: " + e.getMessage());
+        }
+    }
+}
+
+4. The Test Case (JUnit 5)
+This validates the specific logic: Comp Code < 10000 gets negative sign and Amount is formatted correctly.
+File: src/test/java/com/tcs/fincore/AsciiGenerationService/YsaServiceTest.java
+package com.tcs.fincore.AsciiGenerationService;
+
+import com.tcs.fincore.AsciiGenerationService.Config.AsciiPathConfig;
+import com.tcs.fincore.AsciiGenerationService.Service.YsaGenerationService;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class YsaServiceTest {
+
+    @TempDir
+    Path tempDir; // JUnit 5 automatically creates/deletes this temp folder
+
+    @Test
+    void testYsaGenerationLogic() throws IOException {
+        // --- 1. SETUP MOCK DATA ---
+        // Create a dummy input file in the temp directory
+        Path inputFile = tempDir.resolve("input.txt");
+        List<String> inputLines = Arrays.asList(
+            // Line 1: CompCode 01036 (Liability < 10000), Inner Amount
+            "C 03 001D|SCH.3|SAVINGS BANK A/C|01036|2,191.50|", 
+            // Line 2: CompCode 11000 (Asset >= 10000), Outer Amount, No Inner
+            "|A|TOTAL SAVING|11000||500.00"
+        );
+        Files.write(inputFile, inputLines);
+
+        // Mock the Config to point to our temp file
+        AsciiPathConfig mockConfig = Mockito.mock(AsciiPathConfig.class);
+        Mockito.when(mockConfig.getSourceFilePath()).thenReturn(inputFile.toString());
+
+        // Initialize Service
+        YsaGenerationService service = new YsaGenerationService(mockConfig);
+
+        // --- 2. EXECUTE ---
+        String resultPath = service.processYsaReport();
+
+        // --- 3. VERIFY ---
+        File outputFile = new File(resultPath);
+        assertTrue(outputFile.exists(), "Output file should exist");
+
+        List<String> outputLines = Files.readAllLines(outputFile.toPath());
+        
+        // Assert Header format (BYEP1...)
+        assertTrue(outputLines.get(0).startsWith("BYEP1"), "Header should start with BYEP1");
+
+        // Assert Line 1 Logic:
+        // CompCode: 01036
+        // Amount: 2191.50 -> 219150 -> Padded to 17 digits: 00000000000219150
+        // Sign: < 10000 so "-"
+        // EXPECTED: 0103600000000000219150-
+        String line1 = outputLines.get(1);
+        assertEquals("0103600000000000219150-", line1);
+
+        // Assert Line 2 Logic:
+        // CompCode: 11000
+        // Amount: 500.00 -> 50000 -> Padded: 00000000000050000
+        // Sign: >= 10000 so "+"
+        // EXPECTED: 1100000000000000050000+
+        String line2 = outputLines.get(2);
+        assertEquals("1100000000000000050000+", line2);
+    }
+}
+
+How to use this:
+ * Dependencies: Ensure you have spring-boot-starter-web (for Controller) and spring-boot-starter-test (for JUnit) in your pom.xml.
+ * Config: Update your application.properties with the path to your pipe-delimited text file.
+ * Run: Start the app.
+ * Trigger: Use Postman or curl to hit POST http://localhost:8080/api/ysa/generate.
+ * Result: Check your input folder. You will see a new file starting with GENERATED_.
