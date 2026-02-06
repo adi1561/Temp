@@ -1,151 +1,24 @@
-Here is the complete, verified, and production-ready solution.
-I have double-checked the logic:
- * Regex Fix: It now uses .find() so L[0-9] successfully matches L01A.
- * Controller Fix: It reads the path from application.properties instead of requiring manual input.
- * Amount Logic: It correctly handles the "3 else 4" logic and "divide by 1000" rule.
-Step 1: Database Setup (Oracle SQL)
-Run this in your Database. This creates the rules for the engine.
--- 1. Create the Configuration Table
-CREATE TABLE GENERIC_REPORT_CONFIG (
-    REPORT                      VARCHAR2(50) PRIMARY KEY,
-    TYPE                        VARCHAR2(10),
-    INPUT_FILE_NAME             VARCHAR2(100),
-    OUTPUT_FIRST_LINE           VARCHAR2(50),
-    OUTPUT_END_LINE             VARCHAR2(50),
-    INPUT_HEAD_COL              NUMBER,
-    INPUT_HEAD_LOGIC            VARCHAR2(200),
-    OUTPUT_HEAD_COLUMN_PADDING  VARCHAR2(50),
-    INPUT_AMOUNT_COLUMN         VARCHAR2(50),
-    OUTPUT_AMOUNT_LOGIC         VARCHAR2(200),
-    OUTPUT_AMOUNT_DECIMAL       NUMBER,
-    OUTPUT_AMOUNT_COLUMN_PADDING VARCHAR2(50),
-    OUTPUT_PER_LINE_HEAD        NUMBER,
-    OUTPUT_SIGN_LOGIC           VARCHAR2(50)
-);
+Yes, that is perfectly fine. It is actually a much cleaner design because the API client doesn't need to know internal details like file paths or branch codes—the system works them out automatically.
+Here is the updated solution.
+1. Update application.properties
+Ensure you have the file path configured here.
+# Input file location
+app.input.file.path=C:/Users/User/Documents/Files/input_file.psv
 
--- 2. Insert the 'nwsa' Report Configuration
-INSERT INTO GENERIC_REPORT_CONFIG (
-    REPORT, TYPE, INPUT_FILE_NAME, OUTPUT_FIRST_LINE, OUTPUT_END_LINE, 
-    INPUT_HEAD_COL, INPUT_HEAD_LOGIC, OUTPUT_HEAD_COLUMN_PADDING, 
-    INPUT_AMOUNT_COLUMN, OUTPUT_AMOUNT_LOGIC, OUTPUT_AMOUNT_DECIMAL, 
-    OUTPUT_AMOUNT_COLUMN_PADDING, OUTPUT_PER_LINE_HEAD, OUTPUT_SIGN_LOGIC
-) VALUES (
-    'nwsa', 
-    '.CWP', 
-    'nwsa_report_31122025.psv', 
-    'BWEP1', 
-    NULL, 
-    1, 
-    'A[0-9],L[0-9],S[0-9],N[A-Z]', 
-    '5 Lpad 0', 
-    '3 else 4', 
-    '^L and ^A | ^S-^N devide by 1000', 
-    2, 
-    '16,2', 
-    4, 
-    'No'
-);
+2. Updated Service (AsciiGenerationService.java)
+Changes Made:
+ * Automatic Branch/Date Parsing: Added the logic to scan the input file for "BRANCH ::" and "REPORT DATE ::" so you don't need to pass them manually.
+ * Method Signature: generateReport now only needs reportId and the inputPath (which comes from config).
+<!-- end list -->
+package com.example.ascii.service;
 
-COMMIT;
-
-Step 2: Configuration File (application.properties)
-Add these lines to src/main/resources/application.properties.
-# Server Port
-server.port=8080
-
-# Database Configuration (Update with your credentials)
-spring.datasource.url=jdbc:oracle:thin:@localhost:1521:xe
-spring.datasource.username=system
-spring.datasource.password=password
-spring.jpa.hibernate.ddl-auto=none
-
-# Application Specific Settings
-# 👇 CHANGE THIS TO YOUR ACTUAL LOCAL FILE PATH
-app.input.file.path=C:/Users/User/Documents/nwsa_input.psv
-
-Step 3: Entity Class (ReportConfig.java)
-Path: src/main/java/com/tcs/fincore/entity/ReportConfig.java
-package com.tcs.fincore.entity;
-
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.Id;
-import javax.persistence.Table;
-import lombok.Data;
-
-@Entity
-@Table(name = "GENERIC_REPORT_CONFIG") // Matches your DB table name
-@Data
-public class ReportConfig {
-
-    @Id
-    @Column(name = "REPORT")
-    private String report;
-    
-    @Column(name = "TYPE")
-    private String type;
-    
-    @Column(name = "INPUT_FILE_NAME")
-    private String inputFileName;
-    
-    @Column(name = "OUTPUT_FIRST_LINE")
-    private String outputFirstLine;
-
-    @Column(name = "OUTPUT_END_LINE")
-    private String outputEndLine;
-
-    @Column(name = "INPUT_HEAD_COL")
-    private Integer inputHeadCol;
-
-    @Column(name = "INPUT_HEAD_LOGIC")
-    private String inputHeadLogic;
-
-    @Column(name = "OUTPUT_HEAD_COLUMN_PADDING")
-    private String outputHeadColumnPadding;
-
-    @Column(name = "INPUT_AMOUNT_COLUMN")
-    private String inputAmountColumn;
-
-    @Column(name = "OUTPUT_AMOUNT_LOGIC")
-    private String outputAmountLogic;
-
-    @Column(name = "OUTPUT_AMOUNT_DECIMAL")
-    private Integer outputAmountDecimal;
-
-    @Column(name = "OUTPUT_AMOUNT_COLUMN_PADDING")
-    private String outputAmountColumnPadding;
-
-    @Column(name = "OUTPUT_PER_LINE_HEAD")
-    private Integer outputPerLineHead;
-    
-    @Column(name = "OUTPUT_SIGN_LOGIC")
-    private String outputSignLogic;
-}
-
-Step 4: Repository Interface (ReportConfigRepository.java)
-Path: src/main/java/com/tcs/fincore/repository/ReportConfigRepository.java
-package com.tcs.fincore.repository;
-
-import com.tcs.fincore.entity.ReportConfig;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-
-@Repository
-public interface ReportConfigRepository extends JpaRepository<ReportConfig, String> {
-}
-
-Step 5: The Service (GenericReportService.java)
-Path: src/main/java/com/tcs/fincore/service/GenericReportService.java
-package com.tcs.fincore.service;
-
-import com.tcs.fincore.entity.ReportConfig;
-import com.tcs.fincore.repository.ReportConfigRepository;
+import com.example.ascii.entity.AsciiConfig;
+import com.example.ascii.repository.AsciiConfigRepository;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -156,183 +29,94 @@ import java.util.regex.Pattern;
 
 @Service
 @Slf4j
-public class GenericReportService {
+public class AsciiGenerationService {
 
-    @Autowired
-    private ReportConfigRepository configRepo;
+    private final AsciiConfigRepository configRepo;
 
-    public String generateReport(String reportName, String inputFilePathStr) throws Exception {
-        log.info(">>> SERVICE START: Generating Report '{}' <<<", reportName);
+    public AsciiGenerationService(AsciiConfigRepository configRepo) {
+        this.configRepo = configRepo;
+    }
+
+    public String generateReport(String reportId, String inputPathStr) throws Exception {
+        log.info("Starting generation for Report ID: {}", reportId);
 
         // 1. Fetch Config
-        ReportConfig config = configRepo.findById(reportName)
-                .orElseThrow(() -> new RuntimeException("Config not found for: " + reportName));
+        AsciiConfig config = configRepo.findById(reportId)
+                .orElseThrow(() -> new RuntimeException("Config not found for: " + reportId));
 
-        // 2. Read File
-        Path inputPath = Paths.get(inputFilePathStr);
-        if (!Files.exists(inputPath)) {
-            throw new RuntimeException("Input file not found at: " + inputFilePathStr);
-        }
+        Path inputPath = Paths.get(inputPathStr);
+        if (!Files.exists(inputPath)) throw new IOException("Input file not found at: " + inputPathStr);
+
         List<String> lines = Files.readAllLines(inputPath);
-        log.info("File loaded. Total lines: {}", lines.size());
-
-        // 3. Parse Header (Branch & Date)
+        
+        // 2. Parse Header Info (Branch & Date) from the file content
         HeaderInfo headerInfo = parseHeaderFromInput(lines);
+        log.info("Parsed Header - Branch: {}, Date: {}", headerInfo.branchCode, headerInfo.reportDate);
 
-        // 4. Process Rows
-        List<String> processedItems = new ArrayList<>();
-        int validRows = 0;
+        List<String> outputLines = new ArrayList<>();
+
+        // 3. Generate Output Header Line
+        // Logic: ConfiguredPrefix + LPad(Branch) + Date
+        String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
+        String dateFormatted = headerInfo.reportDate.replace("/", ""); // 31/12/2025 -> 31122025
+        
+        String header = config.getOutputFirstLine() + branchPadded + dateFormatted + "F";
+        outputLines.add(header);
+
+        // 4. Process Body
+        List<String> bufferedItems = new ArrayList<>();
+        int batchSize = config.getOutputPerLineHead();
 
         for (String line : lines) {
             String[] columns = line.split("\\|", -1);
+            
+            if (!isValidRow(columns, config)) continue;
 
-            // KEY FIX: Using .find() to allow partial matching (L0 matches L01A)
-            if (isValidDataRow(columns, config)) {
-                String item = processSingleRow(columns, config);
-                processedItems.add(item);
-                validRows++;
+            List<ProcessingItem> itemsToProcess = extractAmountColumns(columns, config);
+            
+            for (ProcessingItem item : itemsToProcess) {
+                String processedAscii = processSingleItem(item.head, item.amount, item.colIndex, config);
+                bufferedItems.add(processedAscii);
+
+                if (bufferedItems.size() == batchSize) {
+                    outputLines.add(String.join("", bufferedItems));
+                    bufferedItems.clear();
+                }
             }
         }
-        log.info("Processed {} valid data rows.", validRows);
-
-        // 5. Build Output Lines
-        List<String> outputLines = new ArrayList<>();
         
-        // A. Header Line
-        String fileHeader = config.getOutputFirstLine() 
-                          + headerInfo.branchCode 
-                          + headerInfo.reportDate.replace("/", "") 
-                          + "F";
-        outputLines.add(fileHeader);
-
-        // B. Body Lines (Batching Logic)
-        StringBuilder currentLine = new StringBuilder();
-        int count = 0;
-        int batchSize = config.getOutputPerLineHead(); 
-
-        for (String item : processedItems) {
-            currentLine.append(item);
-            count++;
-            if (count == batchSize) {
-                outputLines.add(currentLine.toString());
-                currentLine = new StringBuilder();
-                count = 0;
-            }
+        if (!bufferedItems.isEmpty()) {
+            outputLines.add(String.join("", bufferedItems));
         }
-        if (currentLine.length() > 0) outputLines.add(currentLine.toString());
 
-        // C. Footer Line
-        if (config.getOutputEndLine() != null && !config.getOutputEndLine().equals("-")) {
+        // 5. Generate Footer
+        if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) {
             outputLines.add(config.getOutputEndLine());
         }
 
-        // 6. Write Output File
-        String outputFileName = inputPath.getParent().toString() + "/GENERATED_" + reportName + config.getType();
-        Files.write(Paths.get(outputFileName), outputLines);
+        // 6. Write File
+        String outputFileName = "GENERATED_" + reportId + config.getFileType();
+        Path outputPath = inputPath.getParent().resolve(outputFileName);
+        Files.write(outputPath, outputLines);
         
-        return outputFileName;
+        return outputPath.toString();
     }
 
-    // --- HELPER LOGIC ---
-
-    private boolean isValidDataRow(String[] columns, ReportConfig config) {
-        int index = config.getInputHeadCol() - 1;
-        if (columns.length <= index) return false;
-        
-        String headValue = columns[index].trim();
-        if (headValue.isEmpty()) return false;
-
-        // Convert "A[0-9],L[0-9]" -> "A[0-9]|L[0-9]"
-        String regex = config.getInputHeadLogic().replace(",", "|");
-        
-        Pattern p = Pattern.compile(regex);
-        return p.matcher(headValue).find(); // .find() handles "L01A" vs "L[0-9]"
-    }
-
-    private String processSingleRow(String[] columns, ReportConfig config) {
-        String headRaw = columns[config.getInputHeadCol() - 1].trim();
-        
-        // 1. Padding Logic
-        String headFormatted = applyHeadPadding(headRaw, config.getOutputHeadColumnPadding());
-
-        // 2. Amount Extraction ("3 else 4")
-        BigDecimal amount = extractAmount(columns, config.getInputAmountColumn());
-
-        // 3. Amount Arithmetic (Divide by 1000)
-        amount = applyAmountLogic(amount, headRaw, config.getOutputAmountLogic());
-
-        // 4. Formatting ("16,2")
-        String amountFormatted = applyAmountFormat(amount, config.getOutputAmountColumnPadding());
-
-        return headFormatted + amountFormatted;
-    }
-
-    private BigDecimal extractAmount(String[] columns, String colLogic) {
-        // Logic: "3" or "3 else 4"
-        String[] options = colLogic.split("else");
-        for (String option : options) {
-            try {
-                int index = Integer.parseInt(option.trim()) - 1;
-                if (index < columns.length) {
-                    String val = columns[index].trim().replace(",", "");
-                    if (!val.isEmpty()) return new BigDecimal(val);
-                }
-            } catch (Exception e) { /* ignore parse error */ }
-        }
-        return BigDecimal.ZERO; 
-    }
-
-    private BigDecimal applyAmountLogic(BigDecimal amount, String head, String logic) {
-        if (logic == null || !logic.contains("devide by 1000")) return amount;
-
-        // Simplified logic: Check if head starts with L, A, S, or N
-        char firstChar = head.charAt(0);
-        if ("LASN".indexOf(firstChar) >= 0) {
-             return amount.divide(BigDecimal.valueOf(1000), 2, RoundingMode.HALF_UP);
-        }
-        return amount;
-    }
-
-    private String applyAmountFormat(BigDecimal amount, String formatInfo) {
-        // formatInfo = "16,2"
-        String[] parts = formatInfo.split(",");
-        int totalLen = Integer.parseInt(parts[0]);
-        int decLen = Integer.parseInt(parts[1]);
-
-        BigDecimal scaled = amount.setScale(decLen, RoundingMode.HALF_UP);
-        String raw = scaled.toPlainString(); 
-
-        StringBuilder sb = new StringBuilder();
-        while (sb.length() + raw.length() < totalLen) {
-            sb.append("0");
-        }
-        sb.append(raw);
-        return sb.toString();
-    }
-
-    private String applyHeadPadding(String head, String paddingLogic) {
-        // Logic: "5 Lpad 0"
-        if (paddingLogic.startsWith("5")) {
-             String cleanHead = head.trim();
-             StringBuilder sb = new StringBuilder();
-             while (sb.length() + cleanHead.length() < 5) {
-                 sb.append("0");
-             }
-             sb.append(cleanHead);
-             return sb.toString();
-        }
-        return head;
-    }
+    // --- Helper Logic ---
 
     private HeaderInfo parseHeaderFromInput(List<String> lines) {
         HeaderInfo info = new HeaderInfo();
-        info.branchCode = "00000";
-        info.reportDate = "01012026";
+        // Defaults if parsing fails
+        info.branchCode = "00000"; 
+        info.reportDate = "01012026"; 
+
         for (String line : lines) {
+            // Regex to find "BRANCH :: 12345"
             if (line.contains("BRANCH ::")) {
                 Matcher m = Pattern.compile("BRANCH :: (\\d+)").matcher(line);
                 if (m.find()) info.branchCode = m.group(1);
             }
+            // Regex to find "REPORT DATE :: 31/12/2025"
             if (line.contains("REPORT DATE ::")) {
                 Matcher m = Pattern.compile("REPORT DATE :: (\\S+)").matcher(line);
                 if (m.find()) info.reportDate = m.group(1);
@@ -340,60 +124,119 @@ public class GenericReportService {
         }
         return info;
     }
+
+    private boolean isValidRow(String[] cols, AsciiConfig config) {
+        int idx = config.getInputHeadCol() - 1;
+        if (cols.length <= idx) return false;
+        String head = cols[idx].trim();
+        if (head.isEmpty()) return false;
+        
+        // Use lookingAt() to avoid partial matches inside words (e.g. matching 'N' in 'INDIA')
+        return Pattern.compile(config.getInputHeadRegex()).matcher(head).lookingAt();
+    }
+
+    private String processSingleItem(String head, BigDecimal amount, int colIndex, AsciiConfig config) {
+        amount = RuleParser.applyMathLogic(amount, head, colIndex, config.getOutputAmtColLogic());
+        amount = RuleParser.applyDecimalLogic(amount, head, colIndex, config.getOutputAmtDecimal());
+        String amountStr = RuleParser.applyAmountPadding(amount, head, colIndex, config.getOutputAmtColPad());
+        String signedAmount = RuleParser.applySign(amountStr, amount, head, colIndex, config.getOutputAmtSign());
+        String headPadded = RuleParser.applyHeadPadding(head, config.getOutputHeadColPad());
+        return headPadded + signedAmount;
+    }
+
+    private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
+        List<ProcessingItem> items = new ArrayList<>();
+        String head = cols[config.getInputHeadCol() - 1].trim();
+        String seq = config.getAmountColSeq();
+
+        if (seq.contains("else")) {
+            String[] parts = seq.split("else");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                if (idx < cols.length && !cols[idx].trim().isEmpty()) {
+                    items.add(new ProcessingItem(head, parseAmount(cols[idx]), idx + 1));
+                    return items;
+                }
+            }
+            items.add(new ProcessingItem(head, BigDecimal.ZERO, Integer.parseInt(parts[0].trim())));
+        } else if (seq.contains("and")) {
+            String[] parts = seq.split("and");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+            }
+        } else {
+            int idx = Integer.parseInt(seq.trim()) - 1;
+            items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+        }
+        return items;
+    }
+    
+    private BigDecimal parseAmount(String[] cols, int idx) {
+        if (idx >= cols.length) return BigDecimal.ZERO;
+        return parseAmount(cols[idx]);
+    }
+
+    private BigDecimal parseAmount(String val) {
+        try {
+            return new BigDecimal(val.trim().replace(",", ""));
+        } catch (Exception e) {
+            return BigDecimal.ZERO;
+        }
+    }
+    
+    private static class ProcessingItem {
+        String head; BigDecimal amount; int colIndex;
+        ProcessingItem(String h, BigDecimal a, int c) { head = h; amount = a; colIndex = c; }
+    }
     
     private static class HeaderInfo { String branchCode; String reportDate; }
 }
 
-Step 6: Controller (NwsaController.java)
-Path: src/main/java/com/tcs/fincore/controller/NwsaController.java
-package com.tcs.fincore.controller;
+3. Updated Controller (AsciiController.java)
+Changes Made:
+ * Reads the file path using @Value("${app.input.file.path}").
+ * Endpoint only accepts reportId (via query param).
+<!-- end list -->
+package com.example.ascii.controller;
 
-import com.tcs.fincore.service.GenericReportService;
+import com.example.ascii.service.AsciiGenerationService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 @RestController
-@RequestMapping("/api/reports")
-public class NwsaController {
+@RequestMapping("/api/ascii")
+public class AsciiController {
 
     @Autowired
-    private GenericReportService reportService;
+    private AsciiGenerationService service;
 
-    // Reads the path automatically from application.properties
+    // Inject path from application.properties
     @Value("${app.input.file.path}")
     private String configuredFilePath;
 
-    @PostMapping("/nwsa/generate")
-    public ResponseEntity<String> generateNwsaReport() {
+    @PostMapping("/generate")
+    public ResponseEntity<String> generate(@RequestParam String reportId) {
         try {
-            System.out.println(">>> Controller Triggered <<<");
-            
             if (configuredFilePath == null || configuredFilePath.isEmpty()) {
-                return ResponseEntity.badRequest().body("❌ Error: 'app.input.file.path' is missing in application.properties");
+                return ResponseEntity.badRequest().body("Error: 'app.input.file.path' is missing in properties.");
             }
-            
-            System.out.println("Processing File: " + configuredFilePath);
 
-            // Trigger Service
-            String outputFilePath = reportService.generateReport("nwsa", configuredFilePath);
-            
-            return ResponseEntity.ok("✅ SUCCESS! Report Generated at: " + outputFilePath);
+            // Pass reportId and the configured path
+            String outPath = service.generateReport(reportId, configuredFilePath);
+            return ResponseEntity.ok("Success! File generated at: " + outPath);
 
         } catch (Exception e) {
             e.printStackTrace();
-            return ResponseEntity.internalServerError().body("❌ FAILED: " + e.getMessage());
+            return ResponseEntity.internalServerError().body("Error: " + e.getMessage());
         }
     }
 }
 
-How to Run
- * Verify the path in application.properties points to a real file.
- * Start the Spring Boot App.
- * Hit this URL (POST method) via Postman or Curl:
-   http://localhost:8080/api/reports/nwsa/generate
-   (No body or params needed)
- * Check the logs to see the rows being processed.
+How to Trigger
+Request:
+POST http://localhost:8080/api/ascii/generate?reportId=nwsa
+Response:
+Success! File generated at: C:/Users/User/Documents/Files/GENERATED_nwsa.txt
