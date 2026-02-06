@@ -1,78 +1,217 @@
-This is a great observation. As you add more reports, the header formats will definitely vary.
-To handle this dynamically, we should upgrade parseHeaderFromInput to use Flexible Regex Patterns and a Date Normalizer. This way, it can scan for "Current Year Date" OR "REPORT DATE", and "Branch" OR "BRANCH", and automatically convert formats like YYYY-MM-DD into the required DDMMYYYY.
-Here are the updated methods for your AsciiGenerationService.java.
-1. Updated: parseHeaderFromInput
-Replace your existing method with this smart version. It uses a list of patterns to find the data and automatically normalizes the date.
-    private HeaderInfo parseHeaderFromInput(List<String> lines) {
-        HeaderInfo info = new HeaderInfo();
-        // Default values
-        info.branchCode = "00000"; 
-        info.reportDate = "01012026"; 
+package com.tcs.fincore.AsciiGenerationService.Service;
+import com.tcs.fincore.AsciiGenerationService.Model.AsciiConfig;
+import com.tcs.fincore.AsciiGenerationService.Repository.AsciiConfigRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
 
-        // Regex patterns to look for (Case Insensitive)
-        // 1. Branch Patterns: Matches "BRANCH :: 123" or "Branch:: 123"
-        Pattern branchPattern = Pattern.compile("(?i)(?:BRANCH|Branch)\\s*::\\s*(\\d+)");
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-        // 2. Date Patterns: Matches "REPORT DATE ::" or "Current Year Date::"
-        // We capture the value part (\S+)
-        Pattern datePattern1 = Pattern.compile("REPORT DATE\\s*::\\s*(\\S+)");
-        Pattern datePattern2 = Pattern.compile("Current Year Date\\s*::\\s*(\\S+)");
+@Service
+@Slf4j
+public class AsciiGenerationService {
+
+    private final AsciiConfigRepository configRepo;
+
+    @Value("${app.input.file.path}")
+    private String configuredFilePath;
+
+    public AsciiGenerationService(AsciiConfigRepository configRepo) {
+        this.configRepo = configRepo;
+    }
+
+    public String generateReport(Long id) throws Exception {
+        log.info("Starting generation for Config ID: {}", id);
+
+        // 1. Fetch Config
+        AsciiConfig config = configRepo.findById(id)
+                .orElseThrow(() -> new RuntimeException("Config not found for ID: " + id));
+
+        // 2. Read File
+        Path inputPath = Paths.get(configuredFilePath);
+        if (!Files.exists(inputPath)) {
+            throw new IOException("Input file not found at: " + configuredFilePath);
+        }
+
+        List<String> lines = Files.readAllLines(inputPath);
+        HeaderInfo headerInfo = parseHeaderFromInput(lines);
+
+        List<String> outputLines = new ArrayList<>();
+
+        // 3. Output Header
+        String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
+        String dateFormatted = headerInfo.reportDate.replace("/", "");
+        String header = config.getOutputFirstLine() + branchPadded + dateFormatted + "F";
+        outputLines.add(header);
+
+        // 4. Process Body
+        List<String> bufferedItems = new ArrayList<>();
+        int batchSize = config.getOutputPerLineHead();
 
         for (String line : lines) {
-            // --- FIND BRANCH ---
-            Matcher mBranch = branchPattern.matcher(line);
-            if (mBranch.find()) {
-                info.branchCode = mBranch.group(1);
-            }
+            String[] columns = line.split("\\|", -1);
 
-            // --- FIND DATE ---
-            Matcher mDate1 = datePattern1.matcher(line);
-            if (mDate1.find()) {
-                info.reportDate = normalizeDate(mDate1.group(1));
+            // Strictly check regex (Avoid "STATE BANK" etc.)
+            if (!isValidRow(columns, config)) continue;
+
+            List<ProcessingItem> itemsToProcess = extractAmountColumns(columns, config);
+
+            for (ProcessingItem item : itemsToProcess) {
+                String processedAscii = processSingleItem(item.head, item.amount, item.colIndex, config);
+                bufferedItems.add(processedAscii);
+
+                if (bufferedItems.size() == batchSize) {
+                    outputLines.add(String.join("", bufferedItems));
+                    bufferedItems.clear();
+                }
             }
-            
-            Matcher mDate2 = datePattern2.matcher(line);
-            if (mDate2.find()) {
-                info.reportDate = normalizeDate(mDate2.group(1));
+        }
+
+        if (!bufferedItems.isEmpty()) {
+            outputLines.add(String.join("", bufferedItems));
+        }
+
+        // 5. Footer
+        if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) {
+            outputLines.add(config.getOutputEndLine());
+        }
+
+        // 6. Write File
+        String outputFileName = "GENERATED_" + config.getReportId() + config.getFileType();
+        Path outputPath = inputPath.getParent().resolve(outputFileName);
+        Files.write(outputPath, outputLines);
+
+        return outputPath.toString();
+    }
+
+    private boolean isValidRow(String[] cols, AsciiConfig config) {
+        if (cols.length < 2) return false;
+        int idx = config.getInputHeadCol() - 1;
+        if (cols.length <= idx) return false;
+
+        String head = cols[idx].trim();
+        if (head.isEmpty()) return false;
+
+        // Strict start-of-string check
+        return Pattern.compile(config.getInputHeadRegex()).matcher(head).lookingAt();
+    }
+
+    private String processSingleItem(String head, BigDecimal amount, int colIndex, AsciiConfig config) {
+        amount = RuleParser.applyMathLogic(amount, head, colIndex, config.getOutputAmtColLogic());
+        amount = RuleParser.applyDecimalLogic(amount, head, colIndex, config.getOutputAmtDecimal());
+        String amountStr = RuleParser.applyAmountPadding(amount, head, colIndex, config.getOutputAmtColPad());
+        String signedAmount = RuleParser.applySign(amountStr, amount, head, colIndex, config.getOutputAmtSign());
+        String headPadded = RuleParser.applyHeadPadding(head, config.getOutputHeadColPad());
+        return headPadded + signedAmount;
+    }
+
+    // (Keeping existing helpers for extracting columns and parsing headers...)
+    private HeaderInfo parseHeaderFromInput(List<String> lines) {
+        HeaderInfo info = new HeaderInfo();
+        info.branchCode = "00000"; info.reportDate = "01012026";
+        for (String line : lines) {
+            if (line.contains("BRANCH ::")) {
+                Matcher m = Pattern.compile("BRANCH :: (\\d+)").matcher(line);
+                if (m.find()) info.branchCode = m.group(1);
+            }
+//            if (line.contains("REPORT DATE ::")) {
+//                Matcher m = Pattern.compile("REPORT DATE :: (\\S+)").matcher(line);
+//                if (m.find()) info.reportDate = m.group(1);
+//            }
+
+            // Inside your method or loop where 'line' is processed:
+            if (line.contains("REPORT DATE ::")) {
+                Matcher m = Pattern.compile("REPORT DATE :: (\\S+)").matcher(line);
+                if (m.find()) {
+                    String dateStr = m.group(1);
+                    String normalizedDate = parseAndFormatDate(dateStr);
+                    if (normalizedDate != null) {
+                        info.reportDate = normalizedDate;
+                    } else {
+                        // Handle invalid date
+                        info.reportDate = "INVALID_DATE";
+                    }
+                }
             }
         }
         return info;
     }
 
-2. New Helper: normalizeDate
-Add this small helper method to your Service class. It ensures that no matter how the date comes in (2025-12-14 or 14/12/2025), it always returns 14122025.
-    private String normalizeDate(String rawDate) {
-        if (rawDate == null) return "01012026";
-        
-        // Handle "YYYY-MM-DD" (2025-12-14) -> Convert to DDMMYYYY
-        if (rawDate.contains("-")) {
-            String[] parts = rawDate.split("-");
-            if (parts.length == 3) {
-                // parts[0]=2025, parts[1]=12, parts[2]=14
-                return parts[2] + parts[1] + parts[0]; 
+
+
+    // Method to parse various date formats and output DDMMYYYY
+    private String parseAndFormatDate(String dateStr) {
+        List<DateTimeFormatter> formatters = Arrays.asList(
+                DateTimeFormatter.ofPattern("dd-MM-yyyy"),
+                DateTimeFormatter.ofPattern("dd/MM/yyyy"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd"),
+                DateTimeFormatter.ofPattern("dd.MM.yyyy"),
+                DateTimeFormatter.ofPattern("MM-dd-yyyy"),
+                DateTimeFormatter.ofPattern("MM/dd/yyyy")
+                // Add more if needed
+        );
+
+        for (DateTimeFormatter formatter : formatters) {
+            try {
+                LocalDate date = LocalDate.parse(dateStr, formatter);
+                return date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+            } catch (DateTimeParseException e) {
+                // Try next format
             }
         }
-        
-        // Handle "DD/MM/YYYY" (14/12/2025) -> Remove slashes
-        if (rawDate.contains("/")) {
-            return rawDate.replace("/", "");
-        }
-        
-        // If it's already clean or unknown format, return as is
-        return rawDate;
+        return null; // Return null if no format matches
     }
 
-3. Updated Logic in: generateReport
-Since parseHeaderFromInput now returns a clean date, you should simplify the header generation line inside generateReport.
-Find this block:
-// 5. Generate Output Header
-String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
-String dateFormatted = headerInfo.reportDate.replace("/", ""); // <--- OLD LINE
-String header = config.getOutputFirstLine() + branchPadded + dateFormatted + "F";
+    private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
+        List<ProcessingItem> items = new ArrayList<>();
+        String head = cols[config.getInputHeadCol() - 1].trim();
+        String seq = config.getAmountColSeq();
 
-Change it to:
-// 5. Generate Output Header
-String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
-// Date is already normalized by our new function, so just use it directly
-String header = config.getOutputFirstLine() + branchPadded + headerInfo.reportDate + "F";
+        if (seq.contains("else")) {
+            String[] parts = seq.split("else");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                if (idx < cols.length && !cols[idx].trim().isEmpty()) {
+                    items.add(new ProcessingItem(head, parseAmount(cols[idx]), idx + 1));
+                    return items;
+                }
+            }
+            items.add(new ProcessingItem(head, BigDecimal.ZERO, Integer.parseInt(parts[0].trim())));
+        } else if (seq.contains("and")) {
+            String[] parts = seq.split("and");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+            }
+        } else {
+            int idx = Integer.parseInt(seq.trim()) - 1;
+            items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+        }
+        return items;
+    }
 
+    private BigDecimal parseAmount(String[] cols, int idx) {
+        if (idx >= cols.length) return BigDecimal.ZERO;
+        return parseAmount(cols[idx]);
+    }
+    private BigDecimal parseAmount(String val) {
+        try { return new BigDecimal(val.trim().replace(",", "")); } catch (Exception e) { return BigDecimal.ZERO; }
+    }
+    private static class ProcessingItem { String head; BigDecimal amount; int colIndex; ProcessingItem(String h, BigDecimal a, int c) { head=h; amount=a; colIndex=c; } }
+    private static class HeaderInfo { String branchCode; String reportDate; }
+}
+
+
+this is my current function date convertion and all
