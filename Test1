@@ -1,180 +1,198 @@
-You are absolutely right. The issue is that BigDecimal.toPlainString() includes the negative sign (e.g., "-123.45") at the start of the string. When we padded it, the sign got "trapped" inside the zeros (e.g., 000-123.45), which is wrong.
-To fix this, we must:
- * Strip the sign (take Absolute Value) before padding, so we get a clean number like 000123.45.
- * Append the sign at the end (back) based on your specific rules.
-Here is the fixed RuleParser.java.
-🛠️ Key Changes
- * applyAmountPadding: Added amount.abs() to ensure we only format the positive number (removing any front -).
- * applySign:
-   * NO_SIGN: Returns the clean number (Absolute Value).
-   * SHOW_SIGN: Adds + or - at the end.
-   * Default: Adds - at the end if negative.
-Updated File: RuleParser.java
 package com.tcs.fincore.AsciiGenerationService.Service;
 
+import com.tcs.fincore.AsciiGenerationService.Model.AsciiConfig;
+import com.tcs.fincore.AsciiGenerationService.Repository.AsciiConfigRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
 import java.math.BigDecimal;
-import java.math.RoundingMode;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class RuleParser {
+@Service
+@Slf4j
+public class AsciiGenerationService {
 
-    private static final Pattern RULE_PATTERN = Pattern.compile("\\[\"(.*?)\"\\]\\[(.*?)\\]\\[(.*?)\\]");
+    private final AsciiConfigRepository configRepo;
 
-    public static BigDecimal applyMathLogic(BigDecimal amount, String head, int colIdx, String logicConfig) {
-        if (logicConfig == null) return amount;
-        String logic = findFirstMatchingRule(head, colIdx, logicConfig);
-        if (logic == null) return amount;
+    @Value("${app.input.file.path}")
+    private String configuredFilePath;
 
-        if (logic.contains("/")) {
-            BigDecimal divisor = new BigDecimal(logic.replaceAll("[^0-9.]", ""));
-            return amount.divide(divisor, 6, RoundingMode.HALF_UP);
-        } else if (logic.contains("*")) {
-            BigDecimal multiplier = new BigDecimal(logic.replace("*", "").replace("(", "").replace(")", ""));
-            return amount.multiply(multiplier);
-        }
-        return amount;
+    public AsciiGenerationService(AsciiConfigRepository configRepo) {
+        this.configRepo = configRepo;
     }
 
-    public static BigDecimal applyDecimalLogic(BigDecimal amount, String head, int colIdx, String decimalConfig) {
-        if (decimalConfig == null) return amount;
-        
-        Matcher m = RULE_PATTERN.matcher(decimalConfig);
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String rule = m.group(3);
+    public String generateReport(Long id) throws Exception {
+        log.info("Starting generation for Config ID: {}", id);
 
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            boolean headMatch = Pattern.compile(headRegex).matcher(head).lookingAt();
+        AsciiConfig config = configRepo.findById(id)
+                .orElseThrow(() -> new RuntimeException("Config not found for ID: " + id));
 
-            if (colMatch && headMatch) {
-                if (rule.equalsIgnoreCase("floor")) {
-                    amount = amount.setScale(0, RoundingMode.FLOOR);
-                } else if (rule.equalsIgnoreCase("ceil")) {
-                    amount = amount.setScale(0, RoundingMode.CEILING);
-                } else if (rule.equalsIgnoreCase("round")) {
-                    amount = amount.setScale(0, RoundingMode.HALF_UP);
-                } else if (rule.equalsIgnoreCase("down")) {
-                    amount = amount.setScale(0, RoundingMode.DOWN); 
-                } else {
-                    try {
-                        int scale = Integer.parseInt(rule);
-                        amount = amount.setScale(scale, RoundingMode.HALF_UP);
-                    } catch (NumberFormatException e) {}
+        Path inputPath = Paths.get(configuredFilePath);
+        if (!Files.exists(inputPath)) throw new IOException("Input file not found");
+
+        List<String> lines = Files.readAllLines(inputPath);
+        HeaderInfo headerInfo = parseHeaderFromInput(lines);
+        List<String> outputLines = new ArrayList<>();
+
+        String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
+        String header = config.getOutputFirstLine() + branchPadded + headerInfo.reportDate + "F";
+        outputLines.add(header);
+
+        List<String> bufferedItems = new ArrayList<>();
+        int batchSize = config.getOutputPerLineHead();
+
+        for (String line : lines) {
+            String[] columns = line.split("\\|", -1);
+            if (!isValidRow(columns, config)) continue;
+
+            List<ProcessingItem> itemsToProcess = extractAmountColumns(columns, config);
+            if (itemsToProcess.isEmpty()) continue;
+
+            // --- FIXED LOGIC FOR OMISSION ---
+            
+            StringBuilder amountsOnlyBuilder = new StringBuilder();
+            boolean hasValidContent = false;
+
+            // 1. Process Amounts First
+            for (ProcessingItem item : itemsToProcess) {
+                // Calculate Value
+                BigDecimal finalAmt = RuleParser.applyMathLogic(item.amount, item.head, item.colIndex, config.getOutputAmtColLogic());
+                finalAmt = RuleParser.applyDecimalLogic(finalAmt, item.head, item.colIndex, config.getOutputAmtDecimal());
+                
+                // Check Inclusion Condition (e.g. >0)
+                if (RuleParser.shouldIncludeValue(finalAmt, item.head, item.colIndex, config.getOutputIncludeCondition())) {
+                    
+                    String amountStr = RuleParser.applyAmountPadding(finalAmt, item.head, item.colIndex, config.getOutputAmtColPad());
+                    String signedAmt = RuleParser.applySign(amountStr, finalAmt, item.head, item.colIndex, config.getOutputAmtSign());
+                    
+                    amountsOnlyBuilder.append(signedAmt);
+                    hasValidContent = true; // Mark that we actually have something to print
                 }
             }
+            
+            // 2. Only Add Head + Amounts IF we have valid content
+            // If hasValidContent is false, it means all amounts were skipped (e.g. they were 0).
+            // In that case, we DO NOT add the Head. We skip the entire row.
+            if (hasValidContent) {
+                String head = itemsToProcess.get(0).head;
+                String headPadded = RuleParser.applyHeadPadding(head, config.getOutputHeadColPad());
+                
+                // Prepend Head to the valid amounts
+                bufferedItems.add(headPadded + amountsOnlyBuilder.toString());
+            }
+            // Else: The row is completely ignored (Head is omitted), and bufferedItems count does not increase.
+
+            // --- BATCHING WORKS AUTOMATICALLY ---
+            // Because we only added to 'bufferedItems' if content was valid,
+            // this size check only triggers when we truly have 'batchSize' number of valid items.
+            if (bufferedItems.size() == batchSize) {
+                outputLines.add(String.join("", bufferedItems));
+                bufferedItems.clear();
+            }
         }
-        return amount;
+
+        if (!bufferedItems.isEmpty()) outputLines.add(String.join("", bufferedItems));
+        if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) outputLines.add(config.getOutputEndLine());
+
+        String outputFileName = "GENERATED_" + config.getReportId() + config.getFileType();
+        Path outputPath = inputPath.getParent().resolve(outputFileName);
+        Files.write(outputPath, outputLines);
+
+        return outputPath.toString();
     }
 
-    // --- FIX 1: Always format the ABSOLUTE value (Remove sign from front) ---
-    public static String applyAmountPadding(BigDecimal amount, String head, int colIdx, String padConfig) {
-        // Use Absolute Value to prevent "-123" becoming "000-123"
-        BigDecimal absAmount = amount.abs();
-        
-        if (padConfig == null) return absAmount.toPlainString();
-        String rule = findFirstMatchingRule(head, colIdx, padConfig);
-        if (rule == null) return absAmount.toPlainString();
+    // --- Helper Methods (Identical to previous working version) ---
+    
+    private HeaderInfo parseHeaderFromInput(List<String> lines) {
+        HeaderInfo info = new HeaderInfo();
+        info.branchCode = "00000"; info.reportDate = "01012026";
+        Pattern branchPattern = Pattern.compile("(?i)(?:BRANCH|Branch)\\s*::\\s*(\\d+)");
+        Pattern datePattern1 = Pattern.compile("REPORT DATE\\s*::\\s*(\\S+)");
+        Pattern datePattern2 = Pattern.compile("Current Year Date\\s*::\\s*(\\S+)");
 
-        if (rule.contains(",")) {
-            String[] parts = rule.split(",");
-            int totalLen = Integer.parseInt(parts[0]);
-            int decimalLen = Integer.parseInt(parts[1]);
-            
-            BigDecimal scaled = absAmount.setScale(decimalLen, RoundingMode.HALF_UP);
-            String raw = scaled.toPlainString(); 
-            
-            return padLeft(raw, totalLen, '0');
+        for (String line : lines) {
+            Matcher mBranch = branchPattern.matcher(line);
+            if (mBranch.find()) info.branchCode = mBranch.group(1);
+            Matcher mDate1 = datePattern1.matcher(line);
+            if (mDate1.find()) info.reportDate = normalizeDate(mDate1.group(1));
+            Matcher mDate2 = datePattern2.matcher(line);
+            if (mDate2.find()) info.reportDate = normalizeDate(mDate2.group(1));
+        }
+        return info;
+    }
+
+    private String normalizeDate(String dateStr) {
+        if (dateStr == null) return "01012026";
+        List<DateTimeFormatter> formatters = Arrays.asList(
+            DateTimeFormatter.ofPattern("dd-MM-yyyy"), DateTimeFormatter.ofPattern("dd/MM/yyyy"),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd"), DateTimeFormatter.ofPattern("dd.MM.yyyy"),
+            DateTimeFormatter.ofPattern("MM-dd-yyyy"));
+        for (DateTimeFormatter formatter : formatters) {
+            try { return LocalDate.parse(dateStr, formatter).format(DateTimeFormatter.ofPattern("ddMMyyyy")); } 
+            catch (DateTimeParseException e) {}
+        }
+        if (dateStr.contains("-") && dateStr.split("-").length == 3) {
+             String[] parts = dateStr.split("-");
+             if (parts[0].length() == 4) return parts[2] + parts[1] + parts[0]; 
+        }
+        return "01012026";
+    }
+
+    private boolean isValidRow(String[] cols, AsciiConfig config) {
+        if (cols.length < 2) return false;
+        int idx = config.getInputHeadCol() - 1;
+        if (cols.length <= idx) return false;
+        String head = cols[idx].trim();
+        if (head.isEmpty()) return false;
+        return Pattern.compile(config.getInputHeadRegex()).matcher(head).lookingAt();
+    }
+
+    private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
+        List<ProcessingItem> items = new ArrayList<>();
+        String head = cols[config.getInputHeadCol() - 1].trim();
+        String seq = config.getAmountColSeq();
+        if (seq.contains("else")) {
+            String[] parts = seq.split("else");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                if (idx < cols.length && !cols[idx].trim().isEmpty()) {
+                    items.add(new ProcessingItem(head, parseAmount(cols[idx]), idx + 1));
+                    return items;
+                }
+            }
+            items.add(new ProcessingItem(head, BigDecimal.ZERO, Integer.parseInt(parts[0].trim())));
+        } else if (seq.contains("and")) {
+            String[] parts = seq.split("and");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+            }
         } else {
-            int totalLen = Integer.parseInt(rule);
-            String raw = absAmount.toBigInteger().toString(); 
-            return padLeft(raw, totalLen, '0');
+            int idx = Integer.parseInt(seq.trim()) - 1;
+            items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
         }
+        return items;
     }
 
-    // --- FIX 2: Strict Back-End Sign Placement ---
-    public static String applySign(String fmtAmt, BigDecimal origAmt, String head, int colIdx, String signConfig) {
-        // fmtAmt is already "clean" (no sign, just numbers)
-        
-        if (signConfig == null) {
-            // Default: If negative, append "-" at BACK. If positive, nothing.
-            return (origAmt.compareTo(BigDecimal.ZERO) < 0) ? fmtAmt + "-" : fmtAmt;
-        }
-
-        String rule = findFirstMatchingRule(head, colIdx, signConfig);
-        
-        // CASE: NO_SIGN -> Return clean string (Absolute value)
-        if ("NO_SIGN".equalsIgnoreCase(rule)) {
-            return fmtAmt;
-        }
-        
-        // CASE: SHOW_SIGN -> Always append + or - at BACK
-        if ("SHOW_SIGN".equalsIgnoreCase(rule)) {
-            return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "+" : "-");
-        }
-        
-        // CASE: POS_0 -> Append 0 for positive, - for negative
-        if ("POS_0".equalsIgnoreCase(rule)) {
-            return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "0" : "-");
-        }
-        
-        // CASE: Default (Rule defined but not matched above)
-        // Standard logic: 123.00- for negative, 123.00 for positive
-        return (origAmt.compareTo(BigDecimal.ZERO) < 0) ? fmtAmt + "-" : fmtAmt;
+    private BigDecimal parseAmount(String[] cols, int idx) {
+        if (idx >= cols.length) return BigDecimal.ZERO;
+        return parseAmount(cols[idx]);
     }
-
-    public static boolean shouldIncludeValue(BigDecimal amount, String head, int colIdx, String includeConfig) {
-        if (includeConfig == null) return true;
-        String rule = findFirstMatchingRule(head, colIdx, includeConfig);
-        
-        if (rule == null || "ALWAYS".equalsIgnoreCase(rule)) return true;
-        
-        if (rule.equals(">0")) return amount.compareTo(BigDecimal.ZERO) > 0;
-        if (rule.equals("<0")) return amount.compareTo(BigDecimal.ZERO) < 0;
-        if (rule.equals("=0") || rule.equals("0")) return amount.compareTo(BigDecimal.ZERO) == 0;
-        if (rule.equals("!=0")) return amount.compareTo(BigDecimal.ZERO) != 0;
-        
-        return true;
+    private BigDecimal parseAmount(String val) {
+        try { if(val == null || val.trim().isEmpty()) return BigDecimal.ZERO; return new BigDecimal(val.trim().replace(",", "")); } catch (Exception e) { return BigDecimal.ZERO; }
     }
-
-    public static String applyHeadPadding(String head, String padConfig) {
-        if (padConfig == null || padConfig.length() < 3) return head;
-        int len = Integer.parseInt(padConfig.substring(0, padConfig.length() - 2));
-        char dir = padConfig.charAt(padConfig.length() - 2);
-        char pad = padConfig.endsWith("\" \"") ? ' ' : padConfig.charAt(padConfig.length() - 1);
-        return dir == 'L' ? padLeft(head, len, pad) : padRight(head, len, pad);
-    }
-
-    private static String findFirstMatchingRule(String head, int colIdx, String configStr) {
-        if (configStr == null || configStr.isEmpty()) return null;
-        Matcher m = RULE_PATTERN.matcher(configStr);
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String logic = m.group(3);
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            boolean headMatch = Pattern.compile(headRegex).matcher(head).lookingAt();
-            if (colMatch && headMatch) return logic;
-        }
-        return null;
-    }
-
-    private static String padLeft(String str, int len, char pad) {
-        StringBuilder sb = new StringBuilder();
-        while (sb.length() + str.length() < len) sb.append(pad);
-        return sb.append(str).toString();
-    }
-    private static String padRight(String str, int len, char pad) {
-        StringBuilder sb = new StringBuilder(str);
-        while (sb.length() < len) sb.append(pad);
-        return sb.toString();
-    }
+    private static class ProcessingItem { String head; BigDecimal amount; int colIndex; ProcessingItem(String h, BigDecimal a, int c) { head=h; amount=a; colIndex=c; } }
+    private static class HeaderInfo { String branchCode; String reportDate; }
 }
-
-Verification
- * Input: -123.43
- * Padding Rule: [000123.43] (Absolute value padded)
- * Sign Rule NO_SIGN: Result -> 000123.43 (Correct)
- * Sign Rule SHOW_SIGN: Result -> 000123.43- (Correct)
- * Sign Rule DEFAULT: Result -> 000123.43- (Correct)
