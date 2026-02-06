@@ -1,14 +1,40 @@
-The problem is a Rounding Mode Issue.
-Your input value likely has decimals (e.g., 1204658.90 or 1204658.55).
- * Current Behavior (HALF_UP): The system is rounding the number to the nearest neighbor.
-   * -1204658.55 becomes -1204659.00 (Rounds Away from zero).
- * Expected Behavior (DOWN/Truncate): You want to simply chop off the decimals without rounding.
-   * -1204658.55 becomes -1204658.00.
-✅ The Fix
-I will add a DOWN logic option to the RuleParser. This allows you to "Truncate" the value before formatting it.
-1. Update RuleParser.java
-Update the applyDecimalLogic method to support "down" (Truncate).
-    // In RuleParser.java
+You are absolutely right. The issue is that BigDecimal.toPlainString() includes the negative sign (e.g., "-123.45") at the start of the string. When we padded it, the sign got "trapped" inside the zeros (e.g., 000-123.45), which is wrong.
+To fix this, we must:
+ * Strip the sign (take Absolute Value) before padding, so we get a clean number like 000123.45.
+ * Append the sign at the end (back) based on your specific rules.
+Here is the fixed RuleParser.java.
+🛠️ Key Changes
+ * applyAmountPadding: Added amount.abs() to ensure we only format the positive number (removing any front -).
+ * applySign:
+   * NO_SIGN: Returns the clean number (Absolute Value).
+   * SHOW_SIGN: Adds + or - at the end.
+   * Default: Adds - at the end if negative.
+Updated File: RuleParser.java
+package com.tcs.fincore.AsciiGenerationService.Service;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class RuleParser {
+
+    private static final Pattern RULE_PATTERN = Pattern.compile("\\[\"(.*?)\"\\]\\[(.*?)\\]\\[(.*?)\\]");
+
+    public static BigDecimal applyMathLogic(BigDecimal amount, String head, int colIdx, String logicConfig) {
+        if (logicConfig == null) return amount;
+        String logic = findFirstMatchingRule(head, colIdx, logicConfig);
+        if (logic == null) return amount;
+
+        if (logic.contains("/")) {
+            BigDecimal divisor = new BigDecimal(logic.replaceAll("[^0-9.]", ""));
+            return amount.divide(divisor, 6, RoundingMode.HALF_UP);
+        } else if (logic.contains("*")) {
+            BigDecimal multiplier = new BigDecimal(logic.replace("*", "").replace("(", "").replace(")", ""));
+            return amount.multiply(multiplier);
+        }
+        return amount;
+    }
 
     public static BigDecimal applyDecimalLogic(BigDecimal amount, String head, int colIdx, String decimalConfig) {
         if (decimalConfig == null) return amount;
@@ -29,13 +55,8 @@ Update the applyDecimalLogic method to support "down" (Truncate).
                     amount = amount.setScale(0, RoundingMode.CEILING);
                 } else if (rule.equalsIgnoreCase("round")) {
                     amount = amount.setScale(0, RoundingMode.HALF_UP);
-                
-                // --- NEW CODE START ---
                 } else if (rule.equalsIgnoreCase("down")) {
-                    // Truncates (Chops off) decimals: -120.99 -> -120
                     amount = amount.setScale(0, RoundingMode.DOWN); 
-                // --- NEW CODE END ---
-                
                 } else {
                     try {
                         int scale = Integer.parseInt(rule);
@@ -47,18 +68,113 @@ Update the applyDecimalLogic method to support "down" (Truncate).
         return amount;
     }
 
-2. Update Database Config
-You need to apply this new down rule before applying the decimal formatting.
-Logic: "Truncate decimals first, THEN format to 2 decimal places."
-UPDATE ASCII_CONFIG SET 
-    -- Add [down] before [2]
-    OUTPUT_AMT_DECIMAL = '["^.*"][5][down]|["^.*"][1][down]|["^.*"][5][2]|["^.*"][1][2]'
-WHERE ID = 103;
+    // --- FIX 1: Always format the ABSOLUTE value (Remove sign from front) ---
+    public static String applyAmountPadding(BigDecimal amount, String head, int colIdx, String padConfig) {
+        // Use Absolute Value to prevent "-123" becoming "000-123"
+        BigDecimal absAmount = amount.abs();
+        
+        if (padConfig == null) return absAmount.toPlainString();
+        String rule = findFirstMatchingRule(head, colIdx, padConfig);
+        if (rule == null) return absAmount.toPlainString();
 
-COMMIT;
+        if (rule.contains(",")) {
+            String[] parts = rule.split(",");
+            int totalLen = Integer.parseInt(parts[0]);
+            int decimalLen = Integer.parseInt(parts[1]);
+            
+            BigDecimal scaled = absAmount.setScale(decimalLen, RoundingMode.HALF_UP);
+            String raw = scaled.toPlainString(); 
+            
+            return padLeft(raw, totalLen, '0');
+        } else {
+            int totalLen = Integer.parseInt(rule);
+            String raw = absAmount.toBigInteger().toString(); 
+            return padLeft(raw, totalLen, '0');
+        }
+    }
 
-Result:
- * Input: 1204658.99
- * Apply [down]: 1204658.00
- * Apply [2]: 1204658.00
- * Output: 1204658.00 (Matches your expectation)
+    // --- FIX 2: Strict Back-End Sign Placement ---
+    public static String applySign(String fmtAmt, BigDecimal origAmt, String head, int colIdx, String signConfig) {
+        // fmtAmt is already "clean" (no sign, just numbers)
+        
+        if (signConfig == null) {
+            // Default: If negative, append "-" at BACK. If positive, nothing.
+            return (origAmt.compareTo(BigDecimal.ZERO) < 0) ? fmtAmt + "-" : fmtAmt;
+        }
+
+        String rule = findFirstMatchingRule(head, colIdx, signConfig);
+        
+        // CASE: NO_SIGN -> Return clean string (Absolute value)
+        if ("NO_SIGN".equalsIgnoreCase(rule)) {
+            return fmtAmt;
+        }
+        
+        // CASE: SHOW_SIGN -> Always append + or - at BACK
+        if ("SHOW_SIGN".equalsIgnoreCase(rule)) {
+            return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "+" : "-");
+        }
+        
+        // CASE: POS_0 -> Append 0 for positive, - for negative
+        if ("POS_0".equalsIgnoreCase(rule)) {
+            return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "0" : "-");
+        }
+        
+        // CASE: Default (Rule defined but not matched above)
+        // Standard logic: 123.00- for negative, 123.00 for positive
+        return (origAmt.compareTo(BigDecimal.ZERO) < 0) ? fmtAmt + "-" : fmtAmt;
+    }
+
+    public static boolean shouldIncludeValue(BigDecimal amount, String head, int colIdx, String includeConfig) {
+        if (includeConfig == null) return true;
+        String rule = findFirstMatchingRule(head, colIdx, includeConfig);
+        
+        if (rule == null || "ALWAYS".equalsIgnoreCase(rule)) return true;
+        
+        if (rule.equals(">0")) return amount.compareTo(BigDecimal.ZERO) > 0;
+        if (rule.equals("<0")) return amount.compareTo(BigDecimal.ZERO) < 0;
+        if (rule.equals("=0") || rule.equals("0")) return amount.compareTo(BigDecimal.ZERO) == 0;
+        if (rule.equals("!=0")) return amount.compareTo(BigDecimal.ZERO) != 0;
+        
+        return true;
+    }
+
+    public static String applyHeadPadding(String head, String padConfig) {
+        if (padConfig == null || padConfig.length() < 3) return head;
+        int len = Integer.parseInt(padConfig.substring(0, padConfig.length() - 2));
+        char dir = padConfig.charAt(padConfig.length() - 2);
+        char pad = padConfig.endsWith("\" \"") ? ' ' : padConfig.charAt(padConfig.length() - 1);
+        return dir == 'L' ? padLeft(head, len, pad) : padRight(head, len, pad);
+    }
+
+    private static String findFirstMatchingRule(String head, int colIdx, String configStr) {
+        if (configStr == null || configStr.isEmpty()) return null;
+        Matcher m = RULE_PATTERN.matcher(configStr);
+        while (m.find()) {
+            String headRegex = m.group(1);
+            String colReq = m.group(2);
+            String logic = m.group(3);
+            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
+            boolean headMatch = Pattern.compile(headRegex).matcher(head).lookingAt();
+            if (colMatch && headMatch) return logic;
+        }
+        return null;
+    }
+
+    private static String padLeft(String str, int len, char pad) {
+        StringBuilder sb = new StringBuilder();
+        while (sb.length() + str.length() < len) sb.append(pad);
+        return sb.append(str).toString();
+    }
+    private static String padRight(String str, int len, char pad) {
+        StringBuilder sb = new StringBuilder(str);
+        while (sb.length() < len) sb.append(pad);
+        return sb.toString();
+    }
+}
+
+Verification
+ * Input: -123.43
+ * Padding Rule: [000123.43] (Absolute value padded)
+ * Sign Rule NO_SIGN: Result -> 000123.43 (Correct)
+ * Sign Rule SHOW_SIGN: Result -> 000123.43- (Correct)
+ * Sign Rule DEFAULT: Result -> 000123.43- (Correct)
