@@ -1,2 +1,117 @@
-BWEP10000031122025F
-0L01A0000000086726535.030
+package com.example.ascii.service;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class RuleParser {
+
+    // Regex to find ["Regex"][Col][Logic] with support for nested brackets
+    private static final Pattern RULE_PATTERN = Pattern.compile("\\[\"(.*?)\"\\]\\[(.*?)\\]\\[(.*?)\\]");
+
+    public static BigDecimal applyMathLogic(BigDecimal amount, String head, int colIdx, String logicConfig) {
+        if (logicConfig == null) return amount;
+        String logic = findMatchingRule(head, colIdx, logicConfig); 
+        if (logic == null) return amount;
+
+        if (logic.contains("/")) {
+            BigDecimal divisor = new BigDecimal(logic.replaceAll("[^0-9.]", ""));
+            return amount.divide(divisor, 6, RoundingMode.HALF_UP);
+        } else if (logic.contains("*")) {
+            BigDecimal multiplier = new BigDecimal(logic.replace("*", "").replace("(", "").replace(")", ""));
+            return amount.multiply(multiplier);
+        }
+        return amount;
+    }
+
+    public static BigDecimal applyDecimalLogic(BigDecimal amount, String head, int colIdx, String decimalConfig) {
+        if (decimalConfig == null) return amount;
+        String rule = findMatchingRule(head, colIdx, decimalConfig);
+        if (rule == null) return amount;
+        try {
+            return amount.setScale(Integer.parseInt(rule), RoundingMode.HALF_UP);
+        } catch (Exception e) { return amount; }
+    }
+
+    public static String applyAmountPadding(BigDecimal amount, String head, int colIdx, String padConfig) {
+        if (padConfig == null) return amount.toPlainString();
+        String rule = findMatchingRule(head, colIdx, padConfig);
+        if (rule == null) return amount.toPlainString();
+
+        if (rule.contains(",")) {
+            // Format: "19,2" -> Total Length 19, Decimal 2
+            String[] parts = rule.split(",");
+            int totalLen = Integer.parseInt(parts[0]);
+            int decimalLen = Integer.parseInt(parts[1]);
+            
+            BigDecimal scaled = amount.setScale(decimalLen, RoundingMode.HALF_UP);
+            String raw = scaled.toPlainString(); 
+            
+            return padLeft(raw, totalLen, '0');
+        } else {
+            // Format: "18" -> Integer padding
+            int totalLen = Integer.parseInt(rule);
+            String raw = amount.toBigInteger().toString(); 
+            return padLeft(raw, totalLen, '0');
+        }
+    }
+
+    public static String applySign(String fmtAmt, BigDecimal origAmt, String head, int colIdx, String signConfig) {
+        if (signConfig == null) return fmtAmt;
+        String rule = findMatchingRule(head, colIdx, signConfig);
+        
+        // NEW: "POS_0" -> Print '0' if positive, '-' if negative
+        if ("POS_0".equalsIgnoreCase(rule)) {
+            return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "0" : "-");
+        }
+        
+        if ("SHOW_SIGN".equalsIgnoreCase(rule)) {
+            return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "+" : "-");
+        }
+        
+        // Default: only print '-' if negative
+        if (!"NO_SIGN".equalsIgnoreCase(rule) && origAmt.compareTo(BigDecimal.ZERO) < 0) {
+            return fmtAmt + "-";
+        }
+        return fmtAmt;
+    }
+
+    public static String applyHeadPadding(String head, String padConfig) {
+        if (padConfig == null || padConfig.length() < 3) return head;
+        int len = Integer.parseInt(padConfig.substring(0, padConfig.length() - 2));
+        char dir = padConfig.charAt(padConfig.length() - 2);
+        char pad = padConfig.endsWith("\" \"") ? ' ' : padConfig.charAt(padConfig.length() - 1);
+        return dir == 'L' ? padLeft(head, len, pad) : padRight(head, len, pad);
+    }
+
+    private static String findMatchingRule(String head, int colIdx, String configStr) {
+        if (configStr == null) return null;
+        for (String rule : configStr.split("\\|")) {
+            Matcher m = RULE_PATTERN.matcher(rule);
+            if (m.find()) {
+                String headRegex = m.group(1);
+                String colReq = m.group(2);
+                String logic = m.group(3);
+
+                boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
+                // using lookingAt() to check strictly from start (avoids partial matches like 'INDIA')
+                boolean headMatch = Pattern.compile(headRegex).matcher(head).lookingAt();
+
+                if (colMatch && headMatch) return logic;
+            }
+        }
+        return null;
+    }
+
+    private static String padLeft(String str, int len, char pad) {
+        StringBuilder sb = new StringBuilder();
+        while (sb.length() + str.length() < len) sb.append(pad);
+        return sb.append(str).toString();
+    }
+    private static String padRight(String str, int len, char pad) {
+        StringBuilder sb = new StringBuilder(str);
+        while (sb.length() < len) sb.append(pad);
+        return sb.toString();
+    }
+}
