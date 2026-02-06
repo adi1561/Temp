@@ -1,259 +1,121 @@
-Here is the complete, final, and updated AsciiGenerationService.java file.
-This version includes:
- * Strict Row Validation: Checks the correct column index for the "Head" regex.
- * Dynamic Header Parsing: Captures "Current Year Date" or "Branch" in various formats.
- * Concatenation Logic: Handles 5and1 correctly (One Head + Amount 5 + Amount 1 in a single line).
- * Strict File Path: Reads directly from application.properties.
-Complete Updated File: AsciiGenerationService.java
 package com.tcs.fincore.AsciiGenerationService.Service;
 
-import com.tcs.fincore.AsciiGenerationService.Model.AsciiConfig;
-import com.tcs.fincore.AsciiGenerationService.Repository.AsciiConfigRepository;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Service;
-
-import java.io.IOException;
 import java.math.BigDecimal;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import java.math.RoundingMode;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-@Service
-@Slf4j
-public class AsciiGenerationService {
+public class RuleParser {
 
-    private final AsciiConfigRepository configRepo;
+    // Regex to capture: ["Content"] [Col] [Logic]
+    // The \"(.*?)\" ensures we capture everything inside the quotes, including pipes.
+    private static final Pattern RULE_PATTERN = Pattern.compile("\\[\"(.*?)\"\\]\\[(.*?)\\]\\[(.*?)\\]");
 
-    // Inject the Full Path from application.properties
-    @Value("${app.input.file.path}")
-    private String configuredFilePath;
+    public static BigDecimal applyMathLogic(BigDecimal amount, String head, int colIdx, String logicConfig) {
+        if (logicConfig == null) return amount;
+        String logic = findMatchingRule(head, colIdx, logicConfig); 
+        if (logic == null) return amount;
 
-    public AsciiGenerationService(AsciiConfigRepository configRepo) {
-        this.configRepo = configRepo;
+        if (logic.contains("/")) {
+            BigDecimal divisor = new BigDecimal(logic.replaceAll("[^0-9.]", ""));
+            return amount.divide(divisor, 6, RoundingMode.HALF_UP);
+        } else if (logic.contains("*")) {
+            BigDecimal multiplier = new BigDecimal(logic.replace("*", "").replace("(", "").replace(")", ""));
+            return amount.multiply(multiplier);
+        }
+        return amount;
     }
 
-    public String generateReport(Long id) throws Exception {
-        log.info("Starting generation for Config ID: {}", id);
+    public static BigDecimal applyDecimalLogic(BigDecimal amount, String head, int colIdx, String decimalConfig) {
+        if (decimalConfig == null) return amount;
+        String rule = findMatchingRule(head, colIdx, decimalConfig);
+        if (rule == null) return amount;
+        try {
+            return amount.setScale(Integer.parseInt(rule), RoundingMode.HALF_UP);
+        } catch (Exception e) { return amount; }
+    }
 
-        // 1. Fetch Config
-        AsciiConfig config = configRepo.findById(id)
-                .orElseThrow(() -> new RuntimeException("Config not found for ID: " + id));
+    public static String applyAmountPadding(BigDecimal amount, String head, int colIdx, String padConfig) {
+        if (padConfig == null) return amount.toPlainString();
+        String rule = findMatchingRule(head, colIdx, padConfig);
+        if (rule == null) return amount.toPlainString();
 
-        // 2. Read File
-        Path inputPath = Paths.get(configuredFilePath);
-        if (!Files.exists(inputPath)) {
-            throw new IOException("Input file not found at: " + configuredFilePath);
-        }
-
-        List<String> lines = Files.readAllLines(inputPath);
-        
-        // 3. Parse Header Information (Dynamic Branch & Date)
-        HeaderInfo headerInfo = parseHeaderFromInput(lines);
-        log.info("Parsed Header - Branch: {}, Date: {}", headerInfo.branchCode, headerInfo.reportDate);
-
-        List<String> outputLines = new ArrayList<>();
-
-        // 4. Output Header Construction
-        String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
-        // Date is already normalized to DDMMYYYY by parseHeaderFromInput
-        String header = config.getOutputFirstLine() + branchPadded + headerInfo.reportDate + "F";
-        outputLines.add(header);
-
-        // 5. Process Body
-        List<String> bufferedItems = new ArrayList<>();
-        int batchSize = config.getOutputPerLineHead();
-
-        for (String line : lines) {
-            String[] columns = line.split("\\|", -1);
-
-            // Strictly check regex (Gatekeeper)
-            if (!isValidRow(columns, config)) continue;
-
-            // Get amounts in order (e.g. 5 then 1)
-            List<ProcessingItem> itemsToProcess = extractAmountColumns(columns, config);
+        if (rule.contains(",")) {
+            String[] parts = rule.split(",");
+            int totalLen = Integer.parseInt(parts[0]);
+            int decimalLen = Integer.parseInt(parts[1]);
             
-            if (itemsToProcess.isEmpty()) continue;
-
-            // --- CONCATENATION LOGIC ---
+            BigDecimal scaled = amount.setScale(decimalLen, RoundingMode.HALF_UP);
+            String raw = scaled.toPlainString(); 
             
-            // Step A: Generate HEAD only ONCE per row
-            String head = itemsToProcess.get(0).head;
-            String headPadded = RuleParser.applyHeadPadding(head, config.getOutputHeadColPad());
-
-            StringBuilder recordBuilder = new StringBuilder();
-            recordBuilder.append(headPadded); // Add Head First
-
-            // Step B: Append ALL Amounts sequentially
-            for (ProcessingItem item : itemsToProcess) {
-                String processedAmt = processAmountOnly(item.head, item.amount, item.colIndex, config);
-                recordBuilder.append(processedAmt);
-            }
-            
-            // Step C: Add the single composite string to buffer
-            bufferedItems.add(recordBuilder.toString());
-
-            if (bufferedItems.size() == batchSize) {
-                outputLines.add(String.join("", bufferedItems));
-                bufferedItems.clear();
-            }
-        }
-
-        // Add remaining items
-        if (!bufferedItems.isEmpty()) {
-            outputLines.add(String.join("", bufferedItems));
-        }
-
-        // 6. Footer
-        if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) {
-            outputLines.add(config.getOutputEndLine());
-        }
-
-        // 7. Write File
-        String outputFileName = "GENERATED_" + config.getReportId() + config.getFileType();
-        Path outputPath = inputPath.getParent().resolve(outputFileName);
-        Files.write(outputPath, outputLines);
-
-        return outputPath.toString();
-    }
-
-    // --- UPDATED HELPER METHODS ---
-
-    private HeaderInfo parseHeaderFromInput(List<String> lines) {
-        HeaderInfo info = new HeaderInfo();
-        info.branchCode = "00000"; 
-        info.reportDate = "01012026"; 
-
-        // Regex Patterns for dynamic header detection
-        Pattern branchPattern = Pattern.compile("(?i)(?:BRANCH|Branch)\\s*::\\s*(\\d+)");
-        Pattern datePattern1 = Pattern.compile("REPORT DATE\\s*::\\s*(\\S+)");
-        Pattern datePattern2 = Pattern.compile("Current Year Date\\s*::\\s*(\\S+)");
-
-        for (String line : lines) {
-            Matcher mBranch = branchPattern.matcher(line);
-            if (mBranch.find()) info.branchCode = mBranch.group(1);
-
-            Matcher mDate1 = datePattern1.matcher(line);
-            if (mDate1.find()) info.reportDate = normalizeDate(mDate1.group(1));
-            
-            Matcher mDate2 = datePattern2.matcher(line);
-            if (mDate2.find()) info.reportDate = normalizeDate(mDate2.group(1));
-        }
-        return info;
-    }
-
-    private String normalizeDate(String dateStr) {
-        if (dateStr == null) return "01012026";
-
-        List<DateTimeFormatter> formatters = Arrays.asList(
-            DateTimeFormatter.ofPattern("dd-MM-yyyy"),
-            DateTimeFormatter.ofPattern("dd/MM/yyyy"),
-            DateTimeFormatter.ofPattern("yyyy-MM-dd"), // Handles 2025-12-14
-            DateTimeFormatter.ofPattern("dd.MM.yyyy"),
-            DateTimeFormatter.ofPattern("MM-dd-yyyy")
-        );
-
-        for (DateTimeFormatter formatter : formatters) {
-            try {
-                LocalDate date = LocalDate.parse(dateStr, formatter);
-                return date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
-            } catch (DateTimeParseException e) {
-                // Continue
-            }
-        }
-        
-        // Manual fallback for YYYY-MM-DD if parser fails
-        if (dateStr.contains("-") && dateStr.split("-").length == 3) {
-             String[] parts = dateStr.split("-");
-             if (parts[0].length() == 4) return parts[2] + parts[1] + parts[0]; 
-        }
-
-        return "01012026";
-    }
-
-    private boolean isValidRow(String[] cols, AsciiConfig config) {
-        if (cols.length < 2) return false;
-        
-        // Use the configured Column Index (1-based)
-        int idx = config.getInputHeadCol() - 1;
-        if (cols.length <= idx) return false;
-
-        String head = cols[idx].trim();
-        if (head.isEmpty()) return false;
-
-        // Strict Start-of-String Match
-        return Pattern.compile(config.getInputHeadRegex()).matcher(head).lookingAt();
-    }
-
-    private String processAmountOnly(String head, BigDecimal amount, int colIndex, AsciiConfig config) {
-        // Logic chain: Math -> Decimal -> Padding -> Sign
-        amount = RuleParser.applyMathLogic(amount, head, colIndex, config.getOutputAmtColLogic());
-        amount = RuleParser.applyDecimalLogic(amount, head, colIndex, config.getOutputAmtDecimal());
-        String amountStr = RuleParser.applyAmountPadding(amount, head, colIndex, config.getOutputAmtColPad());
-        
-        // Returns "00000086726535.030" (Signed String)
-        return RuleParser.applySign(amountStr, amount, head, colIndex, config.getOutputAmtSign());
-    }
-
-    private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
-        List<ProcessingItem> items = new ArrayList<>();
-        String head = cols[config.getInputHeadCol() - 1].trim();
-        String seq = config.getAmountColSeq();
-
-        if (seq.contains("else")) {
-            // "3else4": Return the first valid one found
-            String[] parts = seq.split("else");
-            for (String part : parts) {
-                int idx = Integer.parseInt(part.trim()) - 1;
-                if (idx < cols.length && !cols[idx].trim().isEmpty()) {
-                    items.add(new ProcessingItem(head, parseAmount(cols[idx]), idx + 1));
-                    return items;
-                }
-            }
-            // Fallback default
-            items.add(new ProcessingItem(head, BigDecimal.ZERO, Integer.parseInt(parts[0].trim())));
-        } else if (seq.contains("and")) {
-            // "5and1": Return BOTH in order
-            String[] parts = seq.split("and");
-            for (String part : parts) {
-                int idx = Integer.parseInt(part.trim()) - 1;
-                items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
-            }
+            return padLeft(raw, totalLen, '0');
         } else {
-            // "3": Single column
-            int idx = Integer.parseInt(seq.trim()) - 1;
-            items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+            int totalLen = Integer.parseInt(rule);
+            String raw = amount.toBigInteger().toString(); 
+            return padLeft(raw, totalLen, '0');
         }
-        return items;
     }
 
-    private BigDecimal parseAmount(String[] cols, int idx) {
-        if (idx >= cols.length) return BigDecimal.ZERO;
-        return parseAmount(cols[idx]);
-    }
-    
-    private BigDecimal parseAmount(String val) {
-        try { 
-            if(val == null || val.trim().isEmpty()) return BigDecimal.ZERO;
-            return new BigDecimal(val.trim().replace(",", "")); 
-        } catch (Exception e) { 
-            return BigDecimal.ZERO; 
+    public static String applySign(String fmtAmt, BigDecimal origAmt, String head, int colIdx, String signConfig) {
+        if (signConfig == null) return fmtAmt;
+        String rule = findMatchingRule(head, colIdx, signConfig);
+        
+        if ("POS_0".equalsIgnoreCase(rule)) {
+            return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "0" : "-");
         }
+        if ("SHOW_SIGN".equalsIgnoreCase(rule)) {
+            return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "+" : "-");
+        }
+        if (!"NO_SIGN".equalsIgnoreCase(rule) && origAmt.compareTo(BigDecimal.ZERO) < 0) {
+            return fmtAmt + "-";
+        }
+        return fmtAmt;
     }
-    
-    // Simple POJOs
-    private static class ProcessingItem { 
-        String head; BigDecimal amount; int colIndex; 
-        ProcessingItem(String h, BigDecimal a, int c) { head=h; amount=a; colIndex=c; } 
+
+    public static String applyHeadPadding(String head, String padConfig) {
+        if (padConfig == null || padConfig.length() < 3) return head;
+        int len = Integer.parseInt(padConfig.substring(0, padConfig.length() - 2));
+        char dir = padConfig.charAt(padConfig.length() - 2);
+        char pad = padConfig.endsWith("\" \"") ? ' ' : padConfig.charAt(padConfig.length() - 1);
+        return dir == 'L' ? padLeft(head, len, pad) : padRight(head, len, pad);
     }
-    private static class HeaderInfo { String branchCode; String reportDate; }
+
+    // --- KEY FIX HERE ---
+    private static String findMatchingRule(String head, int colIdx, String configStr) {
+        if (configStr == null || configStr.isEmpty()) return null;
+        
+        // OLD BUGGY WAY: String[] rules = configStr.split("\\|");
+        
+        // NEW ROBUST WAY:
+        // We scan the full string. The Regex Pattern ["..."] naturally consumes 
+        // the pipe inside the quotes, preventing it from breaking the logic.
+        Matcher m = RULE_PATTERN.matcher(configStr);
+        
+        while (m.find()) {
+            String headRegex = m.group(1); // The Regex inside quotes
+            String colReq = m.group(2);    // The Column Index
+            String logic = m.group(3);     // The Logic
+
+            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
+            
+            // Using lookingAt() to strictly check start of string
+            boolean headMatch = Pattern.compile(headRegex).matcher(head).lookingAt();
+
+            if (colMatch && headMatch) {
+                return logic;
+            }
+        }
+        return null;
+    }
+
+    private static String padLeft(String str, int len, char pad) {
+        StringBuilder sb = new StringBuilder();
+        while (sb.length() + str.length() < len) sb.append(pad);
+        return sb.append(str).toString();
+    }
+    private static String padRight(String str, int len, char pad) {
+        StringBuilder sb = new StringBuilder(str);
+        while (sb.length() < len) sb.append(pad);
+        return sb.toString();
+    }
 }
-
