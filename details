@@ -1,5 +1,207 @@
-BWEP10000031122025F
-STATE BANK OF INDIA0000000000000.00NEW WEEKLY STATEMENT OF AFFAIRS0000000000000.00BRANCH :: 00000 CONSOLIDATION BRANCH0000000000000.00CURRENCY :: 000  INDIAN RUPEE0000000000000.00
-CODE NO.0000000000000.00CREDIT BALANCES0000000000000.000L01A0000086726535.030L01B0000000000000.00
+package com.tcs.fincore.service;
 
-see still this include the this non sence what u are doing man i told u what u need to 
+import com.tcs.fincore.entity.ReportConfig;
+import com.tcs.fincore.repository.ReportConfigRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Service
+@Slf4j
+public class GenericReportService {
+
+    @Autowired
+    private ReportConfigRepository configRepo;
+
+    public String generateReport(String reportName, String inputFilePathStr) throws Exception {
+        log.info(">>> SERVICE START: Generating Report '{}' <<<", reportName);
+
+        // 1. Fetch Config
+        ReportConfig config = configRepo.findById(reportName)
+                .orElseThrow(() -> new RuntimeException("Config not found for: " + reportName));
+
+        // 2. Read File
+        Path inputPath = Paths.get(inputFilePathStr);
+        if (!Files.exists(inputPath)) {
+            throw new RuntimeException("Input file not found at: " + inputFilePathStr);
+        }
+        List<String> lines = Files.readAllLines(inputPath);
+
+        // 3. Parse Header Information
+        HeaderInfo headerInfo = parseHeaderFromInput(lines);
+
+        // 4. Process Rows
+        List<String> processedItems = new ArrayList<>();
+        
+        for (String line : lines) {
+            String[] columns = line.split("\\|", -1);
+
+            // STRICT FILTER: Check if line is valid data
+            if (isValidDataRow(columns, config)) {
+                String item = processSingleRow(columns, config);
+                processedItems.add(item);
+            }
+        }
+
+        // 5. Build Output
+        List<String> outputLines = new ArrayList<>();
+        
+        // A. Header Line (Single line only)
+        String fileHeader = config.getOutputFirstLine() 
+                          + headerInfo.branchCode 
+                          + headerInfo.reportDate.replace("/", "") 
+                          + "F";
+        outputLines.add(fileHeader);
+
+        // B. Body (Batching items)
+        StringBuilder currentLine = new StringBuilder();
+        int count = 0;
+        int batchSize = config.getOutputPerLineHead(); 
+
+        for (String item : processedItems) {
+            currentLine.append(item);
+            count++;
+            if (count == batchSize) {
+                outputLines.add(currentLine.toString());
+                currentLine = new StringBuilder();
+                count = 0;
+            }
+        }
+        if (currentLine.length() > 0) outputLines.add(currentLine.toString());
+
+        // C. Footer
+        if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty() && !config.getOutputEndLine().equals("-")) {
+            outputLines.add(config.getOutputEndLine());
+        }
+
+        // 6. Write File
+        String outputFileName = inputPath.getParent().toString() + "/GENERATED_" + reportName + config.getType();
+        Files.write(Paths.get(outputFileName), outputLines);
+        
+        return outputFileName;
+    }
+
+    // --- LOGIC METHODS ---
+
+    private boolean isValidDataRow(String[] columns, ReportConfig config) {
+        // Rule 1: Must have multiple columns (Headers usually have 0 or 1 pipe)
+        // If your data line looks like "L01A|...|..." it has at least 3 parts.
+        // We reject lines with only 1 part (like "STATE BANK OF INDIA")
+        if (columns.length < 2) return false;
+
+        int index = config.getInputHeadCol() - 1;
+        if (columns.length <= index) return false;
+        
+        String headValue = columns[index].trim();
+        if (headValue.isEmpty()) return false;
+
+        // Rule 2: Regex MUST match from the START of the string
+        String regex = config.getInputHeadLogic().replace(",", "|");
+        Pattern p = Pattern.compile(regex);
+        Matcher m = p.matcher(headValue);
+
+        // FIX: .lookingAt() ensures "N" matches "N01" but NOT "INDIA"
+        return m.lookingAt(); 
+    }
+
+    private String processSingleRow(String[] columns, ReportConfig config) {
+        String headRaw = columns[config.getInputHeadCol() - 1].trim();
+        
+        // 1. Padding
+        String headFormatted = applyHeadPadding(headRaw, config.getOutputHeadColumnPadding());
+
+        // 2. Amount Extraction
+        BigDecimal amount = extractAmount(columns, config.getInputAmountColumn());
+
+        // 3. Amount Logic
+        amount = applyAmountLogic(amount, headRaw, config.getOutputAmountLogic());
+
+        // 4. Formatting
+        String amountFormatted = applyAmountFormat(amount, config.getOutputAmountColumnPadding());
+
+        return headFormatted + amountFormatted;
+    }
+
+    private BigDecimal extractAmount(String[] columns, String colLogic) {
+        String[] options = colLogic.split("else");
+        for (String option : options) {
+            try {
+                int index = Integer.parseInt(option.trim()) - 1;
+                if (index < columns.length) {
+                    String val = columns[index].trim().replace(",", "");
+                    if (!val.isEmpty()) return new BigDecimal(val);
+                }
+            } catch (Exception e) { }
+        }
+        return BigDecimal.ZERO; 
+    }
+
+    private BigDecimal applyAmountLogic(BigDecimal amount, String head, String logic) {
+        if (logic == null || !logic.contains("devide by 1000")) return amount;
+
+        // Start-of-string check for logic application
+        char firstChar = head.charAt(0);
+        if ("LASN".indexOf(firstChar) >= 0) {
+             return amount.divide(BigDecimal.valueOf(1000), 2, RoundingMode.HALF_UP);
+        }
+        return amount;
+    }
+
+    private String applyAmountFormat(BigDecimal amount, String formatInfo) {
+        String[] parts = formatInfo.split(",");
+        int totalLen = Integer.parseInt(parts[0]);
+        int decLen = Integer.parseInt(parts[1]);
+
+        BigDecimal scaled = amount.setScale(decLen, RoundingMode.HALF_UP);
+        String raw = scaled.toPlainString(); 
+
+        StringBuilder sb = new StringBuilder();
+        while (sb.length() + raw.length() < totalLen) {
+            sb.append("0");
+        }
+        sb.append(raw);
+        return sb.toString();
+    }
+
+    private String applyHeadPadding(String head, String paddingLogic) {
+        if (paddingLogic.startsWith("5")) {
+             String cleanHead = head.trim();
+             StringBuilder sb = new StringBuilder();
+             while (sb.length() + cleanHead.length() < 5) {
+                 sb.append("0");
+             }
+             sb.append(cleanHead);
+             return sb.toString();
+        }
+        return head;
+    }
+
+    private HeaderInfo parseHeaderFromInput(List<String> lines) {
+        HeaderInfo info = new HeaderInfo();
+        info.branchCode = "00000";
+        info.reportDate = "01012026";
+        for (String line : lines) {
+            if (line.contains("BRANCH ::")) {
+                Matcher m = Pattern.compile("BRANCH :: (\\d+)").matcher(line);
+                if (m.find()) info.branchCode = m.group(1);
+            }
+            if (line.contains("REPORT DATE ::")) {
+                Matcher m = Pattern.compile("REPORT DATE :: (\\S+)").matcher(line);
+                if (m.find()) info.reportDate = m.group(1);
+            }
+        }
+        return info;
+    }
+    
+    private static class HeaderInfo { String branchCode; String reportDate; }
+}
