@@ -1,4 +1,11 @@
+Here is the updated AsciiGenerationService.java file.
+I have made the following specific changes:
+ * generateReport: Removed the .replace("/", "") logic because the date is now normalized immediately upon reading.
+ * parseHeaderFromInput: Updated to use Regex Patterns so it can find "Branch" / "BRANCH" and "REPORT DATE" / "Current Year Date" dynamically.
+ * normalizeDate: Added this helper to convert various date formats (YYYY-MM-DD, DD/MM/YYYY) into the required DDMMYYYY format cleanly.
+<!-- end list -->
 package com.tcs.fincore.AsciiGenerationService.Service;
+
 import com.tcs.fincore.AsciiGenerationService.Model.AsciiConfig;
 import com.tcs.fincore.AsciiGenerationService.Repository.AsciiConfigRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -46,17 +53,20 @@ public class AsciiGenerationService {
         }
 
         List<String> lines = Files.readAllLines(inputPath);
+        
+        // 3. Parse Header Information (Branch & Date)
         HeaderInfo headerInfo = parseHeaderFromInput(lines);
 
         List<String> outputLines = new ArrayList<>();
 
-        // 3. Output Header
+        // 4. Output Header Construction
         String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
-        String dateFormatted = headerInfo.reportDate.replace("/", "");
-        String header = config.getOutputFirstLine() + branchPadded + dateFormatted + "F";
+        
+        // Note: headerInfo.reportDate is already normalized to DDMMYYYY by parseHeaderFromInput
+        String header = config.getOutputFirstLine() + branchPadded + headerInfo.reportDate + "F";
         outputLines.add(header);
 
-        // 4. Process Body
+        // 5. Process Body
         List<String> bufferedItems = new ArrayList<>();
         int batchSize = config.getOutputPerLineHead();
 
@@ -83,18 +93,90 @@ public class AsciiGenerationService {
             outputLines.add(String.join("", bufferedItems));
         }
 
-        // 5. Footer
+        // 6. Footer
         if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) {
             outputLines.add(config.getOutputEndLine());
         }
 
-        // 6. Write File
+        // 7. Write File
         String outputFileName = "GENERATED_" + config.getReportId() + config.getFileType();
         Path outputPath = inputPath.getParent().resolve(outputFileName);
         Files.write(outputPath, outputLines);
 
         return outputPath.toString();
     }
+
+    // --- UPDATED HEADER PARSING METHODS ---
+
+    private HeaderInfo parseHeaderFromInput(List<String> lines) {
+        HeaderInfo info = new HeaderInfo();
+        info.branchCode = "00000"; 
+        info.reportDate = "01012026"; 
+
+        // 1. Regex for Branch: Matches "BRANCH :: 123" or "Branch:: 123"
+        Pattern branchPattern = Pattern.compile("(?i)(?:BRANCH|Branch)\\s*::\\s*(\\d+)");
+
+        // 2. Regex for Date: Matches "REPORT DATE ::" or "Current Year Date::"
+        // Captures the value part (\S+)
+        Pattern datePattern1 = Pattern.compile("REPORT DATE\\s*::\\s*(\\S+)");
+        Pattern datePattern2 = Pattern.compile("Current Year Date\\s*::\\s*(\\S+)");
+
+        for (String line : lines) {
+            // Find Branch
+            Matcher mBranch = branchPattern.matcher(line);
+            if (mBranch.find()) {
+                info.branchCode = mBranch.group(1);
+            }
+
+            // Find Date (Standard)
+            Matcher mDate1 = datePattern1.matcher(line);
+            if (mDate1.find()) {
+                info.reportDate = normalizeDate(mDate1.group(1));
+            }
+            
+            // Find Date (Alternative/Dynamic)
+            Matcher mDate2 = datePattern2.matcher(line);
+            if (mDate2.find()) {
+                info.reportDate = normalizeDate(mDate2.group(1));
+            }
+        }
+        return info;
+    }
+
+    // Unified Date Normalizer: Converts known formats to DDMMYYYY
+    private String normalizeDate(String dateStr) {
+        if (dateStr == null) return "01012026";
+
+        // Try standard formatters first (Robust)
+        List<DateTimeFormatter> formatters = Arrays.asList(
+            DateTimeFormatter.ofPattern("dd-MM-yyyy"),
+            DateTimeFormatter.ofPattern("dd/MM/yyyy"),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd"), // Handles 2025-12-14
+            DateTimeFormatter.ofPattern("dd.MM.yyyy"),
+            DateTimeFormatter.ofPattern("MM-dd-yyyy"),
+            DateTimeFormatter.ofPattern("MM/dd/yyyy")
+        );
+
+        for (DateTimeFormatter formatter : formatters) {
+            try {
+                LocalDate date = LocalDate.parse(dateStr, formatter);
+                return date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+            } catch (DateTimeParseException e) {
+                // Continue to next format
+            }
+        }
+
+        // Fallback: If simple string manipulation is safer for your specific files
+        if (dateStr.contains("-") && dateStr.split("-").length == 3) {
+             // Quick handling for YYYY-MM-DD if DateTimeFormatter fails slightly
+             String[] parts = dateStr.split("-");
+             if (parts[0].length() == 4) return parts[2] + parts[1] + parts[0]; 
+        }
+
+        return "01012026"; // Default fallback
+    }
+
+    // --- UNCHANGED HELPER METHODS ---
 
     private boolean isValidRow(String[] cols, AsciiConfig config) {
         if (cols.length < 2) return false;
@@ -104,7 +186,6 @@ public class AsciiGenerationService {
         String head = cols[idx].trim();
         if (head.isEmpty()) return false;
 
-        // Strict start-of-string check
         return Pattern.compile(config.getInputHeadRegex()).matcher(head).lookingAt();
     }
 
@@ -115,63 +196,6 @@ public class AsciiGenerationService {
         String signedAmount = RuleParser.applySign(amountStr, amount, head, colIndex, config.getOutputAmtSign());
         String headPadded = RuleParser.applyHeadPadding(head, config.getOutputHeadColPad());
         return headPadded + signedAmount;
-    }
-
-    // (Keeping existing helpers for extracting columns and parsing headers...)
-    private HeaderInfo parseHeaderFromInput(List<String> lines) {
-        HeaderInfo info = new HeaderInfo();
-        info.branchCode = "00000"; info.reportDate = "01012026";
-        for (String line : lines) {
-            if (line.contains("BRANCH ::")) {
-                Matcher m = Pattern.compile("BRANCH :: (\\d+)").matcher(line);
-                if (m.find()) info.branchCode = m.group(1);
-            }
-//            if (line.contains("REPORT DATE ::")) {
-//                Matcher m = Pattern.compile("REPORT DATE :: (\\S+)").matcher(line);
-//                if (m.find()) info.reportDate = m.group(1);
-//            }
-
-            // Inside your method or loop where 'line' is processed:
-            if (line.contains("REPORT DATE ::")) {
-                Matcher m = Pattern.compile("REPORT DATE :: (\\S+)").matcher(line);
-                if (m.find()) {
-                    String dateStr = m.group(1);
-                    String normalizedDate = parseAndFormatDate(dateStr);
-                    if (normalizedDate != null) {
-                        info.reportDate = normalizedDate;
-                    } else {
-                        // Handle invalid date
-                        info.reportDate = "INVALID_DATE";
-                    }
-                }
-            }
-        }
-        return info;
-    }
-
-
-
-    // Method to parse various date formats and output DDMMYYYY
-    private String parseAndFormatDate(String dateStr) {
-        List<DateTimeFormatter> formatters = Arrays.asList(
-                DateTimeFormatter.ofPattern("dd-MM-yyyy"),
-                DateTimeFormatter.ofPattern("dd/MM/yyyy"),
-                DateTimeFormatter.ofPattern("yyyy-MM-dd"),
-                DateTimeFormatter.ofPattern("dd.MM.yyyy"),
-                DateTimeFormatter.ofPattern("MM-dd-yyyy"),
-                DateTimeFormatter.ofPattern("MM/dd/yyyy")
-                // Add more if needed
-        );
-
-        for (DateTimeFormatter formatter : formatters) {
-            try {
-                LocalDate date = LocalDate.parse(dateStr, formatter);
-                return date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
-            } catch (DateTimeParseException e) {
-                // Try next format
-            }
-        }
-        return null; // Return null if no format matches
     }
 
     private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
@@ -213,5 +237,3 @@ public class AsciiGenerationService {
     private static class HeaderInfo { String branchCode; String reportDate; }
 }
 
-
-this is my current function date convertion and all
