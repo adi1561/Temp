@@ -1,39 +1,63 @@
-DELETE FROM ASCII_CONFIG WHERE ID = 104;
+You can add a dedicated rule called "remove_decimal" (or just "remove") to your applyDecimalLogic function. This will effectively multiply by the fractional part's power (e.g., .29 becomes 29) so 123.29 turns into 12329.
+Here is the updated applyDecimalLogic method for your RuleParser.java.
+🛠️ Updated Method: applyDecimalLogic
+Replace your existing method with this one. It now supports the "remove_decimal" rule.
+    // --- 2. DECIMAL LOGIC (CHAINED & UPDATED) ---
+    public static BigDecimal applyDecimalLogic(BigDecimal amount, String head, int colIdx, String decimalConfig) {
+        if (decimalConfig == null) return amount;
+        
+        Matcher m = RULE_PATTERN.matcher(decimalConfig);
+        while (m.find()) {
+            String headRegex = m.group(1);
+            String colReq = m.group(2);
+            String rule = m.group(3);
 
-INSERT INTO ASCII_CONFIG (
-    ID, 
-    REPORT_ID, 
-    FILE_TYPE, 
-    INPUT_FILE_NAME, 
-    OUTPUT_FIRST_LINE, 
-    OUTPUT_END_LINE, 
-    INPUT_HEAD_COL, 
-    INPUT_HEAD_REGEX, 
-    OUTPUT_HEAD_COL_PAD, 
-    AMOUNT_COL_SEQ, 
-    OUTPUT_AMT_COL_LOGIC, 
-    OUTPUT_AMT_DECIMAL, 
-    OUTPUT_AMT_COL_PAD, 
-    OUTPUT_AMT_SIGN, 
-    OUTPUT_PER_LINE_HEAD,
-    OUTPUT_INCLUDE_CONDITION
-) VALUES (
-    104, 
-    'pnl', 
-    '.PL', 
-    'pnl_report_31122025.psv', 
-    'BPEP1', 
-    'EWEP', 
-    4, 
-    '^\d{5}$', 
-    '5L0', 
-    '5and1', 
-    NULL, -- Logic column appeared empty in your paste
-    '["^.*"][5][down]|["^.*"][1][down]|["^.*"][5][2]|["^.*"][1][2]', 
-    '["^.*"][5][19,0]|["^.*"][1][19,0]', 
-    '["^.*"][3][SHOW_SIGN]', -- This is the rule adding the + sign
-    1,
-    '["^.*"][5][!=0]|["^.*"][1][ALWAYS]'
-);
+            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
+            boolean headMatch = Pattern.compile(headRegex).matcher(head).lookingAt();
+
+            if (colMatch && headMatch) {
+                if (rule.equalsIgnoreCase("floor")) {
+                    amount = amount.setScale(0, RoundingMode.FLOOR);
+                } else if (rule.equalsIgnoreCase("ceil")) {
+                    amount = amount.setScale(0, RoundingMode.CEILING);
+                } else if (rule.equalsIgnoreCase("round")) {
+                    amount = amount.setScale(0, RoundingMode.HALF_UP);
+                } else if (rule.equalsIgnoreCase("down")) {
+                    amount = amount.setScale(0, RoundingMode.DOWN); 
+                } 
+                // NEW RULE: Remove Decimal (123.29 -> 12329)
+                else if (rule.equalsIgnoreCase("remove_decimal") || rule.equalsIgnoreCase("remove")) {
+                    // Move the decimal point to the right equal to the scale
+                    // e.g. 123.29 (scale 2) -> 12329
+                    amount = amount.movePointRight(amount.scale());
+                } 
+                else {
+                    try {
+                        int scale = Integer.parseInt(rule);
+                        amount = amount.setScale(scale, RoundingMode.HALF_UP);
+                    } catch (NumberFormatException e) {}
+                }
+            }
+        }
+        return amount;
+    }
+
+🚀 How to Use It in Database
+Now you don't need to chain *100. You can just use this single clean rule.
+UPDATE ASCII_CONFIG 
+SET 
+    -- This single rule turns 123.29 into 12329 directly
+    OUTPUT_AMT_DECIMAL = '["^.*"][5][remove_decimal]|["^.*"][1][remove_decimal]',
+
+    -- Ensure padding treats it as an integer (0 decimals)
+    OUTPUT_AMT_COL_PAD = '["^.*"][5][19,0]|["^.*"][1][19,0]'
+
+WHERE ID = 104;
 
 COMMIT;
+
+🧠 How it works
+ * Input: 123.29 (Scale is 2)
+ * Code: amount.movePointRight(2)
+ * Result: 12329
+ * Padding: [19,0] formats it to 0000000000000012329.
