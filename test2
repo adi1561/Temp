@@ -1,12 +1,10 @@
-You are absolutely right. The issue is that the optimization switched from Files.write (which automatically adds a new line for every list item) to BufferedWriter.write (which writes everything on one single continuous line unless told otherwise).
-This caused your output to look like one giant, messy block of text instead of neat rows.
-Here is the Fixed AsciiGenerationService.java. I have restored the exact formatting structure by explicitly adding writer.newLine() exactly where the old code did.
-🛠️ Fixed AsciiGenerationService.java
-Changes Made:
- * Added writer.newLine() after the Header.
- * Added writer.newLine() after every completed Batch Row (the "Gap" you were missing).
- * Added writer.newLine() before the Footer.
-<!-- end list -->
+Here is the updated AsciiGenerationService.java with the specific changes you requested:
+ * File Extension Fix: The output file name now explicitly uses the FILE_TYPE from the database (e.g., .WK, .PL) instead of just keeping the original input extension.
+ * Timing Logs: I added System.currentTimeMillis() start and end capture to show exactly how many milliseconds each file takes to process.
+ * Exception Handling: You are correct; you do not need a Global Exception Handler (@ControllerAdvice) for this.
+   * Why? Because these tasks run in background threads. A Global Handler only catches HTTP request errors. It cannot catch errors inside a separate thread.
+   * The Fix: We handle exceptions locally inside the processSingleFile method. If one file fails, we catch the error, log it, and let the thread move on to the next file safely.
+🛠️ Updated: AsciiGenerationService.java
 package com.tcs.fincore.AsciiGenerationService.Service;
 
 import com.tcs.fincore.AsciiGenerationService.DTO.FileJob;
@@ -53,62 +51,76 @@ public class AsciiGenerationService {
 
     // --- 1. THE DISCOVERY PHASE ---
     public String initiateBatch(Long configId) {
-        AsciiConfig config = configRepo.findById(configId)
-                .orElseThrow(() -> new RuntimeException("Config not found: " + configId));
+        long startTime = System.currentTimeMillis(); // Start Timer for Batch Scan
+        log.info("Batch Initiation Started for Config ID: {}", configId);
 
-        String reportId = config.getReportId(); 
-        String searchKeyword = reportId.contains("_") ? reportId.split("_")[0] : reportId; 
-        
-        log.info("Scanning folder '{}' for files matching keyword: '{}'", baseDirectoryPath, searchKeyword);
+        try {
+            AsciiConfig config = configRepo.findById(configId)
+                    .orElseThrow(() -> new RuntimeException("Config not found: " + configId));
 
-        int filesFound = 0;
-        Path baseDir = Paths.get(baseDirectoryPath);
-
-        if (!Files.exists(baseDir) || !Files.isDirectory(baseDir)) {
-            throw new RuntimeException("Base directory does not exist: " + baseDirectoryPath);
-        }
-
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(baseDir, entry -> 
-                Files.isRegularFile(entry) && entry.getFileName().toString().contains(searchKeyword))) {
+            String reportId = config.getReportId(); 
+            String searchKeyword = reportId.contains("_") ? reportId.split("_")[0] : reportId; 
             
-            for (Path entry : stream) {
-                jobQueueManager.submitFileJob(new FileJob(configId, entry));
-                filesFound++;
+            Path baseDir = Paths.get(baseDirectoryPath);
+            if (!Files.exists(baseDir) || !Files.isDirectory(baseDir)) {
+                throw new RuntimeException("Base directory does not exist: " + baseDirectoryPath);
             }
-        } catch (IOException e) {
-            log.error("Error scanning directory", e);
-            throw new RuntimeException("Directory scan failed");
-        }
 
-        return "Batch Initiated. Found " + filesFound + " files matching '" + searchKeyword + "'. Processing in background.";
+            int filesFound = 0;
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(baseDir, entry -> 
+                    Files.isRegularFile(entry) && entry.getFileName().toString().contains(searchKeyword))) {
+                
+                for (Path entry : stream) {
+                    jobQueueManager.submitFileJob(new FileJob(configId, entry));
+                    filesFound++;
+                }
+            }
+
+            long duration = System.currentTimeMillis() - startTime;
+            log.info("Batch Scan Completed. Found {} files in {} ms.", filesFound, duration);
+
+            return "Batch Initiated. Found " + filesFound + " files. Scanning took " + duration + " ms.";
+
+        } catch (Exception e) {
+            log.error("Error during Batch Initiation", e);
+            throw new RuntimeException("Failed to initiate batch: " + e.getMessage());
+        }
     }
 
-    // --- 2. THE WORKER PHASE (Fixed Formatting) ---
+    // --- 2. THE WORKER PHASE (With Timing & Local Exception Handling) ---
     public void processSingleFile(FileJob job) {
         Path inputPath = job.getFilePath();
         Long id = job.getConfigId();
+        long startTime = System.currentTimeMillis(); // Start Timer for Single File
 
         log.info("Processing File: {}", inputPath.getFileName());
         
         try {
             AsciiConfig config = configRepo.findById(id).orElseThrow(); 
 
-            String outputFileName = "GENERATED_" + config.getReportId() + "_" + System.currentTimeMillis() + "_" + inputPath.getFileName();
+            // --- FILE EXTENSION FIX ---
+            // 1. Get original file name
+            String originalName = inputPath.getFileName().toString();
+            // 2. Remove old extension (e.g., .psv)
+            String baseName = originalName.contains(".") ? originalName.substring(0, originalName.lastIndexOf('.')) : originalName;
+            // 3. Construct new name: GENERATED_ReportId_OriginalName_Timestamp + DB_FILE_TYPE
+            String outputFileName = "GENERATED_" + config.getReportId() + "_" + baseName + "_" + System.currentTimeMillis() + config.getFileType();
+            
             Path outputPath = inputPath.getParent().resolve(outputFileName);
 
             // --- STREAMING PROCESSING ---
             try (Stream<String> lines = Files.lines(inputPath);
                  BufferedWriter writer = Files.newBufferedWriter(outputPath)) {
 
-                // 1. Header (Write & New Line)
+                // Header
                 HeaderInfo headerInfo = parseHeaderEfficiently(inputPath);
                 String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
                 String header = config.getOutputFirstLine() + branchPadded + headerInfo.reportDate + "F";
                 
                 writer.write(header);
-                writer.newLine(); // <--- RESTORED: Ensures Header is on its own line
+                writer.newLine();
 
-                // 2. Body
+                // Body
                 List<String> lineBuffer = new ArrayList<>();
                 int batchSize = config.getOutputPerLineHead();
 
@@ -118,34 +130,38 @@ public class AsciiGenerationService {
                         if (processedRecord != null) {
                             lineBuffer.add(processedRecord);
                             
-                            // Handle Batching
                             if (lineBuffer.size() == batchSize) {
                                 writer.write(String.join("", lineBuffer));
-                                writer.newLine(); // <--- RESTORED: Ensures records are on separate lines
+                                writer.newLine();
                                 lineBuffer.clear();
                             }
                         }
                     } catch (Exception e) {
-                        log.error("Row error in {}", inputPath.getFileName(), e);
+                        // LOCAL EXCEPTION HANDLING: Log error for this specific row, but continue processing the file
+                        log.error("Row processing error in file: {} | Row Data: {}", inputPath.getFileName(), line, e);
                     }
                 });
 
-                // Flush remaining buffer
                 if (!lineBuffer.isEmpty()) {
                      writer.write(String.join("", lineBuffer));
-                     writer.newLine(); // <--- RESTORED: Ensures final partial row has a line break
+                     writer.newLine();
                 }
 
-                // 3. Footer
+                // Footer
                 if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) {
                     writer.write(config.getOutputEndLine());
-                    // writer.newLine(); // Optional: Add newline at absolute end of file if desired
                 }
             }
-            log.info("Completed: {}", inputPath.getFileName());
 
+            long duration = System.currentTimeMillis() - startTime;
+            log.info("COMPLETED: {} | Time Taken: {} ms", outputFileName, duration);
+
+        } catch (IOException e) {
+            // LOCAL EXCEPTION HANDLING: IO Errors (Permission, Disk Space, etc.)
+            log.error("I/O Error processing file: {}", inputPath, e);
         } catch (Exception e) {
-            log.error("Failed to process file: " + inputPath, e);
+            // LOCAL EXCEPTION HANDLING: Unexpected crashes
+            log.error("CRITICAL Failed to process file: {}", inputPath, e);
         }
     }
 
