@@ -1,78 +1,276 @@
-This error occurs because you have created a Circular Dependency (A loop):
- * AsciiGenerationService needs JobQueueManager (To submit the 25,000 files it finds).
- * JobQueueManager needs AsciiGenerationService (To ask it to process a file).
-Spring cannot decide which one to create first.
-✅ The Fix: Use @Lazy
-You need to tell Spring to initialize one of them "Lazily" (only when needed, not at startup). The best place to put this is in the JobQueueManager.
-Update JobQueueManager.java and add the @Lazy annotation to the AsciiGenerationService injection.
-Updated JobQueueManager.java
+You are absolutely right. The issue is that the optimization switched from Files.write (which automatically adds a new line for every list item) to BufferedWriter.write (which writes everything on one single continuous line unless told otherwise).
+This caused your output to look like one giant, messy block of text instead of neat rows.
+Here is the Fixed AsciiGenerationService.java. I have restored the exact formatting structure by explicitly adding writer.newLine() exactly where the old code did.
+🛠️ Fixed AsciiGenerationService.java
+Changes Made:
+ * Added writer.newLine() after the Header.
+ * Added writer.newLine() after every completed Batch Row (the "Gap" you were missing).
+ * Added writer.newLine() before the Footer.
+<!-- end list -->
 package com.tcs.fincore.AsciiGenerationService.Service;
 
 import com.tcs.fincore.AsciiGenerationService.DTO.FileJob;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
+import com.tcs.fincore.AsciiGenerationService.Model.AsciiConfig;
+import com.tcs.fincore.AsciiGenerationService.Repository.AsciiConfigRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Lazy; // <--- IMPORT THIS
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 @Service
 @Slf4j
-public class JobQueueManager {
+public class AsciiGenerationService {
 
-    private final AsciiGenerationService asciiService;
-
-    // Use Constructor Injection with @Lazy to break the cycle
     @Autowired
-    public JobQueueManager(@Lazy AsciiGenerationService asciiService) {
-        this.asciiService = asciiService;
+    private AsciiConfigRepository configRepo;
+
+    @Autowired
+    private JobQueueManager jobQueueManager; 
+
+    @Value("${app.input.base.path}")
+    private String baseDirectoryPath;
+
+    private static final Map<String, Pattern> INPUT_REGEX_CACHE = new ConcurrentHashMap<>();
+
+    // --- 1. THE DISCOVERY PHASE ---
+    public String initiateBatch(Long configId) {
+        AsciiConfig config = configRepo.findById(configId)
+                .orElseThrow(() -> new RuntimeException("Config not found: " + configId));
+
+        String reportId = config.getReportId(); 
+        String searchKeyword = reportId.contains("_") ? reportId.split("_")[0] : reportId; 
+        
+        log.info("Scanning folder '{}' for files matching keyword: '{}'", baseDirectoryPath, searchKeyword);
+
+        int filesFound = 0;
+        Path baseDir = Paths.get(baseDirectoryPath);
+
+        if (!Files.exists(baseDir) || !Files.isDirectory(baseDir)) {
+            throw new RuntimeException("Base directory does not exist: " + baseDirectoryPath);
+        }
+
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(baseDir, entry -> 
+                Files.isRegularFile(entry) && entry.getFileName().toString().contains(searchKeyword))) {
+            
+            for (Path entry : stream) {
+                jobQueueManager.submitFileJob(new FileJob(configId, entry));
+                filesFound++;
+            }
+        } catch (IOException e) {
+            log.error("Error scanning directory", e);
+            throw new RuntimeException("Directory scan failed");
+        }
+
+        return "Batch Initiated. Found " + filesFound + " files matching '" + searchKeyword + "'. Processing in background.";
     }
 
-    // The Queue: Holds 'FileJob' (Config ID + Specific File Path)
-    private final BlockingQueue<FileJob> jobQueue = new LinkedBlockingQueue<>();
-    
-    // 10 Threads processing files in parallel
-    private final ExecutorService executorService = Executors.newFixedThreadPool(10);
-    
-    private volatile boolean running = true;
+    // --- 2. THE WORKER PHASE (Fixed Formatting) ---
+    public void processSingleFile(FileJob job) {
+        Path inputPath = job.getFilePath();
+        Long id = job.getConfigId();
 
-    @PostConstruct
-    public void startWorkers() {
-        Thread dispatcher = new Thread(() -> {
-            while (running) {
-                try {
-                    FileJob job = jobQueue.take(); 
-                    executorService.submit(() -> asciiService.processSingleFile(job));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
+        log.info("Processing File: {}", inputPath.getFileName());
+        
+        try {
+            AsciiConfig config = configRepo.findById(id).orElseThrow(); 
+
+            String outputFileName = "GENERATED_" + config.getReportId() + "_" + System.currentTimeMillis() + "_" + inputPath.getFileName();
+            Path outputPath = inputPath.getParent().resolve(outputFileName);
+
+            // --- STREAMING PROCESSING ---
+            try (Stream<String> lines = Files.lines(inputPath);
+                 BufferedWriter writer = Files.newBufferedWriter(outputPath)) {
+
+                // 1. Header (Write & New Line)
+                HeaderInfo headerInfo = parseHeaderEfficiently(inputPath);
+                String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
+                String header = config.getOutputFirstLine() + branchPadded + headerInfo.reportDate + "F";
+                
+                writer.write(header);
+                writer.newLine(); // <--- RESTORED: Ensures Header is on its own line
+
+                // 2. Body
+                List<String> lineBuffer = new ArrayList<>();
+                int batchSize = config.getOutputPerLineHead();
+
+                lines.forEach(line -> {
+                    try {
+                        String processedRecord = transformLine(line, config);
+                        if (processedRecord != null) {
+                            lineBuffer.add(processedRecord);
+                            
+                            // Handle Batching
+                            if (lineBuffer.size() == batchSize) {
+                                writer.write(String.join("", lineBuffer));
+                                writer.newLine(); // <--- RESTORED: Ensures records are on separate lines
+                                lineBuffer.clear();
+                            }
+                        }
+                    } catch (Exception e) {
+                        log.error("Row error in {}", inputPath.getFileName(), e);
+                    }
+                });
+
+                // Flush remaining buffer
+                if (!lineBuffer.isEmpty()) {
+                     writer.write(String.join("", lineBuffer));
+                     writer.newLine(); // <--- RESTORED: Ensures final partial row has a line break
+                }
+
+                // 3. Footer
+                if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) {
+                    writer.write(config.getOutputEndLine());
+                    // writer.newLine(); // Optional: Add newline at absolute end of file if desired
                 }
             }
-        });
-        dispatcher.setName("Job-Dispatcher");
-        dispatcher.start();
-        log.info("Batch Processor Started. Waiting for jobs...");
+            log.info("Completed: {}", inputPath.getFileName());
+
+        } catch (Exception e) {
+            log.error("Failed to process file: " + inputPath, e);
+        }
     }
 
-    public void submitFileJob(FileJob job) {
-        jobQueue.offer(job);
+    // --- Helpers (Unchanged) ---
+    private String transformLine(String line, AsciiConfig config) {
+        String[] columns = line.split("\\|", -1);
+        if (!isValidRow(columns, config)) return null;
+
+        List<ProcessingItem> itemsToProcess = extractAmountColumns(columns, config);
+        if (itemsToProcess.isEmpty()) return null;
+
+        StringBuilder amountsOnlyBuilder = new StringBuilder();
+        boolean hasValidContent = false;
+
+        for (ProcessingItem item : itemsToProcess) {
+            BigDecimal finalAmt = RuleParser.applyMathLogic(item.amount, item.head, item.colIndex, config.getOutputAmtColLogic());
+            finalAmt = RuleParser.applyDecimalLogic(finalAmt, item.head, item.colIndex, config.getOutputAmtDecimal());
+
+            if (RuleParser.shouldIncludeValue(finalAmt, item.head, item.colIndex, config.getOutputIncludeCondition())) {
+                String amountStr = RuleParser.applyAmountPadding(finalAmt, item.head, item.colIndex, config.getOutputAmtColPad());
+                String signedAmt = RuleParser.applySign(amountStr, finalAmt, item.head, item.colIndex, config.getOutputAmtSign());
+                amountsOnlyBuilder.append(signedAmt);
+                hasValidContent = true;
+            }
+        }
+
+        if (hasValidContent) {
+            String head = itemsToProcess.get(0).head;
+            String headPadded = RuleParser.applyHeadPadding(head, config.getOutputHeadColPad());
+            return headPadded + amountsOnlyBuilder.toString();
+        }
+        return null;
+    }
+
+    private HeaderInfo parseHeaderEfficiently(Path path) {
+        HeaderInfo info = new HeaderInfo();
+        info.branchCode = "00000"; info.reportDate = "01012026";
+        Pattern branchPattern = Pattern.compile("(?i)(?:BRANCH|Branch)\\s*::\\s*(\\d+)");
+        Pattern datePattern1 = Pattern.compile("REPORT DATE\\s*::\\s*(\\S+)");
+        Pattern datePattern2 = Pattern.compile("Current Year Date\\s*::\\s*(\\S+)");
+
+        try (Stream<String> stream = Files.lines(path).limit(50)) { 
+            stream.forEach(line -> {
+                Matcher mBranch = branchPattern.matcher(line);
+                if (mBranch.find()) info.branchCode = mBranch.group(1);
+                Matcher mDate1 = datePattern1.matcher(line);
+                if (mDate1.find()) info.reportDate = normalizeDate(mDate1.group(1));
+                Matcher mDate2 = datePattern2.matcher(line);
+                if (mDate2.find()) info.reportDate = normalizeDate(mDate2.group(1));
+            });
+        } catch (IOException e) { log.warn("Header read error", e); }
+        return info;
+    }
+
+    private boolean isValidRow(String[] cols, AsciiConfig config) {
+        if (cols.length < 2) return false;
+        int idx = config.getInputHeadCol() - 1;
+        if (cols.length <= idx) return false;
+        String head = cols[idx].trim();
+        if (head.isEmpty()) return false;
+        Pattern p = INPUT_REGEX_CACHE.computeIfAbsent(config.getInputHeadRegex(), Pattern::compile);
+        return p.matcher(head).lookingAt();
+    }
+
+    private String normalizeDate(String dateStr) {
+        if (dateStr == null) return "01012026";
+        List<DateTimeFormatter> formatters = Arrays.asList(
+            DateTimeFormatter.ofPattern("dd-MM-yyyy"), DateTimeFormatter.ofPattern("dd/MM/yyyy"),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd"), DateTimeFormatter.ofPattern("dd.MM.yyyy"),
+            DateTimeFormatter.ofPattern("MM-dd-yyyy")
+        );
+        for (DateTimeFormatter formatter : formatters) {
+            try { return LocalDate.parse(dateStr, formatter).format(DateTimeFormatter.ofPattern("ddMMyyyy")); } 
+            catch (DateTimeParseException e) {}
+        }
+        if (dateStr.contains("-") && dateStr.split("-").length == 3) {
+             String[] parts = dateStr.split("-");
+             if (parts[0].length() == 4) return parts[2] + parts[1] + parts[0]; 
+        }
+        return "01012026";
+    }
+
+    private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
+        List<ProcessingItem> items = new ArrayList<>();
+        String head = cols[config.getInputHeadCol() - 1].trim();
+        String seq = config.getAmountColSeq();
+
+        if (seq.contains("else")) {
+            String[] parts = seq.split("else");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                if (idx < cols.length && !cols[idx].trim().isEmpty()) {
+                    items.add(new ProcessingItem(head, parseAmount(cols[idx]), idx + 1));
+                    return items;
+                }
+            }
+            items.add(new ProcessingItem(head, BigDecimal.ZERO, Integer.parseInt(parts[0].trim())));
+        } else if (seq.contains("and")) {
+            String[] parts = seq.split("and");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+            }
+        } else {
+            int idx = Integer.parseInt(seq.trim()) - 1;
+            items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+        }
+        return items;
+    }
+
+    private BigDecimal parseAmount(String[] cols, int idx) {
+        if (idx >= cols.length) return BigDecimal.ZERO;
+        return parseAmount(cols[idx]);
+    }
+    private BigDecimal parseAmount(String val) {
+        try { 
+            if(val == null || val.trim().isEmpty()) return BigDecimal.ZERO;
+            return new BigDecimal(val.trim().replace(",", "")); 
+        } catch (Exception e) { return BigDecimal.ZERO; }
     }
     
-    public int getQueueSize() {
-        return jobQueue.size();
+    private static class ProcessingItem { 
+        String head; BigDecimal amount; int colIndex; 
+        ProcessingItem(String h, BigDecimal a, int c) { head=h; amount=a; colIndex=c; } 
     }
-
-    @PreDestroy
-    public void shutdown() {
-        running = false;
-        executorService.shutdown();
-    }
+    private static class HeaderInfo { String branchCode; String reportDate; }
 }
 
-🧠 Why this works
-By adding @Lazy, Spring will start JobQueueManager immediately but inject a "Proxy" (a placeholder) for AsciiGenerationService. It won't try to fully create the Service until the first time you actually use it inside the worker thread. This breaks the startup loop.
