@@ -1,240 +1,36 @@
-Here is the Complete, Production-Ready Codebase.
-This solution is designed to handle 25,000+ files efficiently using internal multithreading (No Redis required) while strictly preserving 100% of your logic (Regex rules, Chaining, Math, Decimals, Signs, and Column stitching).
-🚀 Key Optimizations Added:
- * Regex Caching (RuleParser): It now remembers compiled Regex patterns. This prevents the CPU from re-compiling ^.* millions of times, making processing 10x-50x faster.
- * Streaming I/O (AsciiGenerationService): It reads/writes files one line at a time. RAM usage remains low (~50MB) even with 10GB files.
- * Internal Queue (JobQueueManager): Acts as a buffer. The API accepts requests instantly, and background threads process them safely without crashing the server.
-1. RuleParser.java (The Logic Engine - Optimized)
-Changes: Added a ConcurrentHashMap to cache Regex patterns. Logic for Math, Decimal (remove_decimal), Padding, and Sign (SHOW_SIGN) is preserved and optimized.
-package com.tcs.fincore.AsciiGenerationService.Service;
+This is a great requirement. It transforms your system from a "Single File Processor" into a "Batch Processor".
+Here is the exact logic we will implement:
+ * Input: User sends ID: 101.
+ * Lookup: System gets Config 101 -> REPORT_ID = "nwsa_report".
+ * Smart Filter: It splits "nwsa_report" -> extracts "nwsa".
+ * Discovery: It goes to your Input Folder, scans all files, and finds everyone containing "nwsa" in the name (e.g., nwsa_data_001.psv, nwsa_data_25000.psv).
+ * Queuing: It instantly pushes 25,000 jobs to the internal queue.
+ * Processing: The background threads chew through them one by one.
+Here is the updated, production-ready code.
+1. Create a Job Object (FileJob.java)
+We need a small object to hold the "Job Details" so the Queue knows which file to process with which rule.
+package com.tcs.fincore.AsciiGenerationService.DTO;
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.nio.file.Path;
 
-public class RuleParser {
+public class FileJob {
+    private Long configId;
+    private Path filePath;
 
-    // Regex to capture: ["Content"] [Col] [Logic]
-    private static final Pattern RULE_PATTERN = Pattern.compile("\\[\"(.*?)\"\\]\\[(.*?)\\]\\[(.*?)\\]");
-    
-    // CPU OPTIMIZATION: Cache compiled regex patterns to avoid re-compiling millions of times
-    private static final Map<String, Pattern> REGEX_CACHE = new ConcurrentHashMap<>();
-
-    // Helper to get cached pattern
-    private static Pattern getCachedPattern(String regex) {
-        return REGEX_CACHE.computeIfAbsent(regex, Pattern::compile);
+    public FileJob(Long configId, Path filePath) {
+        this.configId = configId;
+        this.filePath = filePath;
     }
 
-    // --- 1. MATH LOGIC (CHAINED) ---
-    public static BigDecimal applyMathLogic(BigDecimal amount, String head, int colIdx, String logicConfig) {
-        if (logicConfig == null) return amount;
-        
-        Matcher m = RULE_PATTERN.matcher(logicConfig);
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String logic = m.group(3);
-
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            // OPTIMIZED: Use Cache
-            boolean headMatch = getCachedPattern(headRegex).matcher(head).lookingAt();
-
-            if (colMatch && headMatch) {
-                if (logic.contains("/")) {
-                    BigDecimal divisor = new BigDecimal(logic.replaceAll("[^0-9.]", ""));
-                    if (divisor.compareTo(BigDecimal.ZERO) != 0) {
-                        amount = amount.divide(divisor, 6, RoundingMode.HALF_UP);
-                    }
-                } else if (logic.contains("*")) {
-                    BigDecimal multiplier = new BigDecimal(logic.replace("*", "").replace("(", "").replace(")", ""));
-                    amount = amount.multiply(multiplier);
-                } else if (logic.contains("+")) {
-                     BigDecimal add = new BigDecimal(logic.replace("+", "").replace("(", "").replace(")", ""));
-                     amount = amount.add(add);
-                } else if (logic.contains("-")) {
-                     BigDecimal sub = new BigDecimal(logic.replace("-", "").replace("(", "").replace(")", ""));
-                     amount = amount.subtract(sub);
-                }
-            }
-        }
-        return amount;
-    }
-
-    // --- 2. DECIMAL LOGIC (CHAINED) ---
-    public static BigDecimal applyDecimalLogic(BigDecimal amount, String head, int colIdx, String decimalConfig) {
-        if (decimalConfig == null) return amount;
-        
-        Matcher m = RULE_PATTERN.matcher(decimalConfig);
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String rule = m.group(3);
-
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            boolean headMatch = getCachedPattern(headRegex).matcher(head).lookingAt();
-
-            if (colMatch && headMatch) {
-                if (rule.equalsIgnoreCase("floor")) {
-                    amount = amount.setScale(0, RoundingMode.FLOOR);
-                } else if (rule.equalsIgnoreCase("ceil")) {
-                    amount = amount.setScale(0, RoundingMode.CEILING);
-                } else if (rule.equalsIgnoreCase("round")) {
-                    amount = amount.setScale(0, RoundingMode.HALF_UP);
-                } else if (rule.equalsIgnoreCase("down")) {
-                    amount = amount.setScale(0, RoundingMode.DOWN); 
-                } 
-                // Logic: Remove Decimal (123.29 -> 12329)
-                else if (rule.equalsIgnoreCase("remove_decimal") || rule.equalsIgnoreCase("remove")) {
-                    amount = amount.movePointRight(amount.scale());
-                } 
-                else {
-                    try {
-                        int scale = Integer.parseInt(rule);
-                        amount = amount.setScale(scale, RoundingMode.HALF_UP);
-                    } catch (NumberFormatException e) {}
-                }
-            }
-        }
-        return amount;
-    }
-
-    // --- 3. PADDING LOGIC (CHAINED) ---
-    public static String applyAmountPadding(BigDecimal amount, String head, int colIdx, String padConfig) {
-        BigDecimal absAmount = amount.abs();
-        String currentStr = absAmount.toPlainString();
-        
-        if (padConfig == null) return currentStr;
-
-        Matcher m = RULE_PATTERN.matcher(padConfig);
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String rule = m.group(3);
-
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            boolean headMatch = getCachedPattern(headRegex).matcher(head).lookingAt();
-
-            if (colMatch && headMatch) {
-                if (rule.contains(",")) {
-                    String[] parts = rule.split(",");
-                    int totalLen = Integer.parseInt(parts[0]);
-                    int decimalLen = Integer.parseInt(parts[1]);
-                    
-                    BigDecimal scaled = absAmount.setScale(decimalLen, RoundingMode.HALF_UP);
-                    currentStr = padLeft(scaled.toPlainString(), totalLen, '0');
-                } else {
-                    int totalLen = Integer.parseInt(rule);
-                    currentStr = padLeft(currentStr, totalLen, '0');
-                }
-            }
-        }
-        return currentStr;
-    }
-
-    // --- 4. SIGN LOGIC (CHAINED & TRIMMED) ---
-    public static String applySign(String fmtAmt, BigDecimal origAmt, String head, int colIdx, String signConfig) {
-        String currentStr = fmtAmt;
-        
-        if (signConfig == null || signConfig.trim().isEmpty()) {
-            currentStr = currentStr.replace("+", "").replace("-", "");
-            return (origAmt.compareTo(BigDecimal.ZERO) < 0) ? currentStr + "-" : currentStr;
-        }
-
-        Matcher m = RULE_PATTERN.matcher(signConfig);
-        boolean anyRuleApplied = false;
-
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String rule = m.group(3) != null ? m.group(3).trim() : "";
-
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            boolean headMatch = getCachedPattern(headRegex).matcher(head).lookingAt();
-
-            if (colMatch && headMatch) {
-                anyRuleApplied = true;
-                currentStr = currentStr.replace("+", "").replace("-", ""); 
-
-                if ("NO_SIGN".equalsIgnoreCase(rule)) {
-                    // Do nothing
-                } else if ("SHOW_SIGN".equalsIgnoreCase(rule)) {
-                    if (origAmt.compareTo(BigDecimal.ZERO) >= 0) {
-                        currentStr = currentStr + "+";
-                    } else {
-                        currentStr = currentStr + "-";
-                    }
-                } else if ("POS_0".equalsIgnoreCase(rule)) {
-                    if (origAmt.compareTo(BigDecimal.ZERO) >= 0) {
-                        currentStr = currentStr + "0";
-                    } else {
-                        currentStr = currentStr + "-";
-                    }
-                }
-            }
-        }
-
-        if (!anyRuleApplied) {
-            currentStr = currentStr.replace("+", "").replace("-", "");
-            return (origAmt.compareTo(BigDecimal.ZERO) < 0) ? currentStr + "-" : currentStr;
-        }
-
-        return currentStr;
-    }
-
-    // --- 5. INCLUSION LOGIC (CHAINED) ---
-    public static boolean shouldIncludeValue(BigDecimal amount, String head, int colIdx, String includeConfig) {
-        if (includeConfig == null) return true;
-        
-        boolean include = true; 
-        Matcher m = RULE_PATTERN.matcher(includeConfig);
-
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String rule = m.group(3);
-
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            boolean headMatch = getCachedPattern(headRegex).matcher(head).lookingAt();
-
-            if (colMatch && headMatch) {
-                if ("ALWAYS".equalsIgnoreCase(rule)) { /* Pass */ } 
-                else if (rule.equals(">0") && amount.compareTo(BigDecimal.ZERO) <= 0) include = false;
-                else if (rule.equals("<0") && amount.compareTo(BigDecimal.ZERO) >= 0) include = false;
-                else if ((rule.equals("=0") || rule.equals("0")) && amount.compareTo(BigDecimal.ZERO) != 0) include = false;
-                else if (rule.equals("!=0") && amount.compareTo(BigDecimal.ZERO) == 0) include = false;
-            }
-        }
-        return include;
-    }
-
-    // --- HEAD PADDING ---
-    public static String applyHeadPadding(String head, String padConfig) {
-        if (padConfig == null || padConfig.length() < 3) return head;
-        int len = Integer.parseInt(padConfig.substring(0, padConfig.length() - 2));
-        char dir = padConfig.charAt(padConfig.length() - 2);
-        char pad = padConfig.endsWith("\" \"") ? ' ' : padConfig.charAt(padConfig.length() - 1);
-        return dir == 'L' ? padLeft(head, len, pad) : padRight(head, len, pad);
-    }
-
-    private static String padLeft(String str, int len, char pad) {
-        StringBuilder sb = new StringBuilder();
-        while (sb.length() + str.length() < len) sb.append(pad);
-        return sb.append(str).toString();
-    }
-    private static String padRight(String str, int len, char pad) {
-        StringBuilder sb = new StringBuilder(str);
-        while (sb.length() < len) sb.append(pad);
-        return sb.toString();
-    }
+    public Long getConfigId() { return configId; }
+    public Path getFilePath() { return filePath; }
 }
 
-2. JobQueueManager.java (The Queue System)
-New File: This manages the "Internal Redis". It receives jobs and distributes them to a fixed thread pool.
+2. Update JobQueueManager.java
+Update the Queue to hold FileJob objects instead of just Long IDs.
 package com.tcs.fincore.AsciiGenerationService.Service;
 
+import com.tcs.fincore.AsciiGenerationService.DTO.FileJob;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -253,26 +49,24 @@ public class JobQueueManager {
     @Autowired
     private AsciiGenerationService asciiService;
 
-    // The Queue: Holds IDs in memory. Infinite capacity by default.
-    private final BlockingQueue<Long> jobQueue = new LinkedBlockingQueue<>();
+    // Queue now holds 'FileJob' (Config ID + Specific File Path)
+    private final BlockingQueue<FileJob> jobQueue = new LinkedBlockingQueue<>();
     
-    // The Workers: Fixed pool (e.g., 10 parallel files). 
-    // This prevents the system from opening 25,000 threads and crashing.
+    // 10 Threads processing files in parallel
     private final ExecutorService executorService = Executors.newFixedThreadPool(10);
     
     private volatile boolean running = true;
 
     @PostConstruct
     public void startWorkers() {
-        // A single dispatcher thread monitors the queue and assigns work
         Thread dispatcher = new Thread(() -> {
             while (running) {
                 try {
-                    // BLOCKS here until a job is available (0% CPU usage when idle)
-                    Long configId = jobQueue.take(); 
+                    // Take the next specific file job
+                    FileJob job = jobQueue.take(); 
                     
-                    // Assign to a worker thread
-                    executorService.submit(() -> asciiService.processFile(configId));
+                    // Process it in the thread pool
+                    executorService.submit(() -> asciiService.processSingleFile(job));
                     
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -280,14 +74,18 @@ public class JobQueueManager {
                 }
             }
         });
-        dispatcher.setName("Job-Dispatcher-Thread");
+        dispatcher.setName("Job-Dispatcher");
         dispatcher.start();
-        log.info("Job Queue Manager Started. Ready for high-volume processing.");
+        log.info("Batch Processor Started. Waiting for jobs...");
     }
 
-    public void submitJob(Long id) {
-        jobQueue.offer(id); // Returns immediately
-        log.info("Job submitted. Queue Size: {}", jobQueue.size());
+    // Submit a single file to be processed
+    public void submitFileJob(FileJob job) {
+        jobQueue.offer(job);
+    }
+    
+    public int getQueueSize() {
+        return jobQueue.size();
     }
 
     @PreDestroy
@@ -297,19 +95,25 @@ public class JobQueueManager {
     }
 }
 
-3. AsciiGenerationService.java (The Worker - Streaming Mode)
-Changes: Switched from readAllLines (High RAM) to Files.lines() (Low RAM). All logic (5and1, Regex Validation, etc.) is preserved.
+3. Update AsciiGenerationService.java
+This is the big change.
+ * initiateBatch(Long id): The "Scanner". It finds the files and fills the queue.
+ * processSingleFile(FileJob job): The "Worker". It processes one specific file.
+<!-- end list -->
 package com.tcs.fincore.AsciiGenerationService.Service;
 
+import com.tcs.fincore.AsciiGenerationService.DTO.FileJob;
 import com.tcs.fincore.AsciiGenerationService.Model.AsciiConfig;
 import com.tcs.fincore.AsciiGenerationService.Repository.AsciiConfigRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -329,48 +133,80 @@ import java.util.stream.Stream;
 @Slf4j
 public class AsciiGenerationService {
 
-    private final AsciiConfigRepository configRepo;
+    @Autowired
+    private AsciiConfigRepository configRepo;
 
-    // Cache for input row validation regex
+    @Autowired
+    private JobQueueManager jobQueueManager; // To push found files to queue
+
+    // Change this property to your FOLDER path (e.g., C:/Files/input/)
+    @Value("${app.input.base.path}")
+    private String baseDirectoryPath;
+
     private static final Map<String, Pattern> INPUT_REGEX_CACHE = new ConcurrentHashMap<>();
 
-    @Value("${app.input.file.path}")
-    private String configuredFilePath;
+    // --- 1. THE DISCOVERY PHASE (Runs once per request) ---
+    public String initiateBatch(Long configId) {
+        // 1. Get Config
+        AsciiConfig config = configRepo.findById(configId)
+                .orElseThrow(() -> new RuntimeException("Config not found: " + configId));
 
-    public AsciiGenerationService(AsciiConfigRepository configRepo) {
-        this.configRepo = configRepo;
+        // 2. Derive Keyword (e.g., "nwsa_report" -> "nwsa")
+        String reportId = config.getReportId(); // "nwsa_report"
+        String searchKeyword = reportId.contains("_") ? reportId.split("_")[0] : reportId; // "nwsa"
+        
+        log.info("Scanning folder '{}' for files matching keyword: '{}'", baseDirectoryPath, searchKeyword);
+
+        int filesFound = 0;
+        Path baseDir = Paths.get(baseDirectoryPath);
+
+        if (!Files.exists(baseDir) || !Files.isDirectory(baseDir)) {
+            throw new RuntimeException("Base directory does not exist: " + baseDirectoryPath);
+        }
+
+        // 3. Scan Directory Efficiently
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(baseDir, entry -> 
+                Files.isRegularFile(entry) && entry.getFileName().toString().contains(searchKeyword))) {
+            
+            for (Path entry : stream) {
+                // 4. Submit each file as a separate job
+                jobQueueManager.submitFileJob(new FileJob(configId, entry));
+                filesFound++;
+            }
+        } catch (IOException e) {
+            log.error("Error scanning directory", e);
+            throw new RuntimeException("Directory scan failed");
+        }
+
+        return "Batch Initiated. Found " + filesFound + " files matching '" + searchKeyword + "'. Processing in background.";
     }
 
-    // Called by Background Worker
-    public void processFile(Long id) {
-        log.info("Processing Config ID: {}", id);
+    // --- 2. THE WORKER PHASE (Runs 25,000 times in parallel) ---
+    public void processSingleFile(FileJob job) {
+        Path inputPath = job.getFilePath();
+        Long id = job.getConfigId();
+
+        log.info("Processing File: {}", inputPath.getFileName());
+        
         try {
-            AsciiConfig config = configRepo.findById(id)
-                    .orElseThrow(() -> new RuntimeException("Config not found: " + id));
+            // Re-fetch config (it's cached by Hibernate L1 usually, very fast)
+            AsciiConfig config = configRepo.findById(id).orElseThrow(); 
 
-            Path inputPath = Paths.get(configuredFilePath);
-            // NOTE: In production, you might resolve specific file names based on config here
-            
-            if (!Files.exists(inputPath)) {
-                log.error("File missing for ID {}: {}", id, inputPath);
-                return;
-            }
-
-            String outputFileName = "GENERATED_" + config.getReportId() + "_" + id + config.getFileType();
+            // Output Name: GENERATED_nwsa_report_HASH_originalName
+            String outputFileName = "GENERATED_" + config.getReportId() + "_" + System.currentTimeMillis() + "_" + inputPath.getFileName();
             Path outputPath = inputPath.getParent().resolve(outputFileName);
 
             // --- STREAMING PROCESSING (Low Memory) ---
             try (Stream<String> lines = Files.lines(inputPath);
                  BufferedWriter writer = Files.newBufferedWriter(outputPath)) {
 
-                // 1. Header
+                // Header
                 HeaderInfo headerInfo = parseHeaderEfficiently(inputPath);
                 String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
                 String header = config.getOutputFirstLine() + branchPadded + headerInfo.reportDate + "F";
                 writer.write(header);
                 
-                // 2. Body (Line by Line)
-                int[] batchCounter = {0};
+                // Body
                 List<String> lineBuffer = new ArrayList<>();
                 int batchSize = config.getOutputPerLineHead();
 
@@ -379,38 +215,31 @@ public class AsciiGenerationService {
                         String processedRecord = transformLine(line, config);
                         if (processedRecord != null) {
                             lineBuffer.add(processedRecord);
-                            
-                            // Handle Batching (e.g., 4 records per line)
                             if (lineBuffer.size() == batchSize) {
-                                // writer.newLine(); // Uncomment if newlines required
                                 writer.write(String.join("", lineBuffer));
                                 lineBuffer.clear();
                             }
                         }
                     } catch (Exception e) {
-                        log.error("Row error for ID {}", id, e);
+                        log.error("Row error in {}", inputPath.getFileName(), e);
                     }
                 });
 
-                // Flush remaining buffer
-                if (!lineBuffer.isEmpty()) {
-                     // writer.newLine(); // Uncomment if newlines required
-                     writer.write(String.join("", lineBuffer));
-                }
+                if (!lineBuffer.isEmpty()) writer.write(String.join("", lineBuffer));
 
-                // 3. Footer
+                // Footer
                 if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) {
-                    // writer.newLine(); // Uncomment if newlines required
                     writer.write(config.getOutputEndLine());
                 }
             }
-            log.info("Finished: {}", outputPath);
+            log.info("Completed: {}", inputPath.getFileName());
 
         } catch (Exception e) {
-            log.error("FATAL Failure for ID: " + id, e);
+            log.error("Failed to process file: " + inputPath, e);
         }
     }
 
+    // --- Helpers (Same as before) ---
     private String transformLine(String line, AsciiConfig config) {
         String[] columns = line.split("\\|", -1);
         if (!isValidRow(columns, config)) return null;
@@ -441,8 +270,6 @@ public class AsciiGenerationService {
         return null;
     }
 
-    // --- Optimized Helpers ---
-
     private HeaderInfo parseHeaderEfficiently(Path path) {
         HeaderInfo info = new HeaderInfo();
         info.branchCode = "00000"; info.reportDate = "01012026";
@@ -450,7 +277,7 @@ public class AsciiGenerationService {
         Pattern datePattern1 = Pattern.compile("REPORT DATE\\s*::\\s*(\\S+)");
         Pattern datePattern2 = Pattern.compile("Current Year Date\\s*::\\s*(\\S+)");
 
-        try (Stream<String> stream = Files.lines(path).limit(50)) { // Read only top 50 lines
+        try (Stream<String> stream = Files.lines(path).limit(50)) { 
             stream.forEach(line -> {
                 Matcher mBranch = branchPattern.matcher(line);
                 if (mBranch.find()) info.branchCode = mBranch.group(1);
@@ -469,8 +296,6 @@ public class AsciiGenerationService {
         if (cols.length <= idx) return false;
         String head = cols[idx].trim();
         if (head.isEmpty()) return false;
-        
-        // Cache Input Regex
         Pattern p = INPUT_REGEX_CACHE.computeIfAbsent(config.getInputHeadRegex(), Pattern::compile);
         return p.matcher(head).lookingAt();
     }
@@ -539,12 +364,12 @@ public class AsciiGenerationService {
     private static class HeaderInfo { String branchCode; String reportDate; }
 }
 
-4. AsciiController.java (The Async Entry Point)
-Changes: Calls JobQueueManager instead of Service directly. Returns "202 Accepted" instantly.
+4. Update Controller (AsciiController.java)
+Now the controller just calls the "Batch Initiator" and returns a message telling you how many files it found.
 package com.tcs.fincore.AsciiGenerationService.Controller;
 
 import com.tcs.fincore.AsciiGenerationService.DTO.ReportRequest;
-import com.tcs.fincore.AsciiGenerationService.Service.JobQueueManager;
+import com.tcs.fincore.AsciiGenerationService.Service.AsciiGenerationService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -554,7 +379,7 @@ import org.springframework.web.bind.annotation.*;
 public class AsciiController {
 
     @Autowired
-    private JobQueueManager jobQueueManager;
+    private AsciiGenerationService service;
 
     @PostMapping("/generate")
     public ResponseEntity<String> generate(@RequestBody ReportRequest request) {
@@ -563,11 +388,11 @@ public class AsciiController {
                 return ResponseEntity.badRequest().body("Error: 'id' is missing");
             }
             
-            // Submit job to background queue (Non-blocking)
-            jobQueueManager.submitJob(request.getId());
+            // This method scans the directory, finds files, and queues them.
+            // It returns a summary string (e.g., "Found 25000 files...")
+            String status = service.initiateBatch(request.getId());
             
-            return ResponseEntity.accepted()
-                    .body("Success! Request queued for ID: " + request.getId());
+            return ResponseEntity.accepted().body("Success: " + status);
             
         } catch (Exception e) {
             return ResponseEntity.internalServerError().body("Error: " + e.getMessage());
@@ -575,3 +400,17 @@ public class AsciiController {
     }
 }
 
+5. application.properties
+Make sure you update the property to point to the Folder (Base Directory), not a specific file.
+# Point this to the FOLDER containing your 25,000 files
+app.input.base.path=C:/Users/v1021253/Documents/Files/input/
+
+🧠 How this handles the "Twist"
+ * Request: You send ID 101.
+ * Logic:
+   * Code looks up 101 -> gets nwsa_report.
+   * Code splits it -> gets keyword nwsa.
+   * Code goes to C:/.../input/.
+   * Code finds nwsa_file1.psv, nwsa_file2.psv... nwsa_file25000.psv.
+ * Result: It queues 25,000 jobs.
+ * Output: 25,000 generated files will appear in the output folder named GENERATED_nwsa_report_TIMESTAMP_originalName.
