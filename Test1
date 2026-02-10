@@ -1,19 +1,41 @@
-UPDATE ASCII_CONFIG 
-SET 
-    -- 1. MATH: Apply /1000 to EVERYTHING in Column 4 (Regex "^.*" matches all)
-    OUTPUT_AMT_COL_LOGIC = '["^.*"][4][/1000]',
+    private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
+        List<ProcessingItem> items = new ArrayList<>();
+        String head = cols[config.getInputHeadCol() - 1].trim();
+        String seq = config.getAmountColSeq(); // e.g., "3else4"
 
-    -- 2. DECIMAL: Apply standard 'round' (HALF_UP) to EVERYTHING in Column 4
-    -- This matches Oracle's ROUND() function perfectly.
-    OUTPUT_AMT_DECIMAL = '["^.*"][4][round]',
+        // --- NEW LOGIC: "else" skips Zero, Null, and Empty ---
+        if (seq.contains("else")) {
+            String[] parts = seq.split("else");
+            
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                
+                // 1. Safe Parse: Handles Null, Empty, Spaces, "0", "0.00" -> Returns BigDecimal
+                BigDecimal val = parseAmount(cols, idx);
 
-    -- 3. PADDING: Standard 19-char padding
-    OUTPUT_AMT_COL_PAD = '["^.*"][4][19,0]',
-
-    -- 4. SIGN: No sign
-    OUTPUT_AMT_SIGN = '["^.*"][4][NO_SIGN]'
-
-WHERE ID = 102;
-
-COMMIT;
-
+                // 2. CHECK: Is this value NON-ZERO?
+                if (val.compareTo(BigDecimal.ZERO) != 0) {
+                    // Found a "Real" number! Take it and stop looking.
+                    items.add(new ProcessingItem(head, val, idx + 1));
+                    return items; 
+                }
+            }
+            
+            // 3. Fallback: If loop finishes and everything was 0/Null, return 0 from the FIRST column in the list.
+            int firstColIdx = Integer.parseInt(parts[0].trim()) - 1;
+            items.add(new ProcessingItem(head, BigDecimal.ZERO, firstColIdx + 1));
+        } 
+        
+        // --- Standard Logic (AND / Single Column) ---
+        else if (seq.contains("and")) {
+            String[] parts = seq.split("and");
+            for (String part : parts) {
+                int idx = Integer.parseInt(part.trim()) - 1;
+                items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+            }
+        } else {
+            int idx = Integer.parseInt(seq.trim()) - 1;
+            items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
+        }
+        return items;
+    }
