@@ -1,23 +1,78 @@
+This error occurs because you have created a Circular Dependency (A loop):
+ * AsciiGenerationService needs JobQueueManager (To submit the 25,000 files it finds).
+ * JobQueueManager needs AsciiGenerationService (To ask it to process a file).
+Spring cannot decide which one to create first.
+✅ The Fix: Use @Lazy
+You need to tell Spring to initialize one of them "Lazily" (only when needed, not at startup). The best place to put this is in the JobQueueManager.
+Update JobQueueManager.java and add the @Lazy annotation to the AsciiGenerationService injection.
+Updated JobQueueManager.java
+package com.tcs.fincore.AsciiGenerationService.Service;
 
-***************************
-APPLICATION FAILED TO START
-***************************
+import com.tcs.fincore.AsciiGenerationService.DTO.FileJob;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy; // <--- IMPORT THIS
+import org.springframework.stereotype.Service;
 
-Description:
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 
-The dependencies of some of the beans in the application context form a cycle:
+@Service
+@Slf4j
+public class JobQueueManager {
 
-   asciiController (field private com.tcs.fincore.AsciiGenerationService.Service.AsciiGenerationService com.tcs.fincore.AsciiGenerationService.Controller.AsciiController.service)
-┌─────┐
-|  asciiGenerationService (field private com.tcs.fincore.AsciiGenerationService.Service.JobQueueManager com.tcs.fincore.AsciiGenerationService.Service.AsciiGenerationService.jobQueueManager)
-↑     ↓
-|  jobQueueManager (field private com.tcs.fincore.AsciiGenerationService.Service.AsciiGenerationService com.tcs.fincore.AsciiGenerationService.Service.JobQueueManager.asciiService)
-└─────┘
+    private final AsciiGenerationService asciiService;
 
+    // Use Constructor Injection with @Lazy to break the cycle
+    @Autowired
+    public JobQueueManager(@Lazy AsciiGenerationService asciiService) {
+        this.asciiService = asciiService;
+    }
 
-Action:
+    // The Queue: Holds 'FileJob' (Config ID + Specific File Path)
+    private final BlockingQueue<FileJob> jobQueue = new LinkedBlockingQueue<>();
+    
+    // 10 Threads processing files in parallel
+    private final ExecutorService executorService = Executors.newFixedThreadPool(10);
+    
+    private volatile boolean running = true;
 
-Relying upon circular references is discouraged and they are prohibited by default. Update your application to remove the dependency cycle between beans. As a last resort, it may be possible to break the cycle automatically by setting spring.main.allow-circular-references to true.
+    @PostConstruct
+    public void startWorkers() {
+        Thread dispatcher = new Thread(() -> {
+            while (running) {
+                try {
+                    FileJob job = jobQueue.take(); 
+                    executorService.submit(() -> asciiService.processSingleFile(job));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+        dispatcher.setName("Job-Dispatcher");
+        dispatcher.start();
+        log.info("Batch Processor Started. Waiting for jobs...");
+    }
 
+    public void submitFileJob(FileJob job) {
+        jobQueue.offer(job);
+    }
+    
+    public int getQueueSize() {
+        return jobQueue.size();
+    }
 
-Process finished with exit code 1
+    @PreDestroy
+    public void shutdown() {
+        running = false;
+        executorService.shutdown();
+    }
+}
+
+🧠 Why this works
+By adding @Lazy, Spring will start JobQueueManager immediately but inject a "Proxy" (a placeholder) for AsciiGenerationService. It won't try to fully create the Service until the first time you actually use it inside the worker thread. This breaks the startup loop.
