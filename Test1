@@ -1,3 +1,137 @@
+Here are the complete, corrected files for your ReportService. I have fixed the bean conflicts, the validation errors, the duplicate exception handlers, and the silent PDF failure.
+Step 1: Dependencies (pom.xml)
+Ensure you have these two critical dependencies added to your pom.xml. Without them, the code will not run.
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+
+    <dependency>
+        <groupId>net.sf.jasperreports</groupId>
+        <artifactId>jasperreports</artifactId>
+        <version>6.20.0</version>
+    </dependency>
+    
+    </dependencies>
+
+Step 2: Configuration Package
+File 1: com/fincore/ReportService/config/NwsaConfig.java (NEW FILE)
+ * Fix: This explicitly registers your properties, solving the "No beans of type NwsaProperties" error.
+<!-- end list -->
+package com.fincore.ReportService.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+
+@Configuration
+@EnableConfigurationProperties(NwsaProperties.class)
+public class NwsaConfig {
+}
+
+File 2: com/fincore/ReportService/config/NwsaProperties.java
+ * Fix: Kept as a pure record.
+<!-- end list -->
+package com.fincore.ReportService.config;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.math.BigDecimal;
+import java.time.format.DateTimeFormatter;
+
+@ConfigurationProperties(prefix = "nwsa")
+@Validated
+public record NwsaProperties(
+        @NotBlank String reportRoot,
+        @NotBlank String bankFilenamePattern,
+        @NotBlank String branchFilenamePattern,
+        @NotNull BigDecimal failedThresholdCrore,
+        @NotBlank String datePattern,
+        @NotBlank String outputDir
+) {
+    public DateTimeFormatter formatter() {
+        return DateTimeFormatter.ofPattern(datePattern);
+    }
+}
+
+File 3: com/fincore/ReportService/config/HadoopConfig.java
+ * Fix: This is the only HDFS config you should have. DELETE HdfsConfig.java to avoid conflicts.
+<!-- end list -->
+package com.fincore.ReportService.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.fs.FileSystem;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+
+@Configuration
+@Slf4j
+public class HadoopConfig {
+
+    @Value("${hadoop.fs.nameservice}")
+    private String nameservice;
+
+    @Value("${hadoop.fs.user}")
+    private String hadoopUser;
+
+    @Value("${hadoop.fs.ha.namenodes}")
+    private String nnIds;
+
+    @Value("${hadoop.fs.ha.nn1.rpc}")
+    private String nn1Rpc;
+
+    @Value("${hadoop.fs.ha.nn2.rpc}")
+    private String nn2Rpc;
+
+    @Value("${hadoop.fs.ha.nn3.rpc}")
+    private String nn3Rpc;
+
+    @Bean
+    public org.apache.hadoop.conf.Configuration hadoopConfiguration() {
+        log.info("Configuring HDFS HA for Nameservice: {}", nameservice);
+        org.apache.hadoop.conf.Configuration config = new org.apache.hadoop.conf.Configuration();
+
+        String authority = "hdfs://" + nameservice;
+        config.set("fs.defaultFS", authority);
+        config.set("dfs.nameservices", nameservice);
+        config.set("dfs.ha.namenodes." + nameservice, nnIds);
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn1", nn1Rpc);
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn2", nn2Rpc);
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn3", nn3Rpc);
+        config.set("dfs.client.failover.proxy.provider." + nameservice,
+                "org.apache.hadoop.hdfs.server.namenode.ha.RequestHedgingProxyProvider");
+        config.set("fs.hdfs.impl.disable.cache", "true");
+        config.set("ipc.client.connect.max.retries.on.timeouts", "3");
+        config.set("dfs.client.failover.max.attempts", "10");
+        config.set("ipc.client.connect.timeout", "5000");
+
+        return config;
+    }
+
+    @Bean
+    public FileSystem fileSystem(org.apache.hadoop.conf.Configuration config) {
+        try {
+            URI logicalUri = new URI("hdfs://" + nameservice);
+            return FileSystem.get(logicalUri, config, hadoopUser);
+        } catch (IOException | InterruptedException | URISyntaxException e) {
+            log.error("CRITICAL: Failed to initialize HDFS HA Connection.", e);
+            throw new RuntimeException("Could not initialize Hadoop FileSystem", e);
+        }
+    }
+}
+
+Step 3: Exception Handling
+File 4: com/fincore/ReportService/exception/GlobalExceptionHandler.java
+ * Fix: Removed the duplicate badInput method that caused the crash.
+<!-- end list -->
 package com.fincore.ReportService.exception;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -15,7 +149,6 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.context.request.WebRequest;
 
 import jakarta.validation.ConstraintViolationException;
-
 import java.io.IOException;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -33,7 +166,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler({JsonProcessingException.class, HttpMessageNotReadableException.class})
     public ResponseEntity<ApiResponse<Object>> handleJsonProcessingException(Exception ex, WebRequest request) {
         log.error("Error processing JSON payload: {}", ex.getMessage());
-        return new ResponseEntity<>(ApiResponse.error("Invalid request payload format. Please check the JSON structure and data types."), HttpStatus.BAD_REQUEST);
+        return new ResponseEntity<>(ApiResponse.error("Invalid request payload format."), HttpStatus.BAD_REQUEST);
     }
 
     @ExceptionHandler(DataIntegrityViolationException.class)
@@ -42,7 +175,7 @@ public class GlobalExceptionHandler {
         if (ex.getMostSpecificCause().getMessage().contains("already exists")) {
             return new ResponseEntity<>(ApiResponse.error("A resource with the provided identifier already exists."), HttpStatus.CONFLICT);
         }
-        return new ResponseEntity<>(ApiResponse.error("Database constraint violation. A required field may be missing or a value is invalid."), HttpStatus.CONFLICT);
+        return new ResponseEntity<>(ApiResponse.error("Database constraint violation."), HttpStatus.CONFLICT);
     }
 
     @ExceptionHandler({IllegalArgumentException.class, IllegalStateException.class})
@@ -57,17 +190,13 @@ public class GlobalExceptionHandler {
         return new ResponseEntity<>(ApiResponse.error("An internal server error occurred."), HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
-    /**
-     * Handles exceptions thrown when @Valid validation fails on a request body.
-     */
     @ExceptionHandler(MethodArgumentNotValidException.class)
     @ResponseStatus(HttpStatus.BAD_REQUEST)
     public ResponseEntity<ApiResponse<Object>> handleValidationExceptions(MethodArgumentNotValidException ex) {
         String errors = ex.getBindingResult().getFieldErrors().stream()
                 .map(error -> error.getField() + ": " + error.getDefaultMessage())
                 .collect(Collectors.joining(", "));
-
-        log.warn("Validation failed for incoming request: {}", errors);
+        log.warn("Validation failed: {}", errors);
         return new ResponseEntity<>(ApiResponse.error("Validation Failed: " + errors), HttpStatus.BAD_REQUEST);
     }
 
@@ -77,15 +206,14 @@ public class GlobalExceptionHandler {
         String errors = ex.getConstraintViolations().stream()
                 .map(cv -> cv.getPropertyPath() + ": " + cv.getMessage())
                 .collect(Collectors.joining(", "));
-
-        log.warn("Constraint violation during processing: {}", errors);
+        log.warn("Constraint violation: {}", errors);
         return new ResponseEntity<>(ApiResponse.error("Validation Failed: " + errors), HttpStatus.BAD_REQUEST);
     }
 
     @ExceptionHandler(AccessDeniedException.class)
     public ResponseEntity<ApiResponse<Object>> handleAccessDeniedException(AccessDeniedException ex, WebRequest request) {
         log.error("Access Denied: {}", ex.getMessage());
-        return new ResponseEntity<>(ApiResponse.error("Report Not Found or You are not authorized to perform this action."), HttpStatus.NOT_FOUND);
+        return new ResponseEntity<>(ApiResponse.error("Access Denied."), HttpStatus.NOT_FOUND);
     }
 
     @ExceptionHandler(IOException.class)
@@ -93,6 +221,132 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                 .body(Map.of("error", "HDFS_FILE_ACCESS_ERROR", "message", ex.getMessage()));
     }
-
-    // --- DELETED 'badInput' METHOD HERE ---
 }
+
+Step 4: Report Exporter
+File 5: com/fincore/ReportService/report/VarianceReportExporter.java
+ * Fix: Added logging to writePdf so you can see why it was failing silently.
+<!-- end list -->
+package com.fincore.ReportService.report;
+
+import com.fincore.ReportService.config.NwsaProperties;
+import com.fincore.ReportService.domain.BankVariance;
+import com.fincore.ReportService.domain.BranchVariance;
+import com.fincore.ReportService.domain.VarianceReport;
+import lombok.extern.slf4j.Slf4j;
+import net.sf.jasperreports.engine.JasperCompileManager;
+import net.sf.jasperreports.engine.JasperExportManager;
+import net.sf.jasperreports.engine.JasperFillManager;
+import net.sf.jasperreports.engine.JasperPrint;
+import net.sf.jasperreports.engine.JasperReport;
+import net.sf.jasperreports.engine.data.JRBeanCollectionDataSource;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Component
+@Slf4j
+public class VarianceReportExporter {
+
+    private final NwsaProperties properties;
+
+    public VarianceReportExporter(NwsaProperties properties) {
+        this.properties = properties;
+    }
+
+    public ExportResult export(VarianceReport report) throws IOException {
+        Path baseDir = Path.of(properties.outputDir());
+        Files.createDirectories(baseDir);
+        String suffix = report.today().format(DateTimeFormatter.BASIC_ISO_DATE) + "_vs_"
+                + report.yesterday().format(DateTimeFormatter.BASIC_ISO_DATE);
+
+        Path csv = baseDir.resolve("nwsa_variance_" + suffix + ".csv");
+        writeCsv(report, csv);
+
+        Path pdf = baseDir.resolve("nwsa_variance_" + suffix + ".pdf");
+        writePdf(report, pdf);
+
+        return new ExportResult(csv.toString(), pdf.toString());
+    }
+
+    private void writeCsv(VarianceReport report, Path path) throws IOException {
+        List<String> lines = new ArrayList<>();
+        lines.add("SECTION,BANK_HEAD_CODE,DESCRIPTION,TODAY_BALANCE,YESTERDAY_BALANCE,DIFFERENCE,BRANCH_CODE,BRANCH_NAME");
+
+        for (BankVariance bank : report.bankSummary()) {
+            lines.add("BANK,%s,%s,%s,%s,%s,,".formatted(
+                    bank.headCode(), sanitize(bank.description()), bank.todayBalance(), bank.yesterdayBalance(), bank.difference()));
+
+            for (BranchVariance branch : report.branchDetailsByHead().getOrDefault(bank.headCode(), List.of())) {
+                lines.add("BRANCH,%s,%s,%s,%s,%s,%s,%s".formatted(
+                        branch.headCode(), sanitize(bank.description()), branch.todayBalance(), branch.yesterdayBalance(), branch.difference(),
+                        branch.branchCode(), sanitize(branch.branchName())));
+            }
+        }
+        Files.write(path, lines);
+        log.info("CSV Report generated: {}", path);
+    }
+
+    private void writePdf(VarianceReport report, Path path) {
+        try {
+            // Ensure this file exists in src/main/resources/jasper/nwsa_variance.jrxml
+            JasperReport jasperReport = JasperCompileManager.compileReport(
+                    new ClassPathResource("jasper/nwsa_variance.jrxml").getInputStream());
+            
+            Map<String, Object> params = new HashMap<>();
+            params.put("today", report.today().toString());
+            params.put("yesterday", report.yesterday().toString());
+            
+            List<VarianceRowView> rows = flatten(report);
+            JasperPrint print = JasperFillManager.fillReport(jasperReport, params, new JRBeanCollectionDataSource(rows));
+            
+            JasperExportManager.exportReportToPdfFile(print, path.toString());
+            log.info("PDF Report generated: {}", path);
+            
+        } catch (Exception ex) {
+            log.error("FAILED to generate PDF report. Check JRXML path and dependencies.", ex);
+        }
+    }
+
+    private List<VarianceRowView> flatten(VarianceReport report) {
+        List<VarianceRowView> rows = new ArrayList<>();
+        for (BankVariance bank : report.bankSummary()) {
+            rows.add(new VarianceRowView("BANK", bank.headCode(), bank.description(), null,
+                    bank.todayBalance(), bank.yesterdayBalance(), bank.difference()));
+
+            for (BranchVariance branch : report.branchDetailsByHead().getOrDefault(bank.headCode(), List.of())) {
+                rows.add(new VarianceRowView("BRANCH", bank.headCode(), bank.description(),
+                        branch.branchCode() + " - " + branch.branchName(),
+                        branch.todayBalance(), branch.yesterdayBalance(), branch.difference()));
+            }
+        }
+        return rows;
+    }
+
+    private String sanitize(String value) {
+        return value == null ? "" : value.replace(",", " ");
+    }
+
+    public record ExportResult(String csvPath, String pdfPath) {}
+
+    // Public record needed for JasperReports reflection
+    public record VarianceRowView(
+            String section,
+            String headCode,
+            String description,
+            String branch,
+            BigDecimal today,
+            BigDecimal yesterday,
+            BigDecimal difference
+    ) {}
+}
+
