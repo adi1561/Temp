@@ -1,8 +1,144 @@
-{
-    "success": false,
-    "message": "Wrong FS: file:/D:/reports/11022025/nwsa_report/nwsa_report_11022025.psv, expected: hdfs://fincoredev",
-    "timestamp": "2026-02-13T07:06:35.446202400Z"
+This error confirms that your application is still connecting to the HDFS Cluster (hdfs://fincoredev) instead of your local disk, even though you tried to change the YAML.
+This happens because the property nameservice is still being set to "fincoredev" somewhere in your environment (perhaps in a hidden core-site.xml, an environment variable, or a parent config).
+The Permanent Fix: Code Priority
+Instead of fighting with the configuration files, let's update the Java code to prioritize Local Mode. We will modify HadoopConfig.java to explicitly check if you requested file:/// and force Local Mode, ignoring any accidentally active server settings.
+Here are the complete, corrected files.
+1. HadoopConfig.java (Updated Logic)
+Replace your existing file with this one. I have added a check: If the URI is file:///, ignore everything else and use Local Disk.
+package com.fincore.ReportService.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.fs.FileSystem;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+
+@Configuration
+@Slf4j
+public class HadoopConfig {
+
+    // --- Common Properties ---
+    @Value("${hadoop.fs.user}")
+    private String hadoopUser;
+
+    // --- Simple Mode Property ---
+    @Value("${hadoop.fs.uri:#{null}}")
+    private String simpleFsUri;
+
+    // --- HA Mode Properties ---
+    @Value("${hadoop.fs.nameservice:#{null}}")
+    private String nameservice;
+
+    @Value("${hadoop.fs.ha.namenodes:#{null}}")
+    private String nnIds;
+
+    @Value("${hadoop.fs.ha.nn1.rpc:#{null}}")
+    private String nn1Rpc;
+
+    @Value("${hadoop.fs.ha.nn2.rpc:#{null}}")
+    private String nn2Rpc;
+
+    @Value("${hadoop.fs.ha.nn3.rpc:#{null}}")
+    private String nn3Rpc;
+
+    @Bean
+    public FileSystem fileSystem() {
+        org.apache.hadoop.conf.Configuration config = new org.apache.hadoop.conf.Configuration();
+
+        // 1. Common Robustness Settings
+        config.set("ipc.client.connect.timeout", "5000"); 
+        config.set("ipc.client.rpc-timeout.ms", "30000"); 
+        config.set("fs.hdfs.impl.disable.cache", "true"); 
+
+        URI targetUri;
+
+        // 2. INTELLIGENT MODE SELECTION
+        // Priority Rule: If 'uri' is set to 'file:///', we FORCE Local Mode.
+        // This prevents accidental connections to 'fincoredev' when testing locally.
+        boolean isLocalRequest = simpleFsUri != null && simpleFsUri.trim().startsWith("file:");
+
+        if (!isLocalRequest && nameservice != null && !nameservice.isBlank()) {
+            // --- HIGH AVAILABILITY (HA) MODE ---
+            log.info("Configuring HDFS in HA Mode for Nameservice: {}", nameservice);
+
+            String authority = "hdfs://" + nameservice;
+            config.set("fs.defaultFS", authority);
+            config.set("dfs.nameservices", nameservice);
+            config.set("dfs.ha.namenodes." + nameservice, nnIds); 
+            
+            if (nn1Rpc != null) config.set("dfs.namenode.rpc-address." + nameservice + ".nn1", nn1Rpc);
+            if (nn2Rpc != null) config.set("dfs.namenode.rpc-address." + nameservice + ".nn2", nn2Rpc);
+            if (nn3Rpc != null) config.set("dfs.namenode.rpc-address." + nameservice + ".nn3", nn3Rpc);
+
+            config.set("dfs.client.failover.proxy.provider." + nameservice,
+                    "org.apache.hadoop.hdfs.server.namenode.ha.RequestHedgingProxyProvider");
+
+            targetUri = URI.create(authority);
+
+        } else {
+            // --- SIMPLE / LOCAL MODE ---
+            // If simpleFsUri is missing, default to local file system
+            String effectiveUri = (simpleFsUri != null && !simpleFsUri.isBlank()) ? simpleFsUri : "file:///";
+            
+            log.info("Configuring HDFS in Simple/Local Mode: {}", effectiveUri);
+
+            config.set("fs.defaultFS", effectiveUri);
+            // Disable permission checks for Windows local mode
+            config.set("dfs.permissions.enabled", "false"); 
+
+            targetUri = URI.create(effectiveUri);
+        }
+
+        // 3. Create FileSystem
+        try {
+            return FileSystem.get(targetUri, config, hadoopUser);
+        } catch (IOException | InterruptedException e) {
+            log.error("CRITICAL: Failed to connect to FileSystem. URI: {}", targetUri, e);
+            throw new RuntimeException("Could not initialize Hadoop FileSystem", e);
+        }
+    }
 }
 
-2026-02-13 12:36:35.444 ERROR [http-nio-9005-exec-3] c.f.R.e.GlobalExceptionHandler: Illegal argument or state: Wrong FS: file:/D:/reports/11022025/nwsa_report/nwsa_report_11022025.psv, expected: hdfs://fincoredev 
-2026-02-13 12:36:35.467 WARN  [http-nio-9005-exec-3] o.s.w.s.h.AbstractHandlerExceptionResolver: Resolved [java.lang.IllegalArgumentException: Wrong FS: file:/D:/reports/11022025/nwsa_report/nwsa_report_11022025.psv, expected: hdfs://fincoredev] 
+2. application.yml (Cleaned Up)
+This file ensures the properties match the "Local Mode" logic above.
+spring:
+  application:
+    name: nwsa-variance
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+hadoop:
+  fs:
+    # This triggers the "isLocalRequest" flag in Java
+    uri: file:///
+    user: hadoop-user
+    # Leave these empty to be safe
+    nameservice: ""
+    ha:
+      namenodes: ""
+
+nwsa:
+  # The path to your local folder on D: drive
+  report-root: file:///D:/reports
+  
+  date-pattern: ddMMyyyy
+  bank-filename-pattern: nwsa_report_{date}.psv
+  branch-filename-pattern: nwsa_report_{branchCode}_{date}.psv
+  failed-threshold-crore: 500
+  output-dir: ./output
+
+Summary of the Fix
+ * The Problem: Your environment was still injecting "fincoredev" into the nameservice variable, causing the code to pick HA Mode.
+ * The Solution: I updated HadoopConfig.java to check if (uri.startsWith("file:")). If this is true, it ignores nameservice completely. This forces the system to treat D:/reports as a local file, resolving the Wrong FS error.
