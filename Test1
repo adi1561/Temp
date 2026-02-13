@@ -55,15 +55,12 @@ public class VarianceReportExporter {
         List<String> lines = new ArrayList<>();
         lines.add("SECTION,BANK_HEAD_CODE,DESCRIPTION,TODAY_BALANCE,YESTERDAY_BALANCE,DIFFERENCE,BRANCH_CODE,BRANCH_NAME");
 
-        // Use the same flattened list for CSV to ensure consistent sorting and filtering
         List<VarianceRowView> rows = flatten(report);
 
         for (VarianceRowView row : rows) {
-            // Reconstruct CSV line from the sorted/filtered POJOs
             String branchCode = "";
             String branchName = "";
             
-            // Extract branch info if it exists in the "Branch" column (Format: "Code - Name")
             if (row.getBranch() != null && row.getBranch().contains(" - ")) {
                 String[] parts = row.getBranch().split(" - ", 2);
                 branchCode = parts[0];
@@ -102,7 +99,7 @@ public class VarianceReportExporter {
             JasperPrint print = JasperFillManager.fillReport(jasperReport, params, new JRBeanCollectionDataSource(rows));
             
             if (print.getPages().isEmpty()) {
-                log.warn("PDF Report has 0 pages (No variances found). Generating empty report.");
+                log.warn("PDF Report has 0 pages (No variances found).");
             }
 
             JasperExportManager.exportReportToPdfFile(print, path.toString());
@@ -113,41 +110,46 @@ public class VarianceReportExporter {
         }
     }
 
+    // --- LOGIC CHANGE HERE ---
     private List<VarianceRowView> flatten(VarianceReport report) {
-        List<VarianceRowView> rows = new ArrayList<>();
+        List<VarianceRowView> finalRows = new ArrayList<>();
+        
+        // Temporary lists to hold separated data
+        List<VarianceRowView> bankRows = new ArrayList<>();
+        List<VarianceRowView> branchRows = new ArrayList<>();
 
-        // 1. Sort Banks Alphabetically by Head Code to ensure clean grouping
+        // 1. Sort Banks Alphabetically
         List<BankVariance> sortedBanks = new ArrayList<>(report.bankSummary());
         sortedBanks.sort(Comparator.comparing(BankVariance::headCode));
 
         for (BankVariance bank : sortedBanks) {
-            // --- LOGIC 1: BANK ROW ---
-            // Only add if difference is NOT zero
+            // A. Collect BANK Row (if non-zero)
             if (isNonZero(bank.difference())) {
-                rows.add(new VarianceRowView("BANK", bank.headCode(), bank.description(), "",
+                bankRows.add(new VarianceRowView("BANK", bank.headCode(), bank.description(), "",
                         bank.todayBalance(), bank.yesterdayBalance(), bank.difference()));
             }
 
-            // --- LOGIC 2: BRANCH ROWS (Follows Bank) ---
+            // B. Collect BRANCH Rows (if non-zero)
             List<BranchVariance> branches = report.branchDetailsByHead().getOrDefault(bank.headCode(), List.of());
-            
-            // Sort Branches Alphabetically by Branch Code
             List<BranchVariance> sortedBranches = new ArrayList<>(branches);
             sortedBranches.sort(Comparator.comparing(BranchVariance::branchCode));
 
             for (BranchVariance branch : sortedBranches) {
-                // Only add if difference is NOT zero
                 if (isNonZero(branch.difference())) {
-                    rows.add(new VarianceRowView("BRANCH", bank.headCode(), bank.description(),
+                    branchRows.add(new VarianceRowView("BRANCH", bank.headCode(), bank.description(),
                             branch.branchCode() + " - " + branch.branchName(),
                             branch.todayBalance(), branch.yesterdayBalance(), branch.difference()));
                 }
             }
         }
-        return rows;
+
+        // 2. COMBINE: Put ALL Banks at the top, then ALL Branches at the bottom
+        finalRows.addAll(bankRows);
+        finalRows.addAll(branchRows);
+        
+        return finalRows;
     }
 
-    // Helper to check for non-zero BigDecimal
     private boolean isNonZero(BigDecimal value) {
         return value != null && value.compareTo(BigDecimal.ZERO) != 0;
     }
@@ -158,7 +160,6 @@ public class VarianceReportExporter {
 
     public record ExportResult(String csvPath, String pdfPath) {}
 
-    // POJO for JasperReports
     public static class VarianceRowView {
         private String section;
         private String headCode;
