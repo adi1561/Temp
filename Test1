@@ -1,159 +1,163 @@
-To enable file-based logging, you don't need to change Java code. You just need to add a few lines to your application.yml. This will generate a file named application.log inside a logs folder.
-Step 1: Enable File Logging
-Add this to your application.yml (at the root level, same level as spring:).
-logging:
-  file:
-    name: logs/application.log
-  level:
-    root: INFO
-    com.fincore: DEBUG  # Shows detailed steps for your app
-    org.apache.hadoop: ERROR # Hides confusing Hadoop warnings
-    net.sf.jasperreports: DEBUG # Shows why PDF fails
-
-Restart your application.
-Now, go to your project folder. You will see a logs folder. Open application.log to see the full history.
-Step 2: Fix the "UnsatisfiedLinkError" (The Real Blocker)
-The logs you showed indicate that Hadoop is still trying to run native code for listDirectories. This means my previous "Smart Client" fix was either not applied correctly or the path check failed.
-Let's make the "Smart Client" bulletproof. This version prints the path it sees so you can debug it in the log file.
-Replace HdfsFileSystemClient.java with this:
-package com.fincore.ReportService.hdfs;
-
-import lombok.extern.slf4j.Slf4j;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.springframework.stereotype.Component;
-
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.URI;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.util.Arrays;
-import java.util.stream.Stream;
-
-@Component
-@Slf4j
-public class HdfsFileSystemClient implements FileSystemClient {
-
-    private final FileSystem fileSystem;
-
-    public HdfsFileSystemClient(FileSystem fileSystem) {
-        this.fileSystem = fileSystem;
-    }
-
-    @Override
-    public InputStream open(String pathStr) throws IOException {
-        if (shouldBypassHadoop(pathStr)) {
-            URI uri = URI.create(pathStr); // Parses "file:///D:/..." correctly
-            log.debug("LOCAL OPEN: {}", uri);
-            return new FileInputStream(new java.io.File(uri));
-        }
-        return fileSystem.open(new Path(pathStr));
-    }
-
-    @Override
-    public Stream<String> listDirectories(String pathStr) throws IOException {
-        // Log exactly what we received to find out why it failed before
-        log.debug("LIST REQUEST: {}", pathStr);
-
-        if (shouldBypassHadoop(pathStr)) {
-            log.debug("BYPASSING HADOOP for path: {}", pathStr);
-            try {
-                java.nio.file.Path p = Paths.get(URI.create(pathStr));
-                if (!Files.exists(p)) {
-                    log.warn("Local path does not exist: {}", p);
-                    return Stream.empty();
-                }
-                return Files.list(p)
-                        .filter(Files::isDirectory)
-                        .map(path -> path.getFileName().toString());
-            } catch (Exception e) {
-                log.error("Failed to list local directory: {}", pathStr, e);
-                throw new IOException(e);
-            }
-        }
-
-        // --- Standard Hadoop Logic ---
-        log.debug("USING HADOOP NATIVE for path: {}", pathStr);
-        Path path = new Path(pathStr);
-        if (!fileSystem.exists(path)) {
-            return Stream.empty();
-        }
-        FileStatus[] statuses = fileSystem.listStatus(path);
-        if (statuses == null) {
-            return Stream.empty();
-        }
-        return Arrays.stream(statuses)
-                .filter(FileStatus::isDirectory)
-                .map(s -> s.getPath().getName());
-    }
-
-    @Override
-    public boolean exists(String pathStr) throws IOException {
-        if (shouldBypassHadoop(pathStr)) {
-            return new java.io.File(URI.create(pathStr)).exists();
-        }
-        return fileSystem.exists(new Path(pathStr));
-    }
-
-    // ROBUST CHECK: Handles "file:/", "file:///", and case insensitivity
-    private boolean shouldBypassHadoop(String path) {
-        if (path == null) return false;
-        // Check for local file protocol OR Windows drive letter (e.g., "D:/")
-        boolean isLocalProtocol = path.toLowerCase().startsWith("file:");
-        boolean isDriveLetter = path.matches("^[a-zA-Z]:.*"); 
-        boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
-        
-        return isWindows && (isLocalProtocol || isDriveLetter);
-    }
-}
-
-Step 3: Fix the PDF "No Pages" Issue
-If you replaced the .jrxml with the UUID fix I gave you, but it still fails, it is usually because JasperReports cannot find the font on your system.
-Add this Final Safe Exporter code. It forces the PDF to be generated and logs the exact reason if it fails.
-Replace writePdf in VarianceReportExporter.java:
-    private void writePdf(VarianceReport report, Path path) {
-        try {
-            log.info("STARTING PDF GENERATION: Target -> {}", path);
-            
-            // 1. Load JRXML
-            InputStream reportStream = new ClassPathResource("jasper/nwsa_variance.jrxml").getInputStream();
-            JasperReport jasperReport = JasperCompileManager.compileReport(reportStream);
-            log.debug("JRXML Compiled successfully.");
-
-            // 2. Parameters
-            Map<String, Object> params = new HashMap<>();
-            params.put("today", report.today().toString());
-            params.put("yesterday", report.yesterday().toString());
-            
-            // 3. Data Source
-            List<VarianceRowView> rows = flatten(report);
-            log.info("PDF Data Rows: {}", rows.size());
-
-            // 4. Fill Report
-            // If rows is empty, this is where it might produce "No Pages"
-            JasperPrint print = JasperFillManager.fillReport(jasperReport, params, new JRBeanCollectionDataSource(rows));
-            
-            // 5. Check Pages
-            if (print.getPages().isEmpty()) {
-                log.error("PDF GENERATION FAILED: Report has 0 pages! Check 'whenNoDataType' in JRXML.");
-                return;
-            }
-
-            // 6. Export
-            JasperExportManager.exportReportToPdfFile(print, path.toString());
-            log.info("PDF GENERATED SUCCESSFULLY: {}", path);
-
-        } catch (Exception ex) {
-            log.error("CRITICAL PDF ERROR: Could not generate PDF.", ex);
-            // This stack trace will now appear in your logs/application.log
-        }
-    }
-
-Summary of Actions
- * Update application.yml with the logging config.
- * Update HdfsFileSystemClient.java with the robust "Bypass Hadoop" logic.
- * Update VarianceReportExporter.java with the detailed debug logic.
- * Restart & Check Logs: Open logs/application.log. Search for CRITICAL PDF ERROR or BYPASSING HADOOP.
+2026-02-13 13:03:58.569 INFO  [http-nio-9005-exec-2] o.a.j.l.DirectJDKLog: Initializing Spring DispatcherServlet 'dispatcherServlet' 
+2026-02-13 13:03:58.569 INFO  [http-nio-9005-exec-2] o.s.w.s.FrameworkServlet: Initializing Servlet 'dispatcherServlet' 
+2026-02-13 13:03:58.571 INFO  [http-nio-9005-exec-2] o.s.w.s.FrameworkServlet: Completed initialization in 2 ms 
+2026-02-13 13:03:59.286 INFO  [http-nio-9005-exec-2] c.f.R.r.VarianceReportExporter: STARTING PDF GENERATION: Target -> .\output\nwsa_variance_20250211_vs_20250210.pdf 
+2026-02-13 13:03:59.992 INFO  [http-nio-9005-exec-2] c.f.R.r.VarianceReportExporter: PDF Data Rows: 3 
+2026-02-13 13:04:00.604 ERROR [http-nio-9005-exec-2] c.f.R.r.VarianceReportExporter: CRITICAL PDF ERROR: Could not generate PDF. 
+net.sf.jasperreports.engine.JRException: Error retrieving field value from bean: section.
+	at net.sf.jasperreports.engine.data.JRAbstractBeanDataSource.getBeanProperty(JRAbstractBeanDataSource.java:160)
+	at net.sf.jasperreports.engine.data.JRAbstractBeanDataSource.getFieldValue(JRAbstractBeanDataSource.java:141)
+	at net.sf.jasperreports.engine.data.JRBeanCollectionDataSource.getFieldValue(JRBeanCollectionDataSource.java:104)
+	at net.sf.jasperreports.engine.fill.JRFillDataset.setOldValues(JRFillDataset.java:1533)
+	at net.sf.jasperreports.engine.fill.JRFillDataset.next(JRFillDataset.java:1434)
+	at net.sf.jasperreports.engine.fill.JRFillDataset.next(JRFillDataset.java:1410)
+	at net.sf.jasperreports.engine.fill.JRBaseFiller.next(JRBaseFiller.java:1210)
+	at net.sf.jasperreports.engine.fill.JRVerticalFiller.fillReport(JRVerticalFiller.java:117)
+	at net.sf.jasperreports.engine.fill.JRBaseFiller.fill(JRBaseFiller.java:631)
+	at net.sf.jasperreports.engine.fill.BaseReportFiller.fill(BaseReportFiller.java:435)
+	at net.sf.jasperreports.engine.fill.JRFiller.fill(JRFiller.java:162)
+	at net.sf.jasperreports.engine.fill.JRFiller.fill(JRFiller.java:145)
+	at net.sf.jasperreports.engine.JasperFillManager.fill(JasperFillManager.java:758)
+	at net.sf.jasperreports.engine.JasperFillManager.fillReport(JasperFillManager.java:1074)
+	at com.fincore.ReportService.report.VarianceReportExporter.writePdf(VarianceReportExporter.java:91)
+	at com.fincore.ReportService.report.VarianceReportExporter.export(VarianceReportExporter.java:49)
+	at com.fincore.ReportService.controller.VarianceController.generate(VarianceController.java:45)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:255)
+	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:188)
+	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:118)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.invokeHandlerMethod(RequestMappingHandlerAdapter.java:926)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.handleInternal(RequestMappingHandlerAdapter.java:831)
+	at org.springframework.web.servlet.mvc.method.AbstractHandlerMethodAdapter.handle(AbstractHandlerMethodAdapter.java:87)
+	at org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)
+	at org.springframework.web.servlet.DispatcherServlet.doService(DispatcherServlet.java:979)
+	at org.springframework.web.servlet.FrameworkServlet.processRequest(FrameworkServlet.java:1014)
+	at org.springframework.web.servlet.FrameworkServlet.doPost(FrameworkServlet.java:914)
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:590)
+	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:885)
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:658)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:195)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.apache.tomcat.websocket.server.WsFilter.doFilter(WsFilter.java:51)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:108)
+	at org.springframework.security.web.FilterChainProxy.lambda$doFilterInternal$3(FilterChainProxy.java:231)
+	at org.springframework.security.web.ObservationFilterChainDecorator$FilterObservation$SimpleFilterObservation.lambda$wrap$1(ObservationFilterChainDecorator.java:479)
+	at org.springframework.security.web.ObservationFilterChainDecorator$AroundFilterObservation$SimpleAroundFilterObservation.lambda$wrap$1(ObservationFilterChainDecorator.java:340)
+	at org.springframework.security.web.ObservationFilterChainDecorator.lambda$wrapSecured$0(ObservationFilterChainDecorator.java:82)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:128)
+	at org.springframework.security.web.access.intercept.AuthorizationFilter.doFilter(AuthorizationFilter.java:100)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:126)
+	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:120)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:131)
+	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:85)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.authentication.AnonymousAuthenticationFilter.doFilter(AnonymousAuthenticationFilter.java:100)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter.doFilter(SecurityContextHolderAwareRequestFilter.java:179)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.savedrequest.RequestCacheAwareFilter.doFilter(RequestCacheAwareFilter.java:63)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at com.fincore.commonutilities.security.ContextRbacFilter.doFilterInternal(ContextRbacFilter.java:145)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:107)
+	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:93)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.web.filter.CorsFilter.doFilterInternal(CorsFilter.java:91)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.header.HeaderWriterFilter.doHeadersAfter(HeaderWriterFilter.java:90)
+	at org.springframework.security.web.header.HeaderWriterFilter.doFilterInternal(HeaderWriterFilter.java:75)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:82)
+	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:69)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter.doFilterInternal(WebAsyncManagerIntegrationFilter.java:62)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.session.DisableEncodeUrlFilter.doFilterInternal(DisableEncodeUrlFilter.java:42)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$AroundFilterObservation$SimpleAroundFilterObservation.lambda$wrap$0(ObservationFilterChainDecorator.java:323)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:224)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.FilterChainProxy.doFilterInternal(FilterChainProxy.java:233)
+	at org.springframework.security.web.FilterChainProxy.doFilter(FilterChainProxy.java:191)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113)
+	at org.springframework.web.servlet.handler.HandlerMappingIntrospector.lambda$createCacheFilter$3(HandlerMappingIntrospector.java:195)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113)
+	at org.springframework.web.filter.CompositeFilter.doFilter(CompositeFilter.java:74)
+	at org.springframework.security.config.annotation.web.configuration.WebMvcSecurityConfiguration$CompositeFilterChainProxy.doFilter(WebMvcSecurityConfiguration.java:230)
+	at org.springframework.web.filter.DelegatingFilterProxy.invokeDelegate(DelegatingFilterProxy.java:352)
+	at org.springframework.web.filter.DelegatingFilterProxy.doFilter(DelegatingFilterProxy.java:268)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.RequestContextFilter.doFilterInternal(RequestContextFilter.java:100)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.FormContentFilter.doFilterInternal(FormContentFilter.java:93)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.ServerHttpObservationFilter.doFilterInternal(ServerHttpObservationFilter.java:109)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.CharacterEncodingFilter.doFilterInternal(CharacterEncodingFilter.java:201)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:167)
+	at org.apache.catalina.core.StandardContextValve.invoke(StandardContextValve.java:90)
+	at org.apache.catalina.authenticator.AuthenticatorBase.invoke(AuthenticatorBase.java:482)
+	at org.apache.catalina.core.StandardHostValve.invoke(StandardHostValve.java:115)
+	at org.apache.catalina.valves.ErrorReportValve.invoke(ErrorReportValve.java:93)
+	at org.apache.catalina.core.StandardEngineValve.invoke(StandardEngineValve.java:74)
+	at org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:344)
+	at org.apache.coyote.http11.Http11Processor.service(Http11Processor.java:389)
+	at org.apache.coyote.AbstractProcessorLight.process(AbstractProcessorLight.java:63)
+	at org.apache.coyote.AbstractProtocol$ConnectionHandler.process(AbstractProtocol.java:896)
+	at org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:1741)
+	at org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:52)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1190)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:659)
+	at org.apache.tomcat.util.threads.TaskThread$WrappingRunnable.run(TaskThread.java:63)
+	at java.base/java.lang.Thread.run(Thread.java:1570)
+Caused by: java.lang.NoSuchMethodException: Unknown property 'section' on class 'class com.fincore.ReportService.report.VarianceReportExporter$VarianceRowView'
+	at org.apache.commons.beanutils.PropertyUtilsBean.getSimpleProperty(PropertyUtilsBean.java:1270)
+	at org.apache.commons.beanutils.PropertyUtilsBean.getNestedProperty(PropertyUtilsBean.java:809)
+	at org.apache.commons.beanutils.PropertyUtilsBean.getProperty(PropertyUtilsBean.java:885)
+	at org.apache.commons.beanutils.PropertyUtils.getProperty(PropertyUtils.java:464)
+	at net.sf.jasperreports.engine.data.JRAbstractBeanDataSource.getBeanProperty(JRAbstractBeanDataSource.java:156)
+	... 148 common frames omitted
