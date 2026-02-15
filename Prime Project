@@ -1,0 +1,148 @@
+This is the perfect mindset. You want a project that **breaks** you if you don't use the concepts correctly.
+
+I have designed a project that is **Not** a Management System. It is a **High-Scale IoT (Internet of Things) Cloud Platform**.
+
+This domain is tricky because it deals with **Polymorphism** (different devices have different features), **High Volume Data** (logs/telemetry), and **Strict Ownership** (Security).
+
+---
+
+# 🌩️ Project Name: "Nexus - The IoT Device Cloud"
+
+**The Concept:**
+You are building the backend for a Smart Home company (like Google Home or Apple HomeKit). Users purchase different types of devices (Cameras, Thermostats, Smart Locks), connect them to your cloud, and control them via an App.
+
+**Why this forces "Deep Thinking":**
+
+* **Inheritance:** A `Camera` is completely different from a `Thermostat`, but they are both `Devices`. You **MUST** use an Inheritance Strategy.
+* **One-to-One:** Every device has a sensitive `NetworkConfiguration` (IP, MAC Address, Encryption Key) that shouldn't be loaded every time you list devices.
+* **One-to-Many:** A Device generates thousands of `TelemetryLogs` (Temperature readings, Motion events). If you use `EAGER` fetching here, your API will crash instantly.
+* **DTOs:** You cannot return a raw `Device` entity because a `Camera` has a `streamUrl` but a `Thermostat` has `temperature`. Your DTOs must be polymorphic.
+
+---
+
+## 🏗️ The Schema & The Challenges
+
+### 1. The Inheritance Challenge (The Strategy Pattern) 🧠
+
+**Scenario:**
+You have a base class `Device`.
+
+* **SmartCamera:** Has `resolution` (4K/1080p), `nightVision` (boolean), `storageUrl`.
+* **SmartThermostat:** Has `currentTemp`, `targetTemp`, `humidity`.
+* **SmartLock:** Has `batteryLevel`, `isLocked`, `accessCode`.
+
+**Your Task:**
+
+* You cannot create 3 separate tables (`camera`, `thermostat`, `lock`) because we need a feature to "List All Devices in the House".
+* **Constraint:** You must use **`@Inheritance(strategy = InheritanceType.JOINED)`**.
+* *Why?* Because `Camera` and `Thermostat` have very different columns. `SINGLE_TABLE` would result in too many NULLs.
+
+
+* **Critical Thinking:** Analyze the SQL query generated when you do `deviceRepository.findAll()`. It will do a massive `LEFT JOIN`. Is this acceptable?
+
+### 2. The "One-to-One" Lazy Loading Trap 🐢
+
+**Scenario:**
+Every `Device` has a `NetworkIdentity` (stores strict security data: `macAddress`, `localIp`, `firmwareVersion`, `secretAuthToken`).
+
+**The Trap:**
+When a user opens their dashboard to see "My Devices", they only need the *Name* and *Status*. They do **NOT** need the `secretAuthToken`.
+
+* **Relationship:** `Device` ↔ `NetworkIdentity` (`@OneToOne`).
+* **Constraint:** You **MUST** make this `FetchType.LAZY`.
+* **The Test:** Write a test case where you fetch a Device, and assert that the `NetworkIdentity` query has **not** run yet.
+
+### 3. The "One-to-Many" Performance Bomb 💣
+
+**Scenario:**
+Devices send data every minute.
+
+* A `Thermostat` sends: `{ "temp": 22.5, "timestamp": "10:00" }`.
+* A `Camera` sends: `{ "motionDetected": true, "timestamp": "10:05" }`.
+
+**The Relationship:**
+`Device` ➡ `TelemetryLog` (`@OneToMany`).
+
+**The Constraint:**
+
+* A device might have **1,000,000 logs**.
+* **Constraint 1:** You must use `FetchType.LAZY`.
+* **Constraint 2:** You must implement a **DTO** that only returns the *last 10 logs*, not the whole list. You cannot simply call `device.getLogs()` because that loads 1,000,000 rows into RAM. You need a specific Repository query.
+
+### 4. The "Orphan Removal" Logic 🗑️
+
+**Scenario:**
+A User has a `Home`. A `Home` has `Rooms`. A `Room` has `Devices`.
+
+* If I delete a `Home`, everything inside it (Rooms, Devices, Logs) must be destroyed immediately.
+* **Constraint:** Use `CascadeType.ALL` and `orphanRemoval = true`.
+* **The Test:** Delete a Home ID and check the Database. Ensure the `Device` table and `TelemetryLog` table are empty for that home.
+
+### 5. The Polymorphic DTO Challenge 📦
+
+**Scenario:**
+You have one API endpoint: `GET /api/devices`.
+It must return a JSON list, but the objects inside are different.
+
+**Output JSON:**
+
+```json
+[
+  {
+    "type": "THERMOSTAT",
+    "id": 1,
+    "name": "Living Room AC",
+    "currentTemp": 24.0  // <--- Specific to Thermostat
+  },
+  {
+    "type": "CAMERA",
+    "id": 2,
+    "name": "Front Door",
+    "resolution": "4K"   // <--- Specific to Camera
+  }
+]
+
+```
+
+**Your Task:**
+
+* Create a `DeviceResponseDTO` (Parent).
+* Create `ThermostatDTO` and `CameraDTO` (Children).
+* In your **Service Layer**, when you fetch entities, you must inspect them (`instanceof`) and map them to the correct Child DTO.
+
+---
+
+## 🛠️ Implementation Steps (Your Roadmap)
+
+### Phase 1: The Core (Inheritance)
+
+1. Create `BaseEntity` (`@MappedSuperclass`) with Auditing (`createdAt`, `updatedAt`).
+2. Create `Device` (Abstract Parent Entity) using `JOINED` strategy.
+3. Create `SmartCamera` and `SmartThermostat` extending `Device`.
+4. **Check:** Save a Camera. Check your DB tool (DBeaver/pgAdmin). Did it create 2 tables (`device` and `smart_camera`)?
+
+### Phase 2: The Data & Relationships
+
+5. Create `NetworkIdentity` entity. Link it One-to-One with `Device` (Lazy).
+6. Create `TelemetryLog` entity. Link it Many-to-One with `Device`.
+7. **Check:** Try to fetch a Device. If you see a query for `network_identity` immediately, you failed the Lazy Load test.
+
+### Phase 3: The API & DTOs
+
+8. Create `DeviceController`.
+9. Implement `POST /devices` (Complex: The input JSON determines which subclass to create).
+10. Implement `GET /devices` (Polymorphic DTO mapping).
+
+### Phase 4: The Clean Up (Orphan Removal)
+
+11. Create a `Home` entity that holds a List of Devices.
+12. Delete a Home and ensure all linked Devices are wiped from the DB.
+
+---
+
+## 🧘 Critical Thinking Questions (Ask yourself while coding)
+
+1. *Since I used `JOINED` strategy, every time I fetch a generic `Device`, Hibernate does a JOIN on all 3 tables (Device, Camera, Thermostat) to figure out what type it is. Is this slow? Would `SINGLE_TABLE` be faster? Why didn't we use `SINGLE_TABLE`?*
+2. *I made `NetworkIdentity` Lazy. But when I convert Entity -> DTO in the Service layer, I accidentally called `device.getNetworkIdentity().getIp()`. Did I just trigger the query I was trying to avoid? How do I handle DTO conversion without accidentally triggering Lazy loading?*
+
+**Do you accept this challenge?** 🛡️ This project is technically "smaller" than a full app, but much **deeper** in complexity.
