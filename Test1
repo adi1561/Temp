@@ -1,32 +1,202 @@
-table name -> P_L_TRANSFER
+This is a classic financial aggregation task. To make this production-ready and compliant with SOLID principles, we will separate concerns strictly:
+ * Entity Layer (SRP): Represents the database state only.
+ * Repository Layer (ISP): Handles data access and aggregation queries.
+ * Service Layer (OCP): Contains business logic (converting DB results to DTOs).
+ * Controller Layer (SRP): Handles HTTP requests/responses.
+ * DTOs: Decouples the API contract from the database schema.
+ * Global Exception Handling: Centralizes error management.
+Here is the complete Spring Boot implementation.
+1. Project Structure & Dependencies
+Ensure you have spring-boot-starter-data-jpa, spring-boot-starter-web, and lombok in your pom.xml.
+2. The Entity (Data Layer)
+We map the exact columns provided. We use BigDecimal for PROFIT_LOSS to avoid floating-point precision errors (crucial for financial data).
+package com.company.finance.model;
 
-column names and all details
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
 
-TRANSFER_DATE	DATE	Yes		1	
-BRANCH_CODE	NUMBER(5,0)	No		2	
-CIRCLE_BRANCH_CODE	NUMBER(5,0)	No		3	
-PROFIT_LOSS	NUMBER(25,4)	Yes		4	
+@Entity
+@Table(name = "P_L_TRANSFER")
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ProfitLossTransfer {
 
-sample date 
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id; // Assuming a surrogate key exists, otherwise use composite key
 
-31-01-26	3978	61263	-71610000
-31-01-26	1111	3974	0
-31-01-26	3974	14002	0
-31-01-26	6939	4282	3844.8
+    @Column(name = "TRANSFER_DATE", nullable = false)
+    private LocalDate transferDate;
 
+    @Column(name = "BRANCH_CODE", nullable = false, precision = 5)
+    private Integer branchCode;
 
-heyy , 
+    @Column(name = "CIRCLE_BRANCH_CODE", nullable = false, precision = 5)
+    private Integer circleBranchCode;
 
-i have new task in the spring boot in which u r task to create the summary from above table in which
-we need to create summrey using below 
-u need to show 3 things 
-TRANSFER_DATE
-CIRCLE_BRANCH_CODE 
-PROFIT_LOSS 
-in which from above 
-CIRCLE_BRANCH_CODE -> u need to do group by on this for creating this summrey i hope u understand 
+    @Column(name = "PROFIT_LOSS", precision = 25, scale = 4)
+    private BigDecimal profitLoss;
+}
 
-create production ready code in which it should follow the SOLID priciples 
-using DTOs and all
-use proper stusture and use the global exception
- and all 
+3. The DTO (Data Transfer Object)
+This object defines exactly what the API consumer will see, hiding the complexity of the raw entity.
+package com.company.finance.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class ProfitLossSummaryDto {
+    private LocalDate transferDate;
+    private Integer circleBranchCode;
+    private BigDecimal totalProfitLoss;
+}
+
+4. The Repository (Data Access)
+We use a JPQL query to handle the GROUP BY logic directly in the database. This is more efficient than fetching all records and grouping in Java.
+Note: Since the summary includes TRANSFER_DATE, we must Group By both TRANSFER_DATE and CIRCLE_BRANCH_CODE to maintain data integrity.
+package com.company.finance.repository;
+
+import com.company.finance.dto.ProfitLossSummaryDto;
+import com.company.finance.model.ProfitLossTransfer;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface ProfitLossRepository extends JpaRepository<ProfitLossTransfer, Long> {
+
+    // JPQL Constructor Expression to map directly to DTO
+    @Query("SELECT new com.company.finance.dto.ProfitLossSummaryDto(" +
+           "p.transferDate, p.circleBranchCode, SUM(p.profitLoss)) " +
+           "FROM ProfitLossTransfer p " +
+           "GROUP BY p.circleBranchCode, p.transferDate " +
+           "ORDER BY p.transferDate DESC")
+    List<ProfitLossSummaryDto> findProfitLossSummaryGroupedByCircle();
+}
+
+5. Service Layer (Business Logic)
+This layer acts as a facade. If business rules change (e.g., applying tax logic before returning), we change it here without breaking the controller or repository.
+package com.company.finance.service;
+
+import com.company.finance.dto.ProfitLossSummaryDto;
+import com.company.finance.repository.ProfitLossRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+public interface ProfitLossService {
+    List<ProfitLossSummaryDto> getCircleWiseSummary();
+}
+
+@Service
+@RequiredArgsConstructor
+public class ProfitLossServiceImpl implements ProfitLossService {
+
+    private final ProfitLossRepository repository;
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ProfitLossSummaryDto> getCircleWiseSummary() {
+        List<ProfitLossSummaryDto> summary = repository.findProfitLossSummaryGroupedByCircle();
+        
+        if (summary.isEmpty()) {
+            throw new com.company.finance.exception.ResourceNotFoundException("No profit/loss data found for summary generation.");
+        }
+        
+        return summary;
+    }
+}
+
+6. Global Exception Handling
+We capture errors globally to return consistent JSON error responses, preventing stack traces from leaking to the client.
+package com.company.finance.exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+
+// 1. Custom Exception Class
+class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+
+// 2. Global Handler
+@ControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<Object> handleResourceNotFound(ResourceNotFoundException ex) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("timestamp", LocalDateTime.now());
+        body.put("status", HttpStatus.NOT_FOUND.value());
+        body.put("error", "Not Found");
+        body.put("message", ex.getMessage());
+        return new ResponseEntity<>(body, HttpStatus.NOT_FOUND);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Object> handleGeneralException(Exception ex) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("timestamp", LocalDateTime.now());
+        body.put("status", HttpStatus.INTERNAL_SERVER_ERROR.value());
+        body.put("error", "Internal Server Error");
+        body.put("message", "An unexpected error occurred processing the summary.");
+        return new ResponseEntity<>(body, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+}
+
+7. Controller (Presentation Layer)
+Clean and minimal. It delegates purely to the service.
+package com.company.finance.controller;
+
+import com.company.finance.dto.ProfitLossSummaryDto;
+import com.company.finance.service.ProfitLossService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/v1/finance")
+@RequiredArgsConstructor
+public class ProfitLossController {
+
+    private final ProfitLossService profitLossService;
+
+    @GetMapping("/summary/circle-wise")
+    public ResponseEntity<List<ProfitLossSummaryDto>> getCircleWiseSummary() {
+        return ResponseEntity.ok(profitLossService.getCircleWiseSummary());
+    }
+}
+
+Why this is "Production Ready"
+ * BigDecimal: Used for PROFIT_LOSS instead of Double. In banking/finance, Double causes rounding errors (e.g., 0.1 + 0.2 = 0.30000000004).
+ * DTO Projection: We did not return the Entity. We returned a DTO. This prevents "LazyInitializationException" and accidental data leakage (like internal IDs).
+ * Repository Aggregation: We used SUM() inside the database. Fetching 1,000,000 rows to Java and looping through them to sum them up is slow and memory-intensive. Database aggregation is highly optimized.
+ * Lombok: Used to reduce boilerplate code (@Data, @RequiredArgsConstructor).
+ * Interface-Based Service: ProfitLossService is an interface. This allows you to swap implementations later (e.g., for unit testing) without breaking the controller.
+Would you like me to add a Unit Test using JUnit 5 and Mockito for this service layer?
