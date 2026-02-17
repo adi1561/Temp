@@ -1,29 +1,35 @@
-Yes, we absolutely can. Since JsonProcessingException is a checked exception (forcing you to handle it with try-catch or throws), wrapping it in a RuntimeException or just throwing a generic Exception will make your code cleaner and remove the need for those specific imports in your Controller and Interface.
-Here are the updated files where we replace JsonProcessingException with a generic RuntimeException.
-1. Service Interface (LhoTransferService.java)
-Change: Removed the throws clause completely.
-package com.fincore.YearEndService.Service;
+Yes, you can avoid importing JsonProcessingException by catching the generic Exception class and then wrapping it in your own Custom Exception.
+This is actually a good practice because it decouples your Service layer from the Jackson library's specific error handling.
+Here are the files you need:
+1. Create the Custom Exception File
+Create this file in your Exception package.
+File: src/main/java/com/fincore/YearEndService/Exception/PayloadProcessingException.java
+package com.fincore.YearEndService.Exception;
 
-import com.fincore.YearEndService.Model.CommonReq;
-import java.util.List;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
 
-public interface LhoTransferService {
+// Marking this as Internal Server Error (500) automatically
+@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+public class PayloadProcessingException extends RuntimeException {
+    
+    public PayloadProcessingException(String message) {
+        super(message);
+    }
 
-    // Trigger creation of request
-    // No specific exception declaration needed now
-    CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId);
-
-    // Fetch pending list for approval screen
-    List<CommonReq> getPendingLhoRequests();
+    public PayloadProcessingException(String message, Throwable cause) {
+        super(message, cause);
+    }
 }
 
-2. Service Implementation (LhoTransferServiceImpl.java)
-Change: We wrap the objectMapper call in a try-catch block and throw a RuntimeException if it fails. This prevents the checked exception from leaking out.
+2. Update the Service Implementation
+In the implementation, we remove the Jackson exception import. Instead, we catch the generic Exception and throw our new custom exception.
+File: src/main/java/com/fincore/YearEndService/Service/LhoTransferServiceImpl.java
 package com.fincore.YearEndService.Service;
 
-import com.fasterxml.jackson.core.JsonProcessingException; // Only needed inside implementation now
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.YearEndService.DTO.LhoTransferPayload;
+import com.fincore.YearEndService.Exception.PayloadProcessingException; // Import your custom exception
 import com.fincore.YearEndService.Exception.ResourceNotFoundException;
 import com.fincore.YearEndService.Model.ChangeType;
 import com.fincore.YearEndService.Model.CommonReq;
@@ -69,12 +75,13 @@ public class LhoTransferServiceImpl implements LhoTransferService {
         request.setTargetId(batchId);
         request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
 
-        // WRAP THE JSON CONVERSION
+        // CHANGED: Catch generic Exception to avoid importing JsonProcessingException
         try {
             request.setPayload(objectMapper.writeValueAsString(payload));
-        } catch (JsonProcessingException e) {
-            log.error("Error converting payload to JSON", e);
-            throw new RuntimeException("Failed to process request payload", e);
+        } catch (Exception e) {
+            log.error("Failed to serialize payload for batch: {}", batchId, e);
+            // Throw your custom exception instead
+            throw new PayloadProcessingException("Error processing JSON payload for Batch ID: " + batchId, e);
         }
 
         CommonReq savedReq = commonRequestRepository.save(request);
@@ -116,52 +123,6 @@ public class LhoTransferServiceImpl implements LhoTransferService {
                         new LhoTransferPayload.CircleSummaryDto("Delhi", "DEL", new BigDecimal("40000"), new BigDecimal("20000"))
                 ))
                 .build();
-    }
-}
-
-3. Controller (LhoTransferController.java)
-Change: Removed the throws JsonProcessingException from the method signature.
-package com.fincore.YearEndService.Controller;
-
-import com.fincore.YearEndService.DTO.ApiResponse;
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Service.LhoTransferService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.List;
-import java.util.Map;
-
-@RestController
-@RequestMapping("/api/lho-transfer")
-@RequiredArgsConstructor
-@Slf4j
-public class LhoTransferController {
-
-    private final LhoTransferService lhoTransferService;
-
-    @PostMapping("/trigger")
-    public ResponseEntity<ApiResponse<CommonReq>> triggerLhoProcess(
-            @RequestHeader("Authorization") String token,
-            @RequestBody Map<String, String> payload
-    ) { // No throws clause needed anymore
-
-        String batchId = payload.get("batchId");
-        String userId = "USER_001"; 
-
-        log.info("Trigger received for Batch: {}", batchId);
-
-        CommonReq request = lhoTransferService.createLhoTransferRequest(batchId, userId);
-
-        return ResponseEntity.ok(ApiResponse.success(request, "LHO Transfer Request Generated Successfully"));
-    }
-
-    @GetMapping("/pending")
-    public ResponseEntity<ApiResponse<List<CommonReq>>> getPendingRequests() {
-        List<CommonReq> requests = lhoTransferService.getPendingLhoRequests();
-        return ResponseEntity.ok(ApiResponse.success(requests));
     }
 }
 
