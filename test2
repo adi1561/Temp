@@ -1,177 +1,103 @@
-You are absolutely right. I missed the existing ProfitLossService and its specific DTO ProfitLossSummaryDto that you had already defined.
-I was generating completely random dummy data instead of using the real structure provided by your ProfitLossService.
-Here is the corrected integration.
-What has changed?
- * Injected ProfitLossService: The LhoTransferServiceImpl now calls your existing service to get the real data.
- * Mapped the DTOs: I map your ProfitLossSummaryDto (Circle Code, Profit/Loss) directly into the Payload.
- * Removed Wrong Dummy Data: I removed the random "Mumbai/Delhi" dummy method and replaced it with a method that returns a List<ProfitLossSummaryDto> (either from your service or a proper dummy list matching YOUR DTO structure).
-1. Updated Payload DTO
-I updated this to match your ProfitLossSummaryDto fields (using circleBranchCode and amount).
-File: src/main/java/com/fincore/YearEndService/DTO/LhoTransferPayload.java
-package com.fincore.YearEndService.DTO;
+2026-02-17T14:20:30.099+05:30  WARN 27104 --- [YearEndService] [nio-8080-exec-4] org.hibernate.orm.jdbc.error             : ORA-12899: value too large for column "FINCORE"."COMMON_REQ"."CHANGE_TYPE" (actual: 3, maximum: 2)
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+https://docs.oracle.com/error-help/db/ora-12899/
+2026-02-17T14:20:30.128+05:30 ERROR 27104 --- [YearEndService] [nio-8080-exec-4] o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed: org.springframework.orm.jpa.JpaSystemException: could not execute statement [ORA-12899: value too large for column "FINCORE"."COMMON_REQ"."CHANGE_TYPE" (actual: 3, maximum: 2)
 
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.util.List;
+https://docs.oracle.com/error-help/db/ora-12899/] [insert into common_req (change_type,creator_id,execution_date,executor_id,executor_remarks,req_date,req_status,req_type,target_id,req_id,execution_remarks,payload) values (?,?,?,?,?,?,?,?,?,?,?,?)]] with root cause
 
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class LhoTransferPayload implements KeyablePayload {
+Error : 12899, Position : 173, SQL = insert into common_req (change_type,creator_id,execution_date,executor_id,executor_remarks,req_date,req_status,req_type,target_id,req_id,execution_remarks,payload) values (:1 ,:2 ,:3 ,:4 ,:5 ,:6 ,:7 ,:8 ,:9 ,:10 ,:11 ,:12 ), Original SQL = insert into common_req (change_type,creator_id,execution_date,executor_id,executor_remarks,req_date,req_status,req_type,target_id,req_id,execution_remarks,payload) values (?,?,?,?,?,?,?,?,?,?,?,?), Error Message = ORA-12899: value too large for column "FINCORE"."COMMON_REQ"."CHANGE_TYPE" (actual: 3, maximum: 2)
 
-    private String batchId;
-    private LocalDate processDate; // Changed to LocalDate to match your DTO
-    
-    // Aggregate totals calculated from the list
-    private BigDecimal totalAmount; 
-    private int totalRecordCount;
-
-    // The list of circle summaries
-    private List<ProfitLossSummaryDto> circleWiseDetails;
-
-    @Override
-    @JsonIgnore
-    public String getKey() {
-        return this.batchId;
-    }
-}
-
-2. Updated Service Implementation
-This is the Critical Fix. It now uses your ProfitLossService.
-File: src/main/java/com/fincore/YearEndService/Service/LhoTransferServiceImpl.java
-package com.fincore.YearEndService.Service;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.YearEndService.DTO.LhoTransferPayload;
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-import com.fincore.YearEndService.Exception.PayloadProcessingException;
-import com.fincore.YearEndService.Exception.ResourceNotFoundException;
-import com.fincore.YearEndService.Model.ChangeType;
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Model.RequestStatus;
-import com.fincore.YearEndService.Repository.CommonRequestRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.List;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class LhoTransferServiceImpl implements LhoTransferService {
-
-    private final CommonRequestRepository commonRequestRepository;
-    private final NotificationWriterService notificationWriterService;
-    private final ObjectMapper objectMapper;
-    
-    // INJECTING YOUR EXISTING SERVICE
-    private final ProfitLossService profitLossService;
-
-    private static final String LHO_REQ_TYPE = "LHO_TRANSFER";
-
-    @Override
-    @Transactional
-    public CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId) {
-        log.info("Generating LHO Transfer Request for Batch: {}", batchId);
-
-        // 1. Fetch Real Data using YOUR ProfitLossService
-        List<ProfitLossSummaryDto> summaryList = profitLossService.getCircleWiseSummary();
-
-        // 2. Validate Data (If empty, we might want to throw error or create empty request)
-        if (summaryList == null || summaryList.isEmpty()) {
-            // Optional: If you want to force DUMMY data for testing when DB is empty:
-            log.warn("No data found in ProfitLossService. Using DUMMY data for testing.");
-            summaryList = getDummyProfitLossData(); 
-            // OR throw new ResourceNotFoundException("No Profit/Loss data found.");
-        }
-
-        // 3. Calculate Totals for the Header
-        BigDecimal totalAmount = summaryList.stream()
-                .map(ProfitLossSummaryDto::getTotalProfitLoss)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        // 4. Build the Payload Object
-        LhoTransferPayload payload = LhoTransferPayload.builder()
-                .batchId(batchId)
-                .processDate(LocalDate.now())
-                .totalRecordCount(summaryList.size())
-                .totalAmount(totalAmount)
-                .circleWiseDetails(summaryList) // Directly setting your DTO list
-                .build();
-
-        // 5. Create Entity
-        CommonReq request = new CommonReq();
-        request.setCreatorId(triggeredByUserId);
-        request.setReqType(LHO_REQ_TYPE);
-        request.setChangeType(ChangeType.ADD);
-        request.setReqStatus(RequestStatus.PENDING);
-        request.setTargetId(batchId);
-        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-
-        // 6. Serialize Payload
-        try {
-            request.setPayload(objectMapper.writeValueAsString(payload));
-        } catch (Exception e) {
-            log.error("Failed to serialize payload for batch: {}", batchId, e);
-            throw new PayloadProcessingException("Error processing JSON payload", e);
-        }
-
-        // 7. Save
-        CommonReq savedReq = commonRequestRepository.save(request);
-        log.info("Saved LHO Request ID: {}", savedReq.getId());
-
-        // 8. Notification
-        try {
-            notificationWriterService.createNotification(
-                    null,
-                    "LHO_CHECKER",
-                    "New LHO Transfer Request (Batch: " + batchId + ")",
-                    "/lho-approval",
-                    savedReq.getId().toString(),
-                    "YearEndService"
-            );
-        } catch (Exception e) {
-            log.warn("Notification failed, but request saved.");
-        }
-
-        return savedReq;
-    }
-
-    @Override
-    public List<CommonReq> getPendingLhoRequests() {
-        return commonRequestRepository.findByReqStatusAndReqType(
-                RequestStatus.PENDING,
-                LHO_REQ_TYPE
-        );
-    }
-
-    /**
-     * Helper to generate DUMMY data that matches YOUR ProfitLossSummaryDto structure.
-     * Used only if the real service returns empty list during testing.
-     */
-    private List<ProfitLossSummaryDto> getDummyProfitLossData() {
-        List<ProfitLossSummaryDto> dummyList = new ArrayList<>();
-        
-        // Matches your DTO: LocalDate, Integer circleCode, BigDecimal amount
-        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 101, new BigDecimal("50000.00")));
-        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 102, new BigDecimal("75000.50")));
-        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 103, new BigDecimal("-12000.00"))); // Loss scenario
-        
-        return dummyList;
-    }
-}
+	at oracle.jdbc.driver.T4CTTIoer11.processError(T4CTTIoer11.java:723) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.T4CTTIoer11.processError(T4CTTIoer11.java:615) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.T4C8Oall.processError(T4C8Oall.java:1372) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.T4CTTIfun.receive(T4CTTIfun.java:972) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.T4CTTIfun.doRPC(T4CTTIfun.java:237) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.T4C8Oall.doOALL(T4C8Oall.java:524) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.T4CPreparedStatement.doOall8(T4CPreparedStatement.java:298) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.T4CPreparedStatement.executeForRows(T4CPreparedStatement.java:1510) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.OracleStatement.executeSQLStatement(OracleStatement.java:2020) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.OracleStatement.doExecuteWithTimeout(OracleStatement.java:1633) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.OraclePreparedStatement.executeInternal(OraclePreparedStatement.java:3973) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.OraclePreparedStatement.doExecuteLargeUpdate(OraclePreparedStatement.java:4339) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.OraclePreparedStatement.executeLargeUpdate(OraclePreparedStatement.java:4316) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.OraclePreparedStatement.executeUpdate(OraclePreparedStatement.java:4291) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at oracle.jdbc.driver.OraclePreparedStatementWrapper.executeUpdate(OraclePreparedStatementWrapper.java:1007) ~[ojdbc11-23.9.0.25.07.jar:23.9.0.25.07]
+	at com.zaxxer.hikari.pool.ProxyPreparedStatement.executeUpdate(ProxyPreparedStatement.java:61) ~[HikariCP-7.0.2.jar:na]
+	at com.zaxxer.hikari.pool.HikariProxyPreparedStatement.executeUpdate(HikariProxyPreparedStatement.java) ~[HikariCP-7.0.2.jar:na]
+	at org.hibernate.engine.jdbc.internal.ResultSetReturnImpl.executeUpdate(ResultSetReturnImpl.java:181) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.engine.jdbc.mutation.internal.AbstractMutationExecutor.performNonBatchedMutation(AbstractMutationExecutor.java:145) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.engine.jdbc.mutation.internal.MutationExecutorSingleNonBatched.performNonBatchedOperations(MutationExecutorSingleNonBatched.java:53) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.engine.jdbc.mutation.internal.AbstractMutationExecutor.execute(AbstractMutationExecutor.java:66) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.engine.jdbc.mutation.internal.AbstractMutationExecutor.execute(AbstractMutationExecutor.java:55) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.persister.entity.mutation.InsertCoordinatorStandard.doStaticInserts(InsertCoordinatorStandard.java:180) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.persister.entity.mutation.InsertCoordinatorStandard.coordinateInsert(InsertCoordinatorStandard.java:120) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.persister.entity.mutation.InsertCoordinatorStandard.insert(InsertCoordinatorStandard.java:93) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.action.internal.EntityInsertAction.execute(EntityInsertAction.java:108) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.engine.spi.ActionQueue.executeActions(ActionQueue.java:634) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.engine.spi.ActionQueue.executeActions(ActionQueue.java:505) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.event.internal.AbstractFlushingEventListener.performExecutions(AbstractFlushingEventListener.java:381) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.event.internal.DefaultFlushEventListener.onFlush(DefaultFlushEventListener.java:40) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.event.service.internal.EventListenerGroupImpl.fireEventOnEachListener(EventListenerGroupImpl.java:138) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.internal.SessionImpl.fireFlush(SessionImpl.java:1489) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.internal.SessionImpl.managedFlush(SessionImpl.java:481) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.internal.SessionImpl.flushBeforeTransactionCompletion(SessionImpl.java:2116) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.internal.SessionImpl.beforeTransactionCompletion(SessionImpl.java:2038) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.engine.jdbc.internal.JdbcCoordinatorImpl.beforeTransactionCompletion(JdbcCoordinatorImpl.java:410) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.resource.transaction.backend.jdbc.internal.JdbcResourceLocalTransactionCoordinatorImpl.beforeCompletionCallback(JdbcResourceLocalTransactionCoordinatorImpl.java:166) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.resource.transaction.backend.jdbc.internal.JdbcResourceLocalTransactionCoordinatorImpl$TransactionDriverControlImpl.commitNoRollbackOnly(JdbcResourceLocalTransactionCoordinatorImpl.java:248) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.resource.transaction.backend.jdbc.internal.JdbcResourceLocalTransactionCoordinatorImpl$TransactionDriverControlImpl.commit(JdbcResourceLocalTransactionCoordinatorImpl.java:242) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.hibernate.engine.transaction.internal.TransactionImpl.commit(TransactionImpl.java:89) ~[hibernate-core-7.2.1.Final.jar:7.2.1.Final]
+	at org.springframework.orm.jpa.JpaTransactionManager.doCommit(JpaTransactionManager.java:553) ~[spring-orm-7.0.3.jar:7.0.3]
+	at org.springframework.transaction.support.AbstractPlatformTransactionManager.processCommit(AbstractPlatformTransactionManager.java:794) ~[spring-tx-7.0.3.jar:7.0.3]
+	at org.springframework.transaction.support.AbstractPlatformTransactionManager.commit(AbstractPlatformTransactionManager.java:757) ~[spring-tx-7.0.3.jar:7.0.3]
+	at org.springframework.transaction.interceptor.TransactionAspectSupport.commitTransactionAfterReturning(TransactionAspectSupport.java:687) ~[spring-tx-7.0.3.jar:7.0.3]
+	at org.springframework.transaction.interceptor.TransactionAspectSupport.invokeWithinTransaction(TransactionAspectSupport.java:408) ~[spring-tx-7.0.3.jar:7.0.3]
+	at org.springframework.transaction.interceptor.TransactionInterceptor.invoke(TransactionInterceptor.java:130) ~[spring-tx-7.0.3.jar:7.0.3]
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:179) ~[spring-aop-7.0.3.jar:7.0.3]
+	at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:719) ~[spring-aop-7.0.3.jar:7.0.3]
+	at com.fincore.YearEndService.Service.LhoTransferServiceImpl$$SpringCGLIB$$0.createLhoTransferRequest(<generated>) ~[classes/:na]
+	at com.fincore.YearEndService.Controller.LhoTransferController.triggerLhoProcess(LhoTransferController.java:33) ~[classes/:na]
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104) ~[na:na]
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565) ~[na:na]
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:258) ~[spring-web-7.0.3.jar:7.0.3]
+	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:190) ~[spring-web-7.0.3.jar:7.0.3]
+	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:117) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.invokeHandlerMethod(RequestMappingHandlerAdapter.java:934) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.handleInternal(RequestMappingHandlerAdapter.java:853) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at org.springframework.web.servlet.mvc.method.AbstractHandlerMethodAdapter.handle(AbstractHandlerMethodAdapter.java:86) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:963) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at org.springframework.web.servlet.DispatcherServlet.doService(DispatcherServlet.java:866) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at org.springframework.web.servlet.FrameworkServlet.processRequest(FrameworkServlet.java:1003) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at org.springframework.web.servlet.FrameworkServlet.doPost(FrameworkServlet.java:903) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:649) ~[tomcat-embed-core-11.0.15.jar:6.1]
+	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:874) ~[spring-webmvc-7.0.3.jar:7.0.3]
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:710) ~[tomcat-embed-core-11.0.15.jar:6.1]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:128) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.tomcat.websocket.server.WsFilter.doFilter(WsFilter.java:53) ~[tomcat-embed-websocket-11.0.15.jar:11.0.15]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:107) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.springframework.web.filter.RequestContextFilter.doFilterInternal(RequestContextFilter.java:100) ~[spring-web-7.0.3.jar:7.0.3]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-7.0.3.jar:7.0.3]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:107) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.springframework.web.filter.FormContentFilter.doFilterInternal(FormContentFilter.java:93) ~[spring-web-7.0.3.jar:7.0.3]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-7.0.3.jar:7.0.3]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:107) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.springframework.web.filter.CharacterEncodingFilter.doFilterInternal(CharacterEncodingFilter.java:199) ~[spring-web-7.0.3.jar:7.0.3]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-7.0.3.jar:7.0.3]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:107) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:165) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.catalina.core.StandardContextValve.invoke(StandardContextValve.java:77) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.catalina.authenticator.AuthenticatorBase.invoke(AuthenticatorBase.java:482) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.catalina.core.StandardHostValve.invoke(StandardHostValve.java:113) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.catalina.valves.ErrorReportValve.invoke(ErrorReportValve.java:83) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.catalina.core.StandardEngineValve.invoke(StandardEngineValve.java:72) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:341) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.coyote.http11.Http11Processor.service(Http11Processor.java:397) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.coyote.AbstractProcessorLight.process(AbstractProcessorLight.java:63) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.coyote.AbstractProtocol$ConnectionHandler.process(AbstractProtocol.java:903) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:1778) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:52) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:946) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:480) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at org.apache.tomcat.util.threads.TaskThread$WrappingRunnable.run(TaskThread.java:57) ~[tomcat-embed-core-11.0.15.jar:11.0.15]
+	at java.base/java.lang.Thread.run(Thread.java:1474) ~[na:na]
 
