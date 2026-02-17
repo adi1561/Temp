@@ -1,540 +1,366 @@
-package com.fincore.YearEndService.Controller;
+package com.fincore.ReportService.controller;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Service.LhoTransferService;
-import com.tcs.fincore.CommonRequestService.dto.ApiResponse;
-import com.tcs.fincore.LhoTransferService.model.CommonReq;
-import com.tcs.fincore.LhoTransferService.service.LhoTransferService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.dto.DifferenceSearchDto;
+import com.fincore.ReportService.service.DifferenceService;
+import jakarta.validation.Valid;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.List;
-import java.util.Map;
-
 @RestController
-@RequestMapping("/api/lho-transfer")
-@RequiredArgsConstructor
-@Slf4j
-public class LhoTransferController {
+@RequestMapping("/api/differences")
+public class DifferenceController {
 
-    private final LhoTransferService lhoTransferService;
+    @Autowired
+    private DifferenceService service;
 
-    /**
-     * Trigger the LHO Request Creation.
-     * Expects payload: { "batchId": "BATCH_2023_001" }
-     */
-    @PostMapping("/trigger")
-    public ResponseEntity<ApiResponse<CommonReq>> triggerLhoProcess(
-            @RequestHeader("Authorization") String token,
-            @RequestBody Map<String, String> payload
-    ) throws JsonProcessingException {
-
-        String batchId = payload.get("batchId");
-        String userId = "USER_001"; // Extract from token in real implementation
-
-        log.info("Trigger received for Batch: {}", batchId);
-
-        CommonReq request = lhoTransferService.createLhoTransferRequest(batchId, userId);
-
-        return ResponseEntity.ok(ApiResponse.success(request, "LHO Transfer Request Generated Successfully"));
+    // Basic Get All
+    @GetMapping
+    public ResponseEntity<Page<DifferenceDTO>> getDifferences(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        return ResponseEntity.ok(service.getAllDifferences(page, size));
     }
 
     /**
-     * Get Pending Requests for the Approval Screen.
+     * MASTER SEARCH ENDPOINT
+     * Handles: Date Range, Branch, Currency, CGL in any combination.
      */
-    @GetMapping("/pending")
-    public ResponseEntity<ApiResponse<List<CommonReq>>> getPendingRequests() {
-        List<CommonReq> requests = lhoTransferService.getPendingLhoRequests();
-        return ResponseEntity.ok(ApiResponse.success(requests));
+    @PostMapping("/search")
+    public ResponseEntity<Page<DifferenceDTO>> searchDifferences(
+            @Valid @RequestBody DifferenceSearchDto criteria,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) {
+        // Validation: Date is mandatory
+        if (criteria.getFromDate() == null) {
+            throw new IllegalArgumentException("fromDate is required");
+        }
+
+        Page<DifferenceDTO> result = service.searchDifferences(criteria, page, size);
+
+        if (result.isEmpty()) {
+            return ResponseEntity.noContent().build();
+        }
+        return ResponseEntity.ok(result);
     }
+
+
 }
 
-above file ApiResponse and JsonProcessingException
- having error 
 
-package com.fincore.YearEndService.DTO;
-
-import com.fasterxml.jackson.annotation.JsonIgnore;
-
+package com.fincore.ReportService.dto;
+import java.math.BigDecimal;
+import java.time.LocalDate;
 import lombok.AllArgsConstructor;
-import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-import java.math.BigDecimal;
-import java.util.List;
-
 @Data
-@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class LhoTransferPayload implements KeyablePayload {
+public class DifferenceDTO {
+    private LocalDate reconRunDate;
+    private String branchCode;
+    private String currency;
+    private String cgl;
+    private BigDecimal cbsBalance;
+    private BigDecimal glBalance;
+    private BigDecimal differenceAmount;
+    private BigDecimal diffBwYesterday;
+    private String type;
+    private String head;
+    private LocalDate FIRST_ERROR_DATE;
+}
 
-    private String batchId;
-    private String processDate;
-    private BigDecimal totalCreditAmount;
-    private BigDecimal totalDebitAmount;
-    private int totalRecordCount;
 
-    // The Circle-wise summary details
-    private List<CircleSummaryDto> circleSummaries;
+package com.fincore.ReportService.dto;
 
-    @Data
-    @Builder
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class CircleSummaryDto {
-        private String circleName;
-        private String circleCode;
-        private BigDecimal creditAmount;
-        private BigDecimal debitAmount;
-    }
+import java.time.LocalDate;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class DifferenceSearchDto {
+
+    // Mandatory: The start date (or the specific single date)
+    private LocalDate fromDate;
+
+    // Optional: If null, we assume the user wants data for ONLY the fromDate
+    private LocalDate toDate;
+
+    // Optional Filters (Send null or empty string to ignore)
+    private String branchCode;
+    private String currency;
+    private String cgl;
 
     /**
-     * Returns the Batch ID as the key.
+     * Helper method to standardize date range logic.
+     * If toDate is missing, we default it to fromDate (Single Day Search).
      */
-    @Override
-    @JsonIgnore
-    public String getKey() {
-        return this.batchId;
+    public LocalDate getEffectiveToDate() {
+        return (toDate == null) ? fromDate : toDate;
     }
 }
 
-KeyablePayload -> this having error
 
 
-package com.fincore.YearEndService.Model;
+package com.fincore.ReportService.exception;
 
-import com.fasterxml.jackson.annotation.JsonRawValue;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.ReportService.dto.ApiResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.context.request.WebRequest;
+
+import jakarta.validation.ConstraintViolationException;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@ControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Object>> handleResourceNotFoundException(ResourceNotFoundException ex, WebRequest request) {
+        log.error("Report not found: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error(ex.getMessage()), HttpStatus.NOT_FOUND);
+    }
+
+    @ExceptionHandler({JsonProcessingException.class, HttpMessageNotReadableException.class})
+    public ResponseEntity<ApiResponse<Object>> handleJsonProcessingException(Exception ex, WebRequest request) {
+        log.error("Error processing JSON payload: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error("Invalid request payload format. Please check the JSON structure and data types."), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiResponse<Object>> handleDataIntegrityViolationException(DataIntegrityViolationException ex, WebRequest request) {
+        log.error("Data integrity violation: {}", ex.getMessage());
+        if (ex.getMostSpecificCause().getMessage().contains("already exists")) {
+            return new ResponseEntity<>(ApiResponse.error("A resource with the provided identifier already exists."), HttpStatus.CONFLICT);
+        }
+        return new ResponseEntity<>(ApiResponse.error("Database constraint violation. A required field may be missing or a value is invalid."), HttpStatus.CONFLICT);
+    }
+
+    @ExceptionHandler({IllegalArgumentException.class, IllegalStateException.class})
+    public ResponseEntity<ApiResponse<Object>> handleArgumentAndStateExceptions(RuntimeException ex, WebRequest request) {
+        log.error("Illegal argument or state: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error(ex.getMessage()), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Object>> handleGlobalException(Exception ex, WebRequest request) {
+        log.error("An unexpected error occurred: {}", ex.getMessage(), ex);
+        return new ResponseEntity<>(ApiResponse.error("An internal server error occurred."), HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    /**
+     * Handles exceptions thrown when @Valid validation fails on a request body.
+     */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ResponseEntity<ApiResponse<Object>> handleValidationExceptions(MethodArgumentNotValidException ex) {
+        String errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                .collect(Collectors.joining(", "));
+
+        log.warn("Validation failed for incoming request: {}", errors);
+        return new ResponseEntity<>(ApiResponse.error("Validation Failed: " + errors), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ResponseEntity<ApiResponse<Object>> handleConstraintViolationException(ConstraintViolationException ex) {
+        String errors = ex.getConstraintViolations().stream()
+                .map(cv -> cv.getPropertyPath() + ": " + cv.getMessage())
+                .collect(Collectors.joining(", "));
+
+        log.warn("Constraint violation during processing: {}", errors);
+        return new ResponseEntity<>(ApiResponse.error("Validation Failed: " + errors), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ApiResponse<Object>> handleAccessDeniedException(AccessDeniedException ex, WebRequest request) {
+        log.error("Access Denied: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error("Report Not Found or You are not authorized to perform this action."), HttpStatus.NOT_FOUND);
+    }
+
+    @ExceptionHandler(IOException.class)
+    public ResponseEntity<Map<String, String>> io(IOException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                .body(Map.of("error", "HDFS_FILE_ACCESS_ERROR", "message", ex.getMessage()));
+    }
+
+}
+
+package com.fincore.ReportService.model;
 
 import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-import java.time.LocalDateTime;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
-@Getter
-@Setter
 @Entity
-@Table(name = "COMMON_REQ")
-public class CommonReq {
+@Data
+@NoArgsConstructor
+public class Difference {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "COMMON_REQ_id_gen")
-    @SequenceGenerator(name = "COMMON_REQ_id_gen", sequenceName = "COMMON_REQ_SEQ", allocationSize = 1)
-    @Column(name = "REQ_ID", nullable = false)
+    @Column(name = "ID")
     private Long id;
 
-    /**
-     * CHANGED: Using String instead of Enum to allow hardcoding "LHO_TRANSFER"
-     */
-    @Column(name = "REQ_TYPE", nullable = false, length = 20)
-    private String reqType;
+    @Column(name = "RECON_RUN_DATE")
+    private LocalDate reconRunDate;
 
-    @Column(name = "CHANGE_TYPE", nullable = false, length = 2)
-    private ChangeType changeType;
+    @Column(name = "BRANCH_CODE", length = 5)
+    private String branchCode;
 
-    @Column(name = "REQ_STATUS", nullable = false, length = 2)
-    private RequestStatus reqStatus;
+    @Column(name = "CURRENCY", length = 3)
+    private String currency;
 
-    @Column(name = "REQ_DATE", nullable = false, updatable = false)
-    private LocalDateTime reqDate;
+    @Column(name = "CGL", length = 10)
+    private String cgl;
 
-    @Column(name = "CREATOR_ID", nullable = false, length = 12)
-    private String creatorId;
+    @Column(name = "CBS_BALANCE", precision = 25, scale = 4)
+    private BigDecimal cbsBalance;
 
-    @Column(name = "EXECUTION_DATE")
-    private LocalDateTime executionDate;
+    @Column(name = "GL_BALANCE", precision = 25, scale = 4)
+    private BigDecimal glBalance;
 
-    @Lob
-    @Column(name = "EXECUTION_REMARKS")
-    private String executionRemarks;
+    @Column(name = "DIFFERENCE_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal differenceAmount;
 
-    @Column(name = "EXECUTOR_ID", length = 12)
-    private String executorId;
+    @Column(name = "DIFF_BW_YESTERDAY", precision = 25, scale = 4)
+    private BigDecimal diffBwYesterday;
 
-    @Column(name = "EXECUTOR_REMARKS", length = 500)
-    private String executorRemarks;
+    @Column(name = "TYPE", length = 40)
+    private String type;
 
-    @Lob
-    @Column(name = "PAYLOAD", nullable = false)
-    private String payload;
+    @Column(name = "HEAD", length = 30)
+    private String head;
 
-    @Column(name = "TARGET_ID", length = 4000)
-    private String targetId;
-
-    @JsonRawValue
-    public String getPayload() {
-        return payload;
-    }
+    @Column(name = "FIRST_ERROR_DATE")
+    private LocalDate FIRST_ERROR_DATE;
 }
 
-ChangeType  , RequestStatus -> error in this 
 
+package com.fincore.ReportService.repository;
 
-package com.fincore.YearEndService.Repository;
-
-
-
-import com.fincore.YearEndService.Model.CommonReq;
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.model.Difference;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
-
-import java.util.List;
+import java.time.LocalDate;
 
 @Repository
-public interface CommonRequestRepository extends JpaRepository<CommonReq, Long> {
+public interface DifferenceRepository extends JpaRepository<Difference, Long> {
 
-    // Fetch all pending requests based on the Hardcoded String reqType
-    List<CommonReq> findByReqStatusAndReqType(RequestStatus reqStatus, String reqType);
+    // 1. Keep the original 'Find All' for basic listing
+    @Query("""
+        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
+            d.reconRunDate, d.branchCode, d.currency, d.cgl,
+            d.cbsBalance, d.glBalance, d.differenceAmount,
+            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
+        )
+        FROM Difference d
+    """)
+    Page<DifferenceDTO> findAllAsDto(Pageable pageable);
+
+    /**
+     * 2. MASTER DYNAMIC FILTER
+     * Handles: Date Range, Optional Branch, Optional Currency, Optional CGL
+     */
+    @Query("""
+        SELECT new com.fincore.ReportService.dto.DifferenceDTO(
+            d.reconRunDate, d.branchCode, d.currency, d.cgl,
+            d.cbsBalance, d.glBalance, d.differenceAmount,
+            d.diffBwYesterday, d.type, d.head, d.FIRST_ERROR_DATE
+        )
+        FROM Difference d
+        WHERE (d.reconRunDate BETWEEN :fromDate AND :toDate)
+        AND (:branchCode IS NULL OR d.branchCode = :branchCode)
+        AND (:currency IS NULL OR d.currency = :currency)
+        AND (:cgl IS NULL OR d.cgl = :cgl)
+    """)
+    Page<DifferenceDTO> searchDifferencesDynamic(
+            @Param("fromDate") LocalDate fromDate,
+            @Param("toDate") LocalDate toDate,
+            @Param("branchCode") String branchCode,
+            @Param("currency") String currency,
+            @Param("cgl") String cgl,
+            Pageable pageable
+    );
 }
 
 
-RequestStatus- having error 
 
-package com.fincore.YearEndService.Service;
+package com.fincore.ReportService.service;
 
-import com.fincore.YearEndService.Model.CommonReq;
-
-import java.util.List;
-
-public interface LhoTransferService {
-
-    // Trigger creation of request
-    CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId) throws JsonProcessingException;
-
-    // Fetch pending list for approval screen
-    List<CommonReq> getPendingLhoRequests();
-}
-JsonProcessingException ->  having error in this 
-
-
-package com.fincore.YearEndService.Service;
-
-import com.fincore.YearEndService.DTO.LhoTransferPayload;
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Repository.CommonRequestRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import com.fincore.ReportService.dto.DifferenceDTO;
+import com.fincore.ReportService.dto.DifferenceSearchDto;
+import com.fincore.ReportService.repository.DifferenceRepository;
+import io.micrometer.common.util.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import tools.jackson.databind.ObjectMapper;
-
-import java.math.BigDecimal;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.util.List;
 
 @Service
-@RequiredArgsConstructor
-@Slf4j
-public class LhoTransferServiceImpl implements LhoTransferService {
+public class DifferenceService {
 
-    private final CommonRequestRepository commonRequestRepository;
-    private final NotificationWriterService notificationWriterService;
-    private final ObjectMapper objectMapper;
+    @Autowired
+    private DifferenceRepository repository;
 
-    // Hardcoded Constant for the Request Type
-    private static final String LHO_REQ_TYPE = "LHO_TRANSFER";
-
-    @Override
-    @Transactional
-    public CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId) throws JsonProcessingException {
-        log.info("Generating LHO Transfer Request for Batch: {}", batchId);
-
-        // 1. Fetch Summary (Mocked logic for P_L_TRANSFER table)
-        // We MUST fetch this because 'Payload' column is nullable=false in DB
-        LhoTransferPayload payload = generateSummaryFromPlTable(batchId);
-
-        if (payload == null) {
-            throw new ResourceNotFoundException("No P_L_TRANSFER data found for Batch: " + batchId);
-        }
-
-        // 2. Create Entity with HARDCODED Request Type
-        CommonReq request = new CommonReq();
-        request.setCreatorId(triggeredByUserId);
-
-        // Hardcoded String Type
-        request.setReqType(LHO_REQ_TYPE);
-
-        request.setChangeType(ChangeType.ADD);
-        request.setReqStatus(RequestStatus.PENDING);
-
-        // We set TargetId to BatchId for reference
-        request.setTargetId(batchId);
-
-        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-
-        // Payload is MANDATORY in the DB Schema
-        request.setPayload(objectMapper.writeValueAsString(payload));
-
-        // 3. Save
-        CommonReq savedReq = commonRequestRepository.save(request);
-        log.info("Saved LHO Request ID: {}", savedReq.getId());
-
-        // 4. Notification
-        try {
-            notificationWriterService.createNotification(
-                    null,
-                    "LHO_CHECKER", // Hardcoded Role for this service
-                    "New LHO Transfer Request (Batch: " + batchId + ")",
-                    "/lho-approval",
-                    savedReq.getId().toString(),
-                    "LhoTransferService"
-            );
-        } catch (Exception e) {
-            log.warn("Notification failed, but request saved.");
-        }
-
-        return savedReq;
+    @Transactional(readOnly = true)
+    public Page<DifferenceDTO> getAllDifferences(int page, int size) {
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
+        return repository.findAllAsDto(pageRequest);
     }
 
-    @Override
-    public List<CommonReq> getPendingLhoRequests() {
-        // Fetch only requests where Type is "LHO_TRANSFER" and Status is PENDING
-        return commonRequestRepository.findByReqStatusAndReqType(
-                RequestStatus.PENDING,
-                LHO_REQ_TYPE
-        );
-    }
+    @Transactional(readOnly = true)
+    public Page<DifferenceDTO> searchDifferences(DifferenceSearchDto criteria, int page, int size) {
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("id"));
 
-    // --- Mock Helper for P_L_TRANSFER ---
-    // In real code, Inject your PlTransferRepository and call its method here
-    private LhoTransferPayload generateSummaryFromPlTable(String batchId) {
-        return LhoTransferPayload.builder()
-                .batchId(batchId)
-                .processDate("2023-12-31")
-                .totalCreditAmount(new BigDecimal("100000"))
-                .totalDebitAmount(new BigDecimal("50000"))
-                .totalRecordCount(150)
-                .circleSummaries(List.of(
-                        new LhoTransferPayload.CircleSummaryDto("Mumbai", "MUM", new BigDecimal("60000"), new BigDecimal("30000")),
-                        new LhoTransferPayload.CircleSummaryDto("Delhi", "DEL", new BigDecimal("40000"), new BigDecimal("20000"))
-                ))
-                .build();
-    }
-}
+        // sanitize inputs: convert empty strings to null so SQL ignores them
+        String branch = StringUtils.isBlank(criteria.getBranchCode()) ? null : criteria.getBranchCode();
+        String curr = StringUtils.isBlank(criteria.getCurrency()) ? null : criteria.getCurrency();
+        String cgl = StringUtils.isBlank(criteria.getCgl()) ? null : criteria.getCgl();
 
-
-JsonProcessingException , ChangeType  , RequestStatus  , ResourceNotFoundException -> this having error in above 
-
-
-package com.fincore.YearEndService.Service;
-
-
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Model.NotificationTable;
-import com.fincore.YearEndService.Repository.NotificationRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.SneakyThrows;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
-import tools.jackson.databind.ObjectMapper;
-
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-
-/**
- * A service to create and save Notification events to the outbox table.
- * [cite_start]Adapted from[span_1](end_span).
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class NotificationWriterService {
-
-    private final NotificationRepository notificationRepository;
-    private final ObjectMapper objectMapper;
-
-    /**
-     * Creates and saves a notification outbox event.
-     * This method joins the existing transaction from the calling service.
-     * [span_2](start_span)
-     */
-    @Transactional(propagation = Propagation.MANDATORY)
-    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
-
-        if (userId == null && targetRole == null) {
-            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
-            return;
-        }
-
-        if (message == null || message.isBlank()) {
-            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
-            throw new IllegalArgumentException("Notification message cannot be null or blank.");
-        }
-
-        NotificationTable notification = NotificationTable.builder()
-                .userId(userId)
-                .targetRole(targetRole)
-                .message(message)
-                .linkUrl(linkUrl)
-                .aggregateId(aggregateId)
-                .eventSource(eventSource)
-                .eventTimestamp(LocalDateTime.now(ZoneId.of("Asia/Kolkata")))
-                .build();
-
-        notificationRepository.save(notification);
-
-        if (targetRole != null) {
-            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
-        } else {
-            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
-        }
-    }
-
-    /**
-     * Logic to create notification when a Request is Approved.
-     *[span_2](end_span)
-     */
-    @SneakyThrows
-    public void createRequestApprovedNotification(CommonReq request, String approverId) {
-        String action = request.getChangeType().name(); // Default is UPDATE
-
-        // Custom logic to detect "Block" action for CGL
-        if (request.getReqType().equals(RequestType.CGL_CODE) && request.getChangeType() == ChangeType.UPDATE) {
-            CGLMaster payload = objectMapper.readValue(request.getPayload(), CGLMaster.class);
-            if (payload.getStatus() == 0) {
-                action = "BLOCK";
-            }
-        }
-
-        String notificationMessage = "Your " + request.getReqType() +" "+action
-                + " request for '" + request.getTargetId() + "' has been approved by " + approverId;
-
-        createNotification(
-                request.getCreatorId(),
-                null,
-                notificationMessage,
-                "/my-requests",
-                request.getId().toString(),
-                "CommonRequestService"
-        );
-    }
-
-    /**
-     * Logic to create notification when a Request is Rejected.
-     *[span_3](start_span)[span_3](end_span)
-     */
-    @SneakyThrows
-    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
-        String notificationMessage = "Your " + request.getReqType() +" "+request.getChangeType().name()
-                + " request for '" + request.getTargetId() + "' was rejected by " + rejectorId;
-
-        if (reason != null && !reason.isBlank()) {
-            notificationMessage += " Reason: " + reason;
-        }
-
-        createNotification(
-                request.getCreatorId(),
-                null,
-                notificationMessage,
-                "/my-requests",
-                request.getId().toString(),
-                "CommonRequestService"
+        return repository.searchDifferencesDynamic(
+                criteria.getFromDate(),
+                criteria.getEffectiveToDate(), // Handles the "Single Date vs Range" logic
+                branch,
+                curr,
+                cgl,
+                pageRequest
         );
     }
 }
 
+from this service from this code i dont follow the SOLID priciple for creating this use proper SOLID priciples and rewrite this by keeping the logic same
 
-name , RequestType , CGLMaster , getStatus -> having error and 
-
-one more thing in this service what is this CGLMaster i told u na it should not having common it should for our service only 
-
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-	<modelVersion>4.0.0</modelVersion>
-	<parent>
-		<groupId>org.springframework.boot</groupId>
-		<artifactId>spring-boot-starter-parent</artifactId>
-		<version>4.0.2</version>
-		<relativePath/> <!-- lookup parent from repository -->
-	</parent>
-	<groupId>com.fincore</groupId>
-	<artifactId>YearEndService</artifactId>
-	<version>0.0.1-SNAPSHOT</version>
-	<name>YearEndService</name>
-	<description> year end service</description>
-	<url/>
-	<licenses>
-		<license/>
-	</licenses>
-	<developers>
-		<developer/>
-	</developers>
-	<scm>
-		<connection/>
-		<developerConnection/>
-		<tag/>
-		<url/>
-	</scm>
-	<properties>
-		<java.version>21</java.version>
-	</properties>
-	<dependencies>
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-data-jpa</artifactId>
-		</dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-
-		<dependency>
-			<groupId>com.oracle.database.jdbc</groupId>
-			<artifactId>ojdbc11</artifactId>
-			<scope>runtime</scope>
-		</dependency>
-		<dependency>
-			<groupId>org.projectlombok</groupId>
-			<artifactId>lombok</artifactId>
-			<optional>true</optional>
-		</dependency>
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-data-jpa-test</artifactId>
-			<scope>test</scope>
-		</dependency>
-	</dependencies>
-
-	<build>
-		<plugins>
-			<plugin>
-				<groupId>org.apache.maven.plugins</groupId>
-				<artifactId>maven-compiler-plugin</artifactId>
-				<configuration>
-					<annotationProcessorPaths>
-						<path>
-							<groupId>org.projectlombok</groupId>
-							<artifactId>lombok</artifactId>
-						</path>
-					</annotationProcessorPaths>
-				</configuration>
-			</plugin>
-			<plugin>
-				<groupId>org.springframework.boot</groupId>
-				<artifactId>spring-boot-maven-plugin</artifactId>
-				<configuration>
-					<excludes>
-						<exclude>
-							<groupId>org.projectlombok</groupId>
-							<artifactId>lombok</artifactId>
-						</exclude>
-					</excludes>
-				</configuration>
-			</plugin>
-		</plugins>
-	</build>
-
-</project>
-
-above is pom file dont change anyting just tell mi any depe... missing in this 
-
-and i give u a file and what ever the error in that below that i mention that 
-
+and also  new com.fincore.ReportService.dto.DifferenceDTO( dont write like this create a saparate dto for this 
