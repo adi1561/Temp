@@ -16,7 +16,8 @@ import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
 // --- API Constants ---
-const TRIGGER_API_URL = "/PS/airflow/trigger";
+// Updated to your YearEndService endpoint
+const TRIGGER_API_URL = "/api/lho-transfer/trigger";
 
 const styles = {
   mainContainer: {
@@ -66,30 +67,55 @@ export default function TransferDataLho() {
 
   // State
   const [isTransferring, setIsTransferring] = useState(false);
-  const [rows] = useState([]); 
+  const [rows, setRows] = useState([]); 
+  const [userId, setUserId] = useState(null);
 
   useEffect(() => {
     isMounted.current = true;
+    
+    // --- Extract UserId from Storage ---
+    try {
+      const authData = localStorage.getItem("persist:auth") || sessionStorage.getItem("persist:auth");
+      if (authData) {
+        const parsedAuth = JSON.parse(authData);
+        // User field is stringified in your persist structure
+        if (parsedAuth.user) {
+          const userData = JSON.parse(parsedAuth.user);
+          if (userData.userId) {
+            setUserId(userData.userId);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error parsing user from storage:", error);
+    }
+
     return () => {
       isMounted.current = false;
     };
   }, []);
 
   const handleTransferLho = async () => {
+    if (!userId) {
+      showSnackBar("User ID not found. Please log in again.", "error");
+      return;
+    }
+
     setIsTransferring(true);
 
+    // The backend uses the token to get the ID, but we keep batchId in payload
     const payload = {
-        "dagId": "process_3",
-        "conf": {},
-        "remarks": "oii;;;p",
-        "processId": 7
+        "batchId": "BATCH_2023_001"
     };
 
     try {
+      // The callApi utility usually attaches the token from storage automatically
       await callApi(TRIGGER_API_URL, payload, "POST");
       
       if (isMounted.current) {
-        showSnackBar("LHO Transfer triggered successfully", "success");
+        showSnackBar("LHO Transfer Request Generated Successfully", "success");
+        // Optionally fetch pending list here to update the grid
+        fetchPendingRequests();
       }
     } catch (error) {
       if (isMounted.current) {
@@ -100,37 +126,56 @@ export default function TransferDataLho() {
     }
   };
 
+  const fetchPendingRequests = async () => {
+    try {
+      const response = await callApi("/api/lho-transfer/pending", null, "GET");
+      if (isMounted.current && response.success) {
+        setRows(response.data || []);
+      }
+    } catch (error) {
+      console.error("Failed to fetch pending requests", error);
+    }
+  };
+
+  // Run fetch on mount
+  useEffect(() => {
+    fetchPendingRequests();
+  }, []);
+
   const columns = [
     {
       field: "id",
-      headerName: "ID",
-      width: 150,
+      headerName: "Req ID",
+      width: 100,
       align: "center",
       headerAlign: "center",
     },
     {
-      field: "processName",
-      headerName: "Process Name",
+      field: "targetId",
+      headerName: "Batch ID",
       flex: 1,
-      minWidth: 200,
+      minWidth: 150,
       align: "left",
       headerAlign: "left",
     },
     {
-      field: "status",
+      field: "reqStatus",
       headerName: "Status",
       width: 150,
       align: "center",
       headerAlign: "center",
+      renderCell: (params) => (
+        <Typography variant="body2" sx={{ fontWeight: 'bold' }}>
+           {params.value === 'P' ? 'PENDING' : params.value}
+        </Typography>
+      )
     },
     {
-      field: "actions",
-      headerName: "Actions",
-      width: 150,
-      align: "center",
-      headerAlign: "center",
-      sortable: false,
-    },
+        field: "reqDate",
+        headerName: "Created Date",
+        width: 200,
+        renderCell: (params) => new Date(params.value).toLocaleString()
+    }
   ];
 
   return (
@@ -144,15 +189,15 @@ export default function TransferDataLho() {
           onClick={handleTransferLho}
           disabled={isTransferring}
         >
-          {isTransferring ? "Transferring..." : "Transfer LHO"}
+          {isTransferring ? "Processing..." : "Transfer LHO"}
         </Button>
       </Box>
 
       <DataGrid
         rows={rows}
         columns={columns}
-        loading={isTransferring} // Optional: show loading on grid while triggering
-        getRowId={(row) => row.id || Math.random()}
+        loading={isTransferring}
+        getRowId={(row) => row.id}
         disableRowSelectionOnClick
         pageSizeOptions={[5, 10, 25]}
         disableColumnResize
