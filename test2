@@ -1,128 +1,86 @@
-Yes, you can avoid importing JsonProcessingException by catching the generic Exception class and then wrapping it in your own Custom Exception.
-This is actually a good practice because it decouples your Service layer from the Jackson library's specific error handling.
-Here are the files you need:
-1. Create the Custom Exception File
-Create this file in your Exception package.
-File: src/main/java/com/fincore/YearEndService/Exception/PayloadProcessingException.java
-package com.fincore.YearEndService.Exception;
+I OK CHEAK THE CODE 
+i think u missunderstand something like 
 
-import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.ResponseStatus;
+u dont remmber 
 
-// Marking this as Internal Server Error (500) automatically
-@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
-public class PayloadProcessingException extends RuntimeException {
-    
-    public PayloadProcessingException(String message) {
-        super(message);
-    }
+package com.fincore.YearEndService.Controller;
 
-    public PayloadProcessingException(String message, Throwable cause) {
-        super(message, cause);
+
+import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
+import com.fincore.YearEndService.Service.ProfitLossService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/yearend")
+@RequiredArgsConstructor
+public class ProfitLossController {
+
+    private final ProfitLossService profitLossService;
+
+        @GetMapping("/summary/circle-wise")
+    public ResponseEntity<List<ProfitLossSummaryDto>> getCircleWiseSummary() {
+        return ResponseEntity.ok(profitLossService.getCircleWiseSummary());
     }
 }
+package com.fincore.YearEndService.DTO;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
 
-2. Update the Service Implementation
-In the implementation, we remove the Jackson exception import. Instead, we catch the generic Exception and throw our new custom exception.
-File: src/main/java/com/fincore/YearEndService/Service/LhoTransferServiceImpl.java
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class ProfitLossSummaryDto {
+    private LocalDate transferDate;
+    private Integer circleBranchCode;
+    private BigDecimal totalProfitLoss;
+}
+
 package com.fincore.YearEndService.Service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.YearEndService.DTO.LhoTransferPayload;
-import com.fincore.YearEndService.Exception.PayloadProcessingException; // Import your custom exception
-import com.fincore.YearEndService.Exception.ResourceNotFoundException;
-import com.fincore.YearEndService.Model.ChangeType;
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Model.RequestStatus;
-import com.fincore.YearEndService.Repository.CommonRequestRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
 
-import java.math.BigDecimal;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
+
+import java.util.List;
+
+public interface ProfitLossService {
+    List<ProfitLossSummaryDto> getCircleWiseSummary();
+}
+
+package com.fincore.YearEndService.Service;
+
+import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
+import com.fincore.YearEndService.Repository.ProfitLossRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+
 import java.util.List;
 
 @Service
 @RequiredArgsConstructor
-@Slf4j
-public class LhoTransferServiceImpl implements LhoTransferService {
+public class ProfitLossServiceImpl implements ProfitLossService {
 
-    private final CommonRequestRepository commonRequestRepository;
-    private final NotificationWriterService notificationWriterService;
-    private final ObjectMapper objectMapper;
-
-    private static final String LHO_REQ_TYPE = "LHO_TRANSFER";
+    private final ProfitLossRepository repository;
 
     @Override
-    @Transactional
-    public CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId) {
-        log.info("Generating LHO Transfer Request for Batch: {}", batchId);
+    public List<ProfitLossSummaryDto> getCircleWiseSummary() {
+        List<ProfitLossSummaryDto> summary = repository.findProfitLossSummaryGroupedByCircle();
 
-        LhoTransferPayload payload = generateSummaryFromPlTable(batchId);
+//        if (summary.isEmpty()) {
+//            throw new com.company.finance.exception.ResourceNotFoundException("No profit/loss data found for summary generation.");
+//        }
 
-        if (payload == null) {
-            throw new ResourceNotFoundException("No P_L_TRANSFER data found for Batch: " + batchId);
-        }
-
-        CommonReq request = new CommonReq();
-        request.setCreatorId(triggeredByUserId);
-        request.setReqType(LHO_REQ_TYPE);
-        request.setChangeType(ChangeType.ADD);
-        request.setReqStatus(RequestStatus.PENDING);
-        request.setTargetId(batchId);
-        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-
-        // CHANGED: Catch generic Exception to avoid importing JsonProcessingException
-        try {
-            request.setPayload(objectMapper.writeValueAsString(payload));
-        } catch (Exception e) {
-            log.error("Failed to serialize payload for batch: {}", batchId, e);
-            // Throw your custom exception instead
-            throw new PayloadProcessingException("Error processing JSON payload for Batch ID: " + batchId, e);
-        }
-
-        CommonReq savedReq = commonRequestRepository.save(request);
-        log.info("Saved LHO Request ID: {}", savedReq.getId());
-
-        try {
-            notificationWriterService.createNotification(
-                    null,
-                    "LHO_CHECKER",
-                    "New LHO Transfer Request (Batch: " + batchId + ")",
-                    "/lho-approval",
-                    savedReq.getId().toString(),
-                    "YearEndService"
-            );
-        } catch (Exception e) {
-            log.warn("Notification failed, but request saved.");
-        }
-
-        return savedReq;
-    }
-
-    @Override
-    public List<CommonReq> getPendingLhoRequests() {
-        return commonRequestRepository.findByReqStatusAndReqType(
-                RequestStatus.PENDING,
-                LHO_REQ_TYPE
-        );
-    }
-
-    private LhoTransferPayload generateSummaryFromPlTable(String batchId) {
-        return LhoTransferPayload.builder()
-                .batchId(batchId)
-                .processDate("2023-12-31")
-                .totalCreditAmount(new BigDecimal("100000"))
-                .totalDebitAmount(new BigDecimal("50000"))
-                .totalRecordCount(150)
-                .circleSummaries(List.of(
-                        new LhoTransferPayload.CircleSummaryDto("Mumbai", "MUM", new BigDecimal("60000"), new BigDecimal("30000")),
-                        new LhoTransferPayload.CircleSummaryDto("Delhi", "DEL", new BigDecimal("40000"), new BigDecimal("20000"))
-                ))
-                .build();
+        return summary;
     }
 }
 
+i think u forget anbout this kind of Dummy data u are sending that is wrong i want this dummy data to be there in that payload 
+but u are sending that wrong dummy data 
