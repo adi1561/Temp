@@ -1,17 +1,182 @@
-EVENT_ID	RAW	No	SYS_GUID()	1	Unique primary key for the outbox event.
-USER_ID	VARCHAR2(255 BYTE)	Yes		2	The ID of the user who should receive this notification. In a scenario where both role and userId are provided, the userId will be excluded from the users in the targetRole (applicable when the same user has both creation and execution permissions).
-MESSAGE	VARCHAR2(1024 BYTE)	No		3	The human-readable message to be displayed.
-LINK_URL	VARCHAR2(1024 BYTE)	Yes		4	The relative URL the user should be taken to when clicking the notification.
-EVENT_SOURCE	VARCHAR2(100 BYTE)	Yes		5	The microservice that generated this event (e.g., REPORT_SERVICE).
-AGGREGATE_ID	VARCHAR2(255 BYTE)	Yes		6	The primary key of the business object (e.g., the Report ID).
-EVENT_TIMESTAMP	TIMESTAMP(6) WITH TIME ZONE	No	CURRENT_TIMESTAMP	7	The timestamp when the event was created.
-TARGET_ROLE	VARCHAR2(100 BYTE)	Yes		8	For 1-to-many notifications, if USER_ID is null, this role is used. For all users and all roles scenarios, use "ALL_USERS" as the role.
+Based on the schema and data you provided, here is the exact solution to fix the ORA-01465 (Invalid Hex) and ORA-00904 (Invalid Identifier) errors.
+The Problem
+ * ORA-01465: The EVENT_ID column is defined as RAW in Oracle (binary data), but your Java code was trying to save a String. You must use byte[] in Java to interact with RAW columns.
+ * ORA-00904: The IS_READ column is not in the schema list you just provided (Columns 1 to 8). We must remove it from the Java Entity.
+ * Timestamp: The database uses TIMESTAMP WITH TIME ZONE, so we should use ZonedDateTime in Java.
+Here are the 3 Updated Files. Replace them completely.
+1. Updated Entity: NotificationTable.java
+Changes:
+ * Table name set to NOTIFICATIONS (to match your error logs).
+ * eventId changed from String to byte[].
+ * eventTimestamp changed to ZonedDateTime.
+ * Removed isRead field.
+<!-- end list -->
+package com.fincore.YearEndService.Model;
 
-47E1591579FD492FA08357B93A8DECC7	1023044	CNTR Report (Suspense Report) downloaded successfully.	/glif-reports	ReportService	cntr_report_2026-01-07	17-02-26 05:40:30.172134000 AM GMT	
-39D1C06087AB40F8BB2E84A3F8E34290	1023044	Balance Compare Report downloaded successfully.	/glif-reports	ReportService	balance_compare_report_2026-01-07	17-02-26 05:40:43.022187000 AM GMT	
-1B1BA7F06721433E8C1A46EEF7ADF2A3	1023044	NWSA Report (New Weekly Statement Of Abstract) downloaded successfully.	/glif-reports	ReportService	nwsa_report_2026-01-07	17-02-26 05:40:50.038134000 AM GMT	
-1EAA6C75D1F8400E8A38456AEADA24E8	1023044	CNTR Report (Suspense Report) downloaded successfully.	/glif-reports	ReportService	cntr_report_2026-01-07	17-02-26 05:41:28.956598000 AM GMT	
-5609276D580C48E7B16A4AC63669F52B	1023044	INTR Report (Core Interbranch Report) downloaded successfully.	/glif-reports	ReportService	intr_report_2026-01-07	17-02-26 05:08:47.063064000 AM GMT	
+import jakarta.persistence.*;
+import lombok.*;
+import org.hibernate.annotations.CreationTimestamp;
+import java.time.ZonedDateTime;
 
+@Entity
+// Using the table name from your error logs and schema description
+@Table(name = "NOTIFICATIONS") 
+@Getter
+@Setter
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class NotificationTable {
 
-above is the example data and DB existing the table i cant change that we need to change the code acoordinlgy
+    @Id
+    @Column(name = "EVENT_ID", columnDefinition = "RAW(16)")
+    private byte[] eventId; // Changed to byte[] to match Oracle RAW column
+
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
+    @Column(name = "MESSAGE", nullable = false, length = 1024)
+    private String message;
+
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP")
+    private ZonedDateTime eventTimestamp; // Matches TIMESTAMP WITH TIME ZONE
+
+    // Removed IS_READ because it is not in your DB schema provided
+}
+
+2. Updated Repository: NotificationRepository.java
+Changes: Updated the ID type in the interface definition from String to byte[].
+package com.fincore.YearEndService.Repository;
+
+import com.fincore.YearEndService.Model.NotificationTable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+// Change generic type <NotificationTable, String> to <NotificationTable, byte[]>
+@Repository
+public interface NotificationRepository extends JpaRepository<NotificationTable, byte[]> {
+    
+    List<NotificationTable> findByUserId(String userId);
+
+    List<NotificationTable> findByTargetRole(String targetRole);
+}
+
+3. Updated Service: NotificationWriterService.java
+Changes:
+ * Added logic to generate a UUID and convert it to byte[] before saving.
+ * Updated the imports.
+<!-- end list -->
+package com.fincore.YearEndService.Service;
+
+import com.fincore.YearEndService.Model.CommonReq;
+import com.fincore.YearEndService.Model.NotificationTable;
+import com.fincore.YearEndService.Repository.NotificationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.nio.ByteBuffer;
+import java.time.ZonedDateTime;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null.");
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        // Generate ID as byte array to fit Oracle RAW column
+        byte[] rawEventId = generateRawUuid();
+
+        NotificationTable notification = NotificationTable.builder()
+                .eventId(rawEventId)
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .eventTimestamp(ZonedDateTime.now()) // Use ZonedDateTime
+                .build();
+
+        notificationRepository.save(notification);
+        log.info("Saved notification for AggregateID: {}", aggregateId);
+    }
+
+    @SneakyThrows
+    public void createRequestApprovedNotification(CommonReq request, String approverId) {
+        String notificationMessage = "Your " + request.getReqType() + " ADD request for '" 
+                                     + request.getTargetId() + "' has been approved by " + approverId;
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests",
+                request.getId().toString(),
+                "YearEndService"
+        );
+    }
+
+    @SneakyThrows
+    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
+        String notificationMessage = "Your " + request.getReqType() + " ADD request for '" 
+                                     + request.getTargetId() + "' was rejected by " + rejectorId;
+
+        if (reason != null && !reason.isBlank()) {
+            notificationMessage += " Reason: " + reason;
+        }
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests",
+                request.getId().toString(),
+                "YearEndService"
+        );
+    }
+
+    /**
+     * Helper to convert Java UUID to 16-byte array for Oracle RAW column
+     */
+    private byte[] generateRawUuid() {
+        UUID uuid = UUID.randomUUID();
+        ByteBuffer bb = ByteBuffer.wrap(new byte[16]);
+        bb.putLong(uuid.getMostSignificantBits());
+        bb.putLong(uuid.getLeastSignificantBits());
+        return bb.array();
+    }
+}
+
