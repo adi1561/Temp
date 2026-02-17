@@ -1,86 +1,177 @@
-I OK CHEAK THE CODE 
-i think u missunderstand something like 
-
-u dont remmber 
-
-package com.fincore.YearEndService.Controller;
-
-
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-import com.fincore.YearEndService.Service.ProfitLossService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.List;
-
-@RestController
-@RequestMapping("/api/yearend")
-@RequiredArgsConstructor
-public class ProfitLossController {
-
-    private final ProfitLossService profitLossService;
-
-        @GetMapping("/summary/circle-wise")
-    public ResponseEntity<List<ProfitLossSummaryDto>> getCircleWiseSummary() {
-        return ResponseEntity.ok(profitLossService.getCircleWiseSummary());
-    }
-}
+You are absolutely right. I missed the existing ProfitLossService and its specific DTO ProfitLossSummaryDto that you had already defined.
+I was generating completely random dummy data instead of using the real structure provided by your ProfitLossService.
+Here is the corrected integration.
+What has changed?
+ * Injected ProfitLossService: The LhoTransferServiceImpl now calls your existing service to get the real data.
+ * Mapped the DTOs: I map your ProfitLossSummaryDto (Circle Code, Profit/Loss) directly into the Payload.
+ * Removed Wrong Dummy Data: I removed the random "Mumbai/Delhi" dummy method and replaced it with a method that returns a List<ProfitLossSummaryDto> (either from your service or a proper dummy list matching YOUR DTO structure).
+1. Updated Payload DTO
+I updated this to match your ProfitLossSummaryDto fields (using circleBranchCode and amount).
+File: src/main/java/com/fincore/YearEndService/DTO/LhoTransferPayload.java
 package com.fincore.YearEndService.DTO;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+
 import java.math.BigDecimal;
 import java.time.LocalDate;
-
-@Data
-@AllArgsConstructor
-@NoArgsConstructor
-public class ProfitLossSummaryDto {
-    private LocalDate transferDate;
-    private Integer circleBranchCode;
-    private BigDecimal totalProfitLoss;
-}
-
-package com.fincore.YearEndService.Service;
-
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-
-
 import java.util.List;
 
-public interface ProfitLossService {
-    List<ProfitLossSummaryDto> getCircleWiseSummary();
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class LhoTransferPayload implements KeyablePayload {
+
+    private String batchId;
+    private LocalDate processDate; // Changed to LocalDate to match your DTO
+    
+    // Aggregate totals calculated from the list
+    private BigDecimal totalAmount; 
+    private int totalRecordCount;
+
+    // The list of circle summaries
+    private List<ProfitLossSummaryDto> circleWiseDetails;
+
+    @Override
+    @JsonIgnore
+    public String getKey() {
+        return this.batchId;
+    }
 }
 
+2. Updated Service Implementation
+This is the Critical Fix. It now uses your ProfitLossService.
+File: src/main/java/com/fincore/YearEndService/Service/LhoTransferServiceImpl.java
 package com.fincore.YearEndService.Service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.YearEndService.DTO.LhoTransferPayload;
 import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-import com.fincore.YearEndService.Repository.ProfitLossRepository;
+import com.fincore.YearEndService.Exception.PayloadProcessingException;
+import com.fincore.YearEndService.Exception.ResourceNotFoundException;
+import com.fincore.YearEndService.Model.ChangeType;
+import com.fincore.YearEndService.Model.CommonReq;
+import com.fincore.YearEndService.Model.RequestStatus;
+import com.fincore.YearEndService.Repository.CommonRequestRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.List;
 
 @Service
 @RequiredArgsConstructor
-public class ProfitLossServiceImpl implements ProfitLossService {
+@Slf4j
+public class LhoTransferServiceImpl implements LhoTransferService {
 
-    private final ProfitLossRepository repository;
+    private final CommonRequestRepository commonRequestRepository;
+    private final NotificationWriterService notificationWriterService;
+    private final ObjectMapper objectMapper;
+    
+    // INJECTING YOUR EXISTING SERVICE
+    private final ProfitLossService profitLossService;
+
+    private static final String LHO_REQ_TYPE = "LHO_TRANSFER";
 
     @Override
-    public List<ProfitLossSummaryDto> getCircleWiseSummary() {
-        List<ProfitLossSummaryDto> summary = repository.findProfitLossSummaryGroupedByCircle();
+    @Transactional
+    public CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId) {
+        log.info("Generating LHO Transfer Request for Batch: {}", batchId);
 
-//        if (summary.isEmpty()) {
-//            throw new com.company.finance.exception.ResourceNotFoundException("No profit/loss data found for summary generation.");
-//        }
+        // 1. Fetch Real Data using YOUR ProfitLossService
+        List<ProfitLossSummaryDto> summaryList = profitLossService.getCircleWiseSummary();
 
-        return summary;
+        // 2. Validate Data (If empty, we might want to throw error or create empty request)
+        if (summaryList == null || summaryList.isEmpty()) {
+            // Optional: If you want to force DUMMY data for testing when DB is empty:
+            log.warn("No data found in ProfitLossService. Using DUMMY data for testing.");
+            summaryList = getDummyProfitLossData(); 
+            // OR throw new ResourceNotFoundException("No Profit/Loss data found.");
+        }
+
+        // 3. Calculate Totals for the Header
+        BigDecimal totalAmount = summaryList.stream()
+                .map(ProfitLossSummaryDto::getTotalProfitLoss)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        // 4. Build the Payload Object
+        LhoTransferPayload payload = LhoTransferPayload.builder()
+                .batchId(batchId)
+                .processDate(LocalDate.now())
+                .totalRecordCount(summaryList.size())
+                .totalAmount(totalAmount)
+                .circleWiseDetails(summaryList) // Directly setting your DTO list
+                .build();
+
+        // 5. Create Entity
+        CommonReq request = new CommonReq();
+        request.setCreatorId(triggeredByUserId);
+        request.setReqType(LHO_REQ_TYPE);
+        request.setChangeType(ChangeType.ADD);
+        request.setReqStatus(RequestStatus.PENDING);
+        request.setTargetId(batchId);
+        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+
+        // 6. Serialize Payload
+        try {
+            request.setPayload(objectMapper.writeValueAsString(payload));
+        } catch (Exception e) {
+            log.error("Failed to serialize payload for batch: {}", batchId, e);
+            throw new PayloadProcessingException("Error processing JSON payload", e);
+        }
+
+        // 7. Save
+        CommonReq savedReq = commonRequestRepository.save(request);
+        log.info("Saved LHO Request ID: {}", savedReq.getId());
+
+        // 8. Notification
+        try {
+            notificationWriterService.createNotification(
+                    null,
+                    "LHO_CHECKER",
+                    "New LHO Transfer Request (Batch: " + batchId + ")",
+                    "/lho-approval",
+                    savedReq.getId().toString(),
+                    "YearEndService"
+            );
+        } catch (Exception e) {
+            log.warn("Notification failed, but request saved.");
+        }
+
+        return savedReq;
+    }
+
+    @Override
+    public List<CommonReq> getPendingLhoRequests() {
+        return commonRequestRepository.findByReqStatusAndReqType(
+                RequestStatus.PENDING,
+                LHO_REQ_TYPE
+        );
+    }
+
+    /**
+     * Helper to generate DUMMY data that matches YOUR ProfitLossSummaryDto structure.
+     * Used only if the real service returns empty list during testing.
+     */
+    private List<ProfitLossSummaryDto> getDummyProfitLossData() {
+        List<ProfitLossSummaryDto> dummyList = new ArrayList<>();
+        
+        // Matches your DTO: LocalDate, Integer circleCode, BigDecimal amount
+        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 101, new BigDecimal("50000.00")));
+        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 102, new BigDecimal("75000.50")));
+        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 103, new BigDecimal("-12000.00"))); // Loss scenario
+        
+        return dummyList;
     }
 }
 
-i think u forget anbout this kind of Dummy data u are sending that is wrong i want this dummy data to be there in that payload 
-but u are sending that wrong dummy data 
