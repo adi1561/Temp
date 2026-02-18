@@ -1,476 +1,142 @@
-This is a sophisticated file transformation requirement involving dynamic parsing, conditional logic, and formatting rules driven by database configuration.
-Below is the Production-Grade Solution designed with Spring Boot. I have focused on SOLID principles, specifically the Single Responsibility Principle (breaking logic into helper methods) and Open/Closed Principle (using regex-driven configurations).
-Part 1: Database Setup (Oracle SQL)
-CREATE TABLE ASCII_CONFIG (
-    REPORT_ID               VARCHAR2(50) PRIMARY KEY, -- 'nwsa'
-    FILE_TYPE               VARCHAR2(10),             -- Extension e.g., '.txt'
-    INPUT_FILE_NAME         VARCHAR2(100),            -- Input file name/pattern
-    OUTPUT_FIRST_LINE       VARCHAR2(100),            -- Fixed Header Prefix
-    OUTPUT_END_LINE         VARCHAR2(100),            -- Fixed Footer text
-    
-    -- INPUT IDENTIFICATION
-    INPUT_HEAD_COL          NUMBER,                   -- Column index (1-based) for Head
-    INPUT_HEAD_REGEX        VARCHAR2(200),            -- Regex to identify valid rows
-    
-    -- PROCESSING RULES
-    OUTPUT_HEAD_COL_PAD     VARCHAR2(50),             -- e.g., '5L0', '6R '
-    AMOUNT_COL_SEQ          VARCHAR2(50),             -- '3', '5else6', '5and1'
-    
-    -- COMPLEX LOGIC COLUMNS (Pipe separated rules: [Regex][Col][Logic])
-    OUTPUT_AMT_COL_LOGIC    VARCHAR2(4000),           -- e.g. ["^S"][3][/(1000)]
-    OUTPUT_AMT_DECIMAL      VARCHAR2(4000),           -- e.g. ["^.*"][3][2] (2 decimal places)
-    OUTPUT_AMT_COL_PAD      VARCHAR2(4000),           -- e.g. ["^.*"][3][16,2]
-    OUTPUT_AMT_SIGN         VARCHAR2(4000),           -- e.g. ["^.*"][3][NO_SIGN]
-    
-    OUTPUT_PER_LINE_HEAD    NUMBER,                   -- Batch size per line
-    CREATED_DATE            TIMESTAMP DEFAULT SYSDATE
-);
+To integrate your YearEndService (LHO Transfer) into the centralized CommonRequestService architecture, you must move away from local repository saves and adopt the Maker-Checker Strategy pattern.
+1. New DTO: LhoTransferPayloadDto.java
+This class replaces LhoTransferPayload. It implements KeyablePayload to tell the central service to use the batchId as the targetId in the COMMON_REQ table.
+File: com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto.java
+package com.tcs.fincore.CommonRequestService.dto;
 
-COMMENT ON COLUMN ASCII_CONFIG.OUTPUT_HEAD_COL_PAD IS 'Format: Length + Direction(L/R) + Char. E.g. 5L0 = 5 chars, Left Pad with 0';
-COMMENT ON COLUMN ASCII_CONFIG.AMOUNT_COL_SEQ IS 'Logic: 3 (Col 3), 5else6 (Col 5 if valid else 6), 5and1 (Col 5 then Col 1)';
-COMMENT ON COLUMN ASCII_CONFIG.OUTPUT_AMT_COL_LOGIC IS 'Format: [HeadRegex][ColIndex][Operation]. Ops: /1000, *(-1)';
-
--- Sample Data Insertion
-INSERT INTO ASCII_CONFIG (
-    REPORT_ID, FILE_TYPE, INPUT_FILE_NAME, OUTPUT_FIRST_LINE, OUTPUT_END_LINE,
-    INPUT_HEAD_COL, INPUT_HEAD_REGEX, OUTPUT_HEAD_COL_PAD, AMOUNT_COL_SEQ,
-    OUTPUT_AMT_COL_LOGIC, OUTPUT_AMT_DECIMAL, OUTPUT_AMT_COL_PAD, OUTPUT_AMT_SIGN, OUTPUT_PER_LINE_HEAD
-) VALUES (
-    'nwsa', 
-    '.txt', 
-    'input_file.psv', 
-    'BWEP1', 
-    'END-OF-REPORT',
-    1, 
-    '^[ALS][0-9].*|^N[A-Z].*', -- Matches L01A, A01, etc.
-    '5L0', 
-    '3else4', 
-    '["^[LASN]"][3][/(1000)]|["^[LASN]"][4][/(1000)]', -- Divide by 1000 if head starts with L,A,S,N
-    '["^.*"][3][2]|["^.*"][4][2]',                      -- Keep 2 decimal places
-    '["^.*"][3][16,2]|["^.*"][4][16,2]',                -- 16 chars total, 2 decimal places
-    '["^.*"][3][NO_SIGN]|["^.*"][4][NO_SIGN]',          -- Don't show sign
-    1
-);
-COMMIT;
-
-Part 2: Spring Boot Implementation
-1. Entity (AsciiConfig.java)
-package com.example.ascii.entity;
-
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
-import lombok.Data;
-
-@Entity
-@Table(name = "ASCII_CONFIG")
-@Data
-public class AsciiConfig {
-    @Id
-    @Column(name = "REPORT_ID")
-    private String reportId;
-    
-    @Column(name = "FILE_TYPE")
-    private String fileType;
-    
-    @Column(name = "INPUT_FILE_NAME")
-    private String inputFileName;
-    
-    @Column(name = "OUTPUT_FIRST_LINE")
-    private String outputFirstLine;
-    
-    @Column(name = "OUTPUT_END_LINE")
-    private String outputEndLine;
-    
-    @Column(name = "INPUT_HEAD_COL")
-    private Integer inputHeadCol;
-    
-    @Column(name = "INPUT_HEAD_REGEX")
-    private String inputHeadRegex;
-    
-    @Column(name = "OUTPUT_HEAD_COL_PAD")
-    private String outputHeadColPad;
-    
-    @Column(name = "AMOUNT_COL_SEQ")
-    private String amountColSeq;
-    
-    @Column(name = "OUTPUT_AMT_COL_LOGIC")
-    private String outputAmtColLogic;
-    
-    @Column(name = "OUTPUT_AMT_DECIMAL")
-    private String outputAmtDecimal;
-    
-    @Column(name = "OUTPUT_AMT_COL_PAD")
-    private String outputAmtColPad;
-    
-    @Column(name = "OUTPUT_AMT_SIGN")
-    private String outputAmtSign;
-    
-    @Column(name = "OUTPUT_PER_LINE_HEAD")
-    private Integer outputPerLineHead;
-}
-
-2. Repository (AsciiConfigRepository.java)
-package com.example.ascii.repository;
-
-import com.example.ascii.entity.AsciiConfig;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-
-@Repository
-public interface AsciiConfigRepository extends JpaRepository<AsciiConfig, String> {
-}
-
-3. Core Logic Service (AsciiGenerationService.java)
-This service handles the heavy lifting using a helper class to parse the rules.
-package com.example.ascii.service;
-
-import com.example.ascii.entity.AsciiConfig;
-import com.example.ascii.repository.AsciiConfigRepository;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.io.IOException;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import lombok.*;
 import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-@Service
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@JsonTypeName("LHO_TRANSFER") // Identifier for the Common Service
+public class LhoTransferPayloadDto implements KeyablePayload {
+
+    private String batchId;
+    private LocalDate processDate;
+    private BigDecimal totalAmount;
+    private int totalRecordCount;
+    private List<ProfitLossSummaryDto> circleWiseDetails;
+
+    @Override
+    @JsonIgnore
+    public String getKey() {
+        return this.batchId; // Used as TARGET_ID in COMMON_REQ
+    }
+}
+
+2. New Strategy: LhoTransferStrategy.java
+This defines what happens when the Checker approves the request. It deserializes the payload and triggers the actual process.
+File: com.tcs.fincore.CommonRequestService.service.strategy.LhoTransferStrategy.java
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
 @Slf4j
-public class AsciiGenerationService {
+@Component
+@RequiredArgsConstructor
+public class LhoTransferStrategy implements RequestTypeStrategy {
 
-    private final AsciiConfigRepository configRepo;
+    private final ObjectMapper objectMapper;
 
-    public AsciiGenerationService(AsciiConfigRepository configRepo) {
-        this.configRepo = configRepo;
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.LHO_TRANSFER;
     }
 
-    public String generateReport(String reportId, String inputPathStr, String branchCode) throws Exception {
-        log.info("Starting generation for Report: {}", reportId);
-
-        // 1. Fetch Config
-        AsciiConfig config = configRepo.findById(reportId)
-                .orElseThrow(() -> new RuntimeException("Config not found for: " + reportId));
-
-        Path inputPath = Paths.get(inputPathStr);
-        if (!Files.exists(inputPath)) throw new IOException("Input file not found");
-
-        List<String> lines = Files.readAllLines(inputPath);
-        List<String> outputLines = new ArrayList<>();
-
-        // 2. Generate Header
-        String dateStr = LocalDate.now().format(DateTimeFormatter.ofPattern("ddMMyyyy"));
-        String headerPad = String.format("%5s", branchCode).replace(' ', '0'); // L pad 5
-        String header = config.getOutputFirstLine() + headerPad + dateStr;
-        outputLines.add(header);
-
-        // 3. Process Body
-        List<String> bufferedItems = new ArrayList<>();
-        int batchSize = config.getOutputPerLineHead();
-
-        for (String line : lines) {
-            String[] columns = line.split("\\|", -1);
-            
-            // Validate Row (Gatekeeper)
-            if (!isValidRow(columns, config)) continue;
-
-            // Process Items based on '5and1' or '3' logic
-            List<ProcessingItem> itemsToProcess = extractAmountColumns(columns, config);
-            
-            for (ProcessingItem item : itemsToProcess) {
-                String processedAscii = processSingleItem(item.head, item.amount, item.colIndex, config);
-                bufferedItems.add(processedAscii);
-
-                if (bufferedItems.size() == batchSize) {
-                    outputLines.add(String.join("", bufferedItems));
-                    bufferedItems.clear();
-                }
-            }
-        }
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        LhoTransferPayloadDto payload = objectMapper.readValue(request.getPayload(), LhoTransferPayloadDto.class);
         
-        // Flush remaining buffer
-        if (!bufferedItems.isEmpty()) {
-            outputLines.add(String.join("", bufferedItems));
-        }
-
-        // 4. Generate Footer
-        if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) {
-            outputLines.add(config.getOutputEndLine());
-        }
-
-        // 5. Write File
-        String outputFileName = "GENERATED_" + reportId + config.getFileType();
-        Path outputPath = inputPath.getParent().resolve(outputFileName);
-        Files.write(outputPath, outputLines);
+        log.info("LHO Transfer APPROVED for Batch: {}. Executing core logic...", payload.getBatchId());
         
-        return outputPath.toString();
-    }
-
-    // --- Helper Logic ---
-
-    private boolean isValidRow(String[] cols, AsciiConfig config) {
-        int idx = config.getInputHeadCol() - 1;
-        if (cols.length <= idx) return false;
-        String head = cols[idx].trim();
-        if (head.isEmpty()) return false;
-        return Pattern.compile(config.getInputHeadRegex()).matcher(head).find();
-    }
-
-    private String processSingleItem(String head, BigDecimal amount, int colIndex, AsciiConfig config) {
-        // 1. Apply Logic (e.g., /1000)
-        amount = RuleParser.applyMathLogic(amount, head, colIndex, config.getOutputAmtColLogic());
-        
-        // 2. Apply Decimal/Rounding
-        amount = RuleParser.applyDecimalLogic(amount, head, colIndex, config.getOutputAmtDecimal());
-        
-        // 3. Format Amount (Padding)
-        String amountStr = RuleParser.applyAmountPadding(amount, head, colIndex, config.getOutputAmtColPad());
-        
-        // 4. Handle Sign
-        String signedAmount = RuleParser.applySign(amountStr, amount, head, colIndex, config.getOutputAmtSign());
-        
-        // 5. Pad Head
-        String headPadded = RuleParser.applyHeadPadding(head, config.getOutputHeadColPad());
-
-        return headPadded + signedAmount;
-    }
-
-    private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
-        List<ProcessingItem> items = new ArrayList<>();
-        String head = cols[config.getInputHeadCol() - 1].trim();
-        String seq = config.getAmountColSeq();
-
-        if (seq.contains("else")) {
-            // "5else6" logic
-            String[] parts = seq.split("else");
-            for (String part : parts) {
-                int idx = Integer.parseInt(part.trim()) - 1;
-                if (idx < cols.length && !cols[idx].trim().isEmpty()) {
-                    items.add(new ProcessingItem(head, parseAmount(cols[idx]), idx + 1));
-                    return items; // Return only the first valid one found
-                }
-            }
-            // If all failed, default to first option with 0
-            items.add(new ProcessingItem(head, BigDecimal.ZERO, Integer.parseInt(parts[0].trim())));
-        } else if (seq.contains("and")) {
-            // "5and1" logic
-            String[] parts = seq.split("and");
-            for (String part : parts) {
-                int idx = Integer.parseInt(part.trim()) - 1;
-                items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
-            }
-        } else {
-            // Simple "3" logic
-            int idx = Integer.parseInt(seq.trim()) - 1;
-            items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
-        }
-        return items;
-    }
-    
-    private BigDecimal parseAmount(String[] cols, int idx) {
-        if (idx >= cols.length) return BigDecimal.ZERO;
-        return parseAmount(cols[idx]);
-    }
-
-    private BigDecimal parseAmount(String val) {
-        try {
-            return new BigDecimal(val.trim().replace(",", ""));
-        } catch (Exception e) {
-            return BigDecimal.ZERO;
-        }
-    }
-    
-    private static class ProcessingItem {
-        String head; BigDecimal amount; int colIndex;
-        ProcessingItem(String h, BigDecimal a, int c) { head = h; amount = a; colIndex = c; }
+        // TODO: Call your Airflow Trigger or Stored Procedure here
+        // triggerActualTransfer(payload);
     }
 }
 
-4. Rule Parser Utility (RuleParser.java)
-This class parses the bracket notation [Regex][Col][Logic].
-package com.example.ascii.service;
+3. Updated Enum: RequestType.java
+You must register LHO_TRANSFER so the database converter and logic recognize it.
+File: com.tcs.fincore.CommonRequestService.model.enums.RequestType.java
+@Getter
+public enum RequestType {
+    // ... existing entries ...
+    REPORT_TEMPLATE_CONFIG("REPORT_TEMPLATE_CONFIG"),
+    LHO_TRANSFER("LHO_TRANSFER"); // Add this
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+    private final String dbValue;
 
-public class RuleParser {
-
-    private static final Pattern RULE_PATTERN = Pattern.compile("\\[(.*?)\\]\\[(.*?)\\]\\[(.*?)\\]");
-
-    public static BigDecimal applyMathLogic(BigDecimal amount, String head, int colIdx, String logicConfig) {
-        if (logicConfig == null) return amount;
-        String logic = findMatchingRule(head, colIdx, logicConfig); // returns "/(1000)" or "*(-1)"
-        
-        if (logic == null) return amount;
-
-        if (logic.contains("/")) {
-            BigDecimal divisor = new BigDecimal(logic.replaceAll("[^0-9.]", ""));
-            return amount.divide(divisor, 6, RoundingMode.HALF_UP);
-        } else if (logic.contains("*")) {
-            BigDecimal multiplier = new BigDecimal(logic.replace("*", "").replace("(", "").replace(")", ""));
-            return amount.multiply(multiplier);
-        }
-        return amount;
-    }
-
-    public static BigDecimal applyDecimalLogic(BigDecimal amount, String head, int colIdx, String decimalConfig) {
-        if (decimalConfig == null) return amount;
-        String rule = findMatchingRule(head, colIdx, decimalConfig);
-        if (rule == null) return amount;
-
-        // "2" -> 2 decimal places
-        // "floor", "ceil"
-        if (rule.equalsIgnoreCase("floor")) return amount.setScale(0, RoundingMode.FLOOR);
-        if (rule.equalsIgnoreCase("ceil")) return amount.setScale(0, RoundingMode.CEILING);
-        if (rule.equalsIgnoreCase("round")) return amount.setScale(0, RoundingMode.HALF_UP);
-        
-        try {
-            int scale = Integer.parseInt(rule);
-            return amount.setScale(scale, RoundingMode.HALF_UP);
-        } catch (NumberFormatException e) {
-            return amount;
-        }
-    }
-
-    public static String applyAmountPadding(BigDecimal amount, String head, int colIdx, String padConfig) {
-        // Default format if no rule found
-        if (padConfig == null) return amount.toPlainString();
-        String rule = findMatchingRule(head, colIdx, padConfig); // e.g., "16,2" or "18"
-
-        if (rule == null) return amount.toPlainString();
-
-        if (rule.contains(",")) {
-            // "16,2" -> 16 total chars, 2 decimal places
-            String[] parts = rule.split(",");
-            int totalLen = Integer.parseInt(parts[0]);
-            int decimalLen = Integer.parseInt(parts[1]);
-            
-            BigDecimal scaled = amount.setScale(decimalLen, RoundingMode.HALF_UP);
-            String raw = scaled.toPlainString(); // "123.45"
-            
-            return padLeft(raw, totalLen, '0');
-        } else {
-            // "18" -> Treat as integer (strip decimal point)
-            int totalLen = Integer.parseInt(rule);
-            String raw = amount.toBigInteger().toString(); // Strip decimal
-            return padLeft(raw, totalLen, '0');
-        }
-    }
-
-    public static String applySign(String formattedAmt, BigDecimal originalAmt, String head, int colIdx, String signConfig) {
-        if (signConfig == null) return formattedAmt;
-        String rule = findMatchingRule(head, colIdx, signConfig);
-        
-        if ("NO_SIGN".equalsIgnoreCase(rule)) return formattedAmt;
-        if ("SHOW_SIGN".equalsIgnoreCase(rule)) {
-            return formattedAmt + (originalAmt.compareTo(BigDecimal.ZERO) >= 0 ? "+" : "-");
-        }
-        // Default: If negative, append -
-        if (originalAmt.compareTo(BigDecimal.ZERO) < 0) {
-            return formattedAmt + "-";
-        }
-        return formattedAmt;
-    }
-
-    public static String applyHeadPadding(String head, String padConfig) {
-        // "5L0" -> Length 5, Left, Char '0'
-        if (padConfig == null) return head;
-        
-        int len = Integer.parseInt(padConfig.substring(0, padConfig.length() - 2));
-        char direction = padConfig.charAt(padConfig.length() - 2);
-        char padChar = padConfig.charAt(padConfig.length() - 1);
-        
-        // Handle "6R " (space)
-        if (padConfig.endsWith("\" \"")) padChar = ' ';
-
-        if (direction == 'L') return padLeft(head, len, padChar);
-        return padRight(head, len, padChar);
-    }
-
-    // --- Internal Helpers ---
-
-    private static String findMatchingRule(String head, int colIdx, String configStr) {
-        if (configStr == null || configStr.isEmpty()) return null;
-        
-        String[] rules = configStr.split("\\|");
-        for (String rule : rules) {
-            Matcher m = RULE_PATTERN.matcher(rule);
-            if (m.find()) {
-                String headRegex = m.group(1); // "^S\d"
-                String colReq = m.group(2);    // "3"
-                String logic = m.group(3);     // "/1000"
-
-                boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-                boolean headMatch = Pattern.compile(headRegex).matcher(head).find();
-
-                if (colMatch && headMatch) {
-                    return logic;
-                }
-            }
-        }
-        return null;
-    }
-
-    private static String padLeft(String str, int len, char pad) {
-        if (str.length() >= len) return str;
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < len - str.length(); i++) sb.append(pad);
-        sb.append(str);
-        return sb.toString();
-    }
-    
-    private static String padRight(String str, int len, char pad) {
-        if (str.length() >= len) return str;
-        StringBuilder sb = new StringBuilder(str);
-        for (int i = 0; i < len - str.length(); i++) sb.append(pad);
-        return sb.toString();
+    RequestType(String dbValue) {
+        this.dbValue = dbValue;
     }
 }
 
-5. Controller (AsciiController.java)
-package com.example.ascii.controller;
+4. Updated DTO: CreateRequestDto.java
+Add the new payload class to the @JsonSubTypes list so the system can handle LHO JSON.
+File: com.tcs.fincore.CommonRequestService.dto.CreateRequestDto.java
+// ... within @JsonSubTypes list ...
+@JsonSubTypes.Type(value = CalenderConfigPayloadDto.class, name = "CALENDER"),
+@JsonSubTypes.Type(value = LhoTransferPayloadDto.class, name = "LHO_TRANSFER") // Add this
 
-import com.example.ascii.service.AsciiGenerationService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+5. Updated Service Implementation: LhoTransferServiceImpl.java
+This file now calls the centralized RequestService instead of saving to the database itself.
+File: com.fincore.YearEndService.Service.LhoTransferServiceImpl.java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class LhoTransferServiceImpl implements LhoTransferService {
 
-@RestController
-@RequestMapping("/api/ascii")
-public class AsciiController {
+    private final ProfitLossService profitLossService;
+    private final RequestService requestService; // Inject Central Service
 
-    @Autowired
-    private AsciiGenerationService service;
+    @Override
+    @Transactional
+    public CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId, String token) {
+        // 1. Fetch Real Data
+        List<ProfitLossSummaryDto> summaryList = profitLossService.getCircleWiseSummary();
 
-    @PostMapping("/generate")
-    public ResponseEntity<String> generate(
-            @RequestParam String reportId,
-            @RequestParam String filePath,
-            @RequestParam String branchCode) {
-        try {
-            String outPath = service.generateReport(reportId, filePath, branchCode);
-            return ResponseEntity.ok("File generated: " + outPath);
-        } catch (Exception e) {
-            e.printStackTrace();
-            return ResponseEntity.internalServerError().body("Error: " + e.getMessage());
-        }
+        // 2. Calculate Totals
+        BigDecimal totalAmount = summaryList.stream()
+                .map(ProfitLossSummaryDto::getTotalProfitLoss)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        // 3. Build Payload DTO
+        LhoTransferPayloadDto payload = LhoTransferPayloadDto.builder()
+                .batchId(batchId)
+                .processDate(LocalDate.now())
+                .totalRecordCount(summaryList.size())
+                .totalAmount(totalAmount)
+                .circleWiseDetails(summaryList)
+                .build();
+
+        // 4. Wrap into CreateRequestDto
+        CreateRequestDto createDto = new CreateRequestDto();
+        createDto.setRequestType(RequestType.LHO_TRANSFER);
+        createDto.setChangeType(ChangeType.ADD);
+        createDto.setPayload(payload);
+
+        // 5. Delegate to Central Service (Handles DB Save & Notifications)
+        return requestService.createRequest(createDto, triggeredByUserId, token);
     }
 }
 
-Key Design Decisions:
- * RuleParser Utility: I moved the messy parsing of string logic ([regex][col][val]) into a static utility. This keeps the Service clean and testable.
- * Flexible Column Logic: The extractAmountColumns method handles 3, 3else4, and 3and4 natively, abstracting that complexity away from the main loop.
- * BigDecimal: Used everywhere for financial accuracy.
- * Extensibility: If you need a new operation (e.g., square), you only edit RuleParser.java, not the main service loop.
- * Performance: Regex patterns are compiled on the fly. For massive scale (millions of rows), you would cache these Pattern objects in a Map<String, Pattern> to avoid recompiling them for every row.
+Summary of Component Architecture
+ * Maker: Calls the updated LhoTransferServiceImpl, which sends a CreateRequestDto to the RequestService.
+ * RequestService: Saves the request as PENDING and triggers a notification.
+ * Checker: Calls updateRequestStatus.
+ * Strategy: The central system finds the LhoTransferStrategy and executes the process approval logic.
+Would you like me to help you configure the RBAC Permissions in the PERMISSIONS table for this new LHO_TRANSFER request type?
