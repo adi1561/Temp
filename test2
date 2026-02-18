@@ -1,793 +1,106 @@
-package com.fincore.YearEndService.Controller;
-
-import com.fincore.YearEndService.DTO.ApiResponse;
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Service.LhoTransferService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.ObjectMapper;
-
-import java.util.Base64;
-
-import java.util.List;
-import java.util.Map;
-
-@RestController
-@RequestMapping("/api/lho-transfer")
-@RequiredArgsConstructor
-@Slf4j
-public class LhoTransferController {
-
-    private final LhoTransferService lhoTransferService;
-    private final ObjectMapper objectMapper;
-
-    @PostMapping("/trigger")
-    public ResponseEntity<ApiResponse<CommonReq>> triggerLhoProcess(
-            @RequestHeader("Authorization") String token,
-            @RequestBody Map<String, String> payload
-    ) {
-        String batchId = payload.get("batchId");
-
-        String userId = extractUserIdFromToken(token);
-
-        log.info("Trigger received for Batch: {} from User: {}", batchId, userId);
-
-        CommonReq request = lhoTransferService.createLhoTransferRequest(batchId, userId);
-
-        return ResponseEntity.ok(ApiResponse.success(request, "LHO Transfer Request Generated Successfully"));
-    }
-
-    /**
-     * Helper to decode the JWT and get userId without needing a full Security filter setup
-     */
-    private String extractUserIdFromToken(String token) {
-        try {
-            // Remove "Bearer " prefix
-            String actualToken = token.replace("Bearer ", "");
-            String[] chunks = actualToken.split("\\.");
-            Base64.Decoder decoder = Base64.getUrlDecoder();
-
-            // The payload is the second chunk
-            String payload = new String(decoder.decode(chunks[1]));
-            JsonNode node = objectMapper.readTree(payload);
-
-            // Matches the "userId" key in your frontend example
-            return node.get("userId").asText();
-        } catch (Exception e) {
-            log.error("Failed to extract userId from token", e);
-            return "SYSTEM"; // Fallback
-        }
-    }
-
-    @GetMapping("/pending")
-    public ResponseEntity<ApiResponse<List<CommonReq>>> getPendingRequests() {
-        List<CommonReq> requests = lhoTransferService.getPendingLhoRequests();
-        return ResponseEntity.ok(ApiResponse.success(requests));
-    }
-}
-
-
-package com.fincore.YearEndService.Controller;
-
-
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-import com.fincore.YearEndService.Service.ProfitLossService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.List;
-
-@RestController
-@RequestMapping("/api/yearend")
-@RequiredArgsConstructor
-public class ProfitLossController {
-
-    private final ProfitLossService profitLossService;
-
-        @GetMapping("/summary/circle-wise")
-    public ResponseEntity<List<ProfitLossSummaryDto>> getCircleWiseSummary() {
-        return ResponseEntity.ok(profitLossService.getCircleWiseSummary());
-    }
-}
-
-
-package com.fincore.YearEndService.DTO;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-@Data
-@AllArgsConstructor
-@NoArgsConstructor
-public class ApiResponse<T> {
-    private boolean success;
-    private String message;
-    private T data;
-
-    public static <T> ApiResponse<T> success(T data) {
-        return new ApiResponse<>(true, "Success", data);
-    }
-
-    public static <T> ApiResponse<T> success(T data, String message) {
-        return new ApiResponse<>(true, message, data);
-    }
-}
-
-package com.fincore.YearEndService.DTO;
-import java.math.BigDecimal;
-import java.time.LocalDate;
-
-public interface IProfitLossSummary {
-    LocalDate getTransferDate();
-    Integer getCircleBranchCode();
-    BigDecimal getTotalProfitLoss();
-}
-
-
-package com.fincore.YearEndService.DTO;
-
-public interface KeyablePayload {
-    String getKey();
-}
-
-package com.fincore.YearEndService.DTO;
-
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.util.List;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class LhoTransferPayload implements KeyablePayload {
-
-    private String batchId;
-    private LocalDate processDate; // Changed to LocalDate to match your DTO
-
-    // Aggregate totals calculated from the list
-    private BigDecimal totalAmount;
-    private int totalRecordCount;
-
-    // The list of circle summaries
-    private List<ProfitLossSummaryDto> circleWiseDetails;
-
-    @Override
-    @JsonIgnore
-    public String getKey() {
-        return this.batchId;
-    }
-}
-
-package com.fincore.YearEndService.DTO;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-import java.math.BigDecimal;
-import java.time.LocalDate;
-
-@Data
-@AllArgsConstructor
-@NoArgsConstructor
-public class ProfitLossSummaryDto {
-    private LocalDate transferDate;
-    private Integer circleBranchCode;
-    private BigDecimal totalProfitLoss;
-}
-
-package com.fincore.YearEndService.Exceptions;
-
-import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.ResponseStatus;
-
-// Marking this as Internal Server Error (500) automatically
-@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
-public class PayloadProcessingException extends RuntimeException {
-
-    public PayloadProcessingException(String message) {
-        super(message);
-    }
-
-    public PayloadProcessingException(String message, Throwable cause) {
-        super(message, cause);
-    }
-}
-
-package com.fincore.YearEndService.Exceptions;
-
-public class ResourceNotFoundException extends RuntimeException {
-    public ResourceNotFoundException(String message) {
-        super(message);
-    }
-}
-
-
-package com.fincore.YearEndService.Model.Converter;
-
-import com.fincore.YearEndService.Model.ChangeType;
-import jakarta.persistence.AttributeConverter;
-import jakarta.persistence.Converter;
-import java.util.stream.Stream;
-
-@Converter(autoApply = true)
-public class ChangeTypeConverter implements AttributeConverter<ChangeType, String> {
-
-    @Override
-    public String convertToDatabaseColumn(ChangeType changeType) {
-        if (changeType == null) return null;
-        return changeType.getCode(); // Returns "A" instead of "ADD"
-    }
-
-    @Override
-    public ChangeType convertToEntityAttribute(String code) {
-        if (code == null) return null;
-        return Stream.of(ChangeType.values())
-                .filter(c -> c.getCode().equals(code))
-                .findFirst()
-                .orElseThrow(IllegalArgumentException::new);
-    }
-}
-
-package com.fincore.YearEndService.Model.Converter;
-
-import com.fincore.YearEndService.Model.RequestStatus;
-import jakarta.persistence.AttributeConverter;
-import jakarta.persistence.Converter;
-import java.util.stream.Stream;
-
-@Converter(autoApply = true)
-public class RequestStatusConverter implements AttributeConverter<RequestStatus, String> {
-
-    @Override
-    public String convertToDatabaseColumn(RequestStatus status) {
-        if (status == null) return null;
-        return status.getCode(); // Returns "P" instead of "PENDING"
-    }
-
-    @Override
-    public RequestStatus convertToEntityAttribute(String code) {
-        if (code == null) return null;
-        return Stream.of(RequestStatus.values())
-                .filter(c -> c.getCode().equals(code))
-                .findFirst()
-                .orElseThrow(IllegalArgumentException::new);
-    }
-}
-
-
-package com.fincore.YearEndService.Model;
+To integrate the LHO Transfer logic into your existing CommonRequestService, we need to align the code you provided with the architecture of the primary service. This includes creating a new Strategy to handle the approval of LHO requests, updating the RequestType enum, and ensuring the DTOs follow the polymorphic payload pattern.
+Here are the updated files to incorporate this logic.
+1. Update the Enum: RequestType.java
+Add LHO_TRANSFER to the list of supported request types.
+package com.tcs.fincore.CommonRequestService.model.enums;
 
 import lombok.Getter;
 
 @Getter
-public enum ChangeType {
-    ADD("A"),
-    UPDATE("U"),
-    DELETE("D");
+public enum RequestType {
+    SEGMENT_CODE("SEGMENT"),
+    CGL_CODE("CGL"),
+    STATE("STATE"),
+    BRANCH("BRANCH"),
+    CIRCLE("CIRCLE"),
+    CURRENCY("CURRENCY"),
+    CALENDER("CALENDER"),
+    FILE_TYPE_MASTER("FILE_TYPE_MASTER"),
+    CURRENCY_RATE_CHANGE("CURRENCY_RATE"),
+    REPORT_TEMPLATE_CONFIG("REPORT_TEMPLATE_CONFIG"),
+    [span_0](start_span)// New Request Type for LHO Transfer[span_0](end_span)
+    LHO_TRANSFER("LHO_TRANSFER");
 
-    private final String code;
+    private final String dbValue;
 
-    ChangeType(String code) {
-        this.code = code;
+    RequestType(String dbValue) {
+        this.dbValue = dbValue;
     }
 }
 
-package com.fincore.YearEndService.Model;
-
-import com.fasterxml.jackson.annotation.JsonRawValue;
-import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-import java.time.LocalDateTime;
-
-@Getter
-@Setter
-@Entity
-@Table(name = "COMMON_REQ")
-public class CommonReq {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "COMMON_REQ_id_gen")
-    @SequenceGenerator(name = "COMMON_REQ_id_gen", sequenceName = "COMMON_REQ_SEQ", allocationSize = 1)
-    @Column(name = "REQ_ID", nullable = false)
-    private Long id;
-
-    @Column(name = "REQ_TYPE", nullable = false, length = 20)
-    private String reqType;
-
-    // REMOVED @Enumerated. The Converter will handle turning this into "A"
-    @Column(name = "CHANGE_TYPE", nullable = false, length = 2)
-    private ChangeType changeType;
-
-    // REMOVED @Enumerated. The Converter will handle turning this into "P"
-    @Column(name = "REQ_STATUS", nullable = false, length = 2)
-    private RequestStatus reqStatus;
-
-    @Column(name = "REQ_DATE", nullable = false, updatable = false)
-    private LocalDateTime reqDate;
-
-    @Column(name = "CREATOR_ID", nullable = false, length = 12)
-    private String creatorId;
-
-    @Column(name = "EXECUTION_DATE")
-    private LocalDateTime executionDate;
-
-    @Lob
-    @Column(name = "EXECUTION_REMARKS")
-    private String executionRemarks;
-
-    @Column(name = "EXECUTOR_ID", length = 12)
-    private String executorId;
-
-    @Column(name = "EXECUTOR_REMARKS", length = 500)
-    private String executorRemarks;
-
-    @Lob
-    @Column(name = "PAYLOAD", nullable = false)
-    private String payload;
-
-    @Column(name = "TARGET_ID", length = 4000)
-    private String targetId;
-
-    @JsonRawValue
-    public String getPayload() {
-        return payload;
-    }
-}
-
-package com.fincore.YearEndService.Model;
-
-import jakarta.persistence.*;
-import lombok.*;
-import org.hibernate.annotations.CreationTimestamp;
-import java.time.ZonedDateTime;
-
-@Entity
-@Table(name = "NOTIFICATIONS")
-@Getter
-@Setter
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class NotificationTable {
-
-    @Id
-    @Column(name = "EVENT_ID", columnDefinition = "RAW(16)")
-    private byte[] eventId; // Changed to byte[] to match Oracle RAW column
-
-    @Column(name = "USER_ID", length = 255)
-    private String userId;
-
-    @Column(name = "TARGET_ROLE", length = 100)
-    private String targetRole;
-
-    @Column(name = "MESSAGE", nullable = false, length = 1024)
-    private String message;
-
-    @Column(name = "LINK_URL", length = 1024)
-    private String linkUrl;
-
-    @Column(name = "AGGREGATE_ID", length = 255)
-    private String aggregateId;
-
-    @Column(name = "EVENT_SOURCE", length = 100)
-    private String eventSource;
-
-    @CreationTimestamp
-    @Column(name = "EVENT_TIMESTAMP")
-    private ZonedDateTime eventTimestamp; // Matches TIMESTAMP WITH TIME ZONE
-
-}
-
-package com.fincore.YearEndService.Model;
-
-
-import jakarta.persistence.*;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-import java.math.BigDecimal;
-import java.time.LocalDate;
-
-@Entity
-@Table(name = "P_L_TRANSFER")
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-public class ProfitLossTransfer {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id; // Assuming a surrogate key exists, otherwise use composite key
-
-    @Column(name = "TRANSFER_DATE", nullable = false)
-    private LocalDate transferDate;
-
-    @Column(name = "BRANCH_CODE", nullable = false, precision = 5)
-    private Integer branchCode;
-
-    @Column(name = "CIRCLE_BRANCH_CODE", nullable = false, precision = 5)
-    private Integer circleBranchCode;
-
-    @Column(name = "PROFIT_LOSS", precision = 25, scale = 4)
-    private BigDecimal profitLoss;
-}
-
-
-package com.fincore.YearEndService.Model;
-
-import lombok.Getter;
-
-@Getter
-public enum RequestStatus {
-    PENDING("P"),
-    ACCEPTED("A"),
-    REJECTED("R");
-
-    private final String code;
-
-    RequestStatus(String code) {
-        this.code = code;
-    }
-}
-
-package com.fincore.YearEndService.Repository;
-
-
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Model.RequestStatus;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-
-import java.util.List;
-
-@Repository
-public interface CommonRequestRepository extends JpaRepository<CommonReq, Long> {
-    List<CommonReq> findByReqStatusAndReqType(RequestStatus reqStatus, String reqType);
-}
-
-package com.fincore.YearEndService.Repository;
-
-import com.fincore.YearEndService.Model.NotificationTable;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-
-import java.util.List;
-
-// Change generic type <NotificationTable, String> to <NotificationTable, byte[]>
-@Repository
-public interface NotificationRepository extends JpaRepository<NotificationTable, byte[]> {
-
-    List<NotificationTable> findByUserId(String userId);
-
-    List<NotificationTable> findByTargetRole(String targetRole);
-}
-
-package com.fincore.YearEndService.Repository;
-
-
-import com.fincore.YearEndService.DTO.IProfitLossSummary;
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-import com.fincore.YearEndService.Model.ProfitLossTransfer;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.stereotype.Repository;
-
-import java.util.List;
-
-@Repository
-public interface ProfitLossRepository extends JpaRepository<ProfitLossTransfer, Long> {
-
-    @Query("SELECT p.transferDate as transferDate, " +
-            "p.circleBranchCode as circleBranchCode, " +
-            "SUM(p.profitLoss) as totalProfitLoss " +
-            "FROM ProfitLossTransfer p " +
-            "GROUP BY p.circleBranchCode, p.transferDate " +
-            "ORDER BY p.transferDate DESC")
-    List<IProfitLossSummary> findProfitLossSummaryGroupedByCircle();
-}
-
-package com.fincore.YearEndService.Service;
-
-
-import com.fincore.YearEndService.Model.CommonReq;
-import java.util.List;
-
-public interface LhoTransferService {
-
-    // Trigger creation of request
-    // No specific exception declaration needed now
-    CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId);
-
-    // Fetch pending list for approval screen
-    List<CommonReq> getPendingLhoRequests();
-}
-]
-package com.fincore.YearEndService.Service;
-
-import com.fincore.YearEndService.DTO.LhoTransferPayload;
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-import com.fincore.YearEndService.Exceptions.PayloadProcessingException;
-import com.fincore.YearEndService.Model.ChangeType;
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Model.RequestStatus;
-import com.fincore.YearEndService.Repository.CommonRequestRepository;
+2. Create the Strategy: LhoTransferStrategy.java
+Since you requested the payload logic be handled later (currently null/placeholder), this strategy defines how an LHO Transfer is "approved" (e.g., moving data to a final table or marking a batch as processed).
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import tools.jackson.databind.ObjectMapper;
+import org.springframework.stereotype.Component;
 
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.List;
-
-@Service
-@RequiredArgsConstructor
 @Slf4j
-public class LhoTransferServiceImpl implements LhoTransferService {
-
-    private final CommonRequestRepository commonRequestRepository;
-    private final NotificationWriterService notificationWriterService;
-    private final ObjectMapper objectMapper;
-
-    // INJECTING YOUR EXISTING SERVICE
-    private final ProfitLossService profitLossService;
-
-    private static final String LHO_REQ_TYPE = "LHO_TRANSFER";
+@Component
+@RequiredArgsConstructor
+public class LhoTransferStrategy implements RequestTypeStrategy {
 
     @Override
-    @Transactional
-    public CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId) {
-        log.info("Generating LHO Transfer Request for Batch: {}", batchId);
-
-        // 1. Fetch Real Data using YOUR ProfitLossService
-        List<ProfitLossSummaryDto> summaryList = profitLossService.getCircleWiseSummary();
-
-        // 2. Validate Data (If empty, we might want to throw error or create empty request)
-        if (summaryList == null || summaryList.isEmpty()) {
-            // Optional: If you want to force DUMMY data for testing when DB is empty:
-            log.warn("No data found in ProfitLossService..");
-            summaryList = getDummyProfitLossData();
-            // OR throw new ResourceNotFoundException("No Profit/Loss data found.");
-        }
-
-        // 3. Calculate Totals for the Header
-        BigDecimal totalAmount = summaryList.stream()
-                .map(ProfitLossSummaryDto::getTotalProfitLoss)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        // 4. Build the Payload Object
-        LhoTransferPayload payload = LhoTransferPayload.builder()
-                .batchId(batchId)
-                .processDate(LocalDate.now())
-                .totalRecordCount(summaryList.size())
-                .totalAmount(totalAmount)
-                .circleWiseDetails(summaryList) // Directly setting your DTO list
-                .build();
-
-        // 5. Create Entity
-        CommonReq request = new CommonReq();
-        request.setCreatorId(triggeredByUserId);
-        request.setReqType(LHO_REQ_TYPE);
-        request.setChangeType(ChangeType.ADD);
-        request.setReqStatus(RequestStatus.PENDING);
-        request.setTargetId(batchId);
-        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-
-        // 6. Serialize Payload
-        try {
-            request.setPayload(objectMapper.writeValueAsString(payload));
-        } catch (Exception e) {
-            log.error("Failed to serialize payload for batch: {}", batchId, e);
-            throw new PayloadProcessingException("Error processing JSON payload", e);
-        }
-
-        // 7. Save
-        CommonReq savedReq = commonRequestRepository.save(request);
-        log.info("Saved LHO Request ID: {}", savedReq.getId());
-
-        // 8. Notification
-        try {
-            notificationWriterService.createNotification(
-                    null,
-                    "LHO_CHECKER",
-                    "New LHO Transfer Request (Batch: " + batchId + ")",
-                    "/lho-approval",
-                    savedReq.getId().toString(),
-                    "YearEndService"
-            );
-        } catch (Exception e) {
-            log.warn("Notification failed, but request saved.");
-        }
-
-        return savedReq;
+    public RequestType getRequestType() {
+        return RequestType.LHO_TRANSFER;
     }
 
     @Override
-    public List<CommonReq> getPendingLhoRequests() {
-        return commonRequestRepository.findByReqStatusAndReqType(
-                RequestStatus.PENDING,
-                LHO_REQ_TYPE
-        );
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Processing Approval for LHO Transfer Batch: {}", request.getTargetId());
+        
+        // Logic for what happens when the Checker clicks 'Approve'
+        switch (request.getChangeType()) {
+            case ADD:
+                handleLhoApproval(request);
+                break;
+            default:
+                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported for LHO.");
+        }
     }
 
+    private void handleLhoApproval(CommonReq request) {
+        // TODO: Logic to finalize the P&L Transfer in the master tables
+        log.info("LHO Transfer Batch {} successfully approved and finalized.", request.getTargetId());
+    }
+}
+
+3. Update the DTO: CreateRequestDto.java
+Update the @JsonSubTypes to include the LhoTransferPayload. This allows the ApiResponseWrapper and RequestController to recognize the new request type.
+[span_3](start_span)// Add this entry inside @JsonSubTypes in CreateRequestDto.java[span_3](end_span)
+@JsonSubTypes({
+    // ... existing types
+    @JsonSubTypes.Type(value = LhoTransferPayload.class, name = "LHO_TRANSFER")
+})
+private Payload payload;
+
+4. Updated Controller Logic: RequestController.java
+You can now use the existing /create-request endpoint. If you want a specific "trigger" method as seen in your provided code, add this to RequestController:
     /**
-     * Helper to generate DUMMY data that matches YOUR ProfitLossSummaryDto structure.
-     * Used only if the real service returns empty list during testing.
+     * [span_4](start_span)Specific trigger for LHO Transfer process[span_4](end_span)
      */
-    private List<ProfitLossSummaryDto> getDummyProfitLossData() {
-        List<ProfitLossSummaryDto> dummyList = new ArrayList<>();
-
-        // Matches your DTO: LocalDate, Integer circleCode, BigDecimal amount
-        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 101, new BigDecimal("50000.00")));
-        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 102, new BigDecimal("75000.50")));
-        dummyList.add(new ProfitLossSummaryDto(LocalDate.now(), 103, new BigDecimal("-12000.00"))); // Loss scenario
-
-        return dummyList;
-    }
-}
-
-package com.fincore.YearEndService.Service;
-
-import com.fincore.YearEndService.Model.CommonReq;
-import com.fincore.YearEndService.Model.NotificationTable;
-import com.fincore.YearEndService.Repository.NotificationRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.SneakyThrows;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.nio.ByteBuffer;
-import java.time.ZonedDateTime;
-import java.util.UUID;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class NotificationWriterService {
-
-    private final NotificationRepository notificationRepository;
-
-    @Transactional(propagation = Propagation.MANDATORY)
-    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
-
-        if (userId == null && targetRole == null) {
-            log.warn("Skipping notification creation: Both userId and targetRole are null.");
-            return;
-        }
-
-        if (message == null || message.isBlank()) {
-            throw new IllegalArgumentException("Notification message cannot be null or blank.");
-        }
-
-        // Generate ID as byte array to fit Oracle RAW column
-        byte[] rawEventId = generateRawUuid();
-
-        NotificationTable notification = NotificationTable.builder()
-                .eventId(rawEventId)
-                .userId(userId)
-                .targetRole(targetRole)
-                .message(message)
-                .linkUrl(linkUrl)
-                .aggregateId(aggregateId)
-                .eventSource(eventSource)
-                .eventTimestamp(ZonedDateTime.now()) // Use ZonedDateTime
-                .build();
-
-        notificationRepository.save(notification);
-        log.info("Saved notification for AggregateID: {}", aggregateId);
+    @PostMapping("/lho/trigger")
+    @ResponseStatus(HttpStatus.CREATED)
+    public CommonReq triggerLhoTransfer(
+            @RequestBody Map<String, String> body,
+            @RequestHeader("Authorization") String token
+    ) throws JsonProcessingException {
+        String batchId = body.get("batchId");
+        String userId = jwtUtil.getUserIdFromToken(token);
+        
+        log.info("Triggering LHO Transfer for Batch: {} by User: {}", batchId, userId);
+        
+        // This would call a method in RequestService that builds the CommonReq 
+        // using RequestType.LHO_TRANSFER
+        return requestService.createLhoRequest(batchId, userId, token);
     }
 
-    @SneakyThrows
-    public void createRequestApprovedNotification(CommonReq request, String approverId) {
-        String notificationMessage = "Your " + request.getReqType() + " ADD request for '"
-                + request.getTargetId() + "' has been approved by " + approverId;
-
-        createNotification(
-                request.getCreatorId(),
-                null,
-                notificationMessage,
-                "/my-requests",
-                request.getId().toString(),
-                "YearEndService"
-        );
-    }
-
-    @SneakyThrows
-    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
-        String notificationMessage = "Your " + request.getReqType() + " ADD request for '"
-                + request.getTargetId() + "' was rejected by " + rejectorId;
-
-        if (reason != null && !reason.isBlank()) {
-            notificationMessage += " Reason: " + reason;
-        }
-
-        createNotification(
-                request.getCreatorId(),
-                null,
-                notificationMessage,
-                "/my-requests",
-                request.getId().toString(),
-                "YearEndService"
-        );
-    }
-
-    /**
-     * Helper to convert Java UUID to 16-byte array for Oracle RAW column
-     */
-    private byte[] generateRawUuid() {
-        UUID uuid = UUID.randomUUID();
-        ByteBuffer bb = ByteBuffer.wrap(new byte[16]);
-        bb.putLong(uuid.getMostSignificantBits());
-        bb.putLong(uuid.getLeastSignificantBits());
-        return bb.array();
-    }
-}
-
-package com.fincore.YearEndService.Service;
-
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-
-
-import java.util.List;
-
-public interface ProfitLossService {
-    List<ProfitLossSummaryDto> getCircleWiseSummary();
-}
-
-
-package com.fincore.YearEndService.Service;
-
-import com.fincore.YearEndService.DTO.IProfitLossSummary;
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
-import com.fincore.YearEndService.Repository.ProfitLossRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class ProfitLossServiceImpl implements ProfitLossService {
-
-    private final ProfitLossRepository repository;
-
-    @Override
-    public List<ProfitLossSummaryDto> getCircleWiseSummary() {
-        log.info("Fetching circle-wise profit/loss summary from database");
-
-        List<IProfitLossSummary> results = repository.findProfitLossSummaryGroupedByCircle();
-
-        return results.stream()
-                .map(projection -> new ProfitLossSummaryDto(
-                        projection.getTransferDate(),
-                        projection.getCircleBranchCode(),
-                        projection.getTotalProfitLoss()
-                ))
-                .collect(Collectors.toList());
-    }
-}
-
-
-
+5. Key Differences & Integration Notes
+ * Payload Handling: In the LhoTransferServiceImpl you provided, you used objectMapper.writeValueAsString(payload). In the existing CommonRequestService, this is handled automatically by the strategy or the service layer before saving the CommonReq entity.
+ * Notifications: The existing NotificationWriterService already has a createNotification method. Use the existing one to avoid duplicate NotificationTable logic.
+ * UUID vs Byte[]: Your YearEndService used byte[] for Oracle RAW(16). Ensure your NotificationTable.java in the common service matches your database requirements (The common service currently uses UUID).
+Would you like me to provide the full implementation of the createLhoRequest method in the RequestService to handle the data fetching and payload construction?
