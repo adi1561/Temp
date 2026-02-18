@@ -1,106 +1,61 @@
-To integrate the LHO Transfer logic into your existing CommonRequestService, we need to align the code you provided with the architecture of the primary service. This includes creating a new Strategy to handle the approval of LHO requests, updating the RequestType enum, and ensuring the DTOs follow the polymorphic payload pattern.
-Here are the updated files to incorporate this logic.
-1. Update the Enum: RequestType.java
-Add LHO_TRANSFER to the list of supported request types.
-package com.tcs.fincore.CommonRequestService.model.enums;
-
-import lombok.Getter;
-
-@Getter
-public enum RequestType {
-    SEGMENT_CODE("SEGMENT"),
-    CGL_CODE("CGL"),
-    STATE("STATE"),
-    BRANCH("BRANCH"),
-    CIRCLE("CIRCLE"),
-    CURRENCY("CURRENCY"),
-    CALENDER("CALENDER"),
-    FILE_TYPE_MASTER("FILE_TYPE_MASTER"),
-    CURRENCY_RATE_CHANGE("CURRENCY_RATE"),
-    REPORT_TEMPLATE_CONFIG("REPORT_TEMPLATE_CONFIG"),
-    [span_0](start_span)// New Request Type for LHO Transfer[span_0](end_span)
-    LHO_TRANSFER("LHO_TRANSFER");
-
-    private final String dbValue;
-
-    RequestType(String dbValue) {
-        this.dbValue = dbValue;
-    }
+To create a testing payload for your LHO Transfer request, we must align the JSON structure with your existing CreateRequestDto [cite: 263-265]. [cite_start]Since you specifically mentioned wanting to save to the common request table and using the polymorphic payload structure, you need to provide the requestType, changeType, and a payload object that implements your marker interface.
+LHO Transfer Testing Payload
+This payload represents a new ADD request for the LHO Transfer batch.
+{
+  "requestType": "LHO_TRANSFER",
+  "changeType": "ADD",
+  "targetId": "BATCH-2026-001",
+  "payload": {
+    "batchId": "BATCH-2026-001",
+    "processDate": "2026-02-18",
+    "totalAmount": 113000.50,
+    "totalRecordCount": 3,
+    "circleWiseDetails": [
+      {
+        "transferDate": "2026-02-18",
+        "circleBranchCode": 101,
+        "totalProfitLoss": 50000.00
+      },
+      {
+        "transferDate": "2026-02-18",
+        "circleBranchCode": 102,
+        "totalProfitLoss": 75000.50
+      },
+      {
+        "transferDate": "2026-02-18",
+        "circleBranchCode": 103,
+        "totalProfitLoss": -12000.00
+      }
+    ]
+  }
 }
 
-2. Create the Strategy: LhoTransferStrategy.java
-Since you requested the payload logic be handled later (currently null/placeholder), this strategy defines how an LHO Transfer is "approved" (e.g., moving data to a final table or marking a batch as processed).
-package com.tcs.fincore.CommonRequestService.service.strategy;
+Implementation Checklist for the Payload
+To make the above payload work with your current system, ensure these two classes exist in your project:
+1. The Marker Interface
+The payload must implement your Payload interface to be accepted by the CreateRequestDto.
+package com.tcs.fincore.CommonRequestService.dto.payload;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Component;
-
-@Slf4j
-@Component
-@RequiredArgsConstructor
-public class LhoTransferStrategy implements RequestTypeStrategy {
-
-    @Override
-    public RequestType getRequestType() {
-        return RequestType.LHO_TRANSFER;
-    }
-
-    @Override
-    public void processApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Processing Approval for LHO Transfer Batch: {}", request.getTargetId());
-        
-        // Logic for what happens when the Checker clicks 'Approve'
-        switch (request.getChangeType()) {
-            case ADD:
-                handleLhoApproval(request);
-                break;
-            default:
-                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported for LHO.");
-        }
-    }
-
-    private void handleLhoApproval(CommonReq request) {
-        // TODO: Logic to finalize the P&L Transfer in the master tables
-        log.info("LHO Transfer Batch {} successfully approved and finalized.", request.getTargetId());
-    }
+public class LhoTransferPayload implements Payload {
+    private String batchId;
+    private String processDate;
+    private double totalAmount;
+    private int totalRecordCount;
+    private List<Map<String, Object>> circleWiseDetails;
+    // Getters and Setters
 }
 
-3. Update the DTO: CreateRequestDto.java
-Update the @JsonSubTypes to include the LhoTransferPayload. This allows the ApiResponseWrapper and RequestController to recognize the new request type.
-[span_3](start_span)// Add this entry inside @JsonSubTypes in CreateRequestDto.java[span_3](end_span)
+2. Update SubType Mapping
+Your CreateRequestDto uses @JsonSubTypes to determine which class to instantiate. You must add the entry for LHO_TRANSFER as shown below:
 @JsonSubTypes({
     // ... existing types
     @JsonSubTypes.Type(value = LhoTransferPayload.class, name = "LHO_TRANSFER")
 })
-private Payload payload;
+[span_7](start_span)private Payload payload; [cite: 280-282]
 
-4. Updated Controller Logic: RequestController.java
-You can now use the existing /create-request endpoint. If you want a specific "trigger" method as seen in your provided code, add this to RequestController:
-    /**
-     * [span_4](start_span)Specific trigger for LHO Transfer process[span_4](end_span)
-     */
-    @PostMapping("/lho/trigger")
-    @ResponseStatus(HttpStatus.CREATED)
-    public CommonReq triggerLhoTransfer(
-            @RequestBody Map<String, String> body,
-            @RequestHeader("Authorization") String token
-    ) throws JsonProcessingException {
-        String batchId = body.get("batchId");
-        String userId = jwtUtil.getUserIdFromToken(token);
-        
-        log.info("Triggering LHO Transfer for Batch: {} by User: {}", batchId, userId);
-        
-        // This would call a method in RequestService that builds the CommonReq 
-        // using RequestType.LHO_TRANSFER
-        return requestService.createLhoRequest(batchId, userId, token);
-    }
-
-5. Key Differences & Integration Notes
- * Payload Handling: In the LhoTransferServiceImpl you provided, you used objectMapper.writeValueAsString(payload). In the existing CommonRequestService, this is handled automatically by the strategy or the service layer before saving the CommonReq entity.
- * Notifications: The existing NotificationWriterService already has a createNotification method. Use the existing one to avoid duplicate NotificationTable logic.
- * UUID vs Byte[]: Your YearEndService used byte[] for Oracle RAW(16). Ensure your NotificationTable.java in the common service matches your database requirements (The common service currently uses UUID).
-Would you like me to provide the full implementation of the createLhoRequest method in the RequestService to handle the data fetching and payload construction?
+Testing via Postman/cURL
+You can test this by hitting your existing endpoint:
+ * [cite_start]URL: POST /api/create-request
+ * Headers: * Authorization: Bearer <your_token>
+   * Content-Type: application/json
+Would you like me to provide the Java code for the LhoTransferPayload DTO including all the specific fields from your previous files?
