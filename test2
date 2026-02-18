@@ -1,148 +1,128 @@
-package org.example.demo1.DTO;
+To integrate the LHO Transfer into your existing Common Request Service architecture, you need to update several files to handle the new request type, its payload, and the polymorphic JSON processing.
+Here are the updated files based on the common service structure you provided:
+1. New DTO: LhoTransferPayloadDto.java
+This file must be created in the payload DTO package. It implements KeyablePayload so the system knows to use batchId as the targetId in the COMMON_REQ table.
+Path: com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto
+package com.tcs.fincore.CommonRequestService.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Data;
-import lombok.Getter;
-import lombok.Setter;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.util.List;
 
 @Data
-@Getter
-@Setter
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+[span_2](start_span)@JsonTypeName("LHO_TRANSFER") // Discriminator used by Jackson[span_2](end_span)
+public class LhoTransferPayloadDto implements KeyablePayload {
 
-public class PaymentRequest {
+    private String batchId;
+    private LocalDate processDate;
+    private BigDecimal totalAmount;
+    private int totalRecordCount;
+    private List<ProfitLossSummaryDto> circleWiseDetails;
 
-    private String payment_type;
-
-    private String name;
-    private double amount;
-
-    private String cardNumber;
-    private String email;
-
-
+    @Override
+    @JsonIgnore
+    public String getKey() {
+        [span_3](start_span)[span_4](start_span)// Constructs the primary key for common_req target_id[span_3](end_span)[span_4](end_span)
+        return this.batchId;
+    }
 }
 
+2. Updated Enum: RequestType.java
+You must add the LHO_TRANSFER constant so the validator and the RequestTypeConverter recognize the type.
+Path: com.tcs.fincore.CommonRequestService.model.enums.RequestType
+package com.tcs.fincore.CommonRequestService.model.enums;
 
-
-package org.example.demo1.Models;
-import jakarta.persistence.DiscriminatorValue;
-import jakarta.persistence.Entity;
 import lombok.Getter;
-import lombok.Setter;
 
-@Entity
 @Getter
-@Setter
+public enum RequestType {
+    SEGMENT_CODE("SEGMENT"),
+    CGL_CODE("CGL"),
+    STATE("STATE"),
+    BRANCH("BRANCH"),
+    CIRCLE("CIRCLE"),
+    CURRENCY("CURRENCY"),
+    CALENDER("CALENDER"),
+    FILE_TYPE_MASTER("FILE_TYPE_MASTER"),
+    CURRENCY_RATE_CHANGE("CURRENCY_RATE_CHANGE"),
+    REPORT_TEMPLATE_CONFIG("REPORT_TEMPLATE_CONFIG"),
+    LHO_TRANSFER("LHO_TRANSFER"); // Added for Year-End LHO Process
 
-@DiscriminatorValue("CreditCardPayment")
-public class CreditCardPayment extends Payment{
+    private final String dbValue;
 
-
-    private String cardNumber;
-}
-package org.example.demo1.Models;
-
-
-import jakarta.persistence.*;
-
-import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-
-@Entity
-@Getter
-@Setter
-@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
-@DiscriminatorColumn( name  = "payment_type" ,discriminatorType = DiscriminatorType.STRING )
-
-public abstract class  Payment {
-
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.AUTO)
-    private Long id;
-
-    private String name;
-    private double amount;
-
-
-
+    RequestType(String dbValue) {
+        this.dbValue = dbValue;
+    }
 }
 
+3. Updated DTO: CreateRequestDto.java
+You must add the new payload class to the @JsonSubTypes registry. This allows the RequestController to correctly deserialize the JSON payload when a user triggers the process.
+Path: com.tcs.fincore.CommonRequestService.dto.CreateRequestDto
+// ... existing imports
+@JsonSubTypes({
+    @JsonSubTypes.Type(value = SegmentPayloadDto.class, name = "SEGMENT_CODE"),
+    @JsonSubTypes.Type(value = CglPayloadDto.class, name = "CGL_CODE"),
+    @JsonSubTypes.Type(value = BranchRequestPayloadDTO.class, name = "BRANCH"),
+    @JsonSubTypes.Type(value = CircleRequestPayloadDTO.class, name = "CIRCLE"),
+    @JsonSubTypes.Type(value = StateReqPayloadDto.class, name = "STATE"),
+    @JsonSubTypes.Type(value = CurrencyMasterDto.class, name = "CURRENCY"),
+    @JsonSubTypes.Type(value = CalenderConfigPayloadDto.class, name = "CALENDER"),
+    @JsonSubTypes.Type(value = CurrencyRateChangeDto.class, name = "CURRENCY_RATE_CHANGE"),
+    @JsonSubTypes.Type(value = FIleTypeDTO.class, name = "FILE_TYPE_MASTER"),
+    @JsonSubTypes.Type(value = LhoTransferPayloadDto.class, name = "LHO_TRANSFER") // Register LHO Payload
+})
+private Payload payload;
 
-package org.example.demo1.Models;
-import jakarta.persistence.DiscriminatorValue;
-import jakarta.persistence.Entity;
-import lombok.Getter;
-import lombok.Setter;
+4. Updated Service: LhoTransferServiceImpl.java
+Now, instead of manually saving to a repository, your service will call the centralized RequestService.
+Path: com.tcs.fincore.CommonRequestService.service.LhoTransferServiceImpl
+package com.tcs.fincore.CommonRequestService.service;
 
-@Entity
-@Getter
-@Setter
-
-
-@DiscriminatorValue("PayPalPayment")
-public class PayPalPayment extends Payment {
-
-    private String email;
-}
-
-
-package org.example.demo1.Repository;
-
-import org.example.demo1.Models.Payment;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-
-
-@Repository
-public interface PaymentRepo extends JpaRepository<Payment , Long> {
-
-}
-
-
-package org.example.demo1.Service;
-
-import org.example.demo1.DTO.PaymentRequest;
-import org.example.demo1.Models.CreditCardPayment;
-import org.example.demo1.Models.PayPalPayment;
-import org.example.demo1.Models.Payment;
-import org.example.demo1.Repository.PaymentRepo;
-import org.springframework.beans.factory.annotation.Autowired;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
-public class PaymentService {
+@RequiredArgsConstructor
+@Slf4j
+public class LhoTransferServiceImpl implements LhoTransferService {
 
+    private final RequestService requestService; [span_11](start_span)// Inject the centralized service[span_11](end_span)
 
-    @Autowired
-    private PaymentRepo paymentRepo;
+    @Override
+    @Transactional
+    public CommonReq createLhoTransferRequest(LhoTransferPayloadDto payload, String userId, String token) {
+        log.info("Creating Common Request for LHO Transfer batch: {}", payload.getBatchId());
 
+        [span_12](start_span)// Wrap the payload in the standard CreateRequestDto structure[span_12](end_span)
+        CreateRequestDto createRequestDto = new CreateRequestDto();
+        createRequestDto.setRequestType(RequestType.LHO_TRANSFER);
+        createRequestDto.setChangeType(ChangeType.ADD); [span_13](start_span)//[span_13](end_span)
+        createRequestDto.setPayload(payload);
+        createRequestDto.setTargetId(payload.getKey());
 
-    public Payment createPayment(PaymentRequest paymentRequest) {
-
-            Payment payment;
-
-            if(paymentRequest.getPayment_type().equals("CreditCardPayment")) {
-
-                CreditCardPayment cardPayment = new CreditCardPayment();
-                cardPayment.setCardNumber(paymentRequest.getCardNumber());
-
-            }
-            else if(paymentRequest.getPayment_type().equals("PayPalPayment")) {
-
-                PayPalPayment payPalPayment = new PayPalPayment();
-                payPalPayment.setEmail(paymentRequest.getEmail());
-            }
-            else {
-                throw erro or exception
-            }
+        [span_14](start_span)// Use the centralized request logic which handles DB save and notifications[span_14](end_span)
+        return requestService.createRequest(createRequestDto, userId, token);
     }
-
-
-
-
-
 }
 
-
-cheak this i am not created controller as u know give mi score 
+Next Steps
+ * Database Order: Ensure the LHO_TRANSFER value is allowed in your COMMON_REQ table constraints.
+ * Strategy: You will need a LhoTransferStrategy class (similar to BranchMasterStrategy) to handle what happens when the Checker clicks "Approve."
+Would you like me to write the LhoTransferStrategy for you now?
