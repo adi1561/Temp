@@ -1,8 +1,28 @@
-To integrate the LHO Transfer into your existing Common Request Service architecture, you need to update several files to handle the new request type, its payload, and the polymorphic JSON processing.
-Here are the updated files based on the common service structure you provided:
-1. New DTO: LhoTransferPayloadDto.java
-This file must be created in the payload DTO package. It implements KeyablePayload so the system knows to use batchId as the targetId in the COMMON_REQ table.
-Path: com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto
+To fully integrate the LHO Transfer into your Common Request Service architecture, you need to update the core registry files and create the necessary DTOs. This ensures that the system can serialize your circle-wise summary into the COMMON_REQ table and handle it through the Maker-Checker workflow.
+Here are the complete files you need:
+1. The Summary DTO
+This is the data structure for the individual circle rows.
+File: com.tcs.fincore.CommonRequestService.dto.ProfitLossSummaryDto.java
+package com.tcs.fincore.CommonRequestService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ProfitLossSummaryDto {
+    private LocalDate transferDate;
+    private Integer circleBranchCode;
+    private BigDecimal totalProfitLoss;
+}
+
+2. The Main Payload DTO
+This class wraps the summary list and implements KeyablePayload. The @JsonTypeName allows the system to identify this specific payload during deserialization.
+File: com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto.java
 package com.tcs.fincore.CommonRequestService.dto;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
@@ -20,7 +40,7 @@ import java.util.List;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-[span_2](start_span)@JsonTypeName("LHO_TRANSFER") // Discriminator used by Jackson[span_2](end_span)
+@JsonTypeName("LHO_TRANSFER") 
 public class LhoTransferPayloadDto implements KeyablePayload {
 
     private String batchId;
@@ -32,14 +52,14 @@ public class LhoTransferPayloadDto implements KeyablePayload {
     @Override
     @JsonIgnore
     public String getKey() {
-        [span_3](start_span)[span_4](start_span)// Constructs the primary key for common_req target_id[span_3](end_span)[span_4](end_span)
+        [span_3](start_span)[span_4](start_span)// This returns the Batch ID to be used as TARGET_ID in COMMON_REQ table[span_3](end_span)[span_4](end_span)
         return this.batchId;
     }
 }
 
-2. Updated Enum: RequestType.java
-You must add the LHO_TRANSFER constant so the validator and the RequestTypeConverter recognize the type.
-Path: com.tcs.fincore.CommonRequestService.model.enums.RequestType
+3. Updated RequestType Enum
+You must add the LHO_TRANSFER constant so the RequestTypeConverter can map it to the database.
+File: com.tcs.fincore.CommonRequestService.model.enums.RequestType.java
 package com.tcs.fincore.CommonRequestService.model.enums;
 
 import lombok.Getter;
@@ -56,7 +76,7 @@ public enum RequestType {
     FILE_TYPE_MASTER("FILE_TYPE_MASTER"),
     CURRENCY_RATE_CHANGE("CURRENCY_RATE_CHANGE"),
     REPORT_TEMPLATE_CONFIG("REPORT_TEMPLATE_CONFIG"),
-    LHO_TRANSFER("LHO_TRANSFER"); // Added for Year-End LHO Process
+    LHO_TRANSFER("LHO_TRANSFER"); [span_7](start_span)// Added for Year-End LHO Process[span_7](end_span)
 
     private final String dbValue;
 
@@ -65,27 +85,29 @@ public enum RequestType {
     }
 }
 
-3. Updated DTO: CreateRequestDto.java
-You must add the new payload class to the @JsonSubTypes registry. This allows the RequestController to correctly deserialize the JSON payload when a user triggers the process.
-Path: com.tcs.fincore.CommonRequestService.dto.CreateRequestDto
-// ... existing imports
-@JsonSubTypes({
-    @JsonSubTypes.Type(value = SegmentPayloadDto.class, name = "SEGMENT_CODE"),
-    @JsonSubTypes.Type(value = CglPayloadDto.class, name = "CGL_CODE"),
-    @JsonSubTypes.Type(value = BranchRequestPayloadDTO.class, name = "BRANCH"),
-    @JsonSubTypes.Type(value = CircleRequestPayloadDTO.class, name = "CIRCLE"),
-    @JsonSubTypes.Type(value = StateReqPayloadDto.class, name = "STATE"),
-    @JsonSubTypes.Type(value = CurrencyMasterDto.class, name = "CURRENCY"),
-    @JsonSubTypes.Type(value = CalenderConfigPayloadDto.class, name = "CALENDER"),
-    @JsonSubTypes.Type(value = CurrencyRateChangeDto.class, name = "CURRENCY_RATE_CHANGE"),
-    @JsonSubTypes.Type(value = FIleTypeDTO.class, name = "FILE_TYPE_MASTER"),
-    @JsonSubTypes.Type(value = LhoTransferPayloadDto.class, name = "LHO_TRANSFER") // Register LHO Payload
-})
-private Payload payload;
+4. Updated CreateRequestDto
+This file tells Jackson how to handle the new LhoTransferPayloadDto when it appears in a request.
+File: com.tcs.fincore.CommonRequestService.dto.CreateRequestDto.java
+// ... Existing Imports
+    
+    @JsonSubTypes({
+            @JsonSubTypes.Type(value = SegmentPayloadDto.class, name = "SEGMENT_CODE"),
+            @JsonSubTypes.Type(value = CglPayloadDto.class, name = "CGL_CODE"),
+            @JsonSubTypes.Type(value = BranchRequestPayloadDTO.class, name = "BRANCH"),
+            @JsonSubTypes.Type(value = CircleRequestPayloadDTO.class, name = "CIRCLE"),
+            @JsonSubTypes.Type(value = StateReqPayloadDto.class, name = "STATE"),
+            @JsonSubTypes.Type(value = CurrencyMasterDto.class, name = "CURRENCY"),
+            @JsonSubTypes.Type(value = CalenderConfigPayloadDto.class, name = "CALENDER"),
+            @JsonSubTypes.Type(value = CurrencyRateChangeDto.class, name = "CURRENCY_RATE_CHANGE"),
+            @JsonSubTypes.Type(value = FIleTypeDTO.class, name = "FILE_TYPE_MASTER"),
+            [span_9](start_span)[span_10](start_span)@JsonSubTypes.Type(value = LhoTransferPayloadDto.class, name = "LHO_TRANSFER") // Registered new DTO[span_9](end_span)[span_10](end_span)
+    })
+    private Payload payload;
+// ... Remaining logic
 
-4. Updated Service: LhoTransferServiceImpl.java
-Now, instead of manually saving to a repository, your service will call the centralized RequestService.
-Path: com.tcs.fincore.CommonRequestService.service.LhoTransferServiceImpl
+5. Updated Service Implementation
+This service now coordinates with the RequestService.
+File: com.tcs.fincore.CommonRequestService.service.LhoTransferServiceImpl.java
 package com.tcs.fincore.CommonRequestService.service;
 
 import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
@@ -96,33 +118,26 @@ import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class LhoTransferServiceImpl implements LhoTransferService {
 
-    private final RequestService requestService; [span_11](start_span)// Inject the centralized service[span_11](end_span)
+    private final RequestService requestService; [span_13](start_span)// Injecting the existing central service[span_13](end_span)
 
-    @Override
-    @Transactional
     public CommonReq createLhoTransferRequest(LhoTransferPayloadDto payload, String userId, String token) {
-        log.info("Creating Common Request for LHO Transfer batch: {}", payload.getBatchId());
+        [span_14](start_span)log.info("Initiating LHO Transfer request for user: {}", userId);[span_14](end_span)
 
-        [span_12](start_span)// Wrap the payload in the standard CreateRequestDto structure[span_12](end_span)
-        CreateRequestDto createRequestDto = new CreateRequestDto();
-        createRequestDto.setRequestType(RequestType.LHO_TRANSFER);
-        createRequestDto.setChangeType(ChangeType.ADD); [span_13](start_span)//[span_13](end_span)
-        createRequestDto.setPayload(payload);
-        createRequestDto.setTargetId(payload.getKey());
+        // Wrap into the standardized Request DTO
+        CreateRequestDto createDto = new CreateRequestDto();
+        createDto.setRequestType(RequestType.LHO_TRANSFER);
+        createDto.setChangeType(ChangeType.ADD);
+        createDto.setPayload(payload);
 
-        [span_14](start_span)// Use the centralized request logic which handles DB save and notifications[span_14](end_span)
-        return requestService.createRequest(createRequestDto, userId, token);
+        [span_15](start_span)[span_16](start_span)// Pass to the central service to handle database persistence and notifications[span_15](end_span)[span_16](end_span)
+        return requestService.createRequest(createDto, userId, token);
     }
 }
 
-Next Steps
- * Database Order: Ensure the LHO_TRANSFER value is allowed in your COMMON_REQ table constraints.
- * Strategy: You will need a LhoTransferStrategy class (similar to BranchMasterStrategy) to handle what happens when the Checker clicks "Approve."
-Would you like me to write the LhoTransferStrategy for you now?
+Would you like me to also provide the Strategy file so the Checker can approve these requests?
