@@ -3,7 +3,7 @@ import {
   Box, Button, Typography, CircularProgress, Table, TableBody,
   TableCell, TableContainer, TableHead, TableRow, Paper,
   TablePagination, Dialog, DialogTitle, DialogContent, IconButton,
-  Tooltip, Stack, Divider, DialogActions
+  Tooltip, DialogActions
 } from "@mui/material";
 import {
   PlayArrow as PlayArrowIcon,
@@ -18,8 +18,7 @@ import useCustomSnackbar from "../../utils/useCustomSnackbar";
 // --- API Constants ---
 const TRIGGER_API_URL = "/PS/airflow/trigger";
 const INITIAL_DATA_URL = "/PS/process/processes/data/7";
-// Updated to use the ID parameter for the summary
-const SUMMARY_BASE_URL = "/YE/yearend/summary/"; 
+const SUMMARY_BASE_URL = "/YE/yearend/summary/"; // Standardized to our new backend path
 
 export default function TransferDataLho() {
   const { callApi } = useApi();
@@ -34,7 +33,7 @@ export default function TransferDataLho() {
 
   // Summary popup states
   const [summaryOpen, setSummaryOpen] = useState(false);
-  const [summaryData, setSummaryData] = useState([]); // Will store as [{code, balance}]
+  const [summaryData, setSummaryData] = useState([]); 
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [currentSelectedId, setCurrentSelectedId] = useState(null);
 
@@ -45,9 +44,9 @@ export default function TransferDataLho() {
   // ---------------- FETCH INITIAL DATA ----------------
   const fetchInitialData = async () => {
     try {
-      const response = await callApi(`${INITIAL_DATA_URL}`, null, "GET");
+      const response = await callApi(INITIAL_DATA_URL, null, "GET");
       if (isMounted.current && response) {
-        // Tag initial data as "Run 1" if not specified
+        // Tag initial data to track retry capability
         const formattedData = (response.initialData || []).map(item => ({
           ...item,
           isLatest: true,
@@ -74,7 +73,7 @@ export default function TransferDataLho() {
     try {
       await callApi(TRIGGER_API_URL, payload, "POST");
       showSnackBar("LHO Transfer triggered successfully", "success");
-      fetchInitialData(); // Refresh table
+      fetchInitialData();
     } catch (error) {
       showSnackBar("Failed to trigger LHO Transfer", "error");
     } finally {
@@ -88,11 +87,10 @@ export default function TransferDataLho() {
     setCurrentSelectedId(processRunId);
     
     try {
-      // Calling the optimized endpoint: /YE/yearend/summary/{id}
+      // Endpoint matches backend: /YE/yearend/summary/{id}
       const response = await callApi(`${SUMMARY_BASE_URL}${processRunId}`, null, "GET");
       
-      // Since backend returns Map<String, BigDecimal>, convert to Array for table
-      // response.data = { "3971": 111755000.0000, ... }
+      // Mapping the Map<String, BigDecimal> response to Array
       const rawMap = response?.data || {};
       const formattedSummary = Object.entries(rawMap).map(([code, balance]) => ({
         circleBranchCode: code,
@@ -109,98 +107,78 @@ export default function TransferDataLho() {
   };
 
   const handleRetry = (row, index) => {
-    // 1. Disable retry on the clicked row (the "old" one)
     const updatedTable = [...tableData];
+    
+    // Disable retry on the current row
     updatedTable[index].isLatest = false;
 
-    // 2. Create the "New Run" row
+    // Create new row with incremented Run Version
     const nextRunNumber = (row.runVersion || 1) + 1;
     const newRow = {
       ...row,
-      processRunId: row.processRunId + 1000, // Simulating a new ID as per requirements
+      processRunId: row.processRunId + 1, // New ID for the run
       runId: nextRunNumber,
       runVersion: nextRunNumber,
-      isLatest: true, // This one can be retried
-      processType: `${row.processType} (Run ${nextRunNumber})`,
-      startTime: new Date().toISOString()
+      isLatest: true,
+      processType: `${row.processType} (Run ${nextRunNumber})`
     };
 
-    // 3. Insert new row immediately below the current row
+    // Insert new row immediately below the parent row
     updatedTable.splice(index + 1, 0, newRow);
     setTableData(updatedTable);
-    showSnackBar(`Retry initiated: Run ${nextRunNumber} generated`, "info");
+    showSnackBar(`Retry run ${nextRunNumber} generated`, "success");
   };
 
   const handleRestart = () => {
-    showSnackBar("Process Restarted", "warning");
     fetchInitialData();
+    showSnackBar("Process Restarted", "info");
   };
 
   return (
-    <Box p={3} width="100%" bgcolor="#f5f7fa" minHeight="100vh">
-      <Stack direction="row" justifyContent="space-between" alignItems="center" mb={3}>
-        <Typography variant="h5" fontWeight="bold" color="primary">
-          LHO Data Transfer Management
-        </Typography>
+    <Box p={3} width="100%">
+      <Box display="flex" justifyContent="flex-end" mb={2}>
         <Button
           variant="contained"
-          size="large"
           startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
           onClick={handleTransferLho}
           disabled={isTransferring}
-          sx={{ borderRadius: 2, px: 4 }}
         >
-          {isTransferring ? "Processing..." : "Trigger LHO Transfer"}
+          {isTransferring ? "Transferring..." : "Transfer LHO"}
         </Button>
-      </Stack>
+      </Box>
 
-      <TableContainer component={Paper} elevation={3} sx={{ borderRadius: 2 }}>
+      <TableContainer component={Paper}>
         <Table>
-          <TableHead sx={{ bgcolor: "#eceff1" }}>
+          <TableHead>
             <TableRow>
-              <TableCell align="center"><strong>Run ID</strong></TableCell>
+              <TableCell align="center"><strong>Process Run ID</strong></TableCell>
               <TableCell align="center"><strong>Process ID</strong></TableCell>
               <TableCell align="center"><strong>ETL Date</strong></TableCell>
               <TableCell align="center"><strong>Process Type</strong></TableCell>
-              <TableCell align="center"><strong>Status</strong></TableCell>
-              <TableCell align="center"><strong>Actions</strong></TableCell>
+              <TableCell align="center"><strong>Action</strong></TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {tableData
               .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
               .map((row, index) => (
-                <TableRow key={row.processRunId} hover>
+                <TableRow key={row.processRunId}>
                   <TableCell align="center">{row.processRunId}</TableCell>
                   <TableCell align="center">{row.processId}</TableCell>
                   <TableCell align="center">{row.etlDate}</TableCell>
+                  <TableCell align="center">{row.processType}</TableCell>
                   <TableCell align="center">
-                    <Typography variant="body2" fontWeight={row.isLatest ? 600 : 400}>
-                      {row.processType}
-                    </Typography>
-                  </TableCell>
-                  <TableCell align="center">
-                    <Box 
-                      px={1} py={0.5} borderRadius={1} display="inline-block"
-                      bgcolor={row.isLatest ? "#e8f5e9" : "#f5f5f5"}
-                      color={row.isLatest ? "#2e7d32" : "#9e9e9e"}
-                      fontSize="0.75rem" fontWeight="bold"
-                    >
-                      {row.isLatest ? "ACTIVE" : "ARCHIVED"}
-                    </Box>
-                  </TableCell>
-                  <TableCell align="center">
-                    <Stack direction="row" spacing={1} justifyContent="center">
-                      <Tooltip title="View Summary">
-                        <IconButton color="primary" onClick={() => handleGetSummary(row.processRunId)}>
+                    <Box display="flex" justifyContent="center" gap={1}>
+                      <Tooltip title="Get Summary">
+                        <IconButton size="small" onClick={() => handleGetSummary(row.processRunId)}>
                           <SummaryIcon />
                         </IconButton>
                       </Tooltip>
                       
-                      <Tooltip title={row.isLatest ? "Retry Process" : "Retry Disabled"}>
+                      <Tooltip title="Retry">
                         <span>
                           <IconButton 
-                            color="secondary" 
+                            size="small" 
                             disabled={!row.isLatest} 
                             onClick={() => handleRetry(row, index + (page * rowsPerPage))}
                           >
@@ -209,120 +187,106 @@ export default function TransferDataLho() {
                         </span>
                       </Tooltip>
 
-                      <Tooltip title="Restart Service">
-                        <IconButton color="warning" onClick={handleRestart}>
+                      <Tooltip title="Restart">
+                        <IconButton size="small" onClick={handleRestart}>
                           <RestartIcon />
                         </IconButton>
                       </Tooltip>
-                    </Stack>
+                    </Box>
                   </TableCell>
                 </TableRow>
               ))}
           </TableBody>
         </Table>
         <TablePagination
-          rowsPerPageOptions={[10, 25]}
           component="div"
           count={tableData.length}
-          rowsPerPage={rowsPerPage}
           page={page}
-          onPageChange={(e, p) => setPage(p)}
-          onRowsPerPageChange={(e) => setRowsPerPage(parseInt(e.target.value, 10))}
+          onPageChange={(e, newPage) => setPage(newPage)}
+          rowsPerPage={rowsPerPage}
+          onRowsPerPageChange={(e) => {
+            setRowsPerPage(parseInt(e.target.value, 10));
+            setPage(0);
+          }}
+          rowsPerPageOptions={[10, 25, 50]}
         />
       </TableContainer>
 
-      {/* ---------------- SUMMARY DIALOG ---------------- */}
-      <Dialog 
-        open={summaryOpen} 
-        onClose={() => setSummaryOpen(false)} 
-        maxWidth="sm" 
-        fullWidth
-        PaperProps={{ sx: { borderRadius: 3 } }}
-      >
-        <DialogTitle sx={{ bgcolor: "#f8f9fa", display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <Box>
-            <Typography variant="h6" fontWeight="bold">LHO Transfer Summary</Typography>
-            <Typography variant="caption" color="textSecondary">Run ID: {currentSelectedId}</Typography>
-          </Box>
-          <IconButton onClick={() => setSummaryOpen(false)}><CloseIcon /></IconButton>
+      {/* ---------------- SUMMARY POPUP ---------------- */}
+      <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>
+          Circle Wise Summary (ID: {currentSelectedId})
+          <IconButton
+            onClick={() => setSummaryOpen(false)}
+            sx={{ position: 'absolute', right: 8, top: 8 }}
+          >
+            <CloseIcon />
+          </IconButton>
         </DialogTitle>
         
         <DialogContent dividers>
           {summaryLoading ? (
-            <Box display="flex" flexDirection="column" justifyContent="center" alignItems="center" height="250px">
-              <CircularProgress size={40} />
-              <Typography mt={2} color="textSecondary">Aggregating Financial Data...</Typography>
-            </Box>
+            <Box display="flex" justifyContent="center" py={5}><CircularProgress /></Box>
           ) : (
-            <TableContainer sx={{ maxHeight: 400 }}>
-              <Table stickyHeader size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell align="left"><strong>Branch Code</strong></TableCell>
-                    <TableCell align="right"><strong>Total Profit / Loss (INR)</strong></TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {summaryData.length > 0 ? (
-                    summaryData
-                      .slice(summaryPage * summaryRowsPerPage, summaryPage * summaryRowsPerPage + summaryRowsPerPage)
-                      .map((row, idx) => (
-                        <TableRow key={idx}>
-                          <TableCell>{row.circleBranchCode}</TableCell>
-                          <TableCell 
-                            align="right" 
-                            sx={{ 
-                              fontFamily: 'monospace', 
-                              fontWeight: 'bold',
-                              color: row.totalProfitLoss < 0 ? 'error.main' : 'success.main'
-                            }}
-                          >
-                            {Number(row.totalProfitLoss).toLocaleString('en-IN', {
-                              minimumFractionDigits: 4,
-                              maximumFractionDigits: 4
-                            })}
-                          </TableCell>
-                        </TableRow>
-                      ))
-                  ) : (
+            <>
+              <TableContainer component={Paper} sx={{ mb: 1 }}>
+                <Table size="small">
+                  <TableHead>
                     <TableRow>
-                      <TableCell colSpan={2} align="center" sx={{ py: 3 }}>
-                        No financial data found for this run.
-                      </TableCell>
+                      <TableCell align="center"><strong>Circle Branch Code</strong></TableCell>
+                      <TableCell align="center"><strong>Balance</strong></TableCell>
                     </TableRow>
-                  )}
-                </TableBody>
-              </Table>
+                  </TableHead>
+                  <TableBody>
+                    {summaryData.length > 0 ? (
+                      summaryData
+                        .slice(summaryPage * summaryRowsPerPage, summaryPage * summaryRowsPerPage + summaryRowsPerPage)
+                        .map((row, index) => (
+                          <TableRow key={index}>
+                            <TableCell align="center">{row.circleBranchCode}</TableCell>
+                            <TableCell align="center">
+                              {/* Handling 20-digit precision with 4 decimals */}
+                              {Number(row.totalProfitLoss).toLocaleString('en-IN', {
+                                minimumFractionDigits: 4,
+                                maximumFractionDigits: 4
+                              })}
+                            </TableCell>
+                          </TableRow>
+                        ))
+                    ) : (
+                      <TableRow>
+                        <TableCell colSpan={2} align="center">No Data Available</TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </TableContainer>
               <TablePagination
                 component="div"
                 count={summaryData.length}
                 page={summaryPage}
                 onPageChange={(e, p) => setSummaryPage(p)}
                 rowsPerPage={summaryRowsPerPage}
-                onRowsPerPageChange={(e) => setSummaryRowsPerPage(parseInt(e.target.value, 10))}
+                onRowsPerPageChange={(e) => {
+                  setSummaryRowsPerPage(parseInt(e.target.value, 10));
+                  setSummaryPage(0);
+                }}
                 rowsPerPageOptions={[5, 10]}
               />
-            </TableContainer>
+            </>
           )}
         </DialogContent>
-        
-        <DialogActions sx={{ p: 2, bgcolor: "#f8f9fa" }}>
-          <Button variant="outlined" onClick={() => setSummaryOpen(false)} sx={{ borderRadius: 2 }}>
-            Cancel
-          </Button>
-          <Button 
-            variant="contained" 
-            color="primary" 
-            onClick={() => {
-               showSnackBar("Summary Verified and Submitted", "success");
-               setSummaryOpen(false);
-            }}
-            sx={{ borderRadius: 2, px: 3 }}
-          >
-            Confirm & Submit
+        <DialogActions sx={{ p: 2 }}>
+          <Button variant="outlined" onClick={() => setSummaryOpen(false)}>Close</Button>
+          <Button variant="contained" onClick={() => {
+            showSnackBar("Submitted Successfully", "success");
+            setSummaryOpen(false);
+          }}>
+            Submit Summary
           </Button>
         </DialogActions>
       </Dialog>
     </Box>
   );
 }
+
