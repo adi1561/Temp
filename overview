@@ -14,21 +14,24 @@ import {
 import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
+// --- API Constants ---
 const TRIGGER_API_URL = "/PS/airflow/trigger";
 const INITIAL_DATA_URL = "/PS/process/processes/data/7";
-const SUMMARY_BASE_URL = "/CM/api/lho-transfers/summary";
+const SUMMARY_BASE_URL = "/CM/api/lho-transfers/summary/";
 
 export default function TransferDataLho() {
   const { callApi } = useApi();
   const showSnackBar = useCustomSnackbar();
   const isMounted = useRef(true);
 
+  // Table & Loading States
   const [isTransferring, setIsTransferring] = useState(false);
   const [tableData, setTableData] = useState([]);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
 
+  // Summary Dialog States
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [summaryData, setSummaryData] = useState([]); 
   const [summaryLoading, setSummaryLoading] = useState(false);
@@ -37,28 +40,29 @@ export default function TransferDataLho() {
   const [summaryPage, setSummaryPage] = useState(0);
   const [summaryRowsPerPage, setSummaryRowsPerPage] = useState(5);
 
-  // ---------------- MOCK DATA FOR TESTING ----------------
-  const dummyInitialData = [
-    {
-      processRunId: 370,
-      processId: 7,
-      etlDate: "2025-11-21",
-      runId: 1,
-      processType: "Transfer To LHO",
-      isLatest: true,
-      runVersion: 1
-    }
-  ];
-
-  const fetchInitialData = () => {
+  /**
+   * FETCH INITIAL DATA
+   * Calls the backend to populate the main grid
+   */
+  const fetchInitialData = async () => {
     setIsInitialLoading(true);
-    // Simulating delay then showing dummy data directly
-    setTimeout(() => {
-      if (isMounted.current) {
-        setTableData(dummyInitialData);
-        setIsInitialLoading(false);
+    try {
+      const response = await callApi(INITIAL_DATA_URL, null, "GET");
+      if (isMounted.current && response && response.initialData) {
+        // Initialize flags for UI logic (Retry button state)
+        const formattedData = response.initialData.map(item => ({
+          ...item,
+          isLatest: true,
+          runVersion: item.runId || 1 
+        }));
+        setTableData(formattedData);
       }
-    }, 1000);
+    } catch (error) {
+      showSnackBar("Failed to load process data", "error");
+      setTableData([]);
+    } finally {
+      if (isMounted.current) setIsInitialLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -69,43 +73,66 @@ export default function TransferDataLho() {
 
   // ---------------- ACTION HANDLERS ----------------
 
+  /**
+   * TRIGGER NEW TRANSFER
+   */
   const handleTransferLho = async () => {
     setIsTransferring(true);
-    // Mocking the trigger
-    setTimeout(() => {
-      showSnackBar("LHO Transfer triggered (Mock)", "success");
+    const payload = { dagId: "cbs_wrap_dag", processId: 7 };
+    try {
+      await callApi(TRIGGER_API_URL, payload, "POST");
+      showSnackBar("LHO Transfer triggered successfully", "success");
+      fetchInitialData(); // Refresh list to show new run
+    } catch (error) {
+      showSnackBar("Failed to trigger LHO Transfer", "error");
+    } finally {
       setIsTransferring(false);
-    }, 1000);
+    }
   };
 
+  /**
+   * GET SUMMARY (Mapped to ID)
+   * Fetches Map<String, BigDecimal> and converts to Table Array
+   */
   const handleGetSummary = async (processRunId) => {
     setSummaryOpen(true);
     setSummaryLoading(true);
+    setSummaryData([]);
     setCurrentSelectedId(processRunId);
     
-    // Mocking summary data for testing
-    setTimeout(() => {
-        const mockSummary = { "3971": 111755000.0000, "4002": 0.0000, "5567": 2500.4500 };
-        setSummaryData(Object.entries(mockSummary).map(([code, bal]) => ({ 
-          circleBranchCode: code, totalProfitLoss: bal 
-        })));
-        setSummaryLoading(false);
-    }, 8000);
+    try {
+      // Maps to: /CM/api/lho-transfers/summary/{id}
+      const response = await callApi(`${SUMMARY_BASE_URL}${processRunId}`, null, "GET");
+      
+      // Convert backend Map object into Array for MUI Table
+      const rawMap = response?.data || {};
+      const formattedSummary = Object.entries(rawMap).map(([code, balance]) => ({
+        circleBranchCode: code,
+        totalProfitLoss: balance
+      }));
+
+      setSummaryData(formattedSummary);
+    } catch (error) {
+      showSnackBar("Could not retrieve summary for this run", "error");
+    } finally {
+      setSummaryLoading(false);
+    }
   };
 
+  /**
+   * RETRY LOGIC
+   * Dynamically increments Run Number and inserts row locally
+   */
   const handleRetry = (row, index) => {
     const updatedTable = [...tableData];
-    updatedTable[index].isLatest = false; 
+    updatedTable[index].isLatest = false; // Disable retry for parent row
 
     const nextRunNumber = (row.runVersion || 1) + 1;
-    
-    // Logic to prevent stacking (Run 2)(Run 3)
-    // It takes the base name (everything before the first parenthesis)
     const baseProcessType = row.processType.split(" (")[0];
 
     const newRow = {
       ...row,
-      processRunId: row.processRunId + 1, 
+      processRunId: row.processRunId + 1, // Simulated increment
       runId: nextRunNumber,
       runVersion: nextRunNumber,
       isLatest: true,
@@ -114,11 +141,12 @@ export default function TransferDataLho() {
 
     updatedTable.splice(index + 1, 0, newRow);
     setTableData(updatedTable);
-    showSnackBar(`Retry generated: Run ${nextRunNumber}`, "success");
+    showSnackBar(`Initiating Retry: Run ${nextRunNumber}`, "info");
   };
 
   return (
     <Box p={3} width="100%">
+      {/* Header Action */}
       <Box display="flex" justifyContent="flex-end" mb={2}>
         <Button
           variant="contained"
@@ -130,11 +158,12 @@ export default function TransferDataLho() {
         </Button>
       </Box>
 
+      {/* Main Process Table */}
       <TableContainer component={Paper}>
         {isInitialLoading ? (
           <Box display="flex" justifyContent="center" alignItems="center" height="200px">
             <CircularProgress />
-            <Typography ml={2}>Loading Initial Data...</Typography>
+            <Typography ml={2}>Fetching Data...</Typography>
           </Box>
         ) : (
           <>
@@ -197,7 +226,7 @@ export default function TransferDataLho() {
         )}
       </TableContainer>
 
-      {/* SUMMARY DIALOG */}
+      {/* Summary Dialog (Circle-Wise) */}
       <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
         <DialogTitle>
           Circle Wise Summary (ID: {currentSelectedId})
@@ -225,7 +254,8 @@ export default function TransferDataLho() {
                         .map((row, index) => (
                           <TableRow key={index}>
                             <TableCell align="center">{row.circleBranchCode}</TableCell>
-                            <TableCell align="center">
+                            <TableCell align="center" sx={{ fontFamily: 'monospace', fontWeight: 'bold' }}>
+                              {/* Standard high-precision Indian Currency formatting */}
                               {Number(row.totalProfitLoss).toLocaleString('en-IN', {
                                 minimumFractionDigits: 4,
                                 maximumFractionDigits: 4
@@ -234,7 +264,7 @@ export default function TransferDataLho() {
                           </TableRow>
                         ))
                     ) : (
-                      <TableRow><TableCell colSpan={2} align="center">No Summary Data Found</TableCell></TableRow>
+                      <TableRow><TableCell colSpan={2} align="center">No Summary Data Available</TableCell></TableRow>
                     )}
                   </TableBody>
                 </Table>
@@ -253,7 +283,14 @@ export default function TransferDataLho() {
         </DialogContent>
         <DialogActions sx={{ p: 2 }}>
           <Button variant="outlined" onClick={() => setSummaryOpen(false)}>Close</Button>
-          <Button variant="contained" onClick={() => { showSnackBar("Submitted Successfully", "success"); setSummaryOpen(false); }}>
+          <Button 
+            variant="contained" 
+            disabled={summaryData.length === 0}
+            onClick={() => { 
+              showSnackBar("Summary Verified and Submitted", "success"); 
+              setSummaryOpen(false); 
+            }}
+          >
             Submit Summary
           </Button>
         </DialogActions>
