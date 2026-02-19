@@ -1,3 +1,104 @@
- "3971": 1.11755E8,
+To handle 20-digit numbers with 4 decimal places without falling into scientific notation () or losing precision, you must avoid using `Double` or `Float`. In Java, the senior-standard for financial precision is **`BigDecimal`**.
 
-if the value is bigger it showing like this but it should show all the value as it is thee
+When Jackson serializes `BigDecimal`, it can still sometimes trigger scientific notation depending on the configuration. We will fix this in the **Model**, the **Query**, and the **Service**.
+
+### 1. Update the Model
+
+Ensure the `profitLoss` field in your `PLTransfer` entity uses `BigDecimal`.
+
+**File:** `com.tcs.fincore.CommonMasterService.model.PLTransfer.java`
+
+```java
+@Column(name = "PROFIT_LOSS", precision = 25, scale = 4)
+private BigDecimal profitLoss; 
+
+```
+
+---
+
+### 2. Update the Repository (Native Query)
+
+The native query needs to return `BigDecimal` from the `SUM` function. Most modern DB drivers (Oracle/PostgreSQL) do this automatically for `SUM`.
+
+**File:** `com.tcs.fincore.CommonMasterService.repository.PLTransferRepository.java`
+
+```java
+@Query(value = "SELECT CIRCLE_BRANCH_CODE, SUM(PROFIT_LOSS) " +
+               "FROM P_L_TRANSFER " +
+               "GROUP BY CIRCLE_BRANCH_CODE", nativeQuery = true)
+List<Object[]> getAggregatedSummary();
+
+```
+
+---
+
+### 3. Updated Service Implementation (Optimized for Precision)
+
+We will change the `Map` to use `String` keys and **`BigDecimal`** values. To force Jackson to avoid scientific notation in the final JSON, we can configure the `ObjectMapper` or use `toPlainString()`.
+
+**File:** `com.tcs.fincore.CommonMasterService.service.CommonMasterServiceImpl.java`
+
+```java
+@Override
+@Transactional
+public Object getOrGenerateLhoSummary(Long id) {
+    // 1. Check Cache... (Existing logic)
+
+    // 2. Fetch Aggregation
+    List<Object[]> results = plTransferRepository.getAggregatedSummary();
+    
+    // 3. Use Map<String, BigDecimal> to maintain 20-digit precision
+    Map<String, BigDecimal> summaryMap = new HashMap<>();
+    
+    for (Object[] row : results) {
+        String code = String.valueOf(row[0]);
+        // Cast directly to BigDecimal to preserve precision from DB
+        BigDecimal sum = (row[1] != null) ? new BigDecimal(row[1].toString()) : BigDecimal.ZERO;
+        
+        // Force 4 decimal places
+        summaryMap.put(code, sum.setScale(4, RoundingMode.HALF_UP));
+    }
+
+    try {
+        // 4. Save to CLOB as a plain string (no scientific notation)
+        String jsonPayload = objectMapper.writeValueAsString(summaryMap);
+        lhoSummaryRepository.save(new LhoTransferSummary(id, jsonPayload));
+        
+        return summaryMap;
+    } catch (Exception e) {
+        log.error("Precision error", e);
+        throw new RuntimeException("Summary generation failed");
+    }
+}
+
+```
+
+---
+
+### 4. Global Configuration (The "Lead" Fix)
+
+To ensure the entire microservice handles large `BigDecimal` values as plain strings/numbers in JSON instead of , add this to your `application.properties`:
+
+```properties
+# Prevents Jackson from using scientific notation for BigDecimals
+spring.jackson.serialization.write-bigdecimal-as-plain=true
+
+```
+
+Or, if you prefer code configuration, add this to a `@Configuration` class:
+
+```java
+@Bean
+public Jackson2ObjectMapperBuilderCustomizer jacksonCustomizer() {
+    return builder -> builder.featuresToDisable(SerializationFeature.WRITE_BIGDECIMAL_AS_PLAIN);
+}
+
+```
+
+### Why this is the correct fix:
+
+1. **Precision**: `BigDecimal` handles any number of digits without the rounding errors inherent in `Double`.
+2. **No Scientific Notation**: `write-bigdecimal-as-plain=true` tells the JSON serializer to output `111755000.0000` instead of `1.11755E8`.
+3. **Scale**: Using `.setScale(4, RoundingMode.HALF_UP)` guarantees your requirement of 4 decimal places is met exactly.
+
+**Would you like me to update the `CommonRequestDto` as well to ensure any financial fields there also use `BigDecimal`?** Conclude with a clear next step.
