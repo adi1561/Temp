@@ -9,8 +9,7 @@ import {
   PlayArrow as PlayArrowIcon,
   Close as CloseIcon,
   Assessment as SummaryIcon,
-  Replay as RetryIcon,
-  RestartAlt as RestartIcon
+  Replay as RetryIcon
 } from "@mui/icons-material";
 import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
@@ -26,6 +25,7 @@ export default function TransferDataLho() {
 
   const [isTransferring, setIsTransferring] = useState(false);
   const [tableData, setTableData] = useState([]);
+  const [isInitialLoading, setIsInitialLoading] = useState(true); // Track initial load time
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
 
@@ -43,15 +43,6 @@ export default function TransferDataLho() {
       processRunId: 370,
       processId: 7,
       etlDate: "2025-11-21",
-      runId: 2,
-      processType: "Transfer To LHO",
-      isLatest: true,
-      runVersion: 1
-    },
-    {
-      processRunId: 368,
-      processId: 7,
-      etlDate: "2025-11-21",
       runId: 1,
       processType: "Transfer To LHO",
       isLatest: true,
@@ -60,24 +51,28 @@ export default function TransferDataLho() {
   ];
 
   const fetchInitialData = async () => {
-    try {
-      // Attempting API call
-      const response = await callApi(INITIAL_DATA_URL, null, "GET");
-      if (isMounted.current && response && response.initialData) {
-        const formattedData = response.initialData.map(item => ({
-          ...item,
-          isLatest: true,
-          runVersion: 1
-        }));
-        setTableData(formattedData);
-      } else {
-        // Fallback to dummy data if response is empty
+    setIsInitialLoading(true);
+    // Simulating a 2-second delay to test the loading state
+    setTimeout(async () => {
+      try {
+        const response = await callApi(INITIAL_DATA_URL, null, "GET");
+        if (isMounted.current && response && response.initialData) {
+          const formattedData = response.initialData.map(item => ({
+            ...item,
+            isLatest: true,
+            runVersion: 1
+          }));
+          setTableData(formattedData);
+        } else {
+          setTableData(dummyInitialData);
+        }
+      } catch (error) {
+        console.warn("Server down. Loading dummy data.");
         setTableData(dummyInitialData);
+      } finally {
+        if (isMounted.current) setIsInitialLoading(false);
       }
-    } catch (error) {
-      console.warn("Server down. Loading dummy testing data.");
-      setTableData(dummyInitialData);
-    }
+    }, 2000); 
   };
 
   useEffect(() => {
@@ -94,7 +89,7 @@ export default function TransferDataLho() {
       await callApi(TRIGGER_API_URL, { dagId: "cbs_wrap_dag", processId: 7 }, "POST");
       showSnackBar("LHO Transfer triggered", "success");
     } catch (error) {
-      showSnackBar("Trigger failed (Mock mode active)", "info");
+      showSnackBar("Action failed in mock mode", "info");
     } finally {
       setIsTransferring(false);
     }
@@ -106,12 +101,9 @@ export default function TransferDataLho() {
     setCurrentSelectedId(processRunId);
     
     try {
+      // Path mapping: /YE/yearend/summary/{id}
       const response = await callApi(`${SUMMARY_BASE_URL}${processRunId}`, null, "GET");
-      const rawMap = response?.data || { 
-        "3971": 111755000.0000, 
-        "4002": 0.0000, 
-        "3978": 71610000.0000 
-      }; // Dummy Map if server is down
+      const rawMap = response?.data || {};
 
       const formattedSummary = Object.entries(rawMap).map(([code, balance]) => ({
         circleBranchCode: code,
@@ -120,11 +112,8 @@ export default function TransferDataLho() {
 
       setSummaryData(formattedSummary);
     } catch (error) {
-      // Dummy summary data for UI testing
-      const mockSummary = { "3971": 111755000.0000, "4002": 0.0000 };
-      setSummaryData(Object.entries(mockSummary).map(([code, bal]) => ({ 
-        circleBranchCode: code, totalProfitLoss: bal 
-      })));
+      showSnackBar("Failed to fetch live summary", "error");
+      setSummaryData([]);
     } finally {
       setSummaryLoading(false);
     }
@@ -132,7 +121,7 @@ export default function TransferDataLho() {
 
   const handleRetry = (row, index) => {
     const updatedTable = [...tableData];
-    updatedTable[index].isLatest = false;
+    updatedTable[index].isLatest = false; // Disable previous run's retry
 
     const nextRunNumber = (row.runVersion || 1) + 1;
     const newRow = {
@@ -146,12 +135,7 @@ export default function TransferDataLho() {
 
     updatedTable.splice(index + 1, 0, newRow);
     setTableData(updatedTable);
-    showSnackBar(`Retry run ${nextRunNumber} generated locally`, "success");
-  };
-
-  const handleRestart = () => {
-    fetchInitialData();
-    showSnackBar("Local state reset", "info");
+    showSnackBar(`Retry generated locally: Run ${nextRunNumber}`, "success");
   };
 
   return (
@@ -161,76 +145,80 @@ export default function TransferDataLho() {
           variant="contained"
           startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
           onClick={handleTransferLho}
-          disabled={isTransferring}
+          disabled={isTransferring || isInitialLoading}
         >
           {isTransferring ? "Transferring..." : "Transfer LHO"}
         </Button>
       </Box>
 
       <TableContainer component={Paper}>
-        <Table>
-          <TableHead>
-            <TableRow>
-              <TableCell align="center"><strong>Process Run ID</strong></TableCell>
-              <TableCell align="center"><strong>Process ID</strong></TableCell>
-              <TableCell align="center"><strong>ETL Date</strong></TableCell>
-              <TableCell align="center"><strong>Process Type</strong></TableCell>
-              <TableCell align="center"><strong>Action</strong></TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {tableData
-              .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
-              .map((row, index) => (
-                <TableRow key={row.processRunId}>
-                  <TableCell align="center">{row.processRunId}</TableCell>
-                  <TableCell align="center">{row.processId}</TableCell>
-                  <TableCell align="center">{row.etlDate}</TableCell>
-                  <TableCell align="center">{row.processType}</TableCell>
-                  <TableCell align="center">
-                    <Box display="flex" justifyContent="center" gap={1}>
-                      <Tooltip title="Get Summary">
-                        <IconButton size="small" onClick={() => handleGetSummary(row.processRunId)}>
-                          <SummaryIcon />
-                        </IconButton>
-                      </Tooltip>
-                      <Tooltip title="Retry">
-                        <span>
-                          <IconButton 
-                            size="small" 
-                            disabled={!row.isLatest} 
-                            onClick={() => handleRetry(row, index + (page * rowsPerPage))}
-                          >
-                            <RetryIcon />
-                          </IconButton>
-                        </span>
-                      </Tooltip>
-                      <Tooltip title="Restart">
-                        <IconButton size="small" onClick={handleRestart}>
-                          <RestartIcon />
-                        </IconButton>
-                      </Tooltip>
-                    </Box>
-                  </TableCell>
+        {isInitialLoading ? (
+          <Box display="flex" justifyContent="center" alignItems="center" height="200px">
+            <CircularProgress />
+            <Typography ml={2}>Fetching Initial Data...</Typography>
+          </Box>
+        ) : (
+          <>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell align="center"><strong>Process Run ID</strong></TableCell>
+                  <TableCell align="center"><strong>Process ID</strong></TableCell>
+                  <TableCell align="center"><strong>ETL Date</strong></TableCell>
+                  <TableCell align="center"><strong>Process Type</strong></TableCell>
+                  <TableCell align="center"><strong>Action</strong></TableCell>
                 </TableRow>
-              ))}
-          </TableBody>
-        </Table>
-        <TablePagination
-          component="div"
-          count={tableData.length}
-          page={page}
-          onPageChange={(e, newPage) => setPage(newPage)}
-          rowsPerPage={rowsPerPage}
-          onRowsPerPageChange={(e) => {
-            setRowsPerPage(parseInt(e.target.value, 10));
-            setPage(0);
-          }}
-          rowsPerPageOptions={[10, 25, 50]}
-        />
+              </TableHead>
+              <TableBody>
+                {tableData
+                  .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                  .map((row, index) => (
+                    <TableRow key={row.processRunId}>
+                      <TableCell align="center">{row.processRunId}</TableCell>
+                      <TableCell align="center">{row.processId}</TableCell>
+                      <TableCell align="center">{row.etlDate}</TableCell>
+                      <TableCell align="center">{row.processType}</TableCell>
+                      <TableCell align="center">
+                        <Box display="flex" justifyContent="center" gap={1}>
+                          <Tooltip title="Get Summary">
+                            <IconButton size="small" onClick={() => handleGetSummary(row.processRunId)}>
+                              <SummaryIcon />
+                            </IconButton>
+                          </Tooltip>
+                          <Tooltip title="Retry">
+                            <span>
+                              <IconButton 
+                                size="small" 
+                                disabled={!row.isLatest} 
+                                onClick={() => handleRetry(row, index + (page * rowsPerPage))}
+                              >
+                                <RetryIcon />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        </Box>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+              </TableBody>
+            </Table>
+            <TablePagination
+              component="div"
+              count={tableData.length}
+              page={page}
+              onPageChange={(e, newPage) => setPage(newPage)}
+              rowsPerPage={rowsPerPage}
+              onRowsPerPageChange={(e) => {
+                setRowsPerPage(parseInt(e.target.value, 10));
+                setPage(0);
+              }}
+              rowsPerPageOptions={[10, 25, 50]}
+            />
+          </>
+        )}
       </TableContainer>
 
-      {/* SUMMARY DIALOG remains as per previous optimized version */}
+      {/* SUMMARY DIALOG */}
       <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
         <DialogTitle>
           Circle Wise Summary (ID: {currentSelectedId})
@@ -267,7 +255,7 @@ export default function TransferDataLho() {
                           </TableRow>
                         ))
                     ) : (
-                      <TableRow><TableCell colSpan={2} align="center">No Data Available</TableCell></TableRow>
+                      <TableRow><TableCell colSpan={2} align="center">No Summary Data Found</TableCell></TableRow>
                     )}
                   </TableBody>
                 </Table>
