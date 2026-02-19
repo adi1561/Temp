@@ -1,51 +1,217 @@
-there is new requirement in which i want to create a get api but with little twist and this need to be add in the  common master service only in that what need to is as follow
+As a Technical Lead, using the **Native SQL Query** is the correct decision for performance. It ensures that 10,000+ rows are aggregated within the database engine rather than loading them into your application's heap memory.
 
-in the frontend screen there is a getSummrey button as the user click on that button it picks that id for that row with the row id it will cheak in the table LHO_TRANSFER_SUMMARY that with this id any payload is present (that payload is summrey)
+Below are all the updated files required for this requirement.
 
-if yes pick that payload return that 
+---
 
-if not
+### 1. The Entity Models
 
-there is onther table called as P_L_TRANSFER table in which we need to genrate the summrey using this summrey table data 
+**File:** `com.tcs.fincore.CommonMasterService.model.PLTransfer.java`
+Maps to your source data table.
 
-how to genarate the summrey 
+```java
+package com.tcs.fincore.CommonMasterService.model;
 
-example data for P_L_TRANSFER
+import jakarta.persistence.*;
+import lombok.*;
+import java.math.BigDecimal;
+import java.util.Date;
 
-31-01-26	3978	61263	-71610000
-31-01-26	1111	3974	0
-31-01-26	3974	14002	0
-31-01-26	6939	4282	3844.8
-31-01-26	18974	6939	-3844.8
-31-01-26	17879	3978	71610000
-31-01-26	7999	3971	111755000
-31-01-26	6939	4282	-3844.8
+@Getter @Setter @Entity
+@AllArgsConstructor @NoArgsConstructor @Builder
+@Table(name = "P_L_TRANSFER")
+public class PLTransfer {
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO)
+    private Long id; // Internal JPA ID
 
+    @Column(name = "TRANSFER_DATE")
+    private Date transferDate;
 
-u need to group by circle branch code create a summrey 
+    @Column(name = "BRANCH_CODE")
+    private Long branchCode;
 
-then u need to save the new genrated summrey in the LHO_TRANSFER_SUMMARY with that id 
-and then return that 
+    @Column(name = "CIRCLE_BRANCH_CODE")
+    private Long circleBranchCode;
 
+    @Column(name = "PROFIT_LOSS")
+    private BigDecimal profitLoss;
+}
 
-follwing is the tables data that required 
+```
 
+**File:** `com.tcs.fincore.CommonMasterService.model.LhoTransferSummary.java`
+Maps to your "cache" table.
 
+```java
+package com.tcs.fincore.CommonMasterService.model;
 
-P_L_TRANSFER
+import jakarta.persistence.*;
+import lombok.*;
 
-TRANSFER_DATE	DATE	Yes		1	
-BRANCH_CODE	NUMBER(5,0)	No		2	
-CIRCLE_BRANCH_CODE	NUMBER(5,0)	No		3	
-PROFIT_LOSS	NUMBER(25,4)	Yes		4	
+@Getter @Setter @Entity @Builder
+@AllArgsConstructor @NoArgsConstructor
+@Table(name = "LHO_TRANSFER_SUMMARY")
+public class LhoTransferSummary {
+    @Id
+    @Column(name = "ID")
+    private Long id;
 
-LHO_TRANSFER_SUMMARY 
+    @Lob
+    @Column(name = "PAYLOAD")
+    private String payload;
+}
 
-ID	NUMBER	No		1	
-PAYLOAD	CLOB	No		2	
+```
 
+---
 
+### 2. The Repositories
 
+**File:** `com.tcs.fincore.CommonMasterService.repository.PLTransferRepository.java`
+Contains the aggregation query.
 
+```java
+package com.tcs.fincore.CommonMasterService.repository;
 
+import com.tcs.fincore.CommonMasterService.model.PLTransfer;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import java.util.List;
 
+public interface PLTransferRepository extends JpaRepository<PLTransfer, Long> {
+
+    @Query(value = "SELECT CIRCLE_BRANCH_CODE, SUM(PROFIT_LOSS) FROM P_L_TRANSFER GROUP BY CIRCLE_BRANCH_CODE", nativeQuery = true)
+    List<Object[]> getAggregatedSummary();
+}
+
+```
+
+**File:** `com.tcs.fincore.CommonMasterService.repository.LhoSummaryRepository.java`
+
+```java
+package com.tcs.fincore.CommonMasterService.repository;
+
+import com.tcs.fincore.CommonMasterService.model.LhoTransferSummary;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface LhoSummaryRepository extends JpaRepository<LhoTransferSummary, Long> {
+}
+
+```
+
+---
+
+### 3. Service Layer
+
+Update the interface and implementation to handle the logic flow.
+
+**File:** `com.tcs.fincore.CommonMasterService.service.CommonMasterService.java`
+
+```java
+// Add this to your existing interface
+String getOrGenerateLhoSummary(Long id);
+
+```
+
+**File:** `com.tcs.fincore.CommonMasterService.service.CommonMasterServiceImpl.java`
+
+```java
+// ... existing imports
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonMasterService.model.LhoTransferSummary;
+import com.tcs.fincore.CommonMasterService.repository.PLTransferRepository;
+import com.tcs.fincore.CommonMasterService.repository.LhoSummaryRepository;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class CommonMasterServiceImpl implements CommonMasterService {
+
+    // ... existing injections
+    private final PLTransferRepository plTransferRepository;
+    private final LhoSummaryRepository lhoSummaryRepository;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    @Transactional
+    public String getOrGenerateLhoSummary(Long id) {
+        log.info("Processing LHO Summary request for ID: {}", id);
+
+        // 1. Try to fetch from LHO_TRANSFER_SUMMARY table
+        return lhoSummaryRepository.findById(id)
+                .map(LhoTransferSummary::getPayload)
+                .orElseGet(() -> {
+                    log.info("Summary not found in cache for ID: {}. Generating new aggregation...", id);
+                    
+                    // 2. Perform DB aggregation
+                    List<Object[]> aggregatedData = plTransferRepository.getAggregatedSummary();
+                    
+                    if (aggregatedData.isEmpty()) {
+                        throw new NoDataFoundException("No transfer records found in P_L_TRANSFER to generate summary.");
+                    }
+
+                    // 3. Map result to JSON-friendly format
+                    Map<String, Double> summaryMap = new HashMap<>();
+                    for (Object[] row : aggregatedData) {
+                        summaryMap.put(String.valueOf(row[0]), ((Number) row[1]).doubleValue());
+                    }
+
+                    try {
+                        String jsonPayload = objectMapper.writeValueAsString(summaryMap);
+
+                        // 4. Save to Summary table for persistence
+                        LhoTransferSummary summaryEntity = LhoTransferSummary.builder()
+                                .id(id)
+                                .payload(jsonPayload)
+                                .build();
+                        lhoSummaryRepository.save(summaryEntity);
+
+                        return jsonPayload;
+                    } catch (Exception e) {
+                        log.error("JSON Serialization failed for LHO Summary", e);
+                        throw new RuntimeException("Internal Error generating summary payload");
+                    }
+                });
+    }
+}
+
+```
+
+---
+
+### 4. The Controller
+
+**File:** `com.tcs.fincore.CommonMasterService.Controller.LhoTransferController.java`
+
+```java
+// ... existing imports
+
+@RestController
+@RequestMapping("/api/lho-transfers")
+@RequiredArgsConstructor
+public class LhoTransferController {
+
+    private final CommonMasterService service;
+
+    /**
+     * GET /api/lho-transfers/summary/{id}
+     * Returns the cached summary or generates a new one from P_L_TRANSFER.
+     */
+    @GetMapping("/summary/{id}")
+    public ResponseEntity<ApiResponse<String>> getSummary(@PathVariable Long id) {
+        log.info("API: Fetching Summary for ID: {}", id);
+        String result = service.getOrGenerateLhoSummary(id);
+        return ResponseEntity.ok(ApiResponse.success(result, "Summary processed successfully"));
+    }
+}
+
+```
+
+### Why this works for 10,000+ rows:
+
+1. **Native SQL Performance**: Using `SUM` and `GROUP BY` at the database level is significantly faster than pulling all records into Java memory.
+2. **Memoization (Caching)**: By saving the result into `LHO_TRANSFER_SUMMARY`, subsequent clicks on the "Get Summary" button for that ID will be nearly instantaneous (O(1) lookup).
+3. **Transaction Safety**: Using `@Transactional` ensures that the generation and the saving happen as an atomic unit.
+
+Would you like me to add a **Check** to see if the summary is "stale"? For example, if new rows were added to `P_L_TRANSFER` after the summary was generated, should we re-generate it?
