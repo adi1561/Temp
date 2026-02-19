@@ -1,142 +1,328 @@
-To integrate your YearEndService (LHO Transfer) into the centralized CommonRequestService architecture, you must move away from local repository saves and adopt the Maker-Checker Strategy pattern.
-1. New DTO: LhoTransferPayloadDto.java
-This class replaces LhoTransferPayload. It implements KeyablePayload to tell the central service to use the batchId as the targetId in the COMMON_REQ table.
-File: com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto.java
-package com.tcs.fincore.CommonRequestService.dto;
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Box, Button, Typography, CircularProgress, Table, TableBody,
+  TableCell, TableContainer, TableHead, TableRow, Paper,
+  TablePagination, Dialog, DialogTitle, DialogContent, IconButton,
+  Tooltip, Stack, Divider, DialogActions
+} from "@mui/material";
+import {
+  PlayArrow as PlayArrowIcon,
+  Close as CloseIcon,
+  Assessment as SummaryIcon,
+  Replay as RetryIcon,
+  RestartAlt as RestartIcon
+} from "@mui/icons-material";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.annotation.JsonTypeName;
-import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
-import lombok.*;
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.util.List;
+// --- API Constants ---
+const TRIGGER_API_URL = "/PS/airflow/trigger";
+const INITIAL_DATA_URL = "/PS/process/processes/data/7";
+// Updated to use the ID parameter for the summary
+const SUMMARY_BASE_URL = "/YE/yearend/summary/"; 
 
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-@JsonTypeName("LHO_TRANSFER") // Identifier for the Common Service
-public class LhoTransferPayloadDto implements KeyablePayload {
+export default function TransferDataLho() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
 
-    private String batchId;
-    private LocalDate processDate;
-    private BigDecimal totalAmount;
-    private int totalRecordCount;
-    private List<ProfitLossSummaryDto> circleWiseDetails;
+  // Main table states
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [tableData, setTableData] = useState([]);
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
 
-    @Override
-    @JsonIgnore
-    public String getKey() {
-        return this.batchId; // Used as TARGET_ID in COMMON_REQ
+  // Summary popup states
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [summaryData, setSummaryData] = useState([]); // Will store as [{code, balance}]
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [currentSelectedId, setCurrentSelectedId] = useState(null);
+
+  // Summary Pagination
+  const [summaryPage, setSummaryPage] = useState(0);
+  const [summaryRowsPerPage, setSummaryRowsPerPage] = useState(5);
+
+  // ---------------- FETCH INITIAL DATA ----------------
+  const fetchInitialData = async () => {
+    try {
+      const response = await callApi(`${INITIAL_DATA_URL}`, null, "GET");
+      if (isMounted.current && response) {
+        // Tag initial data as "Run 1" if not specified
+        const formattedData = (response.initialData || []).map(item => ({
+          ...item,
+          isLatest: true,
+          runVersion: 1
+        }));
+        setTableData(formattedData);
+      }
+    } catch (error) {
+      console.error("Error fetching initial data:", error);
     }
-}
+  };
 
-2. New Strategy: LhoTransferStrategy.java
-This defines what happens when the Checker approves the request. It deserializes the payload and triggers the actual process.
-File: com.tcs.fincore.CommonRequestService.service.strategy.LhoTransferStrategy.java
-package com.tcs.fincore.CommonRequestService.service.strategy;
+  useEffect(() => {
+    isMounted.current = true;
+    fetchInitialData();
+    return () => { isMounted.current = false; };
+  }, []);
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto;
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Component;
+  // ---------------- ACTION HANDLERS ----------------
 
-@Slf4j
-@Component
-@RequiredArgsConstructor
-public class LhoTransferStrategy implements RequestTypeStrategy {
-
-    private final ObjectMapper objectMapper;
-
-    @Override
-    public RequestType getRequestType() {
-        return RequestType.LHO_TRANSFER;
+  const handleTransferLho = async () => {
+    setIsTransferring(true);
+    const payload = { dagId: "cbs_wrap_dag", conf: {}, processId: 7 };
+    try {
+      await callApi(TRIGGER_API_URL, payload, "POST");
+      showSnackBar("LHO Transfer triggered successfully", "success");
+      fetchInitialData(); // Refresh table
+    } catch (error) {
+      showSnackBar("Failed to trigger LHO Transfer", "error");
+    } finally {
+      setIsTransferring(false);
     }
+  };
 
-    @Override
-    public void processApproval(CommonReq request) throws JsonProcessingException {
-        LhoTransferPayloadDto payload = objectMapper.readValue(request.getPayload(), LhoTransferPayloadDto.class);
+  const handleGetSummary = async (processRunId) => {
+    setSummaryOpen(true);
+    setSummaryLoading(true);
+    setCurrentSelectedId(processRunId);
+    
+    try {
+      // Calling the optimized endpoint: /YE/yearend/summary/{id}
+      const response = await callApi(`${SUMMARY_BASE_URL}${processRunId}`, null, "GET");
+      
+      // Since backend returns Map<String, BigDecimal>, convert to Array for table
+      // response.data = { "3971": 111755000.0000, ... }
+      const rawMap = response?.data || {};
+      const formattedSummary = Object.entries(rawMap).map(([code, balance]) => ({
+        circleBranchCode: code,
+        totalProfitLoss: balance
+      }));
+
+      setSummaryData(formattedSummary);
+    } catch (error) {
+      showSnackBar("Failed to fetch summary", "error");
+      setSummaryData([]);
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
+  const handleRetry = (row, index) => {
+    // 1. Disable retry on the clicked row (the "old" one)
+    const updatedTable = [...tableData];
+    updatedTable[index].isLatest = false;
+
+    // 2. Create the "New Run" row
+    const nextRunNumber = (row.runVersion || 1) + 1;
+    const newRow = {
+      ...row,
+      processRunId: row.processRunId + 1000, // Simulating a new ID as per requirements
+      runId: nextRunNumber,
+      runVersion: nextRunNumber,
+      isLatest: true, // This one can be retried
+      processType: `${row.processType} (Run ${nextRunNumber})`,
+      startTime: new Date().toISOString()
+    };
+
+    // 3. Insert new row immediately below the current row
+    updatedTable.splice(index + 1, 0, newRow);
+    setTableData(updatedTable);
+    showSnackBar(`Retry initiated: Run ${nextRunNumber} generated`, "info");
+  };
+
+  const handleRestart = () => {
+    showSnackBar("Process Restarted", "warning");
+    fetchInitialData();
+  };
+
+  return (
+    <Box p={3} width="100%" bgcolor="#f5f7fa" minHeight="100vh">
+      <Stack direction="row" justifyContent="space-between" alignItems="center" mb={3}>
+        <Typography variant="h5" fontWeight="bold" color="primary">
+          LHO Data Transfer Management
+        </Typography>
+        <Button
+          variant="contained"
+          size="large"
+          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
+          onClick={handleTransferLho}
+          disabled={isTransferring}
+          sx={{ borderRadius: 2, px: 4 }}
+        >
+          {isTransferring ? "Processing..." : "Trigger LHO Transfer"}
+        </Button>
+      </Stack>
+
+      <TableContainer component={Paper} elevation={3} sx={{ borderRadius: 2 }}>
+        <Table>
+          <TableHead sx={{ bgcolor: "#eceff1" }}>
+            <TableRow>
+              <TableCell align="center"><strong>Run ID</strong></TableCell>
+              <TableCell align="center"><strong>Process ID</strong></TableCell>
+              <TableCell align="center"><strong>ETL Date</strong></TableCell>
+              <TableCell align="center"><strong>Process Type</strong></TableCell>
+              <TableCell align="center"><strong>Status</strong></TableCell>
+              <TableCell align="center"><strong>Actions</strong></TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {tableData
+              .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+              .map((row, index) => (
+                <TableRow key={row.processRunId} hover>
+                  <TableCell align="center">{row.processRunId}</TableCell>
+                  <TableCell align="center">{row.processId}</TableCell>
+                  <TableCell align="center">{row.etlDate}</TableCell>
+                  <TableCell align="center">
+                    <Typography variant="body2" fontWeight={row.isLatest ? 600 : 400}>
+                      {row.processType}
+                    </Typography>
+                  </TableCell>
+                  <TableCell align="center">
+                    <Box 
+                      px={1} py={0.5} borderRadius={1} display="inline-block"
+                      bgcolor={row.isLatest ? "#e8f5e9" : "#f5f5f5"}
+                      color={row.isLatest ? "#2e7d32" : "#9e9e9e"}
+                      fontSize="0.75rem" fontWeight="bold"
+                    >
+                      {row.isLatest ? "ACTIVE" : "ARCHIVED"}
+                    </Box>
+                  </TableCell>
+                  <TableCell align="center">
+                    <Stack direction="row" spacing={1} justifyContent="center">
+                      <Tooltip title="View Summary">
+                        <IconButton color="primary" onClick={() => handleGetSummary(row.processRunId)}>
+                          <SummaryIcon />
+                        </IconButton>
+                      </Tooltip>
+                      
+                      <Tooltip title={row.isLatest ? "Retry Process" : "Retry Disabled"}>
+                        <span>
+                          <IconButton 
+                            color="secondary" 
+                            disabled={!row.isLatest} 
+                            onClick={() => handleRetry(row, index + (page * rowsPerPage))}
+                          >
+                            <RetryIcon />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+
+                      <Tooltip title="Restart Service">
+                        <IconButton color="warning" onClick={handleRestart}>
+                          <RestartIcon />
+                        </IconButton>
+                      </Tooltip>
+                    </Stack>
+                  </TableCell>
+                </TableRow>
+              ))}
+          </TableBody>
+        </Table>
+        <TablePagination
+          rowsPerPageOptions={[10, 25]}
+          component="div"
+          count={tableData.length}
+          rowsPerPage={rowsPerPage}
+          page={page}
+          onPageChange={(e, p) => setPage(p)}
+          onRowsPerPageChange={(e) => setRowsPerPage(parseInt(e.target.value, 10))}
+        />
+      </TableContainer>
+
+      {/* ---------------- SUMMARY DIALOG ---------------- */}
+      <Dialog 
+        open={summaryOpen} 
+        onClose={() => setSummaryOpen(false)} 
+        maxWidth="sm" 
+        fullWidth
+        PaperProps={{ sx: { borderRadius: 3 } }}
+      >
+        <DialogTitle sx={{ bgcolor: "#f8f9fa", display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <Box>
+            <Typography variant="h6" fontWeight="bold">LHO Transfer Summary</Typography>
+            <Typography variant="caption" color="textSecondary">Run ID: {currentSelectedId}</Typography>
+          </Box>
+          <IconButton onClick={() => setSummaryOpen(false)}><CloseIcon /></IconButton>
+        </DialogTitle>
         
-        log.info("LHO Transfer APPROVED for Batch: {}. Executing core logic...", payload.getBatchId());
+        <DialogContent dividers>
+          {summaryLoading ? (
+            <Box display="flex" flexDirection="column" justifyContent="center" alignItems="center" height="250px">
+              <CircularProgress size={40} />
+              <Typography mt={2} color="textSecondary">Aggregating Financial Data...</Typography>
+            </Box>
+          ) : (
+            <TableContainer sx={{ maxHeight: 400 }}>
+              <Table stickyHeader size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell align="left"><strong>Branch Code</strong></TableCell>
+                    <TableCell align="right"><strong>Total Profit / Loss (INR)</strong></TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {summaryData.length > 0 ? (
+                    summaryData
+                      .slice(summaryPage * summaryRowsPerPage, summaryPage * summaryRowsPerPage + summaryRowsPerPage)
+                      .map((row, idx) => (
+                        <TableRow key={idx}>
+                          <TableCell>{row.circleBranchCode}</TableCell>
+                          <TableCell 
+                            align="right" 
+                            sx={{ 
+                              fontFamily: 'monospace', 
+                              fontWeight: 'bold',
+                              color: row.totalProfitLoss < 0 ? 'error.main' : 'success.main'
+                            }}
+                          >
+                            {Number(row.totalProfitLoss).toLocaleString('en-IN', {
+                              minimumFractionDigits: 4,
+                              maximumFractionDigits: 4
+                            })}
+                          </TableCell>
+                        </TableRow>
+                      ))
+                  ) : (
+                    <TableRow>
+                      <TableCell colSpan={2} align="center" sx={{ py: 3 }}>
+                        No financial data found for this run.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+              <TablePagination
+                component="div"
+                count={summaryData.length}
+                page={summaryPage}
+                onPageChange={(e, p) => setSummaryPage(p)}
+                rowsPerPage={summaryRowsPerPage}
+                onRowsPerPageChange={(e) => setSummaryRowsPerPage(parseInt(e.target.value, 10))}
+                rowsPerPageOptions={[5, 10]}
+              />
+            </TableContainer>
+          )}
+        </DialogContent>
         
-        // TODO: Call your Airflow Trigger or Stored Procedure here
-        // triggerActualTransfer(payload);
-    }
+        <DialogActions sx={{ p: 2, bgcolor: "#f8f9fa" }}>
+          <Button variant="outlined" onClick={() => setSummaryOpen(false)} sx={{ borderRadius: 2 }}>
+            Cancel
+          </Button>
+          <Button 
+            variant="contained" 
+            color="primary" 
+            onClick={() => {
+               showSnackBar("Summary Verified and Submitted", "success");
+               setSummaryOpen(false);
+            }}
+            sx={{ borderRadius: 2, px: 3 }}
+          >
+            Confirm & Submit
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
 }
-
-3. Updated Enum: RequestType.java
-You must register LHO_TRANSFER so the database converter and logic recognize it.
-File: com.tcs.fincore.CommonRequestService.model.enums.RequestType.java
-@Getter
-public enum RequestType {
-    // ... existing entries ...
-    REPORT_TEMPLATE_CONFIG("REPORT_TEMPLATE_CONFIG"),
-    LHO_TRANSFER("LHO_TRANSFER"); // Add this
-
-    private final String dbValue;
-
-    RequestType(String dbValue) {
-        this.dbValue = dbValue;
-    }
-}
-
-4. Updated DTO: CreateRequestDto.java
-Add the new payload class to the @JsonSubTypes list so the system can handle LHO JSON.
-File: com.tcs.fincore.CommonRequestService.dto.CreateRequestDto.java
-// ... within @JsonSubTypes list ...
-@JsonSubTypes.Type(value = CalenderConfigPayloadDto.class, name = "CALENDER"),
-@JsonSubTypes.Type(value = LhoTransferPayloadDto.class, name = "LHO_TRANSFER") // Add this
-
-5. Updated Service Implementation: LhoTransferServiceImpl.java
-This file now calls the centralized RequestService instead of saving to the database itself.
-File: com.fincore.YearEndService.Service.LhoTransferServiceImpl.java
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class LhoTransferServiceImpl implements LhoTransferService {
-
-    private final ProfitLossService profitLossService;
-    private final RequestService requestService; // Inject Central Service
-
-    @Override
-    @Transactional
-    public CommonReq createLhoTransferRequest(String batchId, String triggeredByUserId, String token) {
-        // 1. Fetch Real Data
-        List<ProfitLossSummaryDto> summaryList = profitLossService.getCircleWiseSummary();
-
-        // 2. Calculate Totals
-        BigDecimal totalAmount = summaryList.stream()
-                .map(ProfitLossSummaryDto::getTotalProfitLoss)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        // 3. Build Payload DTO
-        LhoTransferPayloadDto payload = LhoTransferPayloadDto.builder()
-                .batchId(batchId)
-                .processDate(LocalDate.now())
-                .totalRecordCount(summaryList.size())
-                .totalAmount(totalAmount)
-                .circleWiseDetails(summaryList)
-                .build();
-
-        // 4. Wrap into CreateRequestDto
-        CreateRequestDto createDto = new CreateRequestDto();
-        createDto.setRequestType(RequestType.LHO_TRANSFER);
-        createDto.setChangeType(ChangeType.ADD);
-        createDto.setPayload(payload);
-
-        // 5. Delegate to Central Service (Handles DB Save & Notifications)
-        return requestService.createRequest(createDto, triggeredByUserId, token);
-    }
-}
-
-Summary of Component Architecture
- * Maker: Calls the updated LhoTransferServiceImpl, which sends a CreateRequestDto to the RequestService.
- * RequestService: Saves the request as PENDING and triggers a notification.
- * Checker: Calls updateRequestStatus.
- * Strategy: The central system finds the LhoTransferStrategy and executes the process approval logic.
-Would you like me to help you configure the RBAC Permissions in the PERMISSIONS table for this new LHO_TRANSFER request type?
