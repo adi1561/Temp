@@ -1,371 +1,263 @@
-This update addresses your two new requirements:
- * Chained Decimal Logic: I have updated the logic to apply all matching rules sequentially (e.g., Floor -> then Decimal Format 2), rather than stopping at the first match.
- * Inclusion Filtering: I added a new column OUTPUT_INCLUDE_CONDITION to filter values (e.g., >0, !=0, ALWAYS). If a value is filtered out, it is strictly omitted from the line.
-1. Database Update (SQL)
-We need to add the new column for inclusion logic and update your configuration to demonstrate the chaining and filtering.
--- 1. Add the new column for filtering logic
-ALTER TABLE ASCII_CONFIG ADD OUTPUT_INCLUDE_CONDITION VARCHAR2(4000);
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Box, Button, Typography, CircularProgress, Table, TableBody,
+  TableCell, TableContainer, TableHead, TableRow, Paper,
+  TablePagination, Dialog, DialogTitle, DialogContent, IconButton,
+  Tooltip, DialogActions
+} from "@mui/material";
+import {
+  PlayArrow as PlayArrowIcon,
+  Close as CloseIcon,
+  Assessment as SummaryIcon,
+  Replay as RetryIcon
+} from "@mui/icons-material";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
--- 2. Update the configuration (ID 103)
-UPDATE ASCII_CONFIG SET 
-    -- DECIMAL LOGIC: Apply "floor" first, THEN "2" decimal places (Chaining)
-    -- Note: We assume the regex matches; both rules will be applied in order.
-    OUTPUT_AMT_DECIMAL = '["^.*"][5][floor]|["^.*"][1][floor]|["^.*"][5][2]|["^.*"][1][2]',
+const TRIGGER_API_URL = "/PS/airflow/trigger";
+const INITIAL_DATA_URL = "/PS/process/processes/data/7";
+const SUMMARY_BASE_URL = "/CM/api/lho-transfers/summary";
 
-    -- INCLUSION LOGIC: 
-    -- Col 5: Include only if Greater Than 0
-    -- Col 1: Include Always (even if 0)
-    OUTPUT_INCLUDE_CONDITION = '["^.*"][5][>0]|["^.*"][1][ALWAYS]'
-WHERE ID = 103;
+export default function TransferDataLho() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
 
-COMMIT;
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [tableData, setTableData] = useState([]);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
 
-2. Entity Update (AsciiConfig.java)
-Add the new field to your Java Entity.
-    @Column(name = "OUTPUT_INCLUDE_CONDITION")
-    private String outputIncludeCondition;
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [summaryData, setSummaryData] = useState([]); 
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [currentSelectedId, setCurrentSelectedId] = useState(null);
 
-3. Updated RuleParser.java
-Changes:
- * applyDecimalLogic: Now loops through all rules. If multiple rules match (e.g. floor and 2), it applies them one by one in order.
- * shouldIncludeValue: A new method to handle logic like >0, <0, !=0, ALWAYS.
-<!-- end list -->
-package com.tcs.fincore.AsciiGenerationService.Service;
+  const [summaryPage, setSummaryPage] = useState(0);
+  const [summaryRowsPerPage, setSummaryRowsPerPage] = useState(5);
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
-public class RuleParser {
-
-    private static final Pattern RULE_PATTERN = Pattern.compile("\\[\"(.*?)\"\\]\\[(.*?)\\]\\[(.*?)\\]");
-
-    public static BigDecimal applyMathLogic(BigDecimal amount, String head, int colIdx, String logicConfig) {
-        if (logicConfig == null) return amount;
-        String logic = findFirstMatchingRule(head, colIdx, logicConfig); // Math usually just needs one rule
-        if (logic == null) return amount;
-
-        if (logic.contains("/")) {
-            BigDecimal divisor = new BigDecimal(logic.replaceAll("[^0-9.]", ""));
-            return amount.divide(divisor, 6, RoundingMode.HALF_UP);
-        } else if (logic.contains("*")) {
-            BigDecimal multiplier = new BigDecimal(logic.replace("*", "").replace("(", "").replace(")", ""));
-            return amount.multiply(multiplier);
-        }
-        return amount;
+  // ---------------- MOCK DATA FOR TESTING ----------------
+  const dummyInitialData = [
+    {
+      processRunId: 370,
+      processId: 7,
+      etlDate: "2025-11-21",
+      runId: 1,
+      processType: "Transfer To LHO",
+      isLatest: true,
+      runVersion: 1
     }
+  ];
 
-    // CHANGED: Applies ALL matching rules sequentially (Chaining)
-    public static BigDecimal applyDecimalLogic(BigDecimal amount, String head, int colIdx, String decimalConfig) {
-        if (decimalConfig == null) return amount;
-        
-        Matcher m = RULE_PATTERN.matcher(decimalConfig);
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String rule = m.group(3);
+  const fetchInitialData = () => {
+    setIsInitialLoading(true);
+    // Simulating delay then showing dummy data directly
+    setTimeout(() => {
+      if (isMounted.current) {
+        setTableData(dummyInitialData);
+        setIsInitialLoading(false);
+      }
+    }, 1000);
+  };
 
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            boolean headMatch = Pattern.compile(headRegex).matcher(head).lookingAt();
+  useEffect(() => {
+    isMounted.current = true;
+    fetchInitialData();
+    return () => { isMounted.current = false; };
+  }, []);
 
-            if (colMatch && headMatch) {
-                // Apply Logic Step-by-Step
-                if (rule.equalsIgnoreCase("floor")) {
-                    amount = amount.setScale(0, RoundingMode.FLOOR);
-                } else if (rule.equalsIgnoreCase("ceil")) {
-                    amount = amount.setScale(0, RoundingMode.CEILING);
-                } else if (rule.equalsIgnoreCase("round")) {
-                    amount = amount.setScale(0, RoundingMode.HALF_UP);
-                } else {
-                    try {
-                        // Treat as Decimal Places (e.g. "2")
-                        int scale = Integer.parseInt(rule);
-                        amount = amount.setScale(scale, RoundingMode.HALF_UP);
-                    } catch (NumberFormatException e) {
-                        // Ignore invalid rules
-                    }
-                }
-            }
-        }
-        return amount;
-    }
+  // ---------------- ACTION HANDLERS ----------------
 
-    public static String applyAmountPadding(BigDecimal amount, String head, int colIdx, String padConfig) {
-        if (padConfig == null) return amount.toPlainString();
-        String rule = findFirstMatchingRule(head, colIdx, padConfig); // Padding usually needs one final format
-        if (rule == null) return amount.toPlainString();
+  const handleTransferLho = async () => {
+    setIsTransferring(true);
+    // Mocking the trigger
+    setTimeout(() => {
+      showSnackBar("LHO Transfer triggered (Mock)", "success");
+      setIsTransferring(false);
+    }, 1000);
+  };
 
-        if (rule.contains(",")) {
-            String[] parts = rule.split(",");
-            int totalLen = Integer.parseInt(parts[0]);
-            int decimalLen = Integer.parseInt(parts[1]);
-            BigDecimal scaled = amount.setScale(decimalLen, RoundingMode.HALF_UP);
-            return padLeft(scaled.toPlainString(), totalLen, '0');
-        } else {
-            int totalLen = Integer.parseInt(rule);
-            return padLeft(amount.toBigInteger().toString(), totalLen, '0');
-        }
-    }
-
-    public static String applySign(String fmtAmt, BigDecimal origAmt, String head, int colIdx, String signConfig) {
-        if (signConfig == null) return fmtAmt;
-        String rule = findFirstMatchingRule(head, colIdx, signConfig);
-        
-        if ("POS_0".equalsIgnoreCase(rule)) return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "0" : "-");
-        if ("SHOW_SIGN".equalsIgnoreCase(rule)) return fmtAmt + (origAmt.compareTo(BigDecimal.ZERO) >= 0 ? "+" : "-");
-        if (!"NO_SIGN".equalsIgnoreCase(rule) && origAmt.compareTo(BigDecimal.ZERO) < 0) return fmtAmt + "-";
-        
-        return fmtAmt;
-    }
-
-    // NEW: Logic to determine if value should be included
-    public static boolean shouldIncludeValue(BigDecimal amount, String head, int colIdx, String includeConfig) {
-        if (includeConfig == null) return true; // Default to ALWAYS include
-        String rule = findFirstMatchingRule(head, colIdx, includeConfig);
-        
-        if (rule == null || "ALWAYS".equalsIgnoreCase(rule)) return true;
-        
-        if (rule.equals(">0")) return amount.compareTo(BigDecimal.ZERO) > 0;
-        if (rule.equals("<0")) return amount.compareTo(BigDecimal.ZERO) < 0;
-        if (rule.equals("=0") || rule.equals("0")) return amount.compareTo(BigDecimal.ZERO) == 0;
-        if (rule.equals("!=0")) return amount.compareTo(BigDecimal.ZERO) != 0;
-        
-        return true;
-    }
-
-    public static String applyHeadPadding(String head, String padConfig) {
-        if (padConfig == null || padConfig.length() < 3) return head;
-        int len = Integer.parseInt(padConfig.substring(0, padConfig.length() - 2));
-        char dir = padConfig.charAt(padConfig.length() - 2);
-        char pad = padConfig.endsWith("\" \"") ? ' ' : padConfig.charAt(padConfig.length() - 1);
-        return dir == 'L' ? padLeft(head, len, pad) : padRight(head, len, pad);
-    }
-
-    // Returns FIRST match (Standard logic)
-    private static String findFirstMatchingRule(String head, int colIdx, String configStr) {
-        if (configStr == null || configStr.isEmpty()) return null;
-        Matcher m = RULE_PATTERN.matcher(configStr);
-        while (m.find()) {
-            String headRegex = m.group(1);
-            String colReq = m.group(2);
-            String logic = m.group(3);
-            boolean colMatch = colReq.isEmpty() || colReq.equals(String.valueOf(colIdx));
-            boolean headMatch = Pattern.compile(headRegex).matcher(head).lookingAt();
-            if (colMatch && headMatch) return logic;
-        }
-        return null;
-    }
-
-    private static String padLeft(String str, int len, char pad) {
-        StringBuilder sb = new StringBuilder();
-        while (sb.length() + str.length() < len) sb.append(pad);
-        return sb.append(str).toString();
-    }
-    private static String padRight(String str, int len, char pad) {
-        StringBuilder sb = new StringBuilder(str);
-        while (sb.length() < len) sb.append(pad);
-        return sb.toString();
-    }
-}
-
-4. Updated AsciiGenerationService.java
-Changes:
- * Modified processAmountOnly loop to check RuleParser.shouldIncludeValue.
- * If the check fails, that specific amount is skipped entirely (nothing added to the string for that amount).
-<!-- end list -->
-package com.tcs.fincore.AsciiGenerationService.Service;
-
-import com.tcs.fincore.AsciiGenerationService.Model.AsciiConfig;
-import com.tcs.fincore.AsciiGenerationService.Repository.AsciiConfigRepository;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Service;
-
-import java.io.IOException;
-import java.math.BigDecimal;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
-@Service
-@Slf4j
-public class AsciiGenerationService {
-
-    private final AsciiConfigRepository configRepo;
-
-    @Value("${app.input.file.path}")
-    private String configuredFilePath;
-
-    public AsciiGenerationService(AsciiConfigRepository configRepo) {
-        this.configRepo = configRepo;
-    }
-
-    public String generateReport(Long id) throws Exception {
-        log.info("Starting generation for Config ID: {}", id);
-
-        AsciiConfig config = configRepo.findById(id)
-                .orElseThrow(() -> new RuntimeException("Config not found for ID: " + id));
-
-        Path inputPath = Paths.get(configuredFilePath);
-        if (!Files.exists(inputPath)) throw new IOException("Input file not found");
-
-        List<String> lines = Files.readAllLines(inputPath);
-        HeaderInfo headerInfo = parseHeaderFromInput(lines);
-        List<String> outputLines = new ArrayList<>();
-
-        String branchPadded = String.format("%5s", headerInfo.branchCode).replace(' ', '0');
-        String header = config.getOutputFirstLine() + branchPadded + headerInfo.reportDate + "F";
-        outputLines.add(header);
-
-        List<String> bufferedItems = new ArrayList<>();
-        int batchSize = config.getOutputPerLineHead();
-
-        for (String line : lines) {
-            String[] columns = line.split("\\|", -1);
-            if (!isValidRow(columns, config)) continue;
-
-            List<ProcessingItem> itemsToProcess = extractAmountColumns(columns, config);
-            if (itemsToProcess.isEmpty()) continue;
-
-            // --- CHANGED LOGIC START ---
-            
-            // 1. Generate Head ONCE
-            String head = itemsToProcess.get(0).head;
-            String headPadded = RuleParser.applyHeadPadding(head, config.getOutputHeadColPad());
-            
-            StringBuilder recordBuilder = new StringBuilder();
-            recordBuilder.append(headPadded);
-
-            // 2. Process Amounts with Inclusion Check
-            for (ProcessingItem item : itemsToProcess) {
-                
-                // NEW: Calculate Math/Decimal logic first to get the final value
-                BigDecimal finalAmt = RuleParser.applyMathLogic(item.amount, item.head, item.colIndex, config.getOutputAmtColLogic());
-                finalAmt = RuleParser.applyDecimalLogic(finalAmt, item.head, item.colIndex, config.getOutputAmtDecimal());
-                
-                // NEW: Check Inclusion Logic (e.g. >0)
-                if (RuleParser.shouldIncludeValue(finalAmt, item.head, item.colIndex, config.getOutputIncludeCondition())) {
-                    
-                    // Only format and append if condition is met
-                    String amountStr = RuleParser.applyAmountPadding(finalAmt, item.head, item.colIndex, config.getOutputAmtColPad());
-                    String signedAmt = RuleParser.applySign(amountStr, finalAmt, item.head, item.colIndex, config.getOutputAmtSign());
-                    recordBuilder.append(signedAmt);
-                } 
-                // Else: Do nothing (Skip this amount entirely)
-            }
-            
-            bufferedItems.add(recordBuilder.toString());
-            // --- CHANGED LOGIC END ---
-
-            if (bufferedItems.size() == batchSize) {
-                outputLines.add(String.join("", bufferedItems));
-                bufferedItems.clear();
-            }
-        }
-
-        if (!bufferedItems.isEmpty()) outputLines.add(String.join("", bufferedItems));
-        if (config.getOutputEndLine() != null && !config.getOutputEndLine().isEmpty()) outputLines.add(config.getOutputEndLine());
-
-        String outputFileName = "GENERATED_" + config.getReportId() + config.getFileType();
-        Path outputPath = inputPath.getParent().resolve(outputFileName);
-        Files.write(outputPath, outputLines);
-
-        return outputPath.toString();
-    }
-
-    // --- Helper Methods (Unchanged parts hidden for brevity) ---
-    // [parseHeaderFromInput, normalizeDate, isValidRow, extractAmountColumns, parseAmount, classes]
-    // ... Copy these exactly from the previous working file ...
+  const handleGetSummary = async (processRunId) => {
+    setSummaryOpen(true);
+    setSummaryLoading(true);
+    setCurrentSelectedId(processRunId);
     
-    // Explicitly including helper methods to ensure file is complete
-    private HeaderInfo parseHeaderFromInput(List<String> lines) {
-        HeaderInfo info = new HeaderInfo();
-        info.branchCode = "00000"; info.reportDate = "01012026";
-        Pattern branchPattern = Pattern.compile("(?i)(?:BRANCH|Branch)\\s*::\\s*(\\d+)");
-        Pattern datePattern1 = Pattern.compile("REPORT DATE\\s*::\\s*(\\S+)");
-        Pattern datePattern2 = Pattern.compile("Current Year Date\\s*::\\s*(\\S+)");
+    // Mocking summary data for testing
+    setTimeout(() => {
+        const mockSummary = { "3971": 111755000.0000, "4002": 0.0000, "5567": 2500.4500 };
+        setSummaryData(Object.entries(mockSummary).map(([code, bal]) => ({ 
+          circleBranchCode: code, totalProfitLoss: bal 
+        })));
+        setSummaryLoading(false);
+    }, 8000);
+  };
 
-        for (String line : lines) {
-            Matcher mBranch = branchPattern.matcher(line);
-            if (mBranch.find()) info.branchCode = mBranch.group(1);
-            Matcher mDate1 = datePattern1.matcher(line);
-            if (mDate1.find()) info.reportDate = normalizeDate(mDate1.group(1));
-            Matcher mDate2 = datePattern2.matcher(line);
-            if (mDate2.find()) info.reportDate = normalizeDate(mDate2.group(1));
-        }
-        return info;
-    }
+  const handleRetry = (row, index) => {
+    const updatedTable = [...tableData];
+    updatedTable[index].isLatest = false; 
 
-    private String normalizeDate(String dateStr) {
-        if (dateStr == null) return "01012026";
-        List<DateTimeFormatter> formatters = Arrays.asList(
-            DateTimeFormatter.ofPattern("dd-MM-yyyy"), DateTimeFormatter.ofPattern("dd/MM/yyyy"),
-            DateTimeFormatter.ofPattern("yyyy-MM-dd"), DateTimeFormatter.ofPattern("dd.MM.yyyy"),
-            DateTimeFormatter.ofPattern("MM-dd-yyyy"));
-        for (DateTimeFormatter formatter : formatters) {
-            try { return LocalDate.parse(dateStr, formatter).format(DateTimeFormatter.ofPattern("ddMMyyyy")); } 
-            catch (DateTimeParseException e) {}
-        }
-        if (dateStr.contains("-") && dateStr.split("-").length == 3) {
-             String[] parts = dateStr.split("-");
-             if (parts[0].length() == 4) return parts[2] + parts[1] + parts[0]; 
-        }
-        return "01012026";
-    }
+    const nextRunNumber = (row.runVersion || 1) + 1;
+    
+    // Logic to prevent stacking (Run 2)(Run 3)
+    // It takes the base name (everything before the first parenthesis)
+    const baseProcessType = row.processType.split(" (")[0];
 
-    private boolean isValidRow(String[] cols, AsciiConfig config) {
-        if (cols.length < 2) return false;
-        int idx = config.getInputHeadCol() - 1;
-        if (cols.length <= idx) return false;
-        String head = cols[idx].trim();
-        if (head.isEmpty()) return false;
-        return Pattern.compile(config.getInputHeadRegex()).matcher(head).lookingAt();
-    }
+    const newRow = {
+      ...row,
+      processRunId: row.processRunId + 1, 
+      runId: nextRunNumber,
+      runVersion: nextRunNumber,
+      isLatest: true,
+      processType: `${baseProcessType} (Run ${nextRunNumber})`
+    };
 
-    private List<ProcessingItem> extractAmountColumns(String[] cols, AsciiConfig config) {
-        List<ProcessingItem> items = new ArrayList<>();
-        String head = cols[config.getInputHeadCol() - 1].trim();
-        String seq = config.getAmountColSeq();
-        if (seq.contains("else")) {
-            String[] parts = seq.split("else");
-            for (String part : parts) {
-                int idx = Integer.parseInt(part.trim()) - 1;
-                if (idx < cols.length && !cols[idx].trim().isEmpty()) {
-                    items.add(new ProcessingItem(head, parseAmount(cols[idx]), idx + 1));
-                    return items;
-                }
-            }
-            items.add(new ProcessingItem(head, BigDecimal.ZERO, Integer.parseInt(parts[0].trim())));
-        } else if (seq.contains("and")) {
-            String[] parts = seq.split("and");
-            for (String part : parts) {
-                int idx = Integer.parseInt(part.trim()) - 1;
-                items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
-            }
-        } else {
-            int idx = Integer.parseInt(seq.trim()) - 1;
-            items.add(new ProcessingItem(head, parseAmount(cols, idx), idx + 1));
-        }
-        return items;
-    }
+    updatedTable.splice(index + 1, 0, newRow);
+    setTableData(updatedTable);
+    showSnackBar(`Retry generated: Run ${nextRunNumber}`, "success");
+  };
 
-    private BigDecimal parseAmount(String[] cols, int idx) {
-        if (idx >= cols.length) return BigDecimal.ZERO;
-        return parseAmount(cols[idx]);
-    }
-    private BigDecimal parseAmount(String val) {
-        try { if(val == null || val.trim().isEmpty()) return BigDecimal.ZERO; return new BigDecimal(val.trim().replace(",", "")); } catch (Exception e) { return BigDecimal.ZERO; }
-    }
-    private static class ProcessingItem { String head; BigDecimal amount; int colIndex; ProcessingItem(String h, BigDecimal a, int c) { head=h; amount=a; colIndex=c; } }
-    private static class HeaderInfo { String branchCode; String reportDate; }
+  return (
+    <Box p={3} width="100%">
+      <Box display="flex" justifyContent="flex-end" mb={2}>
+        <Button
+          variant="contained"
+          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
+          onClick={handleTransferLho}
+          disabled={isTransferring || isInitialLoading}
+        >
+          {isTransferring ? "Transferring..." : "Transfer LHO"}
+        </Button>
+      </Box>
+
+      <TableContainer component={Paper}>
+        {isInitialLoading ? (
+          <Box display="flex" justifyContent="center" alignItems="center" height="200px">
+            <CircularProgress />
+            <Typography ml={2}>Loading Initial Data...</Typography>
+          </Box>
+        ) : (
+          <>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell align="center"><strong>Process Run ID</strong></TableCell>
+                  <TableCell align="center"><strong>Process ID</strong></TableCell>
+                  <TableCell align="center"><strong>ETL Date</strong></TableCell>
+                  <TableCell align="center"><strong>Process Type</strong></TableCell>
+                  <TableCell align="center"><strong>Action</strong></TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {tableData
+                  .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                  .map((row, index) => (
+                    <TableRow key={row.processRunId}>
+                      <TableCell align="center">{row.processRunId}</TableCell>
+                      <TableCell align="center">{row.processId}</TableCell>
+                      <TableCell align="center">{row.etlDate}</TableCell>
+                      <TableCell align="center">{row.processType}</TableCell>
+                      <TableCell align="center">
+                        <Box display="flex" justifyContent="center" gap={1}>
+                          <Tooltip title="Get Summary">
+                            <IconButton size="small" onClick={() => handleGetSummary(row.processRunId)}>
+                              <SummaryIcon />
+                            </IconButton>
+                          </Tooltip>
+                          <Tooltip title="Retry">
+                            <span>
+                              <IconButton 
+                                size="small" 
+                                disabled={!row.isLatest} 
+                                onClick={() => handleRetry(row, index + (page * rowsPerPage))}
+                              >
+                                <RetryIcon />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        </Box>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+              </TableBody>
+            </Table>
+            <TablePagination
+              component="div"
+              count={tableData.length}
+              page={page}
+              onPageChange={(e, newPage) => setPage(newPage)}
+              rowsPerPage={rowsPerPage}
+              onRowsPerPageChange={(e) => {
+                setRowsPerPage(parseInt(e.target.value, 10));
+                setPage(0);
+              }}
+              rowsPerPageOptions={[10, 25, 50]}
+            />
+          </>
+        )}
+      </TableContainer>
+
+      {/* SUMMARY DIALOG */}
+      <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>
+          Circle Wise Summary (ID: {currentSelectedId})
+          <IconButton onClick={() => setSummaryOpen(false)} sx={{ position: 'absolute', right: 8, top: 8 }}>
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {summaryLoading ? (
+            <Box display="flex" justifyContent="center" py={5}><CircularProgress /></Box>
+          ) : (
+            <>
+              <TableContainer component={Paper} sx={{ mb: 1 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell align="center"><strong>Circle Branch Code</strong></TableCell>
+                      <TableCell align="center"><strong>Balance</strong></TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {summaryData.length > 0 ? (
+                      summaryData
+                        .slice(summaryPage * summaryRowsPerPage, summaryPage * summaryRowsPerPage + summaryRowsPerPage)
+                        .map((row, index) => (
+                          <TableRow key={index}>
+                            <TableCell align="center">{row.circleBranchCode}</TableCell>
+                            <TableCell align="center">
+                              {Number(row.totalProfitLoss).toLocaleString('en-IN', {
+                                minimumFractionDigits: 4,
+                                maximumFractionDigits: 4
+                              })}
+                            </TableCell>
+                          </TableRow>
+                        ))
+                    ) : (
+                      <TableRow><TableCell colSpan={2} align="center">No Summary Data Found</TableCell></TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <TablePagination
+                component="div"
+                count={summaryData.length}
+                page={summaryPage}
+                onPageChange={(e, p) => setSummaryPage(p)}
+                rowsPerPage={summaryRowsPerPage}
+                onRowsPerPageChange={(e) => setSummaryRowsPerPage(parseInt(e.target.value, 10))}
+                rowsPerPageOptions={[5, 10]}
+              />
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button variant="outlined" onClick={() => setSummaryOpen(false)}>Close</Button>
+          <Button variant="contained" onClick={() => { showSnackBar("Submitted Successfully", "success"); setSummaryOpen(false); }}>
+            Submit Summary
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
 }
-
