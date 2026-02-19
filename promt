@@ -1,217 +1,103 @@
-As a Technical Lead, using the **Native SQL Query** is the correct decision for performance. It ensures that 10,000+ rows are aggregated within the database engine rather than loading them into your application's heap memory.
+Since you are looking for a more optimized, "Senior-level" approach, the best way to do this is to return a **structured `Map` or a custom DTO** rather than a raw String.
 
-Below are all the updated files required for this requirement.
+Returning a String requires the frontend to manually call `JSON.parse()`, which is clunky and error-prone. By returning a `Map<Long, Double>`, Spring's `Jackson` message converter will automatically serialize it into a **proper JSON Object**.
 
----
+Here is the optimized approach.
 
-### 1. The Entity Models
-
-**File:** `com.tcs.fincore.CommonMasterService.model.PLTransfer.java`
-Maps to your source data table.
-
-```java
-package com.tcs.fincore.CommonMasterService.model;
-
-import jakarta.persistence.*;
-import lombok.*;
-import java.math.BigDecimal;
-import java.util.Date;
-
-@Getter @Setter @Entity
-@AllArgsConstructor @NoArgsConstructor @Builder
-@Table(name = "P_L_TRANSFER")
-public class PLTransfer {
-    @Id
-    @GeneratedValue(strategy = GenerationType.AUTO)
-    private Long id; // Internal JPA ID
-
-    @Column(name = "TRANSFER_DATE")
-    private Date transferDate;
-
-    @Column(name = "BRANCH_CODE")
-    private Long branchCode;
-
-    @Column(name = "CIRCLE_BRANCH_CODE")
-    private Long circleBranchCode;
-
-    @Column(name = "PROFIT_LOSS")
-    private BigDecimal profitLoss;
-}
-
-```
-
-**File:** `com.tcs.fincore.CommonMasterService.model.LhoTransferSummary.java`
-Maps to your "cache" table.
-
-```java
-package com.tcs.fincore.CommonMasterService.model;
-
-import jakarta.persistence.*;
-import lombok.*;
-
-@Getter @Setter @Entity @Builder
-@AllArgsConstructor @NoArgsConstructor
-@Table(name = "LHO_TRANSFER_SUMMARY")
-public class LhoTransferSummary {
-    @Id
-    @Column(name = "ID")
-    private Long id;
-
-    @Lob
-    @Column(name = "PAYLOAD")
-    private String payload;
-}
-
-```
-
----
-
-### 2. The Repositories
-
-**File:** `com.tcs.fincore.CommonMasterService.repository.PLTransferRepository.java`
-Contains the aggregation query.
-
-```java
-package com.tcs.fincore.CommonMasterService.repository;
-
-import com.tcs.fincore.CommonMasterService.model.PLTransfer;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import java.util.List;
-
-public interface PLTransferRepository extends JpaRepository<PLTransfer, Long> {
-
-    @Query(value = "SELECT CIRCLE_BRANCH_CODE, SUM(PROFIT_LOSS) FROM P_L_TRANSFER GROUP BY CIRCLE_BRANCH_CODE", nativeQuery = true)
-    List<Object[]> getAggregatedSummary();
-}
-
-```
-
-**File:** `com.tcs.fincore.CommonMasterService.repository.LhoSummaryRepository.java`
-
-```java
-package com.tcs.fincore.CommonMasterService.repository;
-
-import com.tcs.fincore.CommonMasterService.model.LhoTransferSummary;
-import org.springframework.data.jpa.repository.JpaRepository;
-
-public interface LhoSummaryRepository extends JpaRepository<LhoTransferSummary, Long> {
-}
-
-```
-
----
-
-### 3. Service Layer
-
-Update the interface and implementation to handle the logic flow.
+### 1. Updated Service Interface
 
 **File:** `com.tcs.fincore.CommonMasterService.service.CommonMasterService.java`
+Change the return type to `Map<Long, Double>`.
 
 ```java
-// Add this to your existing interface
-String getOrGenerateLhoSummary(Long id);
+// Returning a Map ensures the API returns a real JSON Object
+Map<Long, Double> getOrGenerateLhoSummary(Long id);
 
 ```
+
+---
+
+### 2. Optimized Service Implementation
 
 **File:** `com.tcs.fincore.CommonMasterService.service.CommonMasterServiceImpl.java`
 
+Instead of manually using `objectMapper.writeValueAsString`, we let Spring handle the conversion. This is cleaner and more performant as it avoids redundant string allocations.
+
 ```java
-// ... existing imports
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonMasterService.model.LhoTransferSummary;
-import com.tcs.fincore.CommonMasterService.repository.PLTransferRepository;
-import com.tcs.fincore.CommonMasterService.repository.LhoSummaryRepository;
+@Override
+@Transactional
+public Map<Long, Double> getOrGenerateLhoSummary(Long id) {
+    log.info("Processing LHO Summary request for ID: {}", id);
 
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class CommonMasterServiceImpl implements CommonMasterService {
-
-    // ... existing injections
-    private final PLTransferRepository plTransferRepository;
-    private final LhoSummaryRepository lhoSummaryRepository;
-    private final ObjectMapper objectMapper;
-
-    @Override
-    @Transactional
-    public String getOrGenerateLhoSummary(Long id) {
-        log.info("Processing LHO Summary request for ID: {}", id);
-
-        // 1. Try to fetch from LHO_TRANSFER_SUMMARY table
-        return lhoSummaryRepository.findById(id)
-                .map(LhoTransferSummary::getPayload)
-                .orElseGet(() -> {
-                    log.info("Summary not found in cache for ID: {}. Generating new aggregation...", id);
-                    
-                    // 2. Perform DB aggregation
-                    List<Object[]> aggregatedData = plTransferRepository.getAggregatedSummary();
-                    
-                    if (aggregatedData.isEmpty()) {
-                        throw new NoDataFoundException("No transfer records found in P_L_TRANSFER to generate summary.");
-                    }
-
-                    // 3. Map result to JSON-friendly format
-                    Map<String, Double> summaryMap = new HashMap<>();
-                    for (Object[] row : aggregatedData) {
-                        summaryMap.put(String.valueOf(row[0]), ((Number) row[1]).doubleValue());
-                    }
-
-                    try {
-                        String jsonPayload = objectMapper.writeValueAsString(summaryMap);
-
-                        // 4. Save to Summary table for persistence
-                        LhoTransferSummary summaryEntity = LhoTransferSummary.builder()
-                                .id(id)
-                                .payload(jsonPayload)
-                                .build();
-                        lhoSummaryRepository.save(summaryEntity);
-
-                        return jsonPayload;
-                    } catch (Exception e) {
-                        log.error("JSON Serialization failed for LHO Summary", e);
-                        throw new RuntimeException("Internal Error generating summary payload");
-                    }
-                });
+    // 1. Check Cache
+    Optional<LhoTransferSummary> cached = lhoSummaryRepository.findById(id);
+    if (cached.isPresent()) {
+        try {
+            // Convert the stored CLOB String back into a Map for the response
+            return objectMapper.readValue(cached.get().getPayload(), new TypeReference<Map<Long, Double>>() {});
+        } catch (Exception e) {
+            log.error("Error parsing cached summary for ID: {}", id);
+        }
     }
+
+    // 2. Cache Miss: Database Aggregation
+    log.info("Generating new aggregation for ID: {}", id);
+    List<Object[]> aggregatedData = plTransferRepository.getAggregatedSummary();
+
+    if (aggregatedData.isEmpty()) {
+        return Collections.emptyMap(); // Return {} instead of throwing error if preferred
+    }
+
+    // 3. Map result
+    Map<Long, Double> summaryMap = aggregatedData.stream()
+            .collect(Collectors.toMap(
+                    row -> ((Number) row[0]).longValue(),
+                    row -> ((Number) row[1]).doubleValue()
+            ));
+
+    // 4. Async/Background Save (Optional Optimization)
+    // We save the JSON string to the DB CLOB for next time
+    try {
+        String jsonPayload = objectMapper.writeValueAsString(summaryMap);
+        lhoSummaryRepository.save(new LhoTransferSummary(id, jsonPayload));
+    } catch (Exception e) {
+        log.warn("Failed to cache summary, but returning data anyway.");
+    }
+
+    return summaryMap;
 }
 
 ```
 
 ---
 
-### 4. The Controller
+### 3. Updated Controller
 
 **File:** `com.tcs.fincore.CommonMasterService.Controller.LhoTransferController.java`
+The `ApiResponse` will now wrap a `Map`, which translates to a JSON `{}` in the response.
 
 ```java
-// ... existing imports
-
-@RestController
-@RequestMapping("/api/lho-transfers")
-@RequiredArgsConstructor
-public class LhoTransferController {
-
-    private final CommonMasterService service;
-
-    /**
-     * GET /api/lho-transfers/summary/{id}
-     * Returns the cached summary or generates a new one from P_L_TRANSFER.
-     */
-    @GetMapping("/summary/{id}")
-    public ResponseEntity<ApiResponse<String>> getSummary(@PathVariable Long id) {
-        log.info("API: Fetching Summary for ID: {}", id);
-        String result = service.getOrGenerateLhoSummary(id);
-        return ResponseEntity.ok(ApiResponse.success(result, "Summary processed successfully"));
-    }
+@GetMapping("/summary/{id}")
+public ResponseEntity<ApiResponse<Map<Long, Double>>> getSummary(@PathVariable Long id) {
+    return ResponseEntity.ok(ApiResponse.success(service.getOrGenerateLhoSummary(id)));
 }
 
 ```
 
-### Why this works for 10,000+ rows:
+---
 
-1. **Native SQL Performance**: Using `SUM` and `GROUP BY` at the database level is significantly faster than pulling all records into Java memory.
-2. **Memoization (Caching)**: By saving the result into `LHO_TRANSFER_SUMMARY`, subsequent clicks on the "Get Summary" button for that ID will be nearly instantaneous (O(1) lookup).
-3. **Transaction Safety**: Using `@Transactional` ensures that the generation and the saving happen as an atomic unit.
+### Why this is optimized:
 
-Would you like me to add a **Check** to see if the summary is "stale"? For example, if new rows were added to `P_L_TRANSFER` after the summary was generated, should we re-generate it?
+1. **Cleaner JSON Structure**:
+* **Old (String):** `"data": "{\"3978\": 71610000}"` (Note the quotes and escapes).
+* **New (Object):** `"data": { "3978": 71610000 }` (A real object the frontend can use immediately).
+
+
+2. **Type Safety**: By using `Map<Long, Double>`, you ensure that the keys are numbers (Branch Codes) and values are decimals, preventing data corruption.
+3. **Jackson Integration**: By returning a Java Collection, you leverage Spring's built-in optimization for JSON serialization.
+
+### Pro-Tip: Database-level JSON (Oracle 12c/19c/21c)
+
+If you are using a modern version of Oracle, you can actually generate the JSON directly in the SQL query using `JSON_OBJECT` and `JSON_ARRAYAGG`. This would be the absolute fastest way because the database would do the aggregation **and** the JSON formatting in one step.
+
+**Would you like me to show you the Native SQL query that generates the JSON directly in Oracle?** This would make your Java code even simpler. Conclude with a clear next step.
