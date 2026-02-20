@@ -1,311 +1,42 @@
-import React, { useState, useRef, useEffect } from "react";
-import {
-  Box, Button, Typography, CircularProgress, Table, TableBody,
-  TableCell, TableContainer, TableHead, TableRow, Paper,
-  TablePagination, Dialog, DialogTitle, DialogContent, IconButton,
-  Tooltip, DialogActions, Chip, Divider, Stack, useTheme, Grid
-} from "@mui/material";
-import {
-  PlayArrow as PlayArrowIcon,
-  Close as CloseIcon,
-  Assessment as SummaryIcon,
-  Replay as RetryIcon,
-  Visibility as ViewIcon,
-  CheckCircle as SuccessIcon,
-  Error as FailedIcon,
-  Schedule as PendingIcon
-} from "@mui/icons-material";
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-
-// --- API Constants ---
-const TRIGGER_API_URL = "/PS/airflow/trigger";
-const INITIAL_DATA_URL = "/PS/process/processes/data/7";
-const SUMMARY_BASE_URL = "/CM/lho-transfers/summary/";
-const CREATE_REQUEST_URL = "/api/create-request";
-
-export default function TransferDataLho() {
-  const theme = useTheme();
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-  const isMounted = useRef(true);
-
-  // Table & Loading States
-  const [isTransferring, setIsTransferring] = useState(false);
-  const [tableData, setTableData] = useState([]);
-  const [totalElements, setTotalElements] = useState(0);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
-  const [page, setPage] = useState(0);
-  const [rowsPerPage, setRowsPerPage] = useState(10);
-
-  // Summary & Submission States
-  const [summaryOpen, setSummaryOpen] = useState(false);
-  const [summaryData, setSummaryData] = useState([]);
-  const [summaryTotals, setSummaryTotals] = useState({ totalAmount: 0, totalRecordCount: 0 });
-  const [summaryLoading, setSummaryLoading] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [summaryPage, setSummaryPage] = useState(0);
-  const [summaryRowsPerPage, setSummaryRowsPerPage] = useState(5);
-
-  // Context for Payload
-  const [activeProcessRef, setActiveProcessRef] = useState({ runId: null, processId: null });
-  const [currentSelectedId, setCurrentSelectedId] = useState(null);
-
-  // Stages Dialog
-  const [stagesOpen, setStagesOpen] = useState(false);
-  const [selectedProcess, setSelectedProcess] = useState(null);
-  const [activeStage, setActiveStage] = useState(null);
-
-  /**
-   * HELPERS
-   */
-  const generateBatchId = (sequence) => {
-    const pad = "000000";
-    const str = String(sequence || 0);
-    return "LHO_" + pad.substring(0, pad.length - str.length) + str;
-  };
-
-  const getTodayFormatted = () => {
-    return new Date().toISOString().split('T')[0]; 
-  };
-
-  /**
-   * API CALLS
-   */
-  const fetchInitialData = async () => {
-    setIsInitialLoading(true);
-    try {
-      const paginatedUrl = `${INITIAL_DATA_URL}?page=${page}&size=${rowsPerPage}`;
-      const response = await callApi(paginatedUrl, null, "GET");
-      if (isMounted.current && response) {
-        setTableData(response.initialData.map(item => ({ ...item, isLatest: true, runVersion: item.runId || 1 })));
-        setTotalElements(response.totalElements || 0);
-      }
-    } catch (error) {
-      showSnackBar("Failed to load process data", "error");
-    } finally {
-      if (isMounted.current) setIsInitialLoading(false);
+    "initialData": [
+        {
+            "processRunId": 417,
+            "processId": 7,
+			
+			this i want in the processRunId  ,processId 
+			in the payload when we create the request 
+			
+			something like this 
+			{
+  "batchId": "LHO_000407",
+  "processDate": "2026-02-20",
+  "totalAmount": 0,
+  "totalRecordCount": 4,
+  processRunId
+  processId
+  
+  "circleWiseDetails": [
+    {
+      "transferDate": "2026-02-20",
+      "circleBranchCode": 3978,
+      "totalProfitLoss": 859320000
+    },
+    {
+      "transferDate": "2026-02-20",
+      "circleBranchCode": 4282,
+      "totalProfitLoss": 46137.6
+    },
+    {
+      "transferDate": "2026-02-20",
+      "circleBranchCode": 6939,
+      "totalProfitLoss": -46137.6
+    },
+    {
+      "transferDate": "2026-02-20",
+      "circleBranchCode": 61263,
+      "totalProfitLoss": -859320000
     }
-  };
-
-  useEffect(() => {
-    isMounted.current = true;
-    fetchInitialData();
-    return () => { isMounted.current = false; };
-  }, [page, rowsPerPage]);
-
-  // --- RESTORED TOP RIGHT TRIGGER LOGIC ---
-  const handleTransferLho = async () => {
-    setIsTransferring(true);
-    const payload = { dagId: "cbs_wrap_dag", processId: 7, remarks: "testing 1" };
-    try {
-      await callApi(TRIGGER_API_URL, payload, "POST");
-      showSnackBar("LHO Transfer triggered successfully", "success");
-      fetchInitialData();
-    } catch (error) {
-      showSnackBar("Failed to trigger LHO Transfer", "error");
-    } finally {
-      setIsTransferring(false);
-    }
-  };
-
-  // --- FINAL SUBMIT LOGIC ---
-  const handleSubmitLhoRequest = async () => {
-    setIsSubmitting(true);
-    const finalRequestPayload = {
-      requestType: "LHO_TRANSFER",
-      changeType: "ADD",
-      targetId: null, 
-      payload: {
-        ProcessRunId: String(activeProcessRef.runId),
-        processId: String(activeProcessRef.processId),
-        batchId: generateBatchId(activeProcessRef.runId),
-        processDate: getTodayFormatted(),
-        totalAmount: summaryTotals.totalAmount,
-        totalRecordCount: summaryTotals.totalRecordCount,
-        circleWiseDetails: summaryData.map(item => ({
-          transferDate: getTodayFormatted(),
-          circleBranchCode: Number(item.circleBranchCode),
-          totalProfitLoss: Number(item.totalProfitLoss)
-        }))
-      }
-    };
-
-    try {
-      await callApi(CREATE_REQUEST_URL, finalRequestPayload, "POST");
-      showSnackBar("LHO Transfer Request Submitted Successfully", "success");
-      setSummaryOpen(false);
-    } catch (error) {
-      showSnackBar("Submission failed.", "error");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const handleGetSummary = async (row) => {
-    setSummaryOpen(true);
-    setSummaryLoading(true);
-    setCurrentSelectedId(row.processRunId);
-    setActiveProcessRef({ runId: row.processRunId, processId: row.processId });
-    
-    try {
-      const response = await callApi(`${SUMMARY_BASE_URL}${row.processRunId}`, null, "GET");
-      const summaryObj = response?.data || {};
-      const rawMap = summaryObj.circleWiseDetails || {};
-      
-      setSummaryTotals({
-        totalAmount: summaryObj.totalAmount || 0,
-        totalRecordCount: summaryObj.totalRecordCount || 0
-      });
-
-      setSummaryData(Object.entries(rawMap).map(([code, balance]) => ({
-        circleBranchCode: code, totalProfitLoss: balance
-      })));
-    } catch (error) {
-      showSnackBar("Could not fetch summary data", "error");
-    } finally {
-      setSummaryLoading(false);
-    }
-  };
-
-  const getStatusChip = (s) => {
-    if (s === 1) return <Chip label="In Progress" color="primary" variant="outlined" size="small" />;
-    if (s === 2) return <Chip label="Success" color="success" size="small" />;
-    if (s === 3) return <Chip label="Fail" color="error" size="small" />;
-    return <Chip label="Unknown" variant="outlined" size="small" />;
-  };
-
-  return (
-    <Box p={3} width="100%">
-      {/* RESTORED TOP RIGHT BUTTON */}
-      <Box display="flex" justifyContent="flex-end" mb={2}>
-        <Button
-          variant="contained"
-          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
-          onClick={handleTransferLho}
-          disabled={isTransferring || isInitialLoading}
-        >
-          {isTransferring ? "Transferring..." : "Transfer LHO"}
-        </Button>
-      </Box>
-
-      <TableContainer component={Paper}>
-        <Table>
-          <TableHead sx={{ bgcolor: theme.palette.action.hover }}>
-            <TableRow>
-              <TableCell align="center"><strong>Process Run ID</strong></TableCell>
-              <TableCell align="center"><strong>Stage Status</strong></TableCell>
-              <TableCell align="center"><strong>Process ID</strong></TableCell>
-              <TableCell align="center"><strong>ETL Date</strong></TableCell>
-              <TableCell align="center"><strong>Process Type</strong></TableCell>
-              <TableCell align="center"><strong>Action</strong></TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {tableData.map((row) => (
-              <TableRow key={row.processRunId}>
-                <TableCell align="center">{row.processRunId}</TableCell>
-                <TableCell align="center">{getStatusChip(row.status)}</TableCell>
-                <TableCell align="center">{row.processId}</TableCell>
-                <TableCell align="center">{row.etlDate}</TableCell>
-                <TableCell align="center">{row.processType}</TableCell>
-                <TableCell align="center">
-                  <Stack direction="row" spacing={1} justifyContent="center">
-                    <Tooltip title="View Stages"><IconButton size="small" onClick={() => { setSelectedProcess(row); setStagesOpen(true); }}><ViewIcon /></IconButton></Tooltip>
-                    <Tooltip title={row.status === 2 ? "Get Summary" : "Not Available"}>
-                      <span><IconButton size="small" disabled={row.status !== 2} onClick={() => handleGetSummary(row)}><SummaryIcon /></IconButton></span>
-                    </Tooltip>
-                    <Tooltip title="Retry"><span><IconButton size="small" disabled={!row.isLatest || row.status === 1}><RetryIcon /></IconButton></span></Tooltip>
-                  </Stack>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-        <TablePagination component="div" count={totalElements} page={page} onPageChange={(e, p) => setPage(p)} rowsPerPage={rowsPerPage} onRowsPerPageChange={(e) => setRowsPerPage(parseInt(e.target.value, 10))} />
-      </TableContainer>
-
-      {/* --- SUMMARY DIALOG WITH SUBMIT --- */}
-      <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
-        <DialogTitle sx={{ m: 0, p: 2 }}>
-          Circle Wise Summary (ID: {currentSelectedId})
-          <IconButton onClick={() => setSummaryOpen(false)} sx={{ position: 'absolute', right: 8, top: 8 }}><CloseIcon /></IconButton>
-        </DialogTitle>
-        <DialogContent dividers>
-          {summaryLoading ? <Box display="flex" justifyContent="center" py={5}><CircularProgress /></Box> : (
-            <>
-              <Paper variant="outlined" sx={{ p: 2, mb: 2, bgcolor: theme.palette.action.hover }}>
-                <Grid container spacing={2}>
-                  <Grid item xs={6}>
-                    <Typography variant="caption" color="text.secondary">Total Records</Typography>
-                    <Typography variant="h6" fontWeight="bold">{summaryTotals.totalRecordCount}</Typography>
-                  </Grid>
-                  <Grid item xs={6}>
-                    <Typography variant="caption" color="text.secondary">Total Volume Amount</Typography>
-                    <Typography variant="h6" fontWeight="bold" color="primary">{Number(summaryTotals.totalAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</Typography>
-                  </Grid>
-                </Grid>
-              </Paper>
-              <TableContainer component={Paper}>
-                <Table size="small">
-                  <TableHead><TableRow><TableCell align="center"><strong>Circle Branch Code</strong></TableCell><TableCell align="center"><strong>Balance</strong></TableCell></TableRow></TableHead>
-                  <TableBody>
-                    {summaryData.slice(summaryPage * summaryRowsPerPage, summaryPage * summaryRowsPerPage + summaryRowsPerPage).map((row, idx) => (
-                      <TableRow key={idx}><TableCell align="center">{row.circleBranchCode}</TableCell><TableCell align="center" sx={{ fontWeight: 'bold' }}>{Number(row.totalProfitLoss).toLocaleString('en-IN', { minimumFractionDigits: 4 })}</TableCell></TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-              <TablePagination component="div" count={summaryData.length} page={summaryPage} onPageChange={(e, p) => setSummaryPage(p)} rowsPerPage={summaryRowsPerPage} onRowsPerPageChange={(e) => setSummaryRowsPerPage(parseInt(e.target.value, 10))} rowsPerPageOptions={[5]} />
-            </>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ p: 2 }}>
-          <Button variant="outlined" onClick={() => setSummaryOpen(false)} disabled={isSubmitting}>Cancel</Button>
-          <Button 
-            variant="contained" 
-            disabled={summaryData.length === 0 || isSubmitting} 
-            onClick={handleSubmitLhoRequest}
-            startIcon={isSubmitting && <CircularProgress size={16} color="inherit" />}
-          >
-            {isSubmitting ? "Submitting..." : "Submit LHO Request"}
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* --- STAGES DIALOG --- */}
-      <Dialog open={stagesOpen} onClose={() => setStagesOpen(false)} maxWidth="md" fullWidth>
-        <DialogTitle sx={{ display: 'flex', justifyContent: 'space-between', borderBottom: `1px solid ${theme.palette.divider}` }}>
-          <Typography variant="h6">Transfer To LHO – Process Details</Typography>
-          <IconButton onClick={() => setStagesOpen(false)}><CloseIcon /></IconButton>
-        </DialogTitle>
-        <DialogContent sx={{ p: 0, display: 'flex', height: '60vh' }}>
-          <Box sx={{ width: '40%', borderRight: `1px solid ${theme.palette.divider}`, overflowY: 'auto', p: 2, bgcolor: theme.palette.action.hover }}>
-            {selectedProcess?.stages?.map((stage, idx) => (
-              <Box key={idx} onClick={() => setActiveStage(stage)} sx={{ display: 'flex', position: 'relative', pb: 3, cursor: 'pointer' }}>
-                {idx !== selectedProcess.stages.length - 1 && <Box sx={{ position: 'absolute', left: 11, top: 24, bottom: 0, width: '2px', bgcolor: theme.palette.divider }} />}
-                <Box sx={{ mr: 2, zIndex: 1 }}>
-                  {stage.stageStatus === 2 ? <SuccessIcon color="success" fontSize="small" /> : stage.stageStatus === 3 ? <FailedIcon color="error" fontSize="small" /> : <PendingIcon color="primary" fontSize="small" />}
-                </Box>
-                <Box sx={{ flex: 1, p: 1, borderRadius: 1, bgcolor: activeStage?.stageId === stage.stageId ? theme.palette.primary.main : 'transparent', color: activeStage?.stageId === stage.stageId ? theme.palette.primary.contrastText : 'inherit' }}>
-                  <Typography variant="body2" fontWeight="bold">{stage.stageId.replace(/_/g, ' ').toUpperCase()}</Typography>
-                  <Typography variant="caption">{stage.stageStatus === 2 ? "Completed" : stage.stageStatus === 3 ? "Failed" : "In Progress"}</Typography>
-                </Box>
-              </Box>
-            ))}
-          </Box>
-          <Box sx={{ flex: 1, p: 3, overflowY: 'auto' }}>
-            {activeStage && (
-              <Stack spacing={2}>
-                <Typography variant="subtitle2" color="text.secondary">Start Time: {new Date(activeStage.startTime).toLocaleString()}</Typography>
-                <Typography variant="subtitle2" color="text.secondary">End Time: {activeStage.endTime ? new Date(activeStage.endTime).toLocaleString() : 'In Progress'}</Typography>
-                <Divider />
-                <Typography variant="body2"><strong>Remarks:</strong> {activeStage.stageRemarks || 'No remarks.'}</Typography>
-              </Stack>
-            )}
-          </Box>
-        </DialogContent>
-      </Dialog>
-    </Box>
-  );
+  ]
 }
+
+and take this from the row for which u are creating the request 
