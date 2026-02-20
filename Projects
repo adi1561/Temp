@@ -19,6 +19,7 @@ import {
 import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
+// --- API Constants ---
 const TRIGGER_API_URL = "/PS/airflow/trigger";
 const INITIAL_DATA_URL = "/PS/process/processes/data/7";
 const SUMMARY_BASE_URL = "/CM/lho-transfers/summary/";
@@ -29,18 +30,22 @@ export default function TransferDataLho() {
   const showSnackBar = useCustomSnackbar();
   const isMounted = useRef(true);
 
-  // Table & Pagination
+  // Table & Loading States
+  const [isTransferring, setIsTransferring] = useState(false);
   const [tableData, setTableData] = useState([]);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
 
-  // Dialogs
+  // Summary Dialog Logic
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [summaryData, setSummaryData] = useState([]);
   const [summaryLoading, setSummaryLoading] = useState(false);
-  
-  // Stages Feature
+  const [summaryPage, setSummaryPage] = useState(0);
+  const [summaryRowsPerPage, setSummaryRowsPerPage] = useState(5);
+  const [currentSelectedId, setCurrentSelectedId] = useState(null);
+
+  // Stages Dialog Logic
   const [stagesOpen, setStagesOpen] = useState(false);
   const [selectedProcess, setSelectedProcess] = useState(null);
   const [activeStage, setActiveStage] = useState(null);
@@ -69,10 +74,64 @@ export default function TransferDataLho() {
     return () => { isMounted.current = false; };
   }, []);
 
+  // --- RESTORED TRIGGER LOGIC ---
+  const handleTransferLho = async () => {
+    setIsTransferring(true);
+    const payload = { dagId: "cbs_wrap_dag", processId: 7, remarks: "testing 1" };
+    try {
+      await callApi(TRIGGER_API_URL, payload, "POST");
+      showSnackBar("LHO Transfer triggered successfully", "success");
+      fetchInitialData();
+    } catch (error) {
+      showSnackBar("Failed to trigger LHO Transfer", "error");
+    } finally {
+      setIsTransferring(false);
+    }
+  };
+
+  const handleGetSummary = async (processRunId) => {
+    setSummaryOpen(true);
+    setSummaryLoading(true);
+    setSummaryData([]);
+    setCurrentSelectedId(processRunId);
+    try {
+      const response = await callApi(`${SUMMARY_BASE_URL}${processRunId}`, null, "GET");
+      const rawMap = response?.data || {};
+      const formattedSummary = Object.entries(rawMap).map(([code, balance]) => ({
+        circleBranchCode: code,
+        totalProfitLoss: balance
+      }));
+      setSummaryData(formattedSummary);
+    } catch (error) {
+      showSnackBar("Could not retrieve summary for this run", "error");
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
   const handleOpenStages = (process) => {
     setSelectedProcess(process);
     setActiveStage(process.stages?.[0] || null);
     setStagesOpen(true);
+  };
+
+  const handleRetry = (row, index) => {
+    const updatedTable = [...tableData];
+    updatedTable[index].isLatest = false;
+    const nextRunNumber = (row.runVersion || 1) + 1;
+    const baseProcessType = row.processType.split(" (")[0];
+    const newRow = {
+      ...row,
+      processRunId: row.processRunId + 1,
+      runId: nextRunNumber,
+      runVersion: nextRunNumber,
+      isLatest: true,
+      status: 1, 
+      processType: `${baseProcessType} (Run ${nextRunNumber})`
+    };
+    updatedTable.splice(index + 1, 0, newRow);
+    setTableData(updatedTable);
+    showSnackBar(`Initiating Retry: Run ${nextRunNumber}`, "info");
   };
 
   const getStatusChip = (status) => {
@@ -85,11 +144,23 @@ export default function TransferDataLho() {
   };
 
   return (
-    <Box p={3}>
-      <TableContainer component={Paper} elevation={2}>
+    <Box p={3} width="100%">
+      {/* RESTORED TRIGGER BUTTON */}
+      <Box display="flex" justifyContent="flex-end" mb={2}>
+        <Button
+          variant="contained"
+          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
+          onClick={handleTransferLho}
+          disabled={isTransferring || isInitialLoading}
+        >
+          {isTransferring ? "Transferring..." : "Transfer LHO"}
+        </Button>
+      </Box>
+
+      <TableContainer component={Paper}>
         <Table>
-          <TableHead>
-            <TableRow sx={{ bgcolor: theme.palette.action.hover }}>
+          <TableHead sx={{ bgcolor: theme.palette.action.hover }}>
+            <TableRow>
               <TableCell align="center"><strong>Process Run ID</strong></TableCell>
               <TableCell align="center"><strong>Stage Status</strong></TableCell>
               <TableCell align="center"><strong>Process ID</strong></TableCell>
@@ -99,8 +170,8 @@ export default function TransferDataLho() {
             </TableRow>
           </TableHead>
           <TableBody>
-            {tableData.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage).map((row) => (
-              <TableRow key={row.processRunId} hover>
+            {tableData.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage).map((row, index) => (
+              <TableRow key={row.processRunId}>
                 <TableCell align="center">{row.processRunId}</TableCell>
                 <TableCell align="center">{getStatusChip(row.status)}</TableCell>
                 <TableCell align="center">{row.processId}</TableCell>
@@ -108,21 +179,31 @@ export default function TransferDataLho() {
                 <TableCell align="center">{row.processType}</TableCell>
                 <TableCell align="center">
                   <Stack direction="row" spacing={1} justifyContent="center">
-                    <Tooltip title="View Details">
-                      <IconButton size="small" onClick={() => handleOpenStages(row)} color="primary">
+                    <Tooltip title="View Stages">
+                      <IconButton size="small" onClick={() => handleOpenStages(row)}>
                         <ViewIcon />
                       </IconButton>
                     </Tooltip>
-                    <Tooltip title="Get Summary">
+
+                    <Tooltip title={row.status === 2 ? "Get Summary" : "Summary Not Available"}>
                       <span>
-                        <IconButton size="small" disabled={row.status !== 2}>
+                        <IconButton 
+                          size="small" 
+                          disabled={row.status !== 2} 
+                          onClick={() => handleGetSummary(row.processRunId)}
+                        >
                           <SummaryIcon />
                         </IconButton>
                       </span>
                     </Tooltip>
+
                     <Tooltip title="Retry">
                       <span>
-                        <IconButton size="small" disabled={!row.isLatest || row.status === 1}>
+                        <IconButton 
+                          size="small" 
+                          disabled={!row.isLatest || row.status === 1} 
+                          onClick={() => handleRetry(row, index + (page * rowsPerPage))}
+                        >
                           <RetryIcon />
                         </IconButton>
                       </span>
@@ -135,135 +216,72 @@ export default function TransferDataLho() {
         </Table>
       </TableContainer>
 
-      {/* ---------------- STAGES DIALOG (VERTICAL TIMELINE) ---------------- */}
-      <Dialog 
-        open={stagesOpen} 
-        onClose={() => setStagesOpen(false)} 
-        maxWidth="md" 
-        fullWidth
-        PaperProps={{ sx: { borderRadius: 2 } }}
-      >
-        <DialogTitle sx={{ 
-          m: 0, p: 2, 
-          display: 'flex', 
-          justifyContent: 'space-between', 
-          alignItems: 'center',
-          borderBottom: `1px solid ${theme.palette.divider}`
-        }}>
-          <Typography variant="h6" fontWeight="600">
-            Transfer To LHO – Process Details
-          </Typography>
-          <IconButton onClick={() => setStagesOpen(false)} size="small">
-            <CloseIcon />
-          </IconButton>
+      {/* --- STAGES DIALOG --- */}
+      <Dialog open={stagesOpen} onClose={() => setStagesOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: 'flex', justifyContent: 'space-between', borderBottom: `1px solid ${theme.palette.divider}` }}>
+          <Typography variant="h6">Transfer To LHO – Process Details</Typography>
+          <IconButton onClick={() => setStagesOpen(false)}><CloseIcon /></IconButton>
         </DialogTitle>
-
         <DialogContent sx={{ p: 0, display: 'flex', height: '60vh' }}>
-          {/* LEFT SIDE: SCROLLABLE STAGES LIST */}
-          <Box sx={{ 
-            width: '40%', 
-            borderRight: `1px solid ${theme.palette.divider}`,
-            overflowY: 'auto',
-            bgcolor: theme.palette.action.hover,
-            p: 2
-          }}>
-            <Stack spacing={0}>
-              {selectedProcess?.stages?.map((stage, idx) => (
-                <Box 
-                  key={stage.stageId} 
-                  onClick={() => setActiveStage(stage)}
-                  sx={{ 
-                    display: 'flex', 
-                    position: 'relative', 
-                    pb: 3, 
-                    cursor: 'pointer',
-                    '&:hover': { opacity: 0.8 }
-                  }}
-                >
-                  {/* Timeline Connector Line */}
-                  {idx !== selectedProcess.stages.length - 1 && (
-                    <Box sx={{ 
-                      position: 'absolute', 
-                      left: 11, top: 24, bottom: 0, 
-                      width: '2px', 
-                      bgcolor: theme.palette.divider 
-                    }} />
-                  )}
-                  
-                  {/* Status Icon */}
-                  <Box sx={{ mr: 2, zIndex: 1, bgcolor: theme.palette.action.hover }}>
-                    {stage.stageStatus === 2 ? <SuccessIcon color="success" fontSize="small" /> : 
-                     stage.stageStatus === 3 ? <FailedIcon color="error" fontSize="small" /> : 
-                     <PendingIcon color="primary" fontSize="small" />}
-                  </Box>
-
-                  {/* Stage Label */}
-                  <Box sx={{ 
-                    flex: 1, 
-                    p: 1, 
-                    borderRadius: 1,
-                    bgcolor: activeStage?.stageId === stage.stageId ? theme.palette.primary.main : 'transparent',
-                    color: activeStage?.stageId === stage.stageId ? theme.palette.primary.contrastText : 'text.primary'
-                  }}>
-                    <Typography variant="body2" fontWeight={activeStage?.stageId === stage.stageId ? "700" : "400"}>
-                      {stage.stageId.replace(/_/g, ' ').toUpperCase()}
-                    </Typography>
-                    <Typography variant="caption" sx={{ 
-                      color: activeStage?.stageId === stage.stageId ? 'inherit' : 'text.secondary',
-                      opacity: 0.8
-                    }}>
-                      {stage.stageStatus === 2 ? "Completed" : stage.stageStatus === 3 ? "Failed" : "In Progress"}
-                    </Typography>
-                  </Box>
+          <Box sx={{ width: '40%', borderRight: `1px solid ${theme.palette.divider}`, overflowY: 'auto', p: 2, bgcolor: theme.palette.action.hover }}>
+            {selectedProcess?.stages?.map((stage, idx) => (
+              <Box key={idx} onClick={() => setActiveStage(stage)} sx={{ display: 'flex', position: 'relative', pb: 3, cursor: 'pointer' }}>
+                {idx !== selectedProcess.stages.length - 1 && <Box sx={{ position: 'absolute', left: 11, top: 24, bottom: 0, width: '2px', bgcolor: theme.palette.divider }} />}
+                <Box sx={{ mr: 2, zIndex: 1 }}>
+                  {stage.stageStatus === 2 ? <SuccessIcon color="success" fontSize="small" /> : stage.stageStatus === 3 ? <FailedIcon color="error" fontSize="small" /> : <PendingIcon color="primary" fontSize="small" />}
                 </Box>
-              ))}
-            </Stack>
-          </Box>
-
-          {/* RIGHT SIDE: SELECTED STAGE DETAILS */}
-          <Box sx={{ flex: 1, p: 3, overflowY: 'auto' }}>
-            {activeStage ? (
-              <Stack spacing={3}>
-                <Box display="flex" alignItems="center" gap={1}>
-                  <InfoIcon color="primary" />
-                  <Typography variant="subtitle1" fontWeight="bold">Stage Metrics</Typography>
+                <Box sx={{ 
+                  flex: 1, p: 1, borderRadius: 1, 
+                  bgcolor: activeStage?.stageId === stage.stageId ? theme.palette.primary.main : 'transparent', 
+                  color: activeStage?.stageId === stage.stageId ? theme.palette.primary.contrastText : 'inherit' 
+                }}>
+                  <Typography variant="body2" fontWeight="bold">{stage.stageId.replace(/_/g, ' ').toUpperCase()}</Typography>
+                  <Typography variant="caption">{stage.stageStatus === 2 ? "Completed" : stage.stageStatus === 3 ? "Failed" : "In Progress"}</Typography>
                 </Box>
-
-                <Divider />
-
-                <Box display="grid" gridTemplateColumns="1fr 1fr" gap={2}>
-                  <Box>
-                    <Typography variant="caption" color="text.secondary">Start Time</Typography>
-                    <Typography variant="body2">{new Date(activeStage.startTime).toLocaleString()}</Typography>
-                  </Box>
-                  <Box>
-                    <Typography variant="caption" color="text.secondary">End Time</Typography>
-                    <Typography variant="body2">
-                      {activeStage.endTime ? new Date(activeStage.endTime).toLocaleString() : 'In Progress'}
-                    </Typography>
-                  </Box>
-                  <Box>
-                    <Typography variant="caption" color="text.secondary">Triggered By</Typography>
-                    <Typography variant="body2">{activeStage.stageSource || 'System'}</Typography>
-                  </Box>
-                </Box>
-
-                <Paper variant="outlined" sx={{ p: 2, bgcolor: theme.palette.background.default }}>
-                  <Typography variant="caption" color="text.secondary" gutterBottom display="block">
-                    Execution Remarks
-                  </Typography>
-                  <Typography variant="body2">
-                    {activeStage.stageRemarks || "No specific remarks provided for this stage."}
-                  </Typography>
-                </Paper>
-              </Stack>
-            ) : (
-              <Box display="flex" justifyContent="center" alignItems="center" height="100%">
-                <Typography color="text.secondary">Select a stage to view execution data.</Typography>
               </Box>
+            ))}
+          </Box>
+          <Box sx={{ flex: 1, p: 3, overflowY: 'auto' }}>
+            {activeStage && (
+              <Stack spacing={2}>
+                <Typography variant="subtitle2" color="text.secondary">Start Time: {new Date(activeStage.startTime).toLocaleString()}</Typography>
+                <Typography variant="subtitle2" color="text.secondary">End Time: {activeStage.endTime ? new Date(activeStage.endTime).toLocaleString() : 'In Progress'}</Typography>
+                <Divider />
+                <Typography variant="body2"><strong>Remarks:</strong> {activeStage.stageRemarks || 'No remarks.'}</Typography>
+                <Typography variant="body2"><strong>Source:</strong> {activeStage.stageSource}</Typography>
+              </Stack>
             )}
           </Box>
         </DialogContent>
+      </Dialog>
+
+      {/* --- SUMMARY DIALOG --- */}
+      <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>
+          Circle Wise Summary (ID: {currentSelectedId})
+          <IconButton onClick={() => setSummaryOpen(false)} sx={{ position: 'absolute', right: 8, top: 8 }}><CloseIcon /></IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {summaryLoading ? <Box display="flex" justifyContent="center" py={5}><CircularProgress /></Box> : (
+            <>
+              <TableContainer component={Paper} sx={{ mb: 1 }}>
+                <Table size="small">
+                  <TableHead><TableRow><TableCell align="center"><strong>Circle Branch Code</strong></TableCell><TableCell align="center"><strong>Balance</strong></TableCell></TableRow></TableHead>
+                  <TableBody>
+                    {summaryData.slice(summaryPage * summaryRowsPerPage, summaryPage * summaryRowsPerPage + summaryRowsPerPage).map((row, idx) => (
+                      <TableRow key={idx}><TableCell align="center">{row.circleBranchCode}</TableCell><TableCell align="center" sx={{ fontWeight: 'bold' }}>{Number(row.totalProfitLoss).toLocaleString('en-IN', { minimumFractionDigits: 4, maximumFractionDigits: 4 })}</TableCell></TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <TablePagination component="div" count={summaryData.length} page={summaryPage} onPageChange={(e, p) => setSummaryPage(p)} rowsPerPage={summaryRowsPerPage} onRowsPerPageChange={(e) => setSummaryRowsPerPage(parseInt(e.target.value, 10))} rowsPerPageOptions={[5, 10]} />
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button variant="outlined" onClick={() => setSummaryOpen(false)}>Close</Button>
+          <Button variant="contained" disabled={summaryData.length === 0} onClick={() => { showSnackBar("Summary Verified and Submitted", "success"); setSummaryOpen(false); }}>Submit Summary</Button>
+        </DialogActions>
       </Dialog>
     </Box>
   );
