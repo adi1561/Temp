@@ -1,103 +1,12 @@
-To get the Total Amount and Total Record Count within your getOrGenerateLhoSummary call, you need to calculate these values during the aggregation loop and change your return type from a simple Map to a structured Response Object.
-As a Lead, I recommend creating a specific DTO for this summary response. This ensures your API remains predictable and easy for the frontend to consume.
-1. Create a Summary Response DTO
-This DTO will wrap your circle-wise data along with the metadata.
-package com.tcs.fincore.CommonMasterService.dto;
-
-import lombok.Builder;
-import lombok.Data;
-import java.math.BigDecimal;
-import java.util.Map;
-
-@Data
-@Builder
-public class LhoSummaryResponseDto {
-    private BigDecimal totalAmount;
-    private int totalRecordCount;
-    private Map<String, BigDecimal> circleWiseDetails;
-}
-
-2. Update the Service Logic
-You need to calculate the sum and the count while iterating through the aggregatedData.
-@Override
-@Transactional
-public Object getOrGenerateLhoSummary(Long id) {
-    log.info("Processing LHO Summary request for ID: {}", id);
-
-    // --- STEP 1: CHECK CACHE ---
-    Optional<LhoTransferSummary> cached = lhoSummaryRepository.findById(id);
-    if (cached.isPresent()) {
-        try {
-            // Updated to use the new DTO structure
-            return objectMapper.readValue(cached.get().getPayload(), LhoSummaryResponseDto.class);
-        } catch (Exception e) {
-            log.error("Error parsing cached summary JSON: {}", e.getMessage());
-            return cached.get().getPayload();
-        }
-    }
-
-    // --- STEP 2: AGGREGATE ---
-    List<Object[]> aggregatedData = plTransferRepository.getAggregatedSummary();
-    if (aggregatedData.isEmpty()) return Collections.emptyMap();
-
-    Map<String, BigDecimal> summaryMap = new HashMap<>();
-    BigDecimal totalAmount = BigDecimal.ZERO;
-
-    for (Object[] row : aggregatedData) {
-        String branchCode = String.valueOf(row[0]);
-        BigDecimal totalPL = (row[1] != null)
-                ? new BigDecimal(row[1].toString()).setScale(2, RoundingMode.HALF_UP)
-                : BigDecimal.ZERO.setScale(2, RoundingMode.HALF_UP);
-
-        summaryMap.put(branchCode, totalPL);
-        
-        // --- CALCULATION LOGIC ---
-        totalAmount = totalAmount.add(totalPL);
-    }
-
-    // --- STEP 3: CONSTRUCT THE RESPONSE ---
-    LhoSummaryResponseDto responseDto = LhoSummaryResponseDto.builder()
-            .totalAmount(totalAmount.setScale(2, RoundingMode.HALF_UP))
-            .totalRecordCount(summaryMap.size()) // Size of the map is the record count
-            .circleWiseDetails(summaryMap)
-            .build();
-
-    // --- STEP 4: PERSIST ---
-    try {
-        String jsonPayload = objectMapper.writeValueAsString(responseDto);
-        LhoTransferSummary summaryEntity = LhoTransferSummary.builder()
-                .id(id)
-                .payload(jsonPayload)
-                .build();
-
-        lhoSummaryRepository.save(summaryEntity);
-        return responseDto;
-    } catch (Exception e) {
-        log.error("Failed to serialize summary: {}", e.getMessage());
-        throw new RuntimeException("Error during LHO Summary persistence.");
-    }
-}
-
-3. The Resulting API Response
-Your JSON output will now look like this, providing exactly what the frontend needs for the header and the grid:
 {
     "success": true,
     "message": "Summary retrieved successfully",
     "data": {
-        "totalAmount": 111751155.20,
-        "totalRecordCount": 4,
-        "circleWiseDetails": {
-            "6939": -15379.20,
-            "4282": 15379.20,
-            "61263": -286440000.00,
-            "3978": 286440000.00
-        }
+        "totalAmount": null,
+        "totalRecordCount": 0,
+        "circleWiseDetails": null
     },
-    "timestamp": "2026-02-20T09:53:48.297382700Z"
+    "timestamp": "2026-02-20T10:08:46.954489700Z"
 }
 
-Why this is the correct solution:
- * Single Pass Calculation: You are calculating the total amount while you are already looping through the data for the map. This is O(n) efficiency.
- * Metadata at the Top: Putting totalAmount and totalRecordCount at the root of the data object allows the frontend to display them in a "Header" or "Summary" section without having to loop through the details themselves.
- * Persistence: The LHO_TRANSFER_SUMMARY table will now store the totals as well, meaning you don't have to re-calculate them on a cache hit.
-Would you like me to update the LhoTransferPayloadDto on the service side to accept this new LhoSummaryResponseDto structure directly? This would make your "Submit" logic much cleaner.
+this is what i am getting what u are doing be creafully do this 
