@@ -1,82 +1,68 @@
-To achieve the nested JSON structure you want on the backend, you are actually very close. The key is how you handle the payload field in your CommonReq entity and how you convert your DTO into that field.
-Since your CommonReq model uses a String payload with @JsonRawValue, you must manually serialize the LhoTransferPayloadDto into a JSON string before saving it.
-Here are the specific changes needed to make your backend handle the payload correctly.
-1. The Service Implementation
-This is where the "magic" happens. You need to use Jackson's ObjectMapper to convert your structured DTO into a String so it can be stored in the database, but appear as a nested object in your API.
-File: com.tcs.fincore.CommonRequestService.service.LhoTransferServiceImpl.java
-@Service
-@RequiredArgsConstructor
-public class LhoTransferServiceImpl implements LhoTransferService {
+As a Senior Lead, I see exactly where the bottleneck is. The "Search" API is likely using a standard JPA projection or a DTO that treats the PAYLOAD column as a simple String, which causes Jackson to escape it (adding those \" backslashes) when it serializes the final response.
+To fix the "Search" API so it returns a clean JSON object instead of a string, you need to ensure the Search DTO uses the @JsonRawValue annotation, just like your entity does.
+1. Update your Search Response DTO
+When your Search API fetches multiple records, it probably uses a DTO (like CommonRequestDto). You must ensure the payload field in this DTO is annotated to prevent string escaping.
+File: com.tcs.fincore.CommonRequestService.dto.CommonRequestDto.java
+package com.tcs.fincore.CommonRequestService.dto;
 
-    private final CommonReqRepository commonReqRepository;
-    private final ObjectMapper objectMapper; // Spring's default JSON mapper
+import com.fasterxml.jackson.annotation.JsonRawValue;
+import lombok.Data;
+import java.time.LocalDateTime;
 
-    @Override
-    @Transactional
-    public CommonReq createLhoTransferRequest(LhoTransferPayloadDto payloadDto, String userId, String token) 
-            throws JsonProcessingException {
-        
-        CommonReq request = new CommonReq();
-        
-        // 1. Set basic metadata
-        request.setReqType(RequestType.LHO_TRANSFER);
-        request.setChangeType(ChangeType.A); // Assuming 'A' for Addition/New
-        request.setReqStatus(RequestStatus.P); // 'P' for Pending
-        request.setCreatorId(userId);
-        request.setReqDate(LocalDateTime.now());
-        request.setTargetId(payloadDto.getBatchId());
+@Data
+public class CommonRequestDto {
+    private Long id;
+    private String reqType;
+    private String reqStatus;
+    private String creatorId;
+    private LocalDateTime reqDate;
 
-        // 2. CONVERSION LOGIC: Map DTO to JSON String
-        // This takes your Object and turns it into a String for the DB
-        String jsonString = objectMapper.writeValueAsString(payloadDto);
-        request.setPayload(jsonString);
-
-        return commonReqRepository.save(request);
-    }
-}
-
-2. The Entity Check
-Your entity is already set up well for the response side because of @JsonRawValue.
- * Saving: When you save, you save a String.
- * Response: When the REST API returns the CommonReq, @JsonRawValue tells Jackson: "Don't treat this string as text; treat it as actual JSON." One small fix for your Entity:
-   Ensure your getPayload() doesn't conflict with the field. It is better to annotate the field or the getter consistently.
-<!-- end list -->
-    @Lob
-    @Column(name = "PAYLOAD", nullable = false)
+    /**
+     * This is the fix! 
+     * Even if the data is a String in the database, 
+     * this tells the Search API to render it as a JSON Object.
+     */
+    @JsonRawValue
     private String payload;
 
-    // This ensures that when the API sends data to the Frontend, 
-    // it looks like a nested object, not a string with backslashes.
-    @JsonRawValue
-    public String getPayload() {
-        return payload;
-    }
-
-3. Verification of the JSON Output
-With the logic above, your API response will now look like the professional format you requested:
-{
-  "id": 2400,
-  "reqType": "LHO_TRANSFER",
-  "payload": {
-    "batchId": "BATCH-2026-001",
-    "processDate": "2026-02-18",
-    "totalAmount": 113000.50,
-    "circleWiseDetails": [
-      {
-        "transferDate": "2026-02-18",
-        "circleBranchCode": 101,
-        "totalProfitLoss": 50000.00
-      }
-    ]
-  }
+    private String targetId;
 }
 
-Why these changes work:
- * Strict DTO Mapping: By using LhoTransferPayloadDto in the service, you ensure the data is validated before it ever touches the database.
- * Raw Value Handling: @JsonRawValue is the most efficient way to handle JSON in a legacy String/CLOB column. It avoids "double-escaping" (those annoying \" quotes).
- * Precision: Since your DTO uses BigDecimal, Jackson will respect your 20-digit numbers and 4 decimal places during the writeValueAsString process.
-One Final Tip: Global Precision
-To make sure those BigDecimal values don't turn into scientific notation (1.1E8) when you save them as a string, add this to your application.properties:
-spring.jackson.serialization.write-bigdecimal-as-plain=true
+2. The Search Logic (Mapping)
+In your CommonRequestServiceImpl, when you map your CommonReq entity to the CommonRequestDto, the mapping is straightforward because both hold the payload as a String.
+public CommonRequestDto toDto(CommonReq entity) {
+    CommonRequestDto dto = new CommonRequestDto();
+    dto.setId(entity.getId());
+    dto.setReqType(entity.getReqType().name());
+    dto.setReqStatus(entity.getReqStatus().name());
+    dto.setCreatorId(entity.getCreatorId());
+    dto.setReqDate(entity.getReqDate());
+    
+    // Just pass the String; @JsonRawValue on the DTO 
+    // handles the "un-stringifying" for the API response.
+    dto.setPayload(entity.getPayload()); 
+    
+    dto.setTargetId(entity.getTargetId());
+    return dto;
+}
 
-Would you like me to show you how to write the Controller to accept this LhoTransferPayloadDto as a @RequestBody? This would complete the end-to-end flow.
+3. Why this solves the Fetching problem
+When Jackson (Spring's JSON engine) builds the final response for your /api/lho-transfers/search endpoint:
+ * Without @JsonRawValue: Jackson sees a String. It thinks: "I need to make sure this text is safe," so it adds quotes and escapes: "payload": "{\"batchId\":\"...\"}".
+ * With @JsonRawValue: Jackson sees the annotation and thinks: "I will just drop this text into the JSON stream exactly as it is." Because your database already contains valid JSON text, the output becomes a perfect nested object: "payload": { "batchId": "..." }.
+4. Implementation Check: The "Search" Method
+Ensure your search method in the service returns a Page or List of the updated DTO:
+@Override
+public PaginatedResponseDto<CommonRequestDto> searchLhoTransfers(SearchRequest request) {
+    Page<CommonReq> page = commonReqRepository.findAll(specs, pageable);
+    
+    List<CommonRequestDto> dtoList = page.getContent().stream()
+            .map(this::toDto) // Using the updated DTO with @JsonRawValue
+            .collect(Collectors.toList());
+            
+    return new PaginatedResponseDto<>(dtoList, page);
+}
+
+Pro-Tip for the Frontend Team
+Now that the Search API is fixed, the frontend team should not use JSON.parse(row.payload). They can now access the data directly: row.payload.batchId or row.payload.circleWiseDetails.
+Would you like me to help you verify the SearchRequest specification to ensure it is filtering by REQ_TYPE = 'LHO_TRANSFER' correctly?
