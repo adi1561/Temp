@@ -1,175 +1,58 @@
- @Override
-    public PaginatedResponseDto<CommonRequestDto> searchLhoTransfers(SearchRequest request) {
-        log.info("Searching Common Requests for REQ_TYPE: LHO_TRANSFER");
-
-        // Set up Pagination & Sorting
-        Sort.Direction direction = (request.getSortOrder() != null && request.getSortOrder().equalsIgnoreCase("DESC"))
-                ? Sort.Direction.DESC : Sort.Direction.ASC;
-        String sortField = (request.getSortField() != null) ? request.getSortField() : "requestDate";
-
-        PageRequest pageRequest = PageRequest.of(request.getPage(), request.getSize(), Sort.by(direction, sortField));
-
-        // Business Rule: Hard filter for LHO_TRANSFER
-        Specification<CommonRequest> lhoTypeSpec = (root, query, cb) ->
-                cb.equal(root.get("requestType"), "LHO_TRANSFER");
-
-        // Combine with dynamic UI filters using your GenericSpecification
-        Specification<CommonRequest> finalSpec = lhoTypeSpec.and(GenericSpecification.build(request.getFilters()));
-
-        Page<CommonRequest> page = commonRequestRepository.findAll(finalSpec, pageRequest);
-
-        if (page.isEmpty()) {
-            throw new NoDataFoundException("No LHO Transfer records found.");
-        }
-
-        List<CommonRequestDto> dtoList = page.getContent().stream()
-                .map(this::mapToRequestDto)
-                .toList();
-
-        return new PaginatedResponseDto<>(
-                page.getNumber(),
-                page.getTotalPages(),
-                page.getSize(),
-                page.getTotalElements(),
-                direction.name(),
-                dtoList
-        );
-    }
-
-    @Override
-    public CommonRequestDto getLhoTransferById(Long id) {
-        CommonRequest entity = commonRequestRepository.findById(id)
-                .orElseThrow(() -> new NoDataFoundException("Request " + id + " not found."));
-
-        // Enforce type check for security
-        if (!"LHO_TRANSFER".equalsIgnoreCase(entity.getRequestType())) {
-            throw new IllegalArgumentException("Access Denied: Record is not an LHO Transfer.");
-        }
-
-        return mapToRequestDto(entity);
-    }
-
-    /**
-     * Helper Mapper: Entity to DTO
-     */
-    private CommonRequestDto mapToRequestDto(CommonRequest entity) {
-        return CommonRequestDto.builder()
-                .id(entity.getId())
-                .requestType(entity.getRequestType())
-                .changeType(entity.getChangeType())
-                .status(entity.getStatus())
-                .requestDate(entity.getRequestDate())
-                .creatorId(entity.getCreatorId())
-                .creatorRemarks(entity.getCreatorRemarks())
-                .executionDate(entity.getExecutionDate())
-                .executionRemarks(entity.getExecutionRemarks())
-                .executorId(entity.getExecutorId())
-                .executorRemarks(entity.getExecutorRemarks())
-                .payload(entity.getPayload())
-                .targetId(entity.getTargetId())
-                .build();
-    }
-
-
-    package com.tcs.fincore.CommonMasterService.Controller;
-
-import com.tcs.fincore.CommonMasterService.dto.ApiResponse;
-import com.tcs.fincore.CommonMasterService.dto.CommonRequestDto;
-import com.tcs.fincore.CommonMasterService.dto.PaginatedResponseDto;
-import com.tcs.fincore.CommonMasterService.dto.SearchRequest;
-import com.tcs.fincore.CommonMasterService.service.CommonMasterService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-@Slf4j
-@RestController
-@RequestMapping("/api/lho-transfers")
-@RequiredArgsConstructor
-public class LhoTransferController {
-
-    private final CommonMasterService service;
-
-
-    @PostMapping("/search")
-    public ResponseEntity<ApiResponse<PaginatedResponseDto<CommonRequestDto>>> searchLhoTransfers(
-            @RequestBody SearchRequest request) {
-        log.info("Received request to search LHO Transfers");
-        PaginatedResponseDto<CommonRequestDto> response = service.searchLhoTransfers(request);
-        return ResponseEntity.ok(ApiResponse.success(response, "LHO Transfers fetched successfully"));
-    }
-
-    /**
-     * GET /api/lho-transfers/{id}
-     * Fetches details for a specific LHO Transfer.
-     */
-    @GetMapping("/{id}")
-    public ResponseEntity<ApiResponse<CommonRequestDto>> getLhoTransferById(@PathVariable Long id) {
-        log.info("Received request to fetch LHO Transfer ID: {}", id);
-        CommonRequestDto response = service.getLhoTransferById(id);
-        return ResponseEntity.ok(ApiResponse.success(response));
-    }
-
-    @GetMapping("/summary/{id}")
-    public ResponseEntity<ApiResponse<Object>> getSummary(@PathVariable Long id) {
-        log.info("API Request: Summary for ID {}", id);
-        Object data = service.getOrGenerateLhoSummary(id);
-        return ResponseEntity.ok(ApiResponse.success(data, "Summary retrieved successfully"));
-    }
+Everything looks solid, and you’ve correctly identified that @JsonRawValue in your CommonRequestDto is the key. However, for this to work seamlessly end-to-end, there are three specific areas where you might be running into issues.
+The main culprit is usually that the Entity (CommonRequest) and the DTO (CommonRequestDto) need to be perfectly aligned in how they handle the payload string.
+1. Update the Helper Mapper
+In your searchLhoTransfers implementation, the mapToRequestDto helper is responsible for moving the data. You need to ensure it pulls the payload correctly.
+File: CommonMasterServiceImpl.java (Inside the mapper method)
+private CommonRequestDto mapToRequestDto(CommonRequest entity) {
+    return CommonRequestDto.builder()
+            .id(entity.getId())
+            .requestType(entity.getRequestType())
+            .changeType(entity.getChangeType())
+            .status(entity.getStatus())
+            .requestDate(entity.getRequestDate())
+            .creatorId(entity.getCreatorId())
+            .creatorRemarks(entity.getCreatorRemarks())
+            .executionDate(entity.getExecutionDate())
+            .executionRemarks(entity.getExecutionRemarks())
+            .executorId(entity.getExecutorId())
+            .executorRemarks(entity.getExecutorRemarks())
+            // CRITICAL: Ensure this is the RAW JSON string from the DB
+            .payload(entity.getPayload()) 
+            .targetId(entity.getTargetId())
+            .build();
 }
 
+2. The Entity Getter Fix
+Even though you have @JsonRawValue on the DTO, if your Entity has a customized getPayload() that is doing anything weird (like extra escaping), it will break. Check your CommonRequest model.
+File: CommonRequest.java (The Entity)
+Ensure the getter is simple. If you have @JsonRawValue here too, it helps when debugging, but it's mandatory on the DTO.
+@Lob
+@Column(name = "PAYLOAD")
+private String payload;
 
-
-package com.tcs.fincore.CommonMasterService.dto;
-
-import com.fasterxml.jackson.annotation.JsonFormat;
-import com.fasterxml.jackson.annotation.JsonRawValue;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-import java.time.LocalDateTime;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class CommonRequestDto {
-    private Long id;
-    private String requestType;
-    private String changeType;
-    private String status;
-
-    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
-    private LocalDateTime requestDate;
-
-    private String creatorId;
-    private String creatorRemarks;
-
-    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
-    private LocalDateTime executionDate;
-
-    private String executionRemarks;
-    private String executorId;
-    private String executorRemarks;
-    @JsonRawValue
-    private String payload;
-    private String targetId;
+public String getPayload() {
+    return this.payload; // Should return exactly: {"batchId": "..."}
 }
 
-package com.tcs.fincore.CommonMasterService.repository;
+3. Verification of the Controller Response
+Your LhoTransferController returns ResponseEntity<ApiResponse<...>>. Ensure your ApiResponse wrapper isn't manually stringifying the data. Jackson should handle the whole object tree at once.
+Why it might still show as a String (Troubleshooting)
+If you still see backslashes in your API response after these changes, check these two things:
+ * Double Serialization: Are you accidentally saving the JSON into the database as a string twice? If the database value looks like "{\"key\": \"value\"}" (with literal quotes at the start and end), Jackson will still treat the inner part as text. The database value should start with { and end with }.
+ * DTO Import: Ensure your searchLhoTransfers is definitely using the CommonRequestDto from the package where you added @JsonRawValue.
+Final Check on your CommonRequestDto
+You have this correctly:
+@JsonRawValue
+private String payload;
 
-import com.tcs.fincore.CommonMasterService.model.CommonRequest;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
-import org.springframework.stereotype.Repository;
-
-@Repository
-public interface CommonRequestRepository extends JpaRepository<CommonRequest, Long>, JpaSpecificationExecutor<CommonRequest> {
-    // Standard CRUD and Specification methods are inherited
+This is 90% of the battle. When Spring sends this DTO through the MappingJackson2HttpMessageConverter, it sees @JsonRawValue and says: "I won't put quotes around this string. I'll just paste the text directly into the output."
+Resulting JSON:
+{
+  "id": 2386,
+  "payload": {
+     "batchId": "BATCH_2025_001",
+     "circleWiseDetails": [...]
+  }
 }
 
-
-All files data i am giving u all files tell where is the changes
-
+Would you like me to provide a SQL snippet to check exactly how the payload is stored in your Oracle/Postgres table? This will confirm if the data is "double-encoded" in the database. Conclude with a clear next step.
