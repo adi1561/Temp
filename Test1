@@ -1,105 +1,156 @@
-    @Override
+Got it. My apologies for the extra explanations. Here are the exact updated methods with the raw database errors hidden and the empty catch blocks fixed, ready to be copy-pasted.
+1. In JournalRequestServiceImpl.java
+Replace your existing executeAsyncBatchProcessing, executeAsyncBatchCancellation, getMyRequests, and getPendingRequests methods with these:
     @Async("bulkExecutor")
     @Transactional
-    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-        // --- MDC TRACING START ---
-        MDC.put("batchId", batchId);
-        MDC.put("user", creatorId);
-        MDC.put("action", "CREATE");
-
-        log.info("ASYNC CREATE: Starting Batch {} (Source: {})", batchId, requestId);
-
+    public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
+        String batchId = dto.getBatchId();
         long start = System.currentTimeMillis();
+
+        MDC.put("batchId", batchId);
+        MDC.put("user", executorId);
+        MDC.put("action", dto.getStatus().name());
+
         try {
-            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+            String creatorId = jdbcTemplate.queryForObject("SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
+            progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Processing on Database...");
 
-            // 1. Fetch from Redis
-            List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                log.info("Calling Oracle Procedure for Batch {}", batchId);
+                List<HdfsSyncDto> syncData = jdbcTemplate.execute(
+                        "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
+                        (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
+                            cs.setString(1, batchId);
+                            cs.setString(2, executorId);
+                            cs.setString(3, dto.getRemarks());
+                            cs.setString(4, "A");
+                            cs.registerOutParameter(5, -10); // Cursor
+                            cs.execute();
 
-            if (cachedRows == null || cachedRows.isEmpty()) {
-                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
-                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
-                return;
+                            List<HdfsSyncDto> list = new ArrayList<>();
+                            try (ResultSet rs = (ResultSet) cs.getObject(5)) {
+                                while (rs.next()) {
+                                    list.add(new HdfsSyncDto(
+                                            rs.getString("BRANCH"), rs.getString("CURRENCY"), rs.getString("CGL"),
+                                            rs.getDate("BAL_DATE").toLocalDate(),
+                                            rs.getBigDecimal("NEW_BALANCE"), rs.getBigDecimal("NEW_INR_BALANCE")
+                                    ));
+                                }
+                            }
+                            return list;
+                        }
+                );
+
+                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ACCEPTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
+                        executorId, dto.getRemarks(), batchId);
+
+                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
+                sendNotification(executorId, null, "You approved Batch " + batchId, batchId);
+                if (creatorId != null && !creatorId.equals(executorId)) {
+                    sendNotification(creatorId, null, "Your Batch " + batchId + " has been ACCEPTED.", batchId);
+                }
+
+                logAudit(executorId, "APPROVE_SUCCESS", "BATCH_ASYNC", "Approved Batch " + batchId);
+                log.info(" Batch {} Processed & ACCEPTED in {}ms", batchId, System.currentTimeMillis() - start);
+
+            } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+                jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
+                        executorId, dto.getRemarks(), batchId);
+                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
+                        executorId, dto.getRemarks(), batchId);
+                logAudit(executorId, "REJECT_OK", "BATCH_ASYNC", "Rejected Batch " + batchId);
+
+                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
+                sendNotification(executorId, null, "You rejected Batch " + batchId, batchId);
+                if (creatorId != null && !creatorId.equals(executorId)) {
+                    sendNotification(creatorId, null, "Your Batch " + batchId + " was REJECTED.", batchId);
+                }
+
+                log.info(" Batch {} Processed & REJECTED in {}ms", batchId, System.currentTimeMillis() - start);
             }
-
-            // 2. Prepare Parallel Execution
-            int totalRows = cachedRows.size();
-            // 5000 is optimal for Oracle JDBC batching (avoids packet fragmentation)
-            int batchSize = 5000;
-
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            LongAdder totalDebit = new LongAdder();
-            LongAdder totalCredit = new LongAdder();
-
-            AtomicInteger completedChunks = new AtomicInteger(0);
-            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
-
-            // 3. Submit Chunks
-            for (int i = 0; i < totalRows; i += batchSize) {
-                final int startIdx = i;
-                final int endIdx = Math.min(i + batchSize, totalRows);
-                final List<ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
-
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
-                        .thenRun(() -> {
-                            // Update Progress
-                            int done = completedChunks.incrementAndGet();
-                            int percent = 5 + (done * 90 / totalChunks); // Map 5% -> 95%
-                           
-                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                                    String.format("Created %d/%d records...", (done * batchSize), totalRows));
-                        });
-                futures.add(future);
-            }
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-
-            // 5. Insert Master Record
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
-                    BigDecimal.valueOf(totalDebit.sum()), BigDecimal.valueOf(totalCredit.sum()), "PENDING");
-
-            // 6. Clean & Log
-            redisTemplate.delete("DATA_" + requestId);
-            redisTemplate.delete("LOCK_REQ_" + requestId);
-            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Created Batch " + batchId);
-
-            // --- FINAL NOTIFICATIONS ---
-            // 1. Progress Bar Complete
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-            // 2. Persistent Notification to CREATOR (Success)
-            sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
-
-            // 3. Persistent Notification to EXECUTORS (Action Required)
-            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-            if (config != null) {
-                String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
-                sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
-            }
-
-            log.info(" Batch {} Created. Rows: {}. Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
-
         } catch (Exception e) {
-            // Log the REAL error to the server console so developers can debug it
-            log.error("Async Create Failed for Batch {}", batchId, e);
-            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Failed to create batch: System Error");
-            redisTemplate.delete("LOCK_REQ_" + requestId);
+            log.error("Async Process Failed for Batch {}", batchId, e);
+            String safeMsg = "System Error: Failed to process batch safely. Please try again.";
             
-            // 1. Delete partial child rows so they don't take up space
-            cleanupFailedBatch(batchId);
-            
-            // 2. Clean, custom error message for the UI
-            String customUiMessage = "Failed to create the batch due to a system error. Please try again.";
-            
-            // 3. Update the Master record to ERROR so it shows on UI with the custom message
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", 
-                                customUiMessage, batchId);
-                                
-            // 4. Send failure progress to UI
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", customUiMessage);
-            
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", safeMsg, batchId);
+            logAudit(executorId, "PROCESS_FAIL", "BATCH_ASYNC", "System Error processing batch");
+            progressService.sendProgress(batchId, executorId, 0, "FAILED", safeMsg);
         } finally {
             MDC.clear();
         }
     }
+
+    @Override
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCancellation(String batchId, String userId) {
+        long start = System.currentTimeMillis();
+        MDC.put("batchId", batchId);
+        MDC.put("user", userId);
+        MDC.put("action", "DELETE");
+
+        try {
+            progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Data...");
+            log.info("Calling PURGE_JOURNAL_BATCH for {}", batchId);
+
+            jdbcTemplate.execute(
+                    "{call PURGE_JOURNAL_BATCH(?, ?)}",
+                    (CallableStatementCallback<Object>) cs -> {
+                        cs.setString(1, batchId);
+                        cs.setString(2, userId);
+                        cs.execute();
+                        return null;
+                    }
+            );
+
+            logAudit(userId, "CANCEL_SUCCESS", "BATCH_ASYNC", "Deleted " + batchId);
+
+            progressService.sendProgress(batchId, userId, 100, "COMPLETED", "Batch Deleted");
+            sendNotification(userId, null, "Batch " + batchId + " deleted successfully.", batchId);
+            log.info(" Batch {} DELETED in {}ms", batchId, System.currentTimeMillis() - start);
+
+        } catch (Exception e) {
+            log.error("Delete Failed for Batch {}", batchId, e);
+            String safeMsg = "Delete Failed: A system timeout or error occurred.";
+            
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", safeMsg, batchId);
+            progressService.sendProgress(batchId, userId, 0, "FAILED", safeMsg);
+        } finally {
+            MDC.clear();
+        }
+    }
+
+    @Override
+    public List<JournalRequest> getMyRequests(String u) {
+        throw new UnsupportedOperationException("This method is deprecated due to bulk size limits. Use paginated endpoints instead.");
+    }
+
+    @Override
+    public List<JournalRequest> getPendingRequests(String u, Integer r) {
+        throw new UnsupportedOperationException("This method is deprecated due to bulk size limits. Use paginated endpoints instead.");
+    }
+
+2. In JournalBulkValidationService.java
+Replace the completeRequest method to add logging to the silent catch block:
+    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv) throws IOException {
+        saveRowsToRedis(reqId, rows);
+        
+        if (!isCsv) {
+            byte[] csv = generateSuccessCsv(rows, pDate);
+            redisTemplate.opsForValue().set("FILE_" + reqId + "_SUCCESS", csv, 30, TimeUnit.MINUTES);
+        }
+        
+        List<Map<String, Object>> preview = rows.stream().limit(2000).map(this::mapToPreview).collect(Collectors.toList());
+        
+        updateState(reqId, s -> {
+            s.setCurrentStage(4);
+            s.setStatus("SUCCESS");
+            s.setMessage("Validation Successful");
+            s.setHasSuccessFile(!isCsv);
+            try {
+                s.setPreviewDataJson(objectMapper.writeValueAsString(preview));
+            } catch (Exception e) {
+                log.error("Failed to serialize preview JSON for UI [ReqID: {}]", reqId, e);
+            }
+        });
+    }
+
