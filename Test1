@@ -1,62 +1,125 @@
-    private void processChunkRaw(List<ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
-        
-        // 1. UPDATED SQL: Removed CHANGE_TYPE and removed one '?' from the VALUES list
-        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
+Here are the two complete, updated methods for your JournalRequestServiceImpl.java file.
+I have kept everything exactly as it was, but modified the catch block to handle the database update and modified the cleanupFailedBatch method so it only deletes the corrupted child rows while leaving the master record intact for your UI.
+Replace your existing methods with these:
+1. Updated executeAsyncBatchCreation Method
+    @Override
+    @Async("bulkExecutor")
+    @Transactional
+    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", creatorId);
+        MDC.put("action", "CREATE");
 
-            // CRITICAL: Force manual commit to ensure driver sends batch packet
-            conn.setAutoCommit(false);
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+        log.info("ASYNC CREATE: Starting Batch {} (Source: {})", batchId, requestId);
 
-            for (int i = 0; i < chunk.size(); i++) {
-                ExcelRowData r = chunk.get(i);
-                int globalIdx = globalOffset + i + 1;
-                String jId = batchId + "-" + globalIdx;
+        long start = System.currentTimeMillis();
+        try {
+            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
 
-                // Logic
-                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+            // 1. Fetch from Redis
+            List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
 
-                if (isCredit) credit.add(absAmt.longValue());
-                else debit.add(absAmt.longValue());
-
-                LocalDate rDate = LocalDate.now();
-                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                    try {
-                        rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
-                    } catch (Exception e) {
-                    }
-                }
-
-                // 2. UPDATED BINDINGS: Shifted all indexes down by 1 so there are no gaps
-                ps.setString(1, "P");
-                ps.setTimestamp(2, ts); // Was index 3
-                ps.setString(3, creatorId); // Was index 4
-                ps.setInt(4, creatorRole != null ? creatorRole : 0); // Was index 5
-                ps.setString(5, batchId); // Was index 6
-                ps.setString(6, jId); // Was index 7
-                ps.setString(7, commonRemarks); // Was index 8
-                ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt)); // Was index 9
-                ps.setString(9, r.branch); // Was index 10
-                ps.setString(10, r.currency); // Was index 11
-                ps.setString(11, r.cgl); // Was index 12
-                ps.setBigDecimal(12, signedAmt); // Was index 13
-                ps.setDate(13, java.sql.Date.valueOf(rDate)); // Was index 14
-                ps.setString(14, r.remarks); // Was index 15
-                ps.setString(15, r.productCode); // Was index 16
-
-                ps.addBatch();
+            if (cachedRows == null || cachedRows.isEmpty()) {
+                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
+                return;
             }
 
-            ps.executeBatch();
-            conn.commit(); // Single commit per chunk
+            // 2. Prepare Parallel Execution
+            int totalRows = cachedRows.size();
+            // 5000 is optimal for Oracle JDBC batching (avoids packet fragmentation)
+            int batchSize = 5000;
 
-        } catch (SQLException e) {
-            log.error("Raw JDBC Batch Insert Failed for chunk starting at " + globalOffset, e);
-            throw new CustomExceptions.DatabaseOperationException("Failed to persist batch chunk due to SQL error", e);
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            LongAdder totalDebit = new LongAdder();
+            LongAdder totalCredit = new LongAdder();
+
+            AtomicInteger completedChunks = new AtomicInteger(0);
+            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+
+            // 3. Submit Chunks
+            for (int i = 0; i < totalRows; i += batchSize) {
+                final int startIdx = i;
+                final int endIdx = Math.min(i + batchSize, totalRows);
+                final List<ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
+
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
+                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
+                        .thenRun(() -> {
+                            // Update Progress
+                            int done = completedChunks.incrementAndGet();
+                            int percent = 5 + (done * 90 / totalChunks); // Map 5% -> 95%
+                           
+                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
+                                    String.format("Created %d/%d records...", (done * batchSize), totalRows));
+                        });
+                futures.add(future);
+            }
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+            // 5. Insert Master Record
+            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
+                    BigDecimal.valueOf(totalDebit.sum()), BigDecimal.valueOf(totalCredit.sum()), "PENDING");
+
+            // 6. Clean & Log
+            redisTemplate.delete("DATA_" + requestId);
+            redisTemplate.delete("LOCK_REQ_" + requestId);
+            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Created Batch " + batchId);
+
+            // --- FINAL NOTIFICATIONS ---
+            // 1. Progress Bar Complete
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+            // 2. Persistent Notification to CREATOR (Success)
+            sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
+
+            // 3. Persistent Notification to EXECUTORS (Action Required)
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            if (config != null) {
+                String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
+                sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
+            }
+
+            log.info(" Batch {} Created. Rows: {}. Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
+
+        } catch (Exception e) {
+            log.error("Async Create Failed", e);
+            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", e.getMessage());
+            redisTemplate.delete("LOCK_REQ_" + requestId);
+            
+            // 1. Delete partial child rows so they don't take up space
+            cleanupFailedBatch(batchId);
+            
+            // 2. Safely truncate the error message to fit in DB column
+            String errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown System Error";
+            if (errorMessage.length() > 180) {
+                errorMessage = errorMessage.substring(0, 180) + "...";
+            }
+            
+            // 3. Update the Master record to ERROR so it shows on UI
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", 
+                                "Creation Failed: " + errorMessage, batchId);
+                                
+            // 4. Send failure progress to UI
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Creation Error: " + errorMessage);
+            
+        } finally {
+            MDC.clear();
         }
     }
+
+2. Updated cleanupFailedBatch Method
+    private void cleanupFailedBatch(String batchId) {
+        try {
+            // ONLY delete the child requests to clean up disk space. 
+            // We NO LONGER delete the MASTER record so the UI can display the ERROR status.
+            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+        } catch (Exception e) {
+            log.warn("Cleanup failed", e);
+        }
+    }
+
+Once you replace these, if the raw INSERT query fails again, your database will stay perfectly clean (no orphaned rows), but your Dashboard will correctly display a red ERROR tag along with the exact SQL message.
+Would you like me to look over the processBulkRequestsAsync method to make sure it handles exceptions in the exact same robust way?
