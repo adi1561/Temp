@@ -1,21 +1,22 @@
-Got it. My apologies for the extra explanations. Here are the exact updated methods with the raw database errors hidden and the empty catch blocks fixed, ready to be copy-pasted.
-1. In JournalRequestServiceImpl.java
-Replace your existing executeAsyncBatchProcessing, executeAsyncBatchCancellation, getMyRequests, and getPendingRequests methods with these:
     @Async("bulkExecutor")
     @Transactional
     public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
         String batchId = dto.getBatchId();
         long start = System.currentTimeMillis();
 
+        // --- MDC TRACING START ---
         MDC.put("batchId", batchId);
         MDC.put("user", executorId);
         MDC.put("action", dto.getStatus().name());
 
         try {
+            // Fetch Creator ID to notify them later
             String creatorId = jdbcTemplate.queryForObject("SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
             progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Processing on Database...");
 
             if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+
+                // 1. Call Oracle PL/SQL (Parallel Mode)
                 log.info("Calling Oracle Procedure for Batch {}", batchId);
                 List<HdfsSyncDto> syncData = jdbcTemplate.execute(
                         "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
@@ -41,11 +42,27 @@ Replace your existing executeAsyncBatchProcessing, executeAsyncBatchCancellation
                         }
                 );
 
+                // 2. Update Summary Table
                 jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ACCEPTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
                         executorId, dto.getRemarks(), batchId);
 
+                // 3. Sync HDFS (With Retry Queue Safety)
+                // try {
+                //     hdfsSyncService.syncToDataLake(syncData);
+                // } catch (Exception e) {
+                //     log.error("HDFS Sync Failed for Batch {}. Queuing for Retry.", batchId, e);
+                //     // Insert into Retry Queue for Recovery Service
+                //     jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
+                // }
+
+                // --- NOTIFICATIONS ---
+                // 1. Progress Done (Executor)
                 progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
+
+                // 2. Persistent Notification to EXECUTOR (Task Done)
                 sendNotification(executorId, null, "You approved Batch " + batchId, batchId);
+
+                // 3. Persistent Notification to CREATOR (Outcome)
                 if (creatorId != null && !creatorId.equals(executorId)) {
                     sendNotification(creatorId, null, "Your Batch " + batchId + " has been ACCEPTED.", batchId);
                 }
@@ -54,13 +71,19 @@ Replace your existing executeAsyncBatchProcessing, executeAsyncBatchCancellation
                 log.info(" Batch {} Processed & ACCEPTED in {}ms", batchId, System.currentTimeMillis() - start);
 
             } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+                // Reject Rows
                 jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
                         executorId, dto.getRemarks(), batchId);
+
+                // Reject Summary
                 jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
                         executorId, dto.getRemarks(), batchId);
+
                 logAudit(executorId, "REJECT_OK", "BATCH_ASYNC", "Rejected Batch " + batchId);
 
+                // --- NOTIFICATIONS ---
                 progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
+
                 sendNotification(executorId, null, "You rejected Batch " + batchId, batchId);
                 if (creatorId != null && !creatorId.equals(executorId)) {
                     sendNotification(creatorId, null, "Your Batch " + batchId + " was REJECTED.", batchId);
@@ -79,78 +102,3 @@ Replace your existing executeAsyncBatchProcessing, executeAsyncBatchCancellation
             MDC.clear();
         }
     }
-
-    @Override
-    @Async("bulkExecutor")
-    public void executeAsyncBatchCancellation(String batchId, String userId) {
-        long start = System.currentTimeMillis();
-        MDC.put("batchId", batchId);
-        MDC.put("user", userId);
-        MDC.put("action", "DELETE");
-
-        try {
-            progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Data...");
-            log.info("Calling PURGE_JOURNAL_BATCH for {}", batchId);
-
-            jdbcTemplate.execute(
-                    "{call PURGE_JOURNAL_BATCH(?, ?)}",
-                    (CallableStatementCallback<Object>) cs -> {
-                        cs.setString(1, batchId);
-                        cs.setString(2, userId);
-                        cs.execute();
-                        return null;
-                    }
-            );
-
-            logAudit(userId, "CANCEL_SUCCESS", "BATCH_ASYNC", "Deleted " + batchId);
-
-            progressService.sendProgress(batchId, userId, 100, "COMPLETED", "Batch Deleted");
-            sendNotification(userId, null, "Batch " + batchId + " deleted successfully.", batchId);
-            log.info(" Batch {} DELETED in {}ms", batchId, System.currentTimeMillis() - start);
-
-        } catch (Exception e) {
-            log.error("Delete Failed for Batch {}", batchId, e);
-            String safeMsg = "Delete Failed: A system timeout or error occurred.";
-            
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", safeMsg, batchId);
-            progressService.sendProgress(batchId, userId, 0, "FAILED", safeMsg);
-        } finally {
-            MDC.clear();
-        }
-    }
-
-    @Override
-    public List<JournalRequest> getMyRequests(String u) {
-        throw new UnsupportedOperationException("This method is deprecated due to bulk size limits. Use paginated endpoints instead.");
-    }
-
-    @Override
-    public List<JournalRequest> getPendingRequests(String u, Integer r) {
-        throw new UnsupportedOperationException("This method is deprecated due to bulk size limits. Use paginated endpoints instead.");
-    }
-
-2. In JournalBulkValidationService.java
-Replace the completeRequest method to add logging to the silent catch block:
-    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv) throws IOException {
-        saveRowsToRedis(reqId, rows);
-        
-        if (!isCsv) {
-            byte[] csv = generateSuccessCsv(rows, pDate);
-            redisTemplate.opsForValue().set("FILE_" + reqId + "_SUCCESS", csv, 30, TimeUnit.MINUTES);
-        }
-        
-        List<Map<String, Object>> preview = rows.stream().limit(2000).map(this::mapToPreview).collect(Collectors.toList());
-        
-        updateState(reqId, s -> {
-            s.setCurrentStage(4);
-            s.setStatus("SUCCESS");
-            s.setMessage("Validation Successful");
-            s.setHasSuccessFile(!isCsv);
-            try {
-                s.setPreviewDataJson(objectMapper.writeValueAsString(preview));
-            } catch (Exception e) {
-                log.error("Failed to serialize preview JSON for UI [ReqID: {}]", reqId, e);
-            }
-        });
-    }
-
