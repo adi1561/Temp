@@ -1,724 +1,350 @@
-import React, { useState, useEffect, useCallback } from "react";
-import {
-  Box,
-  Typography,
-  Grid,
-  TextField,
-  Button,
-  Paper,
-  IconButton,
-  MenuItem,
-  CircularProgress,
-  Autocomplete,
-  Tooltip,
-  Checkbox,
-  FormControlLabel,
-  Chip // Added Chip for Memo UI
-} from "@mui/material";
-import AddIcon from "@mui/icons-material/Add";
-import DeleteIcon from "@mui/icons-material/Delete";
-import { debounce } from "lodash";
 
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Box, Button, Typography, CircularProgress, Table, TableBody,
+  TableCell, TableContainer, TableHead, TableRow, Paper,
+  TablePagination, Dialog, DialogTitle, DialogContent, IconButton,
+  Tooltip, DialogActions, Chip, Divider, Stack, useTheme, Grid
+} from "@mui/material";
+import {
+  PlayArrow as PlayArrowIcon,
+  Close as CloseIcon,
+  Assessment as SummaryIcon,
+  Replay as RetryIcon,
+  Visibility as ViewIcon,
+  CheckCircle as SuccessIcon,
+  Error as FailedIcon,
+  Schedule as PendingIcon
+} from "@mui/icons-material";
 import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-const initialRowState = {
-  id: Date.now(),
-  branch: null,
-  currency: "",
-  cgl: null,
-  amount: "",
-  txnType: "",
-  remarks: "",
-  productCode: "",
-};
+// --- API Constants ---
+const TRIGGER_API_URL = "/PS/airflow/trigger";
+const INITIAL_DATA_URL = "/PS/process/processes/data/7";
+const SUMMARY_BASE_URL = "/CM/lho-transfers/summary/";
+const CREATE_REQUEST_URL = "/CR/create-request";
 
-const formatBigIntForDisplay = (val) => {
-  if (typeof val !== "bigint") {
-    val = BigInt(val || 0);
-  }
-  const str = val.toString().padStart(5, "0");
-  const integer = str.slice(0, -4);
-  const fractional = str.slice(-4);
-  return `${integer || "0"}.${fractional}`;
-};
-
-export default function JournalPosting() {
+export default function TransferDataLho() {
+  const theme = useTheme();
   const { callApi } = useApi();
   const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
 
-  const [rows, setRows] = useState([initialRowState]);
-  const [currencyOptions, setCurrencyOptions] = useState([]);
+  // Table & Loading States
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [tableData, setTableData] = useState([]);
+  const [totalElements, setTotalElements] = useState(0);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
 
+  // Summary & Submission States
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [summaryData, setSummaryData] = useState([]);
+  const [summaryTotals, setSummaryTotals] = useState({ totalAmount: 0, totalRecordCount: 0 });
+  const [summaryLoading, setSummaryLoading] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [summaryPage, setSummaryPage] = useState(0);
+  const [summaryRowsPerPage, setSummaryRowsPerPage] = useState(5);
 
-  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
-  const [postingDate, setPostingDate] = useState("");
+  // --- CAPTURED ROW CONTEXT (From Get API) ---
+  const [rowContext, setRowContext] = useState({ processRunId: null, processId: null });
+  const [currentSelectedId, setCurrentSelectedId] = useState(null);
 
-  // Checkbox
-  const [checked, setChecked] = useState(false);
+  // Stages Dialog States
+  const [stagesOpen, setStagesOpen] = useState(false);
+  const [selectedProcess, setSelectedProcess] = useState(null);
+  const [activeStage, setActiveStage] = useState(null);
 
-  // FIX: Track loading by row.id instead of a single boolean
-  const [branchSearch, setBranchSearch] = useState({
-    loadingId: null,
-    options: [],
-  });
-  const [cglSearch, setCglSearch] = useState({ 
-    loadingId: null, 
-    options: [] 
-  });
+  /**
+   * HELPERS
+   */
+  const generateBatchId = (sequence) => {
+    const pad = "000000";
+    const str = String(sequence || 0);
+    return "LHO_" + pad.substring(0, pad.length - str.length) + str;
+  };
+
+  const getTodayFormatted = () => {
+    return new Date().toISOString().split('T')[0]; 
+  };
+
+  /**
+   * DATA FETCHING
+   */
+  const fetchInitialData = async () => {
+    setIsInitialLoading(true);
+    try {
+      const paginatedUrl = `${INITIAL_DATA_URL}`;
+      const response = await callApi(paginatedUrl, null, "GET");
+      if (isMounted.current && response) {
+        setTableData(response.initialData.map(item => ({ ...item, isLatest: true, runVersion: item.runId || 1 })));
+        setTotalElements(response.totalElements || 0);
+      }
+    } catch (error) {
+      showSnackBar("Failed to load process data", "error");
+    } finally {
+      if (isMounted.current) setIsInitialLoading(false);
+    }
+  };
 
   useEffect(() => {
-    const fetchInitialData = async () => {
-      try {
-        const dateResponse = await callApi(
-          "/JS/journals/current-posting-date",
-          null,
-          "GET"
-        );
-
-        if (dateResponse) {
-          try {
-            const [year, month, day] = dateResponse.split("-");
-            const formattedDate = `${day}-${month}-${year}`;
-            setPostingDate(formattedDate);
-          } catch (e) { 
-            console.error("Could not parse date:", dateResponse, e);
-            setPostingDate(dateResponse);
-          }
-        } else {
-          showSnackBar("Failed to load official posting date.", "error");
-          setPostingDate("Error");
-        }
-
-        const currencyResponse = await callApi("/CM/common-master/currency", null, "GET");
-        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
-          const uniqueCurrencies = [...new Set(currencyResponse.data)];
-          setCurrencyOptions(uniqueCurrencies);
-        } else {
-          showSnackBar("Failed to load currencies.", "error");
-        }
-      } catch (error) {
-        console.error("Error fetching initial data:", error);
-        showSnackBar("An error occurred while loading page data.", "error");
-      }
-    };
-
+    isMounted.current = true;
     fetchInitialData();
-  }, [callApi, showSnackBar]);
+    return () => { isMounted.current = false; };
+  }, [page, rowsPerPage]);
 
-  const handleAddRow = () => {
-    const lastRow = rows[rows.length - 1];
-
-    if (
-      !lastRow.branch ||
-      !lastRow.currency ||
-      !lastRow.cgl ||
-      !lastRow.amount ||
-      !lastRow.txnType
-    ) {
-      showSnackBar(
-        "Please fill all required fields (*) in the current row before adding a new one.",
-        "warning"
-      );
-      return;
-    }
-
-    const newRow = {
-      ...initialRowState,
-      id: Date.now(),
-      remarks: checked ? commonBatchRemarks : "",
-    };
-    setRows([...rows, newRow]);
-  };
-  
-  const handleChange = (event) => {
-    const isChecked = event.target.checked;
-    setChecked(isChecked);
-
-    if (isChecked) {
-      const newRows = rows.map((row) => ({
-        ...row,
-        remarks: commonBatchRemarks,
-      }));
-      setRows(newRows);
-    } else {
-      const newRows = rows.map((row) => ({
-        ...row,
-        remarks: "",
-      }));
-      setRows(newRows);
+  const handleTransferLho = async () => {
+    setIsTransferring(true);
+    const payload = { dagId: "cbs_wrap_dag", processId: 7, remarks: "testing 1" };
+    try {
+      await callApi(TRIGGER_API_URL, payload, "POST");
+      showSnackBar("LHO Transfer triggered successfully", "success");
+      fetchInitialData();
+    } catch (error) {
+      showSnackBar("Failed to trigger LHO Transfer", "error");
+    } finally {
+      setIsTransferring(false);
     }
   };
 
-  const handleDeleteRow = (id) => {
-    if (rows.length > 1) {
-      setRows(rows.filter((row) => row.id !== id));
-    } else {
-      showSnackBar("Cannot delete the first row.", "warning");
-    }
-  };
-
-  const handleRowChange = (id, field, value) => {
-    const newRows = rows.map((row) => {
-      if (row.id === id) {
-        return { ...row, [field]: value };
-      }
-      return row;
-    });
-    setRows(newRows);
-  };
-
-  // FIX: Pass rowId to explicitly map the loading spinner
-  const searchBranches = useCallback(
-    debounce(async (query, rowId) => {
-      if (!query) {
-        setBranchSearch({ loadingId: null, options: [] });
-        return;
-      }
-      setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
-      try {
-        const response = await callApi(
-          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
-          null,
-          "GET"
-        );
-
-        setBranchSearch({ loadingId: null, options: response || [] });
-      } catch (error) {
-        showSnackBar("Branch search failed.", "error");
-        setBranchSearch({ loadingId: null, options: [] });
-      }
-    }, 300),
-    [callApi, showSnackBar]
-  );
-
-  // FIX: Pass rowId to explicitly map the loading spinner
-  const searchCgls = useCallback(
-    debounce(async (query, rowId) => {
-      if (!query) {
-        setCglSearch({ loadingId: null, options: [] });
-        return;
-      }
-      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
-      try { 
-        const response = await callApi(
-          `/JS/cgl-journal/search?query=${encodeURIComponent(query)}`,
-          null,
-          "GET"
-        );
-
-        setCglSearch({ loadingId: null, options: response || [] });
-      } catch (error) {
-        showSnackBar("CGL search failed.", "error");
-        setCglSearch({ loadingId: null, options: [] });
-      }
-    }, 300),
-    [callApi, showSnackBar]
-  );
-
-  const handleSubmit = async () => {
+  /**
+   * CREATE REQUEST SUBMISSION
+   * Explicitly includes processRunId and processId inside the payload
+   */
+  const handleSubmitLhoRequest = async () => {
     setIsSubmitting(true);
-
-    if (!commonBatchRemarks.trim()) {
-      showSnackBar(
-        "Please enter Common Batch Remarks before submitting.",
-        "error"
-      );
-      setIsSubmitting(false);
-      return;
-    }
-
-    const cglCheck = new Map();
-    for (const row of rows) {
-      if (!row.branch || !row.currency || !row.cgl) {
-        continue;
+    
+    const finalRequestPayload = {
+      requestType: "LHO_TRANSFER",
+      changeType: "ADD",
+      targetId: null, 
+      payload: {
+        // Correctly Mapping Dynamic IDs from Row Context
+        processRunId: rowContext.processRunId,
+        processId: rowContext.processId,
+        
+        batchId: generateBatchId(rowContext.processRunId),
+        processDate: getTodayFormatted(),
+        totalAmount: summaryTotals.totalAmount,
+        totalRecordCount: summaryTotals.totalRecordCount,
+        circleWiseDetails: summaryData.map(item => ({
+          transferDate: getTodayFormatted(),
+          circleBranchCode: Number(item.circleBranchCode),
+          totalProfitLoss: Number(item.totalProfitLoss)
+        }))
       }
-      const key = `${row.branch.code}-${row.currency}`;
-      const cgl = row.cgl.cglNumber;
-
-      if (!cglCheck.has(key)) {
-        cglCheck.set(key, new Set());
-      }
-
-      const cglSet = cglCheck.get(key);
-      if (cglSet.has(cgl)) {
-        showSnackBar(
-          `Duplicate CGL entry: "${cgl}" is used more than once for branch "${row.branch.name}" and currency "${row.currency}".`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
-      }
-      cglSet.add(cgl);
-    }
-
-    // --- MEMO LOGIC UPDATE START ---
-    const branchCurrencyTotals = new Map();
-    const branchEntryCheck = new Map();
-    const rowPayloads = [];
-
-    for (const [index, row] of rows.entries()) {
-      if (
-        !row.branch ||
-        !row.currency ||
-        !row.cgl ||
-        !row.amount ||
-        !row.txnType
-      ) {
-        showSnackBar(
-          `Row ${index + 1} is incomplete. Please fill all required fields.`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
-      }
-
-      const branchCode = row.branch.code;
-      const branchName = row.branch.name;
-      const currency = row.currency;
-
-      // Identify Memo vs Normal
-      const cglNumber = String(row.cgl.cglNumber);
-      const isMemo = cglNumber.startsWith("5");
-      const type = isMemo ? "MEMO" : "NORMAL";
-
-      const [integerPart = "0", fractionalPart = "0"] = (
-        row.amount || "0"
-      ).split(".");
-      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
-      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
-
-      // Composite key now includes Type (Memo/Normal)
-      const compositeKey = `${branchCode}-${currency}-${type}`;
-
-      if (!branchCurrencyTotals.has(compositeKey)) {
-        branchCurrencyTotals.set(compositeKey, {
-          totalDebit: 0n,
-          totalCredit: 0n,
-          branchName: branchName,
-          branchCode: branchCode,
-          currency: currency,
-          type: type, // Store type for validation message
-        });
-      }
-      const currencyTotals = branchCurrencyTotals.get(compositeKey);
-
-      if (row.txnType === "Debit") {
-        currencyTotals.totalDebit += amountAsBigInt;
-      } else if (row.txnType === "Credit") {
-        currencyTotals.totalCredit += amountAsBigInt;
-      }
-
-      if (!branchEntryCheck.has(branchCode)) {
-        branchEntryCheck.set(branchCode, {
-          hasDebit: false,
-          hasCredit: false,
-          branchName: branchName,
-        });
-      }
-      const branchCheck = branchEntryCheck.get(branchCode);
-
-      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
-        branchCheck.hasDebit = true;
-      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
-        branchCheck.hasCredit = true;
-      }
-
-      const finalAmount =
-        row.txnType === "Credit" ? "-" + row.amount : row.amount;
-
-      // FIX: Removed changeType: "ADD"
-      rowPayloads.push({
-        branch: row.branch.code,
-        currency: row.currency,
-        cgl: row.cgl.cglNumber,
-        amount: finalAmount,
-        productType: row.productCode,
-        remarks: row.remarks,
-        arFlag: "A",
-      });
-    }
-
-    for (const [branchCode, totals] of branchEntryCheck.entries()) {
-      const { hasDebit, hasCredit, branchName } = totals;
-      if (!hasDebit || !hasCredit) {
-        showSnackBar(
-          `Submission failed. Branch "${branchName}" (${branchCode}) must have at least one Debit and one Credit entry.`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
-      }
-    }
-
-    // Validate Totals (Bucket-wise: Branch + Currency + Type)
-    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
-      const { totalDebit, totalCredit, branchName, branchCode, currency, type } =
-        totals;
-
-      if (totalDebit !== totalCredit) {
-        showSnackBar(
-          `Submission failed. Totals for ${type} entries in branch "${branchName}" (${branchCode}) and currency "${currency}" do not match. Debit: ${formatBigIntForDisplay(
-            totalDebit
-          )}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
-      }
-    }
-    // --- MEMO LOGIC UPDATE END ---
-
-    const finalPayload = {
-      commonBatchRemarks: commonBatchRemarks.trim(),
-      rows: rowPayloads,
     };
 
     try {
-      const response = await callApi(
-        "/JS/journals/create-batch",
-        finalPayload,
-        "POST"
-      );
-
-      const newBatchId = response?.[0]?.batchId || "N/A";
-
-      showSnackBar(
-        `All ${response.length} Journal entries submitted successfully! Batch ID: ${newBatchId}`,
-        "success"
-      );
-      setRows([{ ...initialRowState, id: Date.now() }]);
-      setCommonBatchRemarks("");
-      setChecked(false);
+      await callApi(CREATE_REQUEST_URL, finalRequestPayload, "POST");
+      showSnackBar("LHO Transfer Request Submitted Successfully", "success");
+      setSummaryOpen(false);
     } catch (error) {
-      showSnackBar("Journal Batch submission failed", "error");
+      showSnackBar("Submission failed. Check network/payload.", "error");
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  /**
+   * GET SUMMARY (Captures Row Context)
+   */
+  const handleGetSummary = async (row) => {
+    setSummaryOpen(true);
+    setSummaryLoading(true);
+    setCurrentSelectedId(row.processRunId);
+    
+    // Store row data (processRunId, processId) for the Create Request payload
+    setRowContext({ 
+        processRunId: row.processRunId, 
+        processId: row.processId 
+    });
+    
+    try {
+      const response = await callApi(`${SUMMARY_BASE_URL}${row.processRunId}`, null, "GET");
+      const summaryObj = response?.data || {};
+      const rawMap = summaryObj.circleWiseDetails || {};
+      
+      setSummaryTotals({
+        totalAmount: summaryObj.totalAmount || 0,
+        totalRecordCount: summaryObj.totalRecordCount || 0
+      });
+
+      setSummaryData(Object.entries(rawMap).map(([code, balance]) => ({
+        circleBranchCode: code, totalProfitLoss: balance
+      })));
+    } catch (error) {
+      showSnackBar("Could not fetch summary data", "error");
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
+  const getStatusChip = (s) => {
+    if (s === 1) return <Chip label="In Progress" color="primary" variant="outlined" size="small" />;
+    if (s === 2) return <Chip label="Success" color="success" size="small" />;
+    if (s === 3) return <Chip label="Fail" color="error" size="small" />;
+    return <Chip label="Unknown" variant="outlined" size="small" />;
+  };
+
   return (
-    <Box sx={{ p: 3, maxWidth: "98%" }}>
-      <Paper elevation={3} sx={{ p: 3 }}>
-        <Box>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-            <Typography variant="body1" fontWeight="bold" component="span">
-              Posting Date:
-            </Typography>
-            <Typography variant="body1" fontWeight="bold" component="span">
-              {postingDate}
-            </Typography>
-          </Box>
-          <Box sx={{ marginTop: 0.5 }}>
-            <Typography
-              variant="body2"
-              component="span"
-              sx={{ color: "#ec0101ff" }}
-            >
-              Note: All Journals will be Posted on this Date
-            </Typography>
-          </Box>
-        </Box>
+    <Box p={3} width="100%">
+      {/* TRIGGER BUTTON (Top Right) */}
+      <Box display="flex" justifyContent="flex-end" mb={2}>
+        <Button
+          variant="contained"
+          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
+          onClick={handleTransferLho}
+          disabled={isTransferring || isInitialLoading}
+        >
+          {isTransferring ? "Transferring..." : "Transfer LHO"}
+        </Button>
+      </Box>
 
-        <Grid item xs={12} md={12} sx={{ margin: "1% 0%", width: "95%" }}>
-          <TextField
-            label="Common Batch Remarks"
-            value={commonBatchRemarks}
-            onChange={(e) => {
-              const newValue = e.target.value;
-              if (newValue.length <= 50) {
-                setCommonBatchRemarks(newValue);
+      {/* MAIN TABLE */}
+      <TableContainer component={Paper}>
+        <Table>
+          <TableHead sx={{ bgcolor: theme.palette.action.hover }}>
+            <TableRow>
+              <TableCell align="center"><strong>Process Run ID</strong></TableCell>
+              <TableCell align="center"><strong>Stage Status</strong></TableCell>
+              <TableCell align="center"><strong>Process ID</strong></TableCell>
+              <TableCell align="center"><strong>ETL Date</strong></TableCell>
+              <TableCell align="center"><strong>Process Type</strong></TableCell>
+              <TableCell align="center"><strong>Action</strong></TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {tableData.map((row) => (
+              <TableRow key={row.processRunId}>
+                <TableCell align="center">{row.processRunId}</TableCell>
+                <TableCell align="center">{getStatusChip(row.status)}</TableCell>
+                <TableCell align="center">{row.processId}</TableCell>
+                <TableCell align="center">{row.etlDate}</TableCell>
+                <TableCell align="center">{row.processType}</TableCell>
+                <TableCell align="center">
+                  <Stack direction="row" spacing={1} justifyContent="center">
+                    <Tooltip title="View Stages"><IconButton size="small" onClick={() => { setSelectedProcess(row); setStagesOpen(true); }}><ViewIcon /></IconButton></Tooltip>
+                    <Tooltip title={row.status === 2 ? "Get Summary" : "Not Available"}>
+                      <span><IconButton size="small" disabled={row.status !== 2} onClick={() => handleGetSummary(row)}><SummaryIcon /></IconButton></span>
+                    </Tooltip>
+                    <Tooltip title="Retry"><span><IconButton size="small" disabled={!row.isLatest || row.status === 1}><RetryIcon /></IconButton></span></Tooltip>
+                  </Stack>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        <TablePagination component="div" count={totalElements} page={page} onPageChange={(e, p) => setPage(p)} rowsPerPage={rowsPerPage} onRowsPerPageChange={(e) => { setRowsPerPage(parseInt(e.target.value, 10)); setPage(0); }} />
+      </TableContainer>
 
-                if (checked && newValue.trim()) {
-                  setRows(
-                    rows.map((row) => ({
-                      ...row,
-                      remarks: newValue,
-                    }))
-                  );
-                }
-
-                if (!newValue.trim()) {
-                  setChecked(false);
-                  setRows(
-                    rows.map((row) => ({
-                      ...row,
-                      remarks: "",
-                    }))
-                  );
-                }
-              }
-            }}
-            fullWidth
-            required
-            multiline
-            rows={1}
-            InputProps={{
-              inputProps: {
-                maxLength: 50,
-              },
-            }}
-          />
-          <Box sx={{ display: "flex", alignItems: "center" }}>
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={checked}
-                  onChange={handleChange}
-                  color="primary"
-                  disabled={!commonBatchRemarks.trim()}
-                />
-              }
-              label="Apply This Remark To All Below Transaction"
-            />
-          </Box>
-        </Grid>
-
-        <Box>
-          {rows.map((row, index) => (
-            <React.Fragment key={row.id}>
-              <Grid container spacing={2} alignItems="center">
-                {/* Branch */}
-                <Grid item xs={12} md={3} size={1.8}>
-                  <Autocomplete
-                    popupIcon={null}
-                    autoHighlight
-                    options={branchSearch.options}
-                    getOptionLabel={(option) =>
-                      `${option.code} - ${option.name}`
-                    }
-                    value={row.branch}
-                    onChange={(event, newValue) =>
-                      handleRowChange(row.id, "branch", newValue)
-                    }
-                    onInputChange={(event, newInputValue) =>
-                      searchBranches(newInputValue, row.id) // FIX: pass row.id
-                    }
-                    loading={branchSearch.loadingId === row.id} // FIX: check row.id
-                    filterOptions={(x) => x}
-                    isOptionEqualToValue={(option, value) =>
-                      option.code === value.code
-                    }
-                    noOptionsText=""
-                    renderInput={(params) => (
-                      <Tooltip
-                        title="Search by Branch name or Branch code"
-                        placement="top-start"
-                      >
-                        <TextField
-                          {...params}
-                          label="Branch *"
-                          placeholder="Search by name or code"
-                          InputLabelProps={{ shrink: true }}
-                          InputProps={{
-                            ...params.InputProps,
-                            endAdornment: (
-                              <Box>
-                                {branchSearch.loadingId === row.id ? ( // FIX: check row.id
-                                  <CircularProgress color="inherit" size={20} />
-                                ) : null}
-                                {params.InputProps.endAdornment}
-                              </Box>
-                            ),
-                          }}
-                        />
-                      </Tooltip>
-                    )}
-                  />
+      {/* --- SUMMARY DIALOG --- */}
+      <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle sx={{ m: 0, p: 2 }}>
+          Circle Wise Summary (ID: {currentSelectedId})
+          <IconButton onClick={() => setSummaryOpen(false)} sx={{ position: 'absolute', right: 8, top: 8 }}><CloseIcon /></IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {summaryLoading ? <Box display="flex" justifyContent="center" py={5}><CircularProgress /></Box> : (
+            <>
+              <Paper variant="outlined" sx={{ p: 2, mb: 2, bgcolor: theme.palette.action.hover }}>
+                <Grid container spacing={2}>
+                  <Grid item xs={6}>
+                    <Typography variant="caption" color="text.secondary">Total Records</Typography>
+                    <Typography variant="h6" fontWeight="bold">{summaryTotals.totalRecordCount}</Typography>
+                  </Grid>
+                  <Grid item xs={6}>
+                    <Typography variant="caption" color="text.secondary">Total Volume Amount</Typography>
+                    <Typography variant="h6" fontWeight="bold" color="primary">{Number(summaryTotals.totalAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</Typography>
+                  </Grid>
                 </Grid>
-
-                {/* Currency */}
-                <Grid item xs={12} md={1.5} size={1.5}>
-                  <TextField
-                    popupIcon={null}
-                    select
-                    label="Currency *"
-                    value={row.currency}
-                    onChange={(e) =>
-                      handleRowChange(row.id, "currency", e.target.value)
-                    }
-                    fullWidth
-                  >
-                    <MenuItem value="" disabled>
-                      <em>Select Currency</em>
-                    </MenuItem>
-                    {currencyOptions.map((c) => (
-                      <MenuItem key={c} value={c}>
-                        {c}
-                      </MenuItem>
+              </Paper>
+              <TableContainer component={Paper}>
+                <Table size="small">
+                  <TableHead><TableRow><TableCell align="center"><strong>Circle Branch Code</strong></TableCell><TableCell align="center"><strong>Balance</strong></TableCell></TableRow></TableHead>
+                  <TableBody>
+                    {summaryData.slice(summaryPage * summaryRowsPerPage, summaryPage * summaryRowsPerPage + summaryRowsPerPage).map((row, idx) => (
+                      <TableRow key={idx}><TableCell align="center">{row.circleBranchCode}</TableCell><TableCell align="center" sx={{ fontWeight: 'bold' }}>{Number(row.totalProfitLoss).toLocaleString('en-IN', { minimumFractionDigits: 4 })}</TableCell></TableRow>
                     ))}
-                  </TextField>
-                </Grid>
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <TablePagination component="div" count={summaryData.length} page={summaryPage} onPageChange={(e, p) => setSummaryPage(p)} rowsPerPage={summaryRowsPerPage} onRowsPerPageChange={(e) => setSummaryRowsPerPage(parseInt(e.target.value, 10))} rowsPerPageOptions={[5]} />
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button variant="outlined" onClick={() => setSummaryOpen(false)} disabled={isSubmitting}>Cancel</Button>
+          <Button 
+            variant="contained" 
+            disabled={summaryData.length === 0 || isSubmitting} 
+            onClick={handleSubmitLhoRequest}
+            startIcon={isSubmitting && <CircularProgress size={16} color="inherit" />}
+          >
+            {isSubmitting ? "Submitting..." : "Submit LHO Request"}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
-                {/* CGL */}
-                <Grid item xs={12} md={2} size={1.8}>
-                  <Autocomplete
-                    popupIcon={null}
-                    autoHighlight
-                    options={cglSearch.options}
-                    getOptionLabel={(option) =>
-                      `${option.cglNumber} - ${option.description}`
-                    }
-                    value={row.cgl}
-                    onChange={(event, newValue) =>
-                      handleRowChange(row.id, "cgl", newValue)
-                    }
-                    onInputChange={(event, newInputValue) =>
-                      searchCgls(newInputValue, row.id) // FIX: pass row.id
-                    }
-                    loading={cglSearch.loadingId === row.id} // FIX: check row.id
-                    filterOptions={(x) => x}
-                    isOptionEqualToValue={(option, value) =>
-                      option.cglNumber === value.cglNumber
-                    }
-                    noOptionsText=""
-                    renderInput={(params) => (
-                      <TextField
-                        {...params}
-                        label="CGL *"
-                        placeholder="Search CGL by number or name"
-                        InputLabelProps={{ shrink: true }}
-                        InputProps={{
-                          ...params.InputProps,
-                          endAdornment: (
-                            <Box sx={{ marginLeft: "2%", display: "flex", alignItems: "center" }}>
-                              {row.cgl && String(row.cgl.cglNumber).startsWith("5") && (
-                                <Chip label="MEMO" size="small" color="warning" sx={{ height: 20, fontSize: "0.7rem", mr: 1 }} />
-                              )}
-                              {cglSearch.loadingId === row.id ? ( // FIX: check row.id
-                                <CircularProgress color="inherit" size={20} />
-                              ) : null}
-                              {params.InputProps.endAdornment}
-                            </Box>
-                          ),
-                        }}
-                      />
-                    )}
-                  />
-                </Grid>
-
-                {/* Amount */}
-                <Grid item xs={12} md={2} size={1.5}>
-                  <TextField
-                    label="Amount *"
-                    type="text"
-                    value={row.amount}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (/^\d{0,21}(\.\d{0,4})?$/.test(val)) {
-                        handleRowChange(row.id, "amount", val);
-                      }
-                    }}
-                    fullWidth
-                    placeholder="0.0000"
-                  />
-                </Grid>
-
-                {/* Txn Type */}
-                <Grid item xs={12} md={1} size={1.3}>
-                  <TextField
-                    select
-                    label="Txn Type *"
-                    value={row.txnType}
-                    onChange={(e) =>
-                      handleRowChange(row.id, "txnType", e.target.value)
-                    }
-                    fullWidth
-                  >
-                    <MenuItem value="" disabled>
-                      <em>Select Type</em>
-                    </MenuItem>
-                    <MenuItem value="Debit">Debit</MenuItem>
-                    <MenuItem value="Credit">Credit</MenuItem>
-                  </TextField>
-                </Grid>
-
-                {/* Product Code */}
-                <Grid item xs={12} md={2} size={1.5}>
-                  <TextField
-                    label="Product Code"
-                    value={row.productCode}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (/^\d{0,8}$/.test(val)) {
-                        handleRowChange(row.id, "productCode", val);
-                      }
-                    }}
-                    fullWidth
-                    InputProps={{
-                      inputProps: {
-                        maxLength: 8,
-                      },
-                    }}
-                  />
-                </Grid>
-
-                {/* Remarks (Individual) */}
-                <Grid item xs={12} md={2} size={2}>
-                  <TextField
-                    label="Remarks"
-                    value={row.remarks}
-                    onChange={(e) => {
-                      const val = e.target.value;
-
-                      if (val.length <= 50) {
-                        handleRowChange(row.id, "remarks", val);
-                      }
-                    }}
-                    fullWidth
-                    InputProps={{
-                      inputProps: {
-                        maxLength: 50,
-                      },
-                      readOnly: checked,
-                    }}
-                  />
-                </Grid>
-
-                {/* Actions */}
-                <Grid item xs={12} md={0.5} sx={{ textAlign: "center" }}>
-                  <IconButton
-                    onClick={() => handleDeleteRow(row.id)}
-                    aria-label="delete row"
-                  >
-                    <DeleteIcon />
-                  </IconButton>
-                </Grid>
-              </Grid>
-
-              {index < rows.length - 1 && (
-                <Box
-                  sx={{
-                    borderBottom: 1,
-                    borderColor: "divider",
-                    my: 2,
-                  }}
-                />
-              )}
-            </React.Fragment>
-          ))}
-
-          <Box sx={{ mt: 3, display: "flex", gap: 2, justifyContent: "right" }}>
-            <Button
-              variant="contained"
-              startIcon={<AddIcon />}
-              onClick={handleAddRow}
-            >
-              Add Row
-            </Button>
-
-            <Button
-              variant="contained"
-              color="success"
-              onClick={handleSubmit}
-              disabled={isSubmitting}
-            >
-              {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
-            </Button>
+      {/* --- STAGES DIALOG (Logic Unchanged) --- */}
+      <Dialog open={stagesOpen} onClose={() => setStagesOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: 'flex', justifyContent: 'space-between', borderBottom: `1px solid ${theme.palette.divider}` }}>
+          <Typography variant="h6">Transfer To LHO – Process Details</Typography>
+          <IconButton onClick={() => setStagesOpen(false)}><CloseIcon /></IconButton>
+        </DialogTitle>
+        <DialogContent sx={{ p: 0, display: 'flex', height: '60vh' }}>
+          <Box sx={{ width: '40%', borderRight: `1px solid ${theme.palette.divider}`, overflowY: 'auto', p: 2, bgcolor: theme.palette.action.hover }}>
+            {selectedProcess?.stages?.map((stage, idx) => (
+              <Box key={idx} onClick={() => setActiveStage(stage)} sx={{ display: 'flex', position: 'relative', pb: 3, cursor: 'pointer' }}>
+                {idx !== selectedProcess.stages.length - 1 && <Box sx={{ position: 'absolute', left: 11, top: 24, bottom: 0, width: '2px', bgcolor: theme.palette.divider }} />}
+                <Box sx={{ mr: 2, zIndex: 1 }}>
+                  {stage.stageStatus === 2 ? <SuccessIcon color="success" fontSize="small" /> : stage.stageStatus === 3 ? <FailedIcon color="error" fontSize="small" /> : <PendingIcon color="primary" fontSize="small" />}
+                </Box>
+                <Box sx={{ flex: 1, p: 1, borderRadius: 1, bgcolor: activeStage?.stageId === stage.stageId ? theme.palette.primary.main : 'transparent', color: activeStage?.stageId === stage.stageId ? theme.palette.primary.contrastText : 'inherit' }}>
+                  <Typography variant="body2" fontWeight="bold">{stage.stageId.replace(/_/g, ' ').toUpperCase()}</Typography>
+                  <Typography variant="caption">{stage.stageStatus === 2 ? "Completed" : stage.stageStatus === 3 ? "Failed" : "In Progress"}</Typography>
+                </Box>
+              </Box>
+            ))}
           </Box>
-        </Box>
-      </Paper>
+          <Box sx={{ flex: 1, p: 3, overflowY: 'auto' }}>
+            {activeStage && (
+              <Stack spacing={2}>
+                <Typography variant="subtitle2" color="text.secondary">Start Time: {new Date(activeStage.startTime).toLocaleString()}</Typography>
+                <Typography variant="subtitle2" color="text.secondary">End Time: {activeStage.endTime ? new Date(activeStage.endTime).toLocaleString() : 'In Progress'}</Typography>
+                <Divider />
+                <Typography variant="body2"><strong>Remarks:</strong> {activeStage.stageRemarks || 'No remarks.'}</Typography>
+              </Stack>
+            )}
+          </Box>
+        </DialogContent>
+      </Dialog>
     </Box>
   );
 }
+
+1st change 
+
+from the screen i want the changes like 
+remove all the functilty for retry button 
+
+2nd change 
+
+also remove the that eye related all logic 
+
+
+3rd change 
+when u get the data 
+u get the runId u need to add the new column in the grid 
+starttime -> new column from  processStartTime from same responce fromat this in the format of 19 Feb 2026, 10:39:31 pm something like this 
+endtime -> new column processEndTime
+if end time is not there add - 
+
+
+sequnce should be like 
+
+RunId , Process Name (Process Type)  , Status , starttime , end Time  , Action
+
+do this changes and give mi updated file 
