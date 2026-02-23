@@ -1,7 +1,3 @@
-Here are the two complete, updated methods for your JournalRequestServiceImpl.java file.
-I have kept everything exactly as it was, but modified the catch block to handle the database update and modified the cleanupFailedBatch method so it only deletes the corrupted child rows while leaving the master record intact for your UI.
-Replace your existing methods with these:
-1. Updated executeAsyncBatchCreation Method
     @Override
     @Async("bulkExecutor")
     @Transactional
@@ -85,41 +81,25 @@ Replace your existing methods with these:
             log.info(" Batch {} Created. Rows: {}. Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
 
         } catch (Exception e) {
-            log.error("Async Create Failed", e);
-            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", e.getMessage());
+            // Log the REAL error to the server console so developers can debug it
+            log.error("Async Create Failed for Batch {}", batchId, e);
+            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Failed to create batch: System Error");
             redisTemplate.delete("LOCK_REQ_" + requestId);
             
             // 1. Delete partial child rows so they don't take up space
             cleanupFailedBatch(batchId);
             
-            // 2. Safely truncate the error message to fit in DB column
-            String errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown System Error";
-            if (errorMessage.length() > 180) {
-                errorMessage = errorMessage.substring(0, 180) + "...";
-            }
+            // 2. Clean, custom error message for the UI
+            String customUiMessage = "Failed to create the batch due to a system error. Please try again.";
             
-            // 3. Update the Master record to ERROR so it shows on UI
+            // 3. Update the Master record to ERROR so it shows on UI with the custom message
             jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", 
-                                "Creation Failed: " + errorMessage, batchId);
+                                customUiMessage, batchId);
                                 
             // 4. Send failure progress to UI
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Creation Error: " + errorMessage);
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", customUiMessage);
             
         } finally {
             MDC.clear();
         }
     }
-
-2. Updated cleanupFailedBatch Method
-    private void cleanupFailedBatch(String batchId) {
-        try {
-            // ONLY delete the child requests to clean up disk space. 
-            // We NO LONGER delete the MASTER record so the UI can display the ERROR status.
-            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-        } catch (Exception e) {
-            log.warn("Cleanup failed", e);
-        }
-    }
-
-Once you replace these, if the raw INSERT query fails again, your database will stay perfectly clean (no orphaned rows), but your Dashboard will correctly display a red ERROR tag along with the exact SQL message.
-Would you like me to look over the processBulkRequestsAsync method to make sure it handles exceptions in the exact same robust way?
