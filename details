@@ -1,3 +1,7 @@
+As a Senior Lead, I completely agree with having the full, unbroken files. Copy-pasting snippets into a complex service layer is how bugs get introduced.
+Here are the complete files, clearly marked as either New or Existing (Updated), so you can drop them straight into your project.
+1. [EXISTING FILE - COMPLETE UPDATED FILE] CommonRequestRepository.java
+Location: com.tcs.fincore.CommonRequestService.repository
 package com.tcs.fincore.CommonRequestService.repository;
 
 import com.tcs.fincore.CommonRequestService.model.CommonReq;
@@ -16,26 +20,369 @@ public interface CommonRequestRepository extends JpaRepository<CommonReq, Long> 
 
     List<CommonReq> findByCreatorId(String creatorId);
 
-
     List<CommonReq> findByCreatorIdNotAndReqStatusAndReqType(String creatorId, RequestStatus status, RequestType reqType);
 
     List<CommonReq> findByCreatorIdAndReqType(String creatorId, RequestType reqType);
 
- 
     List<CommonReq> findByTargetIdAndReqStatus(String targetId, RequestStatus status);
 
-}
-package com.tcs.fincore.CommonRequestService.service;
+    // --- ADDED: Strict duplicate check for LHO (ignores status) ---
+    List<CommonReq> findByTargetIdAndReqType(String targetId, RequestType reqType);
 
+}
+
+2. [NEW FILE] LhoTransferService.java
+Location: com.tcs.fincore.CommonRequestService.service
+package com.tcs.fincore.CommonRequestService.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto;
 import com.tcs.fincore.CommonRequestService.model.CommonReq;
 
-
 public interface LhoTransferService {
 
-
     CommonReq createLhoTransferRequest(LhoTransferPayloadDto payload, String userId, String token) throws JsonProcessingException;
+
 }
-LhoTransferService -> i have this also can u make my saprate so it will make much complicated is it 
+
+3. [NEW FILE] LhoTransferServiceImpl.java
+Location: com.tcs.fincore.CommonRequestService.service
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.LhoTransferPayloadDto;
+import com.tcs.fincore.CommonRequestService.dto.NotificationConfigDto;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class LhoTransferServiceImpl implements LhoTransferService {
+
+    private static final String EVENT_SOURCE = "CommonRequestService";
+    private final CommonRequestRepository commonRequestRepository;
+    private final ObjectMapper objectMapper;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+
+    @Override
+    @Transactional(rollbackOn = Exception.class)
+    public CommonReq createLhoTransferRequest(LhoTransferPayloadDto payload, String userId, String token) throws JsonProcessingException {
+        
+        String targetId = payload.getBatchId();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Batch ID is missing from LHO payload.");
+        }
+
+        // --- STRICT DUPLICATE CHECK FOR LHO ---
+        List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqType(targetId, RequestType.LHO_TRANSFER);
+        if (!existingRequests.isEmpty()) {
+            log.warn("LHO Duplicate prevented: Batch {} already exists.", targetId);
+            throw new DataIntegrityViolationException(
+                    "An LHO Transfer request for Batch '" + targetId + "' has already been created and cannot be duplicated."
+            );
+        }
+
+        // --- CREATE AND SAVE ---
+        CommonReq request = new CommonReq();
+        request.setCreatorId(userId);
+        request.setReqType(RequestType.LHO_TRANSFER);
+        request.setChangeType(ChangeType.ADD);
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId);
+        request.setReqStatus(RequestStatus.PENDING);
+        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+
+        log.info("Saving new LHO request for Batch {}", targetId);
+        CommonReq savedRequest = commonRequestRepository.save(request);
+
+        // --- NOTIFICATION LOGIC ---
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig(RequestType.LHO_TRANSFER.name());
+            String message = "New ADD request (" + targetId + ") pending for LHO_TRANSFER";
+            
+            notificationWriterService.createNotification(
+                    userId, 
+                    config.getTargetRoles(), 
+                    message, 
+                    config.getTargetUrl(),
+                    savedRequest.getId().toString(), 
+                    EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to create notification for LHO request: {}. Rolling back.", savedRequest.getId(), e);
+            throw new RuntimeException("Failed to create notification event, rolling back request creation.", e);
+        }
+
+        return savedRequest;
+    }
+}
+
+4. [EXISTING FILE - COMPLETE UPDATED FILE] RequestServiceImpl.java
+Location: com.tcs.fincore.CommonRequestService.service
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.*;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CGLMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Optional;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
+
+    private static final String EVENT_SOURCE = "CommonRequestService";
+    private final CommonRequestRepository commonRequestRepository;
+    private final RequestStrategyFactory strategyFactory;
+    private final ObjectMapper objectMapper;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final BusinessSecurityService businessSecurityService;
+    
+    // --- ADDED: Inject the new LHO Transfer Service ---
+    private final LhoTransferService lhoTransferService;
+
+    @Override
+    @Transactional(rollbackOn = Exception.class)
+    public CommonReq createRequest(
+            CreateRequestDto dto,
+            String creatorId,
+            String token
+    ) throws JsonProcessingException {
+
+        // --- LAYER 2 SECURITY CHECK --- (rbac)
+        businessSecurityService.validateUserAction(token, dto.getRequestType(), dto.getChangeType());
+
+        // --- ROUTING: DELEGATE LHO REQUESTS ---
+        if (dto.getRequestType() == RequestType.LHO_TRANSFER) {
+            log.info("Routing request to dedicated LhoTransferService.");
+            return lhoTransferService.createLhoTransferRequest(
+                    (LhoTransferPayloadDto) dto.getPayload(), 
+                    creatorId, 
+                    token
+            );
+        }
+
+        // ==========================================================
+        // STANDARD LOGIC FOR ALL OTHER REQUEST TYPES
+        // ==========================================================
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+
+        // --- PRE CHECKS ---
+        String targetId = payload.getKey();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Could not determine targetId from payload.");
+        }
+        log.info("Determined targetId for new request as: {}", targetId);
+
+        List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId, RequestStatus.PENDING);
+
+        if (!existingRequests.isEmpty()) {
+            log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
+                    targetId, existingRequests.get(0).getReqStatus());
+            throw new DataIntegrityViolationException(
+                    "An active or pending request for '" + targetId + "' already exists.");
+        }
+        log.info("Uniqueness check passed for targetId: {}", targetId);
+
+        // --- CREATE AND SAVE REQUEST ---
+        CommonReq request = new CommonReq();
+        request.setCreatorId(creatorId);
+        request.setReqType(dto.getRequestType());
+        request.setChangeType(dto.getChangeType());
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId);
+        request.setReqStatus(RequestStatus.PENDING);
+        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+
+        log.info("Saving new, validated request for targetId {}", targetId);
+        CommonReq savedRequest = commonRequestRepository.save(request);
+
+        try {
+            // --- NOTIFICATION LOGIC ---
+            String requestTypeKey = dto.getRequestType().name(); 
+            log.info("Request Type String to fetch role ids from PERMISSIONS: {}", requestTypeKey);
+            NotificationConfigDto config = permissionConfigService.getConfig(requestTypeKey);
+
+            String action = request.getChangeType().name(); 
+
+            if (request.getChangeType() == ChangeType.BLOCK || request.getChangeType() == ChangeType.UNBLOCK) {
+                CGLMaster payload2 = objectMapper.readValue(request.getPayload(), CGLMaster.class);
+                if (payload2.getStatus() == 0) {
+                    action = "BLOCK"; 
+                } else if (payload2.getStatus() == 1) {
+                    action = "UNBLOCK"; 
+                }
+            }
+            String message = "New " + action + " request (" + targetId + ") pending for " + dto.getRequestType();
+
+            notificationWriterService.createNotification(
+                    creatorId,                  
+                    config.getTargetRoles(),    
+                    message,
+                    config.getTargetUrl(),      
+                    savedRequest.getId().toString(),
+                    EVENT_SOURCE
+            );
+
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to create 'pending' notification for request: {}. Rolling back transaction.", savedRequest.getId(), e);
+            throw new RuntimeException("Failed to create notification event, rolling back request creation.", e);
+        }
+        return savedRequest;
+    }
+
+    @Override
+    @Transactional(rollbackOn = Exception.class) 
+    public Optional<CommonReq> updateRequestStatus(
+            ProcessRequestDto dto,
+            String executorId
+    ) throws JsonProcessingException {
+
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        // SELF-APPROVAL CHECK
+        if (executorId.equals(request.getCreatorId())) {
+            log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId, requestId);
+            throw new IllegalStateException("User cannot approve or reject their own request.");
+        }
+
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(), request.getReqStatus());
+            throw new IllegalStateException("Request has already been processed and cannot be modified.");
+        }
+
+        // --- UPDATE REQUEST STATE ---
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+        request.setReqStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+            strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+            notificationWriterService.createRequestApprovedNotification(request, executorId);
+            request.setExecutionRemarks("Successfully processed approval.");
+        } else {
+            log.info("Request {} REJECTED.", dto.getRequestId());
+            notificationWriterService.createRequestRejectedNotification(request, executorId, dto.getRemarks());
+            request.setExecutionRemarks("Request rejected by user.");
+        }
+
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig(request.getReqType().name());
+            String action = dto.getStatus().equals(RequestStatus.ACCEPTED) ? "Approved" : "Rejected";
+            String closureMessage = "CLOSURE: Request " + request.getTargetId() + " was " + action + " by " + executorId;
+
+            notificationWriterService.createNotification(
+                    executorId,                 
+                    config.getTargetRoles(),    
+                    closureMessage,
+                    config.getTargetUrl(),      
+                    request.getId().toString(),
+                    "CommonRequestService"
+            );
+            log.info("Sent closure notification to group for Request ID: {}", requestId);
+        } catch (Exception e) {
+            log.error("Failed to send closure notification for Request ID: {}", requestId, e);
+        }
+
+        CommonReq updatedRequest = commonRequestRepository.save(request);
+        return Optional.of(updatedRequest);
+    }
+
+    @Override
+    @Transactional(rollbackOn = Exception.class)
+    public CommonReq cancelRequest(CancelRequestDto dto, String userId) {
+
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to cancel request ID: {} by user: {}", requestId, userId);
+
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        if (!request.getCreatorId().equals(userId)) {
+            log.warn("SECURITY VIOLATION: User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
+            throw new AccessDeniedException("You are not authorized to cancel this request.");
+        }
+
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to cancel a processed request. ID: {}, Status: {}", requestId, request.getReqStatus());
+            throw new IllegalStateException("Only pending requests can be cancelled. Current status: " + request.getReqStatus());
+        }
+
+        request.setReqStatus(RequestStatus.CANCELLED);
+        request.setExecutorId(userId);
+        request.setExecutionDate(LocalDateTime.now());
+        request.setExecutorRemarks("CANCELLED BY USER: " + (dto.getRemarks() != null ? dto.getRemarks() : "No remarks"));
+
+        CommonReq updatedRequest = commonRequestRepository.save(request);
+        log.info("Request {} successfully cancelled by user.", requestId);
+        return updatedRequest;
+    }
+
+    @Override
+    public List<CommonReq> getMyRequests(String userId, RequestType requestType) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch requests for user : {}", userId);
+            throw new IllegalArgumentException("Request type is missing, Please provide correct request type to fetch requests.");
+        }
+        log.info("Fetching my requests for user {} with type {}", userId, requestType);
+        return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getPendingRequests(String userId, RequestType requestType) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch pending requests.");
+            throw new IllegalArgumentException("Request type is missing, Please provide correct request type to fetch pending requests.");
+        }
+        log.info("Fetching pending requests for user :  {} with type : {}",userId, requestType);
+        return commonRequestRepository.findByCreatorIdNotAndReqStatusAndReqType(userId, RequestStatus.PENDING, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getAllRequests() {
+        return commonRequestRepository.findAll();
+    }
+}
+
+Would you like me to show you how to fetch these requests on the React frontend side so we can visually disable the "Get Summary" button if a Batch ID already exists?
