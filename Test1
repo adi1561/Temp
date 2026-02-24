@@ -1,12 +1,78 @@
+As a Technical Lead, looking at the configuration snippet you shared, I can see those are consumer properties (specifically for an Airflow ETL process). To trigger or send an event to that exact same Kafka cluster from your Spring Boot application, we need to set up the corresponding producer properties using that same bootstrap server address (10.0.17.242:29092).
+Here is the complete, production-ready setup to configure and trigger that event cleanly.
+1. Application Properties Configuration
+Spring Boot's auto-configuration will handle the heavy lifting for us as long as we define the producer properties correctly. Add this to your application.properties (or convert to YAML if you are using application.yml):
+# --- Kafka Producer Configuration ---
+# Pointing to the same external listener from your screenshot
+spring.kafka.producer.bootstrap-servers=10.0.17.242:29092
+
+# Serializers convert your Java Strings into bytes for Kafka
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer
+
+# Custom application property for your specific topic name
+# (Replace 'lho-airflow-topic' with the actual topic your Airflow consumer is listening to)
+app.kafka.topics.lho-transfer=lho-airflow-topic
+
+2. The Kafka Producer Service (Best Practice)
+Instead of cluttering your Strategy classes with raw KafkaTemplate logic, it's best to create a dedicated wrapper service. This makes it highly reusable and easier to mock in tests.
+package com.tcs.fincore.CommonRequestService.service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Service;
+
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class KafkaEventPublisherService {
+
+    private final KafkaTemplate<String, String> kafkaTemplate;
+
+    @Value("${app.kafka.topics.lho-transfer}")
+    private String lhoTopic;
+
+    /**
+     * Triggers an event to the configured Kafka topic.
+     * * @param targetId The unique identifier (used as the Kafka Key for ordered processing)
+     * @param payload  The actual JSON string or data to send
+     */
+    public void publishLhoTransferEvent(String targetId, String payload) {
+        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
+
+        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(lhoTopic, targetId, payload);
+
+        // Async callback to handle success or failure without blocking the main thread
+        future.whenComplete((result, exception) -> {
+            if (exception != null) {
+                log.error("Failed to send Kafka event for targetId: {}. Reason: {}", targetId, exception.getMessage());
+                // Depending on strictness, you might want to throw a custom exception here 
+                // if the event failing should rollback the database transaction.
+            } else {
+                log.info("Successfully published Kafka event. Topic: {}, Partition: {}, Offset: {}", 
+                        result.getRecordMetadata().topic(),
+                        result.getRecordMetadata().partition(),
+                        result.getRecordMetadata().offset());
+            }
+        });
+    }
+}
+
+3. Integrating with Your Strategy
+Now, we simply inject this clean publisher service into the LhoTransferStrategy we built earlier.
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.tcs.fincore.CommonRequestService.model.CommonReq;
 import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.service.KafkaEventPublisherService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
 @Slf4j
@@ -14,13 +80,7 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class LhoTransferStrategy implements RequestTypeStrategy {
 
-    // Inject KafkaTemplate directly
-    private final KafkaTemplate<String, String> kafkaTemplate;
-
-    // Best practice: Externalize your topic name to application.yml 
-    // Fallback to "lho-transfer-events" if not found in properties
-    @Value("${app.kafka.topics.lho-transfer:lho-transfer-events}")
-    private String lhoTopic;
+    private final KafkaEventPublisherService kafkaEventPublisherService;
 
     @Override
     public RequestType getRequestType() {
@@ -41,13 +101,14 @@ public class LhoTransferStrategy implements RequestTypeStrategy {
     }
 
     private void handleLhoApproval(CommonReq request) {
-        log.info("Triggering Kafka event to topic '{}' for LHO targetId: {}", lhoTopic, request.getTargetId());
+        log.info("Triggering final event pipeline for LHO targetId: {}", request.getTargetId());
         
-        // Publish the event. 
-        // We use targetId as the Kafka Message Key to ensure ordered processing for the same targetId.
-        // We pass the JSON payload so the consuming service has all the data it needs to act.
-        kafkaTemplate.send(lhoTopic, request.getTargetId(), request.getPayload());
+        // Trigger the event using our new wrapper service
+        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getPayload());
         
-        log.info("Kafka event successfully dispatched for LHO Transfer Batch {}.", request.getTargetId());
+        log.info("LHO Transfer Batch {} approval process completed.", request.getTargetId());
     }
 }
+
+This setup completely separates your Kafka configuration from your business logic, leveraging Spring Boot's auto-configuration while providing clear observability through the async callbacks.
+Would you like me to walk you through how to handle potential Kafka serialization errors or implement a retry mechanism in case that external listener (10.0.17.242) goes down?
