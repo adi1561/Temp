@@ -46,8 +46,6 @@ export default function TransferDataLho() {
   const [rowContext, setRowContext] = useState({ processRunId: null, processId: null  , runId: null});
   const [currentSelectedId, setCurrentSelectedId] = useState(null);
 
-
-
   const getTodayFormatted = () => new Date().toISOString().split('T')[0];
 
   // Formatter for: 19 Feb 2026, 10:39:31 pm
@@ -67,9 +65,10 @@ export default function TransferDataLho() {
 
   /**
    * DATA FETCHING
+   * @param {boolean} isPolling - If true, skips setting the loading spinner so the UI doesn't flicker
    */
-  const fetchInitialData = async () => {
-    setIsInitialLoading(true);
+  const fetchInitialData = async (isPolling = false) => {
+    if (!isPolling) setIsInitialLoading(true);
     try {
       const paginatedUrl = `${INITIAL_DATA_URL}`; 
       const response = await callApi(paginatedUrl, null, "GET");
@@ -78,42 +77,55 @@ export default function TransferDataLho() {
         setTotalElements(response.totalElements || (response.initialData?.length || 0));
       }
     } catch (error) {
-      showSnackBar("Failed to load process data", "error");
+      if (!isPolling) showSnackBar("Failed to load process data", "error");
     } finally {
-      if (isMounted.current) setIsInitialLoading(false);
+      if (isMounted.current && !isPolling) setIsInitialLoading(false);
     }
   };
 
+  // 1. Initial Load Effect
   useEffect(() => {
     isMounted.current = true;
     fetchInitialData();
     return () => { isMounted.current = false; };
   }, [page, rowsPerPage]);
-const handleTransferLho = async () => {
-  setIsTransferring(true);
-  const payload = { dagId: "cbs_wrap_dag", processId: 7, remarks: "testing 1" };
-  
-  try {
-    await callApi(TRIGGER_API_URL, payload, "POST");
-    showSnackBar("LHO Transfer triggered successfully", "success");
-    fetchInitialData();
-  } catch (error) {
-    const errorMessage = error?.message || "Failed to trigger LHO Transfer";
+
+  // 2. NEW: Silent Polling Effect for Live Updates
+  useEffect(() => {
+    // Check if any row in the current data is "In Progress" (status === 1)
+    const hasInProgressRecords = tableData.some(row => row.status === 1);
     
-    showSnackBar(errorMessage, "error");
-  } finally {
+    let pollInterval;
+    if (hasInProgressRecords) {
+      // Poll the API every 10 seconds silently
+      pollInterval = setInterval(() => {
+        fetchInitialData(true);
+      }, 10000); 
+    }
 
+    // Cleanup interval on unmount or when tableData changes
+    return () => {
+      if (pollInterval) clearInterval(pollInterval);
+    };
+  }, [tableData, page, rowsPerPage]); // Re-evaluate when data changes
+
+  const handleTransferLho = async () => {
+    setIsTransferring(true);
+    const payload = { dagId: "cbs_wrap_dag", processId: 7, remarks: "testing 1" };
     
-    setIsTransferring(false);
+    try {
+      await callApi(TRIGGER_API_URL, payload, "POST");
+      showSnackBar("LHO Transfer triggered successfully", "success");
+      fetchInitialData();
+    } catch (error) {
+      const errorMessage = error?.message || "Failed to trigger LHO Transfer";
+      showSnackBar(errorMessage, "error");
+    } finally {
+      setIsTransferring(false);
+    }
+  };
 
-
-  }
-
-};
-
- 
-const handleSubmitLhoRequest = async () => {
-
+  const handleSubmitLhoRequest = async () => {
     setIsSubmitting(true);
     const finalRequestPayload = {
       requestType: "LHO_TRANSFER",
@@ -122,7 +134,7 @@ const handleSubmitLhoRequest = async () => {
       payload: {
         processRunId: rowContext.processRunId,
         processId: rowContext.processId,
-         batchId: String(rowContext.runId),
+        batchId: String(rowContext.runId),
         processDate: getTodayFormatted(),
         totalAmount: summaryTotals.totalAmount,
         totalRecordCount: summaryTotals.totalRecordCount,
@@ -140,8 +152,7 @@ const handleSubmitLhoRequest = async () => {
       setSummaryOpen(false);
     } catch (error) {
       const errorMessage = error?.message || "Submission failed. Check network/payload";
-    
-    showSnackBar(errorMessage, "error");
+      showSnackBar(errorMessage, "error");
     } finally {
       setIsSubmitting(false);
     }
@@ -296,10 +307,3 @@ const handleSubmitLhoRequest = async () => {
     </Box>
   );
 }
-
-
-
-i want like when ever there is state change for Status	like pending to success somethinglike this then user should need to refresh the page 
-it should automatically happend 
-without refresh live 
-
