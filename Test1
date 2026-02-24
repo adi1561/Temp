@@ -1,46 +1,81 @@
-package com.tcs.fincore.CommonRequestService.service.strategy;
+package com.tcs.fincore.CommonRequestService.service;
 
-// 1. Corrected Import
-import org.springframework.kafka.support.SendResult; 
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Service;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.concurrent.CompletableFuture;
 
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class KafkaEventPublisherService {
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.*;
 
-    private final KafkaTemplate<String, String> kafkaTemplate;
+@ExtendWith(MockitoExtension.class)
+class KafkaEventPublisherServiceTest {
 
-    @Value("${app.kafka.topics.lho-transfer}")
-    private String lhoTopic;
+    @Mock
+    private KafkaTemplate<String, String> kafkaTemplate;
 
-    /**
-     * Triggers an event to the configured Kafka topic.
-     * @param targetId The unique identifier (used as the Kafka Key for ordered processing)
-     * @param payload  The actual JSON string or data to send
-     */
-    public void publishLhoTransferEvent(String targetId, String payload) {
-        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
+    @InjectMocks
+    private KafkaEventPublisherService kafkaEventPublisherService;
 
-        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(lhoTopic, targetId, payload);
+    private final String TEST_TOPIC = "test-lho-topic";
+    private final String TARGET_ID = "LHO-12345";
+    private final String PAYLOAD = "{\"status\":\"APPROVED\"}";
 
-        // Async callback to handle success or failure without blocking the main thread
-        future.whenComplete((result, exception) -> {
-            if (exception != null) {
-                log.error("Failed to send Kafka event for targetId: {}. Reason: {}", targetId, exception.getMessage());
-            } else {
-                log.info("Successfully published Kafka event. Topic: {}, Partition: {}, Offset: {}",
-                        result.getRecordMetadata().topic(),
-                        result.getRecordMetadata().partition(),
-                        result.getRecordMetadata().offset());
-            }
-        });
+    @BeforeEach
+    void setUp() {
+        // Manually inject the @Value property since we aren't loading the full Spring Context
+        ReflectionTestUtils.setField(kafkaEventPublisherService, "lhoTopic", TEST_TOPIC);
+    }
+
+    @Test
+    void publishLhoTransferEvent_Success() {
+        // 1. Arrange: Create the mock objects needed to simulate a successful Kafka response
+        TopicPartition topicPartition = new TopicPartition(TEST_TOPIC, 0);
+        RecordMetadata metadata = new RecordMetadata(topicPartition, 0, 42, System.currentTimeMillis(), 0, 0);
+        ProducerRecord<String, String> producerRecord = new ProducerRecord<>(TEST_TOPIC, TARGET_ID, PAYLOAD);
+        
+        SendResult<String, String> sendResult = new SendResult<>(producerRecord, metadata);
+        
+        // Return a successfully completed future when template.send is called
+        when(kafkaTemplate.send(eq(TEST_TOPIC), eq(TARGET_ID), eq(PAYLOAD)))
+                .thenReturn(CompletableFuture.completedFuture(sendResult));
+
+        // 2. Act: Call your method
+        kafkaEventPublisherService.publishLhoTransferEvent(TARGET_ID, PAYLOAD);
+
+        // 3. Assert: Verify the template was actually called with the right data
+        verify(kafkaTemplate, times(1)).send(TEST_TOPIC, TARGET_ID, PAYLOAD);
+        
+        // (Note: The success log in your .whenComplete block will print to the console during this test)
+    }
+
+    @Test
+    void publishLhoTransferEvent_Failure() {
+        // 1. Arrange: Simulate an exception being thrown by the Kafka broker (e.g., connection refused)
+        RuntimeException kafkaError = new RuntimeException("Kafka cluster is down!");
+        CompletableFuture<SendResult<String, String>> failedFuture = new CompletableFuture<>();
+        failedFuture.completeExceptionally(kafkaError);
+
+        when(kafkaTemplate.send(anyString(), anyString(), anyString()))
+                .thenReturn(failedFuture);
+
+        // 2. Act
+        kafkaEventPublisherService.publishLhoTransferEvent(TARGET_ID, PAYLOAD);
+
+        // 3. Assert
+        verify(kafkaTemplate, times(1)).send(TEST_TOPIC, TARGET_ID, PAYLOAD);
+        
+        // (Note: The error log in your .whenComplete block will print to the console during this test)
     }
 }
