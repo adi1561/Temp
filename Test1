@@ -1,3 +1,733 @@
+   @JsonSubTypes.Type(value = LhoTransferPayloadDto.class, name = "LHO_TRANSFER") this is my screen 
+
+
+
+@PostMapping("/create-request")
+    @ResponseStatus(HttpStatus.CREATED)
+    public CommonReq createRequest(
+            @Valid @RequestBody CreateRequestDto createRequestDto,
+            @RequestHeader("Authorization") String token
+    ) throws JsonProcessingException {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        log.info("Received request creation call from user: {}", userId);
+        return requestService.createRequest(createRequestDto, userId, token);
+    }
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.fasterxml.jackson.annotation.JsonSubTypes;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import com.tcs.fincore.CommonRequestService.dto.payload.Payload;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import lombok.Getter;
+import lombok.Setter;
+
+/**
+ * Data Transfer Object (DTO) for creating a new administrative request within
+ * the system.
+ * This class uses Jackson annotations to handle polymorphic deserialization of
+ * the {@link Payload} field,
+ * dynamically determining the concrete payload type based on the value of the
+ * {@code requestType} field.
+ *
+ * It is used as the input model for REST API endpoints that create requests
+ * (e.g., POST /requests).
+ */
+@Getter
+@Setter
+public class CreateRequestDto {
+
+        /**
+         * Specifies the type of entity being requested for change (e.g., SEGMENT,
+         * BRANCH, CURRENCY).
+         * Jackson automatically maps the incoming JSON string value to the
+         * corresponding {@link RequestType} enum constant.
+         * This field is also used by {@link JsonTypeInfo} to select the correct
+         * concrete payload DTO class.
+         */
+        @NotNull(message = "Request Type cannot be null.")
+        private RequestType requestType;
+
+        /**
+         * Specifies the nature of the change requested (e.g., CREATE, UPDATE, DELETE).
+         */
+        @NotNull(message = "Change Type cannot be null.")
+        private ChangeType changeType;
+
+        /**
+         * The identifier of the target entity the request pertains to. This is optional
+         * and may be null
+         * (e.g., when creating a new entity where the ID is not yet known).
+         */
+        private String targetId;
+
+        /**
+         * The specific details and data required for the request.
+         * The actual class implementing {@link Payload} is determined at runtime based
+         * on the value of {@code requestType}.
+         * The {@link Valid @Valid} annotation ensures that nested validation
+         * constraints within the specific payload DTO are checked.
+         */
+        @NotNull(message = "Payload cannot be null.")
+        @Valid // Triggers validation of the nested payload object
+        @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, // Use the logical name to determine the subtype
+                        include = JsonTypeInfo.As.EXTERNAL_PROPERTY, // The property defining the type is a sibling
+                                                                     // field
+                        property = "requestType" // The sibling field that determines the payload type
+        )
+        @JsonSubTypes({
+                        @JsonSubTypes.Type(value = SegmentPayloadDto.class, name = "SEGMENT_CODE"),
+                        @JsonSubTypes.Type(value = CglPayloadDto.class, name = "CGL_CODE"),
+                        @JsonSubTypes.Type(value = BranchRequestPayloadDTO.class, name = "BRANCH"),
+                        @JsonSubTypes.Type(value = CircleRequestPayloadDTO.class, name = "CIRCLE"),
+                        @JsonSubTypes.Type(value = StateReqPayloadDto.class, name = "STATE"),
+                        @JsonSubTypes.Type(value = CurrencyMasterDto.class, name = "CURRENCY"),
+                        @JsonSubTypes.Type(value = CalenderConfigPayloadDto.class, name = "CALENDER"),
+                        @JsonSubTypes.Type(value = CurrencyRateChangeDto.class, name = "CURRENCY_RATE_CHANGE"),
+                        @JsonSubTypes.Type(value = FIleTypeDTO.class, name = "FILE_TYPE_MASTER"),
+                        @JsonSubTypes.Type(value = LhoTransferPayloadDto.class, name = "LHO_TRANSFER")
+        })
+        private Payload payload;
+}
+package com.tcs.fincore.CommonRequestService.dto;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import jakarta.persistence.Convert;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.util.List;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@JsonTypeName("LHO_TRANSFER")
+public class LhoTransferPayloadDto implements KeyablePayload {
+
+    private Long processRunId;
+    private Long processId;
+
+
+    private String batchId;
+
+    private LocalDate processDate;
+
+    private BigDecimal totalAmount;
+
+    private int totalRecordCount;
+
+
+    private List<ProfitLossSummaryDto> circleWiseDetails;
+
+    @Override
+    @JsonIgnore
+    public String getKey() {
+        return this.batchId;
+    }
+}
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ProfitLossSummaryDto {
+    private LocalDate transferDate;
+    private Integer circleBranchCode;
+    private BigDecimal totalProfitLoss;
+}
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import com.fasterxml.jackson.annotation.JsonRawValue;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.Setter;
+import org.hibernate.annotations.CreationTimestamp;
+import java.time.LocalDateTime;
+import org.hibernate.annotations.SourceType;
+
+/**
+ * Represents a common request entity stored in the "COMMON_REQ" database table.
+ * This entity is used to log and track various types of requests within the system,
+ * including their status, payload, and execution details.
+ *
+ * All enum fields are now handled by their respective {@link jakarta.persistence.Converter @Converter(autoApply = true)} classes.
+ */
+@Getter
+@Setter
+@Entity
+@Table(name = "COMMON_REQ")
+public class CommonReq {
+    /**
+     * The unique identifier for the request.
+     * Generated using a sequence "COMMON_REQ_SEQ".
+     */
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "COMMON_REQ_id_gen")
+    @SequenceGenerator(name = "COMMON_REQ_id_gen", sequenceName = "COMMON_REQ_SEQ", allocationSize = 1)
+    @Column(name = "REQ_ID", nullable = false)
+    private Long id;
+
+    /**
+     * The type of request (e.g., New, Update, Delete).
+     * Mapped to the "REQ_TYPE" column. Handled by an auto-applied JPA converter.
+     */
+    @Column(name = "REQ_TYPE", nullable = false, length = 20)
+    private RequestType reqType;
+
+    /**
+     * The specific type of change associated with the request.
+     * Mapped to the "CHANGE_TYPE" column. Handled by an auto-applied JPA converter.
+     */
+    @Column(name = "CHANGE_TYPE", nullable = false, length = 2)
+    private ChangeType changeType;
+
+    /**
+     * The current status of the request (e.g., PENDING, APPROVED, REJECTED).
+     * Mapped to the "REQ_STATUS" column. Handled by an auto-applied JPA converter.
+     */
+    @Column(name = "REQ_STATUS", nullable = false, length = 2)
+    private RequestStatus reqStatus;
+
+    /**
+     * The Oracle's SYSDATE/CURRENT_TIMESTAMP when the request was created.
+     * Automatically set upon entity creation and is not updatable.
+     * the value comes from not the Java JVM time, fixes time mismatch issues
+     */
+    @Column(name = "REQ_DATE", nullable = false, updatable = false)
+    private LocalDateTime reqDate;
+
+    /**
+     * The ID of the user who created the request.
+     * Mapped to the "CREATOR_ID" column.
+     */
+    @Column(name = "CREATOR_ID", nullable = false, length = 12)
+    private String creatorId;
+
+    /**
+     * The timestamp when the request was executed or processed.
+     * Mapped to the "EXECUTION_DATE" column.
+     */
+    @Column(name = "EXECUTION_DATE")
+    private LocalDateTime executionDate;
+
+    /**
+     * General remarks regarding the execution process.
+     * Stored as a Large Object (LOB) in the "EXECUTION_REMARKS" column.
+     */
+    @Lob
+    @Column(name = "EXECUTION_REMARKS")
+    private String executionRemarks;
+
+    /**
+     * The ID of the user who executed or processed the request.
+     * Mapped to the "EXECUTOR_ID" column.
+     */
+    @Column(name = "EXECUTOR_ID", length = 12)
+    private String executorId;
+
+    /**
+     * Specific remarks provided by the executor.
+     * Mapped to the "EXECUTOR_REMARKS" column.
+     */
+    @Column(name = "EXECUTOR_REMARKS", length = 500)
+    private String executorRemarks;
+
+    /**
+     * The request's main data payload, typically a JSON string.
+     * Stored as a Large Object (LOB) in the "PAYLOAD" column.
+     */
+    @Lob
+    @Column(name = "PAYLOAD", nullable = false)
+    private String payload;
+
+    /**
+     * An identifier for the target entity affected by the request (e.g., account number, user ID).
+     * Mapped to the "TARGET_ID" column.
+     */
+    @Column(name = "TARGET_ID", length = 4000)
+    private String targetId;
+
+
+    /**
+     * Retrieves the payload and marks it for raw JSON serialization.
+     *
+     * When this entity is serialized to JSON (e.g., in a REST API response),
+     * the value returned by this getter will be inserted directly as raw JSON,
+     * assuming the {@link #payload} field already contains a valid JSON string.
+     *
+     * @return The raw JSON payload string.
+     */
+    @JsonRawValue
+    public String getPayload() {
+        return payload;
+    }
+}
+  package com.tcs.fincore.CommonRequestService.service.strategy;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class LhoTransferStrategy implements RequestTypeStrategy {
+
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.LHO_TRANSFER;
+    }
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Processing Approval for LHO Transfer Batch: {}", request.getTargetId());
+
+        // Logic for what happens when the Checker clicks 'Approve'
+        switch (request.getChangeType()) {
+            case ADD:
+                handleLhoApproval(request);
+                break;
+            default:
+                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported for LHO.");
+        }
+    }
+
+    private void handleLhoApproval(CommonReq request) {
+        // TODO: Logic to finalize the P&L Transfer in the master tables
+        log.info("LHO Transfer Batch {} successfully approved and finalized.", request.getTargetId());
+    }
+}
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.*;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CGLMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * - Handle all requests for different business objects [CGL, SEGMENT, CURRENCY]
+ * - Handle creator/executor scenarios
+ * - Used strategy design patter to differentiate different business objects
+ * - Injected NotificationWriterService and PermissionConfigService for notification
+ * - Injected BusinessSecurityService for second level RBAC authentication to check BLOCK/UNBLOCK/CREATE permissions
+ *
+ *   @author Shubhankar Das [v1018405]
+ *   @version 1.0
+ *   @since 2025-12-11
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
+
+    private static final String EVENT_SOURCE = "CommonRequestService";
+    private final CommonRequestRepository commonRequestRepository;
+    private final RequestStrategyFactory strategyFactory;
+    private final ObjectMapper objectMapper;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final BusinessSecurityService businessSecurityService;
+
+    @Override
+    @Transactional(rollbackOn = Exception.class) // Ensure rollback on any exception
+    public CommonReq createRequest(
+            CreateRequestDto dto,
+            String creatorId,
+            String token
+    ) throws JsonProcessingException {
+
+
+        // --- LAYER 2 SECURITY CHECK --- (rbac) <-------- 1st check in filter [shubhankar]
+        // Validate that the user is allowed to perform this SPECIFIC ChangeType (e.g. BLOCK)
+        businessSecurityService.validateUserAction(token, dto.getRequestType(), dto.getChangeType());
+
+
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+
+        // --- PRE CHECKS ---
+        String targetId = payload.getKey();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Could not determine targetId from payload.");
+        }
+        log.info("Determined targetId for new request as: {}", targetId);
+
+        List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId,
+                RequestStatus.PENDING);
+
+        if (!existingRequests.isEmpty()) {
+            log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
+                    targetId, existingRequests.get(0).getReqStatus());
+            throw new DataIntegrityViolationException(
+                    "An active or pending request for '" + targetId + "' already exists.");
+        }
+        log.info("Uniqueness check passed for targetId: {}", targetId);
+
+        // --- CREATE AND SAVE REQUEST ---
+        CommonReq request = new CommonReq();
+        request.setCreatorId(creatorId);
+        request.setReqType(dto.getRequestType());
+        request.setChangeType(dto.getChangeType());
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId);
+        request.setReqStatus(RequestStatus.PENDING);
+        // set correct time date
+        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+
+
+        log.info("Saving new, validated request for targetId {}", targetId);
+        CommonReq savedRequest = commonRequestRepository.save(request);
+
+        try {
+            // --- NOTIFICATION LOGIC ---
+
+            // 1. Fetch Config from CACHE (Fast)
+            String requestTypeKey = dto.getRequestType().name(); // e.g., "SEGMENT_CODE"
+            log.info("Request Type String to fetch role ids from PERMISSIONS: {}", requestTypeKey);
+            NotificationConfigDto config = permissionConfigService.getConfig(requestTypeKey);
+
+            // 2. Customize Message
+            String action = request.getChangeType().name(); // ADD/ DELETE/ UPDATE / BLOCK
+
+            // Validate payload to detect "Block", "UNBLOCK action
+            if (request.getChangeType() == ChangeType.BLOCK || request.getChangeType() == ChangeType.UNBLOCK) {
+                // Parse payload to check if status is 0 (Blocked)
+                CGLMaster payload2 = objectMapper.readValue(request.getPayload(), CGLMaster.class);
+                if (payload2.getStatus() == 0) {
+                    action = "BLOCK"; // Override action name for the message
+                } else if (payload2.getStatus() == 1) {
+                    action = "UNBLOCK"; // Override action name for the message
+                }
+            }
+            String message = "New " + action + " request (" + targetId + ") pending for " + dto.getRequestType();
+
+            // 3. Send to Group (1-to-Many via Outbox)
+            notificationWriterService.createNotification(
+                    creatorId,                  // USER ID TO EXCLUDE FROM ROLES, IN THIS CASE ROLE WILL BE USED TO TARGET USER
+                    config.getTargetRoles(),    // Group to SEND TO "51,55" (Fetched from Cache/DB)
+                    message,
+                    config.getTargetUrl(),      // "/segment-requests" (Fetched from Cache/DB)
+                    savedRequest.getId().toString(),
+                    EVENT_SOURCE
+            );
+
+        } catch (Exception e) {
+            // Log the error and re-throw as a RuntimeException to force a rollback.
+            log.error("CRITICAL: Failed to create 'pending' notification for request: {}. Rolling back transaction.", savedRequest.getId(), e);
+            throw new RuntimeException("Failed to create notification event, rolling back request creation.", e);
+        }
+        return savedRequest;
+    }
+
+    @Override
+    @Transactional(rollbackOn = Exception.class) // Ensure rollback on any exception
+    public Optional<CommonReq> updateRequestStatus(
+            ProcessRequestDto dto,
+            String executorId
+    ) throws JsonProcessingException {
+
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        // SELF-APPROVAL CHECK
+        if (executorId.equals(request.getCreatorId())) {
+            log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId,
+                    requestId);
+            throw new IllegalStateException("User cannot approve or reject their own request.");
+        }
+
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(),
+                    request.getReqStatus());
+            throw new IllegalStateException("Request has already been processed and cannot be modified.");
+        }
+
+        // --- UPDATE REQUEST STATE ---
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+        request.setReqStatus(dto.getStatus());
+
+        // --- PROCESS BUSINESS LOGIC (STRATEGY) & PREPARE NOTIFICATION 1: TO MAKER (1-to-1) ---
+        // This is a 1-to-1, so USER_ID is the recipient, TARGET_ROLE is null.
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+            // 1. Execute the business logic (e.g., save to master table)
+            strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+
+            // Notify Maker: Approved
+            notificationWriterService.createRequestApprovedNotification(request, executorId);
+            request.setExecutionRemarks("Successfully processed approval.");
+
+        } else {
+            log.info("Request {} REJECTED.", dto.getRequestId());
+
+            // Notify Maker: Rejected
+            notificationWriterService.createRequestRejectedNotification(request, executorId, dto.getRemarks());
+            request.setExecutionRemarks("Request rejected by user.");
+        }
+
+        // --- NOTIFICATION 2: CLOSURE (1-to-Many, Filtered) ---
+        // We wrap this in Try/Catch because if this fails, we do NOT want to roll back the actual Approval.
+        // The approval is critical data; the "FYI" notification to the group is secondary.
+        try {
+            // A. Get Group Config from Cache (Zero DB Cost)
+            NotificationConfigDto config = permissionConfigService.getConfig(request.getReqType().name());
+
+            // B. Prepare Message
+            String action = dto.getStatus().equals(RequestStatus.ACCEPTED) ? "Approved" : "Rejected";
+            String closureMessage = "CLOSURE: Request " + request.getTargetId() + " was " + action + " by " + executorId;
+
+            // C. Send to Group (1-to-Many)
+            // Pass the CHECKER'S ID as the exclusion ID.
+            notificationWriterService.createNotification(
+                    executorId,                 // User to EXCLUDE
+                    config.getTargetRoles(),    // // Group to SEND TO -> The same roles that received the Pending alert excluding the executor
+                    closureMessage,
+                    config.getTargetUrl(),      // Link to history
+                    request.getId().toString(),
+                    "CommonRequestService"
+            );
+            log.info("Sent closure notification to group for Request ID: {}", requestId);
+
+        } catch (Exception e) {
+            // Log error but allow transaction to commit
+            log.error("Failed to send closure notification for Request ID: {}", requestId, e);
+        }
+
+        // --- SAVE THE UPDATED REQUEST ---
+        CommonReq updatedRequest = commonRequestRepository.save(request);
+
+        return Optional.of(updatedRequest);
+    }
+
+    @Override
+    @Transactional(rollbackOn = Exception.class)
+    public CommonReq cancelRequest(CancelRequestDto dto, String userId) {
+
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to cancel request ID: {} by user: {}", requestId, userId);
+
+        // 1. Fetch Request
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        // 2. Security Check: Only the CREATOR can cancel
+        if (!request.getCreatorId().equals(userId)) {
+            log.warn("SECURITY VIOLATION: User {} attempted to cancel request {} owned by {}",
+                    userId, requestId, request.getCreatorId());
+            throw new AccessDeniedException("You are not authorized to cancel this request.");
+        }
+
+        // 3. State Check: Must be PENDING
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to cancel a processed request. ID: {}, Status: {}", requestId, request.getReqStatus());
+            throw new IllegalStateException("Only pending requests can be cancelled. Current status: " + request.getReqStatus());
+        }
+
+        // 4. Update State
+        request.setReqStatus(RequestStatus.CANCELLED);
+
+        // We use Executor fields to track who cancelled it (the creator themselves)
+        request.setExecutorId(userId);
+        request.setExecutionDate(LocalDateTime.now());
+        request.setExecutorRemarks("CANCELLED BY USER: " + (dto.getRemarks() != null ? dto.getRemarks() : "No remarks"));
+
+        // 5. Save & Return
+        CommonReq updatedRequest = commonRequestRepository.save(request);
+        log.info("Request {} successfully cancelled by user.", requestId);
+
+        return updatedRequest;
+    }
+
+    @Override
+    public List<CommonReq> getMyRequests(
+            String userId,
+            RequestType requestType
+    ) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch requests for user : {}",
+                    userId);
+            throw new IllegalArgumentException(
+                    "Request type is missing, Please provide correct request type to fetch requests.");
+        }
+        log.info("Fetching my requests for user {} with type {}", userId, requestType);
+        return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getPendingRequests(
+            String userId,
+            RequestType requestType
+    ) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch pending requests.");
+            throw new IllegalArgumentException(
+                    "Request type is missing, Please provide correct request type to fetch pending requests."
+            );
+        }
+        log.info("Fetching pending requests for user :  {} with type : {}",userId, requestType);
+        return commonRequestRepository
+                .findByCreatorIdNotAndReqStatusAndReqType(userId, RequestStatus.PENDING, requestType);
+    }
+
+
+    @Override
+    public List<CommonReq> getAllRequests(
+    ) {
+        return commonRequestRepository.findAll();
+    }
+
+}
+
+frontend 
+
+
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Box, Button, Typography, CircularProgress, Table, TableBody,
+  TableCell, TableContainer, TableHead, TableRow, Paper,
+  TablePagination, Dialog, DialogTitle, DialogContent, IconButton,
+  Tooltip, DialogActions, Chip, Divider, Stack, useTheme, Grid
+} from "@mui/material";
+import {
+  PlayArrow as PlayArrowIcon,
+  Close as CloseIcon,
+  Assessment as SummaryIcon
+} from "@mui/icons-material";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+// --- API Constants ---
+const TRIGGER_API_URL = "/PS/airflow/trigger";
+const INITIAL_DATA_URL = "/PS/process/processes/data/7";
+const SUMMARY_BASE_URL = "/CM/lho-transfers/summary/";
+const CREATE_REQUEST_URL = "/CR/create-request";
+
+export default function TransferDataLho() {
+  const theme = useTheme();
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
+
+  // Table & Loading States
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [tableData, setTableData] = useState([]);
+  const [totalElements, setTotalElements] = useState(0);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
+
+  // Summary & Submission States
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [summaryData, setSummaryData] = useState([]);
+  const [summaryTotals, setSummaryTotals] = useState({ totalAmount: 0, totalRecordCount: 0 });
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [summaryPage, setSummaryPage] = useState(0);
+  const [summaryRowsPerPage, setSummaryRowsPerPage] = useState(5);
+
+  // Payload Context
+  const [rowContext, setRowContext] = useState({ processRunId: null, processId: null });
+  const [currentSelectedId, setCurrentSelectedId] = useState(null);
+
+  /**
+   * HELPERS
+   */
+  const generateBatchId = (sequence) => {
+    const pad = "000000";
+    const str = String(sequence || 0);
+    return "LHO_" + pad.substring(0, pad.length - str.length) + str;
+  };
+
+  const getTodayFormatted = () => new Date().toISOString().split('T')[0];
+
+  // Formatter for: 19 Feb 2026, 10:39:31 pm
+  const formatProcessTime = (dateString) => {
+    if (!dateString) return "-";
+    const date = new Date(dateString);
+    return new Intl.DateTimeFormat('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    }).format(date).replace(',', '');
+  };
+
+  /**
+   * DATA FETCHING
+   */
+  const fetchInitialData = async () => {
+    setIsInitialLoading(true);
+    try {
+      const paginatedUrl = `${INITIAL_DATA_URL}`; // Note: Update with ?page=${page}&size=${rowsPerPage} if backend supports it
+      const response = await callApi(paginatedUrl, null, "GET");
+      if (isMounted.current && response) {
+        setTableData(response.initialData || []);
+        setTotalElements(response.totalElements || (response.initialData?.length || 0));
+      }
+    } catch (error) {
+      showSnackBar("Failed to load process data", "error");
+    } finally {
+      if (isMounted.current) setIsInitialLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    isMounted.current = true;
+    fetchInitialData();
+    return () => { isMounted.current = false; };
+  }, [page, rowsPerPage]);
 const handleTransferLho = async () => {
   setIsTransferring(true);
   const payload = { dagId: "cbs_wrap_dag", processId: 7, remarks: "testing 1" };
@@ -7,15 +737,208 @@ const handleTransferLho = async () => {
     showSnackBar("LHO Transfer triggered successfully", "success");
     fetchInitialData();
   } catch (error) {
-    // --- LEAD'S FIX START ---
-    // The 'error' here is the 'err?.response?.data' thrown by your useApi hook.
-    // We check if the backend provided a specific 'message'.
     const errorMessage = error?.message || "Failed to trigger LHO Transfer";
     
-    // Show the actual error message (e.g., "An Dag is already running...")
     showSnackBar(errorMessage, "error");
-    // --- LEAD'S FIX END ---
   } finally {
     setIsTransferring(false);
   }
 };
+
+  const handleSubmitLhoRequest = async () => {
+    setIsSubmitting(true);
+    const finalRequestPayload = {
+      requestType: "LHO_TRANSFER",
+      changeType: "ADD",
+      targetId: null, 
+      payload: {
+        processRunId: rowContext.processRunId,
+        processId: rowContext.processId,
+        batchId: generateBatchId(rowContext.processRunId),
+        processDate: getTodayFormatted(),
+        totalAmount: summaryTotals.totalAmount,
+        totalRecordCount: summaryTotals.totalRecordCount,
+        circleWiseDetails: summaryData.map(item => ({
+          transferDate: getTodayFormatted(),
+          circleBranchCode: Number(item.circleBranchCode),
+          totalProfitLoss: Number(item.totalProfitLoss)
+        }))
+      }
+    };
+
+    try {
+      await callApi(CREATE_REQUEST_URL, finalRequestPayload, "POST");
+      showSnackBar("LHO Transfer Request Submitted Successfully", "success");
+      setSummaryOpen(false);
+    } catch (error) {
+      showSnackBar("Submission failed. Check network/payload.", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleGetSummary = async (row) => {
+    setSummaryOpen(true);
+    setSummaryLoading(true);
+    setCurrentSelectedId(row.processRunId);
+    setRowContext({ processRunId: row.processRunId, processId: row.processId });
+    
+    try {
+      const response = await callApi(`${SUMMARY_BASE_URL}${row.processRunId}`, null, "GET");
+      const summaryObj = response?.data || {};
+      const rawMap = summaryObj.circleWiseDetails || {};
+      
+      setSummaryTotals({
+        totalAmount: summaryObj.totalAmount || 0,
+        totalRecordCount: summaryObj.totalRecordCount || 0
+      });
+
+      setSummaryData(Object.entries(rawMap).map(([code, balance]) => ({
+        circleBranchCode: code, totalProfitLoss: balance
+      })));
+    } catch (error) {
+      showSnackBar("Could not fetch summary data", "error");
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
+  const getStatusChip = (s) => {
+    if (s === 1) return <Chip label="In Progress" color="primary" variant="outlined" size="small" />;
+    if (s === 2) return <Chip label="Success" color="success" size="small" />;
+    if (s === 3) return <Chip label="Fail" color="error" size="small" />;
+    return <Chip label="Unknown" variant="outlined" size="small" />;
+  };
+
+  return (
+    <Box p={3} width="100%">
+      {/* Header Action */}
+      <Box display="flex" justifyContent="flex-end" mb={2}>
+        <Button
+          variant="contained"
+          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
+          onClick={handleTransferLho}
+          disabled={isTransferring || isInitialLoading}
+        >
+          {isTransferring ? "Transferring..." : "Transfer LHO"}
+        </Button>
+      </Box>
+
+      {/* Main Table */}
+      <TableContainer component={Paper}>
+        <Table>
+          <TableHead sx={{ bgcolor: theme.palette.action.hover }}>
+            <TableRow>
+              <TableCell align="center"><strong>Run Id</strong></TableCell>
+              <TableCell align="center"><strong>Process Name</strong></TableCell>
+              <TableCell align="center"><strong>Status</strong></TableCell>
+              <TableCell align="center"><strong>Start Time</strong></TableCell>
+              <TableCell align="center"><strong>End Time</strong></TableCell>
+              <TableCell align="center"><strong>Action</strong></TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {tableData.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage).map((row) => (
+              <TableRow key={row.processRunId}>
+                <TableCell align="center">{row.runId}</TableCell>
+                <TableCell align="center">{row.processType}</TableCell>
+                <TableCell align="center">{getStatusChip(row.status)}</TableCell>
+                <TableCell align="center">{formatProcessTime(row.processStartTime)}</TableCell>
+                <TableCell align="center">{formatProcessTime(row.processEndTime)}</TableCell>
+                <TableCell align="center">
+                  <Tooltip title={row.status === 2 ? "Get Summary" : "Not Available"}>
+                    <span>
+                      <IconButton 
+                        size="small" 
+                        disabled={row.status !== 2} 
+                        onClick={() => handleGetSummary(row)}
+                        color="primary"
+                      >
+                        <SummaryIcon />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        <TablePagination 
+          component="div" 
+          count={totalElements} 
+          page={page} 
+          onPageChange={(e, p) => setPage(p)} 
+          rowsPerPage={rowsPerPage} 
+          onRowsPerPageChange={(e) => { setRowsPerPage(parseInt(e.target.value, 10)); setPage(0); }} 
+        />
+      </TableContainer>
+
+      {/* --- SUMMARY DIALOG --- */}
+      <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle sx={{ m: 0, p: 2 }}>
+          Circle Wise Summary (ID: {currentSelectedId})
+          <IconButton onClick={() => setSummaryOpen(false)} sx={{ position: 'absolute', right: 8, top: 8 }}><CloseIcon /></IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {summaryLoading ? <Box display="flex" justifyContent="center" py={5}><CircularProgress /></Box> : (
+            <>
+              <Paper variant="outlined" sx={{ p: 2, mb: 2, bgcolor: theme.palette.action.hover }}>
+                <Grid container spacing={2}>
+                  <Grid item xs={6}>
+                    <Typography variant="caption" color="text.secondary">Total Records</Typography>
+                    <Typography variant="h6" fontWeight="bold">{summaryTotals.totalRecordCount}</Typography>
+                  </Grid>
+                  <Grid item xs={6}>
+                    <Typography variant="caption" color="text.secondary">Total Volume Amount</Typography>
+                    <Typography variant="h6" fontWeight="bold" color="primary">{Number(summaryTotals.totalAmount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</Typography>
+                  </Grid>
+                </Grid>
+              </Paper>
+              <TableContainer component={Paper}>
+                <Table size="small">
+                  <TableHead><TableRow><TableCell align="center"><strong>Circle Branch Code</strong></TableCell><TableCell align="center"><strong>Balance</strong></TableCell></TableRow></TableHead>
+                  <TableBody>
+                    {summaryData.slice(summaryPage * summaryRowsPerPage, summaryPage * summaryRowsPerPage + summaryRowsPerPage).map((row, idx) => (
+                      <TableRow key={idx}>
+                        <TableCell align="center">{row.circleBranchCode}</TableCell>
+                        <TableCell align="center" sx={{ fontWeight: 'bold' }}>{Number(row.totalProfitLoss).toLocaleString('en-IN', { minimumFractionDigits: 4 })}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <TablePagination component="div" count={summaryData.length} page={summaryPage} onPageChange={(e, p) => setSummaryPage(p)} rowsPerPage={summaryRowsPerPage} onRowsPerPageChange={(e) => setSummaryRowsPerPage(parseInt(e.target.value, 10))} rowsPerPageOptions={[5]} />
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button variant="outlined" onClick={() => setSummaryOpen(false)} disabled={isSubmitting}>Cancel</Button>
+          <Button 
+            variant="contained" 
+            disabled={summaryData.length === 0 || isSubmitting} 
+            onClick={handleSubmitLhoRequest}
+            startIcon={isSubmitting && <CircularProgress size={16} color="inherit" />}
+          >
+            {isSubmitting ? "Submitting..." : "Submit LHO Request"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+
+there is one problem like i create that batch id from the frontend but the problem is every time when i try to create the request it will create becose of this duplicate request also created
+thats i dont want 
+when ever the request is created i dont want that batch id when i am created i want like 
+
+2438	LHO_TRANSFER	A	P	20-02-26	1021256					{"processRunId":433,"processId":7,"batchId":"LHO_000433","processDate":"2026-02-20","totalAmount":0,"totalRecordCount":4,"circleWiseDetails":[{"transferDate":"2026-02-20","circleBranchCode":3978,"totalProfitLoss":668360000},{"transferDate":"2026-02-20","circleBranchCode":4282,"totalProfitLoss":35884.8},{"transferDate":"2026-02-20","circleBranchCode":6939,"totalProfitLoss":-35884.8},{"transferDate":"2026-02-20","circleBranchCode":61263,"totalProfitLoss":-668360000}]}	LHO_000433	
+2436	LHO_TRANSFER	A	P	20-02-26	1021256					{"processRunId":423,"processId":7,"batchId":"LHO_000423","processDate":"2026-02-20","totalAmount":0,"totalRecordCount":4,"circleWiseDetails":[{"transferDate":"2026-02-20","circleBranchCode":3978,"totalProfitLoss":477400000},{"transferDate":"2026-02-20","circleBranchCode":4282,"totalProfitLoss":25632},{"transferDate":"2026-02-20","circleBranchCode":6939,"totalProfitLoss":-25632},{"transferDate":"2026-02-20","circleBranchCode":61263,"totalProfitLoss":-477400000}]}	LHO_000423	
+2435	LHO_TRANSFER	A	P	20-02-26	1021256					{"processRunId":424,"processId":7,"batchId":"LHO_000424","processDate":"2026-02-20","totalAmount":0,"totalRecordCount":4,"circleWiseDetails":[{"transferDate":"2026-02-20","circleBranchCode":3978,"totalProfitLoss":477400000},{"transferDate":"2026-02-20","circleBranchCode":4282,"totalProfitLoss":25632},{"transferDate":"2026-02-20","circleBranchCode":6939,"totalProfitLoss":-25632},{"transferDate":"2026-02-20","circleBranchCode":61263,"totalProfitLoss":-477400000}]}	LHO_000424	
+2434	LHO_TRANSFER	A	P	20-02-26	1021256					{"processRunId":425,"processId":7,"batchId":"LHO_000425","processDate":"2026-02-20","totalAmount":0,"totalRecordCount":4,"circleWiseDetails":[{"transferDate":"2026-02-20","circleBranchCode":3978,"totalProfitLoss":477400000},{"transferDate":"2026-02-20","circleBranchCode":4282,"totalProfitLoss":25632},{"transferDate":"2026-02-20","circleBranchCode":6939,"totalProfitLoss":-25632},{"transferDate":"2026-02-20","circleBranchCode":61263,"totalProfitLoss":-477400000}]}	LHO_000425	
+2433	LHO_TRANSFER	A	P	20-02-26	1021256					{"processRunId":427,"processId":7,"batchId":"LHO_000427","processDate":"2026-02-20","totalAmount":0,"totalRecordCount":4,"circleWiseDetails":[{"transferDate":"2026-02-20","circleBranchCode":3978,"totalProfitLoss":477400000},{"transferDate":"2026-02-20","circleBranchCode":4282,"totalProfitLoss":25632},{"transferDate":"2026-02-20","circleBranchCode":6939,"totalProfitLoss":-25632},{"transferDate":"2026-02-20","circleBranchCode":61263,"totalProfitLoss":-477400000}]}	LHO_000427	
+2432	LHO_TRANSFER	A	P	20-02-26	1021256					{"processRunId":429,"processId":7,"batchId":"LHO_000429","processDate":"2026-02-20","totalAmount":0,"totalRecordCount":4,"circleWiseDetails":[{"transferDate":"2026-02-20","circleBranchCode":3978,"totalProfitLoss":477400000},{"transferDate":"2026-02-20","circleBranchCode":4282,"totalProfitLoss":25632},{"transferDate":"2026-02-20","circleBranchCode":6939,"totalProfitLoss":-25632},{"transferDate":"2026-02-20","circleBranchCode":61263,"totalProfitLoss":-477400000}]}	LHO_000429	
+2430	LHO_TRANSFER	A	P	20-02-26	1021256					{"processRunId":405,"processId":7,"batchId":"LHO_000405","processDate":"2026-02-20","totalAmount":0,"totalRecordCount":4,"circleWiseDetails":[{"transferDate":"2026-02-20","circleBranchCode":3978,"totalProfitLoss":859320000},{"transferDate":"2026-02-20","circleBranchCode":4282,"totalProfitLoss":46137.6},{"transferDate":"2026-02-20","circleBranchCode":6939,"totalProfitLoss":-46137.6},{"transferDate":"2026-02-20","circleBranchCode":61263,"totalProfitLoss":-859320000}]}	LHO_000405	
+2429	LHO_TRANSFER	A	P	20-02-26	1021253					{"processRunId":412,"processId":7,"batchId":"LHO_000412","processDate":"2026-02-20","totalAmount":0,"totalRecordCount":4,"circleWiseDetails":[{"transferDate":"2026-02-20","circleBranchCode":3978,"totalProfitLoss":859320000},{"transferDate":"2026-02-20","circleBranchCode":4282,"totalProfitLoss":46137.6},{"transferDate":"2026-02-20","circleBranchCode":6939,"totalProfitLoss":-46137.6},{"transferDate":"2026-02-20","circleBranchCode":61263,"totalProfitLoss":-859320000}]}	LHO_000412	
+from this 2438 -> this is request first column how can u use this as a my batch id and target id can help me 
+
+or there is onther way so that duplicate request not be created ???
