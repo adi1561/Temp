@@ -1,13 +1,11 @@
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tcs.fincore.CommonRequestService.model.CommonReq;
 import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import com.tcs.fincore.CommonRequestService.repository.LhoMasterRepository; // Replace with your actual repository
-
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
@@ -16,13 +14,13 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class LhoTransferStrategy implements RequestTypeStrategy {
 
-    // 1. Inject your Repository and Spring's native KafkaTemplate directly
-    private final LhoMasterRepository lhoMasterRepository; 
-    private final KafkaTemplate<String, Object> kafkaTemplate;
-    private final ObjectMapper objectMapper;
+    // Inject KafkaTemplate directly
+    private final KafkaTemplate<String, String> kafkaTemplate;
 
-    // Define your Kafka topic (consider moving to application.yml and injecting via @Value)
-    private static final String LHO_KAFKA_TOPIC = "lho-transfer-events";
+    // Best practice: Externalize your topic name to application.yml 
+    // Fallback to "lho-transfer-events" if not found in properties
+    @Value("${app.kafka.topics.lho-transfer:lho-transfer-events}")
+    private String lhoTopic;
 
     @Override
     public RequestType getRequestType() {
@@ -42,21 +40,14 @@ public class LhoTransferStrategy implements RequestTypeStrategy {
         }
     }
 
-    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Executing master table updates for LHO targetId: {}", request.getTargetId());
+    private void handleLhoApproval(CommonReq request) {
+        log.info("Triggering Kafka event to topic '{}' for LHO targetId: {}", lhoTopic, request.getTargetId());
         
-        // 2. Extract payload if needed to update the master table
-        // LhoPayloadDto payload = objectMapper.readValue(request.getPayload(), LhoPayloadDto.class);
+        // Publish the event. 
+        // We use targetId as the Kafka Message Key to ensure ordered processing for the same targetId.
+        // We pass the JSON payload so the consuming service has all the data it needs to act.
+        kafkaTemplate.send(lhoTopic, request.getTargetId(), request.getPayload());
         
-        // 3. Update the database directly using the repository
-        // Example: lhoMasterRepository.updateTransferStatus(request.getTargetId(), "FINALIZED");
-        
-        // 4. Fire the Kafka Event
-        log.info("Publishing Kafka event to topic {} for targetId: {}", LHO_KAFKA_TOPIC, request.getTargetId());
-        
-        // Sending a simple message. (Key = targetId, Value = Action or Payload)
-        kafkaTemplate.send(LHO_KAFKA_TOPIC, request.getTargetId(), "LHO_TRANSFER_APPROVED");
-        
-        log.info("LHO Transfer Batch {} successfully approved and finalized.", request.getTargetId());
+        log.info("Kafka event successfully dispatched for LHO Transfer Batch {}.", request.getTargetId());
     }
 }
