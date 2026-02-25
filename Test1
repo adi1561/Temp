@@ -2,11 +2,16 @@ package com.tcs.fincore.CommonRequestService.service.strategy;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.kafka.support.SendResult;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.stereotype.Service;
 
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 @Slf4j
@@ -14,37 +19,140 @@ import java.util.concurrent.CompletableFuture;
 @RequiredArgsConstructor
 public class KafkaEventPublisherService {
 
-    // Injects the Spring Boot Kafka Template
     private final KafkaTemplate<String, String> kafkaTemplate;
 
-    // Pulls the topic name from application.yml, defaults to "lho-airflow-topic" if missing
     @Value("${app.kafka.topics.lho-transfer:lho-airflow-topic}")
     private String lhoTopic;
 
-    public void publishLhoTransferEvent(String targetId, String payload) {
+
+
+    public void publishLhoTransferEvent(String targetId, Long requestId, String payload) {
         log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
 
-        // --- REAL KAFKA PUBLISH LOGIC ---
-        // We pass the targetId as the message "Key". This ensures messages for the same batch 
-        // go to the same partition, preserving order.
-        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(lhoTopic, targetId, payload);
+        // 1. Create a ProducerRecord (This is the standard Kafka way)
+        ProducerRecord<String, String> record = new ProducerRecord<>(lhoTopic, targetId, payload);
 
-        // --- ASYNC CALLBACK HANDLING ---
+        // 2. Add your custom header to the record
+        record.headers().add("requestId", String.valueOf(requestId).getBytes());
+
+        // 3. Send it once
+        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(record);
+
         future.whenComplete((result, exception) -> {
             if (exception == null) {
-                // Success: Log the exact location in Kafka where the message was saved
-                log.info("Successfully published LHO Transfer event! Target ID: {} | Topic: {} | Partition: {} | Offset: {}", 
-                        targetId, 
-                        lhoTopic, 
-                        result.getRecordMetadata().partition(), 
-                        result.getRecordMetadata().offset());
+                log.info("Successfully published! Target ID: {} | Topic: {} | Offset: {}",
+                        targetId, lhoTopic, result.getRecordMetadata().offset());
             } else {
-                // Failure: The broker might be down, or topic doesn't exist
-                log.error("CRITICAL: Failed to publish LHO Transfer event for Target ID: {}. Error: {}", 
-                        targetId, 
-                        exception.getMessage(), 
-                        exception);
+                log.error("CRITICAL: Failed to publish for Target ID: {}. Error: {}",
+                        targetId, exception.getMessage());
             }
         });
     }
 }
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class LhoTransferStrategy implements RequestTypeStrategy {
+
+    private final KafkaEventPublisherService kafkaEventPublisherService;
+    private final ObjectMapper objectMapper; // Added Jackson ObjectMapper for JSON manipulation
+
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.LHO_TRANSFER;
+    }
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Processing Approval for LHO Transfer Batch: {}", request.getTargetId());
+
+        switch (request.getChangeType()) {
+            case ADD:
+                handleLhoApproval(request);
+                break;
+            default:
+                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported for LHO.");
+        }
+    }
+
+    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Constructing tailored Kafka payload for LHO targetId: {}", request.getTargetId());
+
+        // 1. Parse the original payload to extract Airflow-specific IDs
+        JsonNode originalPayload = objectMapper.readTree(request.getPayload());
+        Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
+        Long processId = originalPayload.has("processId") ? originalPayload.get("processId").asLong() : null;
+
+        // 2. Build the exact payload required by the consumer
+        Map<String, Object> customKafkaPayload = new HashMap<>();
+        customKafkaPayload.put("requestId" , request.getId());
+        customKafkaPayload.put("processRunId", processRunId);
+        customKafkaPayload.put("processId", 12);
+        customKafkaPayload.put("user", request.getExecutorId());
+        customKafkaPayload.put("remarks", request.getExecutorRemarks());
+
+        // 3. Convert back to a JSON string
+        String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
+
+        // 4. Trigger the event (Currently running your Mock bypass)
+        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(),request.getId(), finalPayloadString);
+
+        log.info("LHO Transfer Batch {} approval process completed successfully.", request.getTargetId());
+
+    }
+}
+
+1st change
+
+before doing the consumer class we need one change in this like as we send the event it means it is going in the pending state -> in DB we need to change that with Q
+i think we also need to update that i told this also i think 
+we need to add in this file also RequestStatus that Queue is it 
+do that and give mi this changes 
+
+
+
+
+2nd change 
+
+
+this are the my updated files in which i did some change in that dont remove that changes 
+
+and also there is changes in the consumers 
+
+i told u alrady that we have to listen  2 topic something like this 
+
+1st listners
+topic name -> trigger-events-responce-one
+in this what we are doing is like for this topic listener if i get false or we can say fail then in this case we need to do again that status to PENDING(P)
+
+
+if u get true or success do nothing
+add logs 
+
+2nd listner
+
+topic -> trigger-events-responce-two
+
+in this if u get the success or true -> mark that as accepted 
+if u get false -> again mark as it as PENDING 
+
+
+
+do this and give mi updated and new files where should i add that folder name and all add logs if u are changing the status and all
