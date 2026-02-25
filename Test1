@@ -1,38 +1,13 @@
-As a Senior Lead, I completely understand why you want to map this out. Moving from a standard API to an event-driven Kafka architecture introduces a lot of moving parts. If you don't have a clear mental model of the flow, it becomes very hard to debug.
-Here is the exact end-to-end journey of your code, broken down into four distinct phases.
-Phase 1: The Origin (Frontend to Database)
-Where the original payload comes from.
- * Frontend (TransferDataLho.jsx): The user selects a row (e.g., Run ID 412) and clicks "Submit LHO Request". The React code builds a JSON payload containing the batchId (which is "412"), the processDate, and the circleWiseDetails.
- * Controller & Service (RequestServiceImpl.java): The Spring Boot backend receives this payload at /CR/create-request. It checks for duplicates.
- * Database Save: The backend wraps this payload inside a CommonReq entity. It saves it to the COMMON_REQ table with a new generated ID (e.g., 2438) and sets the REQ_STATUS to PENDING ("P"). The original frontend JSON is saved as a pure string in the PAYLOAD column.
-Phase 2: The Approval & Dispatch (Strategy & Publisher)
-Where the status changes to QUEUE and the event is fired.
-Later, a Checker logs in and clicks "Approve" on Request 2438. This triggers RequestServiceImpl.updateRequestStatus(), which routes the flow to your specific Strategy class.
- * The Strategy (LhoTransferStrategy.java):
-   * It pulls the CommonReq entity (ID 2438) from the database.
-   * Where the Kafka payload comes from: It opens up that saved PAYLOAD string from the database and reads it using ObjectMapper. It extracts the processRunId (e.g., 412).
-   * It builds a brand new, smaller payload just for Kafka. This payload contains requestId: 2438, processRunId: 412, and processId: 12.
- * The Publisher (KafkaEventPublisherService.java): The Strategy hands this small JSON to the Publisher. The Publisher wraps it in a ProducerRecord and sends it to the main topic (lho-airflow-topic).
- * Status Shift: Immediately after sending the event, the Strategy changes the CommonReq status to QUEUE ("Q") and saves it to the database.
-   * The user now sees this as "In Progress" on the frontend.
-Phase 3: The External Processing (Airflow)
-The Black Box.
- * Airflow (or the Data Team's system) is listening to lho-airflow-topic.
- * It sees your message: "Hey, start processing LHO Batch 412 for Request 2438."
- * Airflow does its heavy lifting (moving money, updating Delta Lake, etc.).
- * When it finishes, Airflow creates a new JSON response (e.g., {"requestId": 2438, "isSuccess": true}) and sends it back to your Spring Boot application via one of the two response topics.
-Phase 4: The Callback (Consumer & Database Update)
-Where the system listens for the result and finalizes the status.
-Your Spring Boot app has two listeners running in the background at all times in LhoKafkaConsumerService.java.
- * Topic 1 Listener (trigger-events-responce-one):
-   * If Airflow sends a message here saying it FAILED (isSuccess: false), this code looks up CommonReq ID 2438 and changes the status back to PENDING ("P").
-   * If Airflow says it SUCCEEDED (isSuccess: true), this code does absolutely nothing. The record stays in QUEUE.
- * Topic 2 Listener (trigger-events-responce-two):
-   * If Airflow sends a message here saying it SUCCEEDED (isSuccess: true), this code looks up CommonReq ID 2438 and changes the status to ACCEPTED ("A").
-   * If Airflow says it FAILED (isSuccess: false), this code changes the status back to PENDING ("P").
-(Meanwhile, your React frontend is silently polling the database every 10 seconds. As soon as the Consumer changes the status in the database to A or P, the UI instantly updates for the user).
-Summary of "What is Where"
- * Initial Payload: Created in React, stored in the PAYLOAD DB column.
- * Kafka Payload: Dynamically built in LhoTransferStrategy by reading the DB and injecting the database ID.
- * State Management: Handled by the database (P -> Q -> A or P), orchestrated by the Kafka Consumer receiving messages from the external system.
-Does this timeline help solidify how the different pieces connect? Would you like me to show you how to map those two new Kafka topics in your application.yml file so your listeners can actually hear the Airflow responses?
+2026-02-25 14:47:42.229 INFO  [http-nio-9000-exec-2] c.t.f.C.s.NotificationWriterService: Saved 1-to-1 notification event for user: 1021256 (AggregateID: 2506) 
+2026-02-25 14:47:42.257 INFO  [http-nio-9000-exec-2] c.t.f.C.s.NotificationWriterService: Saved 1-to-many notification event for role: 51,11,10 (AggregateID: 2506) 
+2026-02-25 14:47:42.257 INFO  [http-nio-9000-exec-2] c.t.f.C.s.RequestServiceImpl: Sent closure notification to group for Request ID: 2506 
+2026-02-25 14:47:42.354 WARN  [http-nio-9000-exec-2] o.h.e.j.s.SqlExceptionHelper: SQL Error: 2290, SQLState: 23000 
+2026-02-25 14:47:42.354 ERROR [http-nio-9000-exec-2] o.h.e.j.s.SqlExceptionHelper: ORA-02290: check constraint (FINCORE.REQ_STATUS_CHK) violated
+ 
+2026-02-25 14:47:42.379 ERROR [http-nio-9000-exec-2] c.t.f.C.e.GlobalExceptionHandler: Data integrity violation: could not execute statement [ORA-02290: check constraint (FINCORE.REQ_STATUS_CHK) violated
+] [update common_req set change_type=?,creator_id=?,execution_date=?,executor_id=?,executor_remarks=?,req_status=?,req_type=?,target_id=?,execution_remarks=?,payload=? where req_id=?]; SQL [update common_req set change_type=?,creator_id=?,execution_date=?,executor_id=?,executor_remarks=?,req_status=?,req_type=?,target_id=?,execution_remarks=?,payload=? where req_id=?]; constraint [null] 
+2026-02-25 14:47:42.379 ERROR [http-nio-9000-exec-2] c.t.f.C.e.GlobalExceptionHandler: error: ORA-02290: check constraint (FINCORE.REQ_STATUS_CHK) violated
+ 
+2026-02-25 14:47:42.399 WARN  [http-nio-9000-exec-2] o.s.w.s.h.AbstractHandlerExceptionResolver: Resolved [org.springframework.dao.DataIntegrityViolationException: could not execute statement [ORA-02290: check constraint (FINCORE.REQ_STATUS_CHK) violated<EOL>] [update common_req set change_type=?,creator_id=?,execution_date=?,executor_id=?,executor_remarks=?,req_status=?,req_type=?,target_id=?,execution_remarks=?,payload=? where req_id=?]; SQL [update common_req set change_type=?,creator_id=?,execution_date=?,executor_id=?,executor_remarks=?,req_status=?,req_type=?,target_id=?,execution_remarks=?,payload=? where req_id=?]; constraint [null]] 
+
+ i think we are sening Queue as it is we need to send the Just "Q" is it 
