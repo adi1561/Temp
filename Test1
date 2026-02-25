@@ -1,100 +1,11 @@
-package com.tcs.fincore.CommonRequestService.service.strategy;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Component;
-
-import java.util.HashMap;
-import java.util.Map;
-
-@Slf4j
-@Component
-@RequiredArgsConstructor
-public class LhoTransferStrategy implements RequestTypeStrategy {
-
-    private final KafkaEventPublisherService kafkaEventPublisherService;
-    private final ObjectMapper objectMapper; // Added Jackson ObjectMapper for JSON manipulation
-
-    @Override
-    public RequestType getRequestType() {
-        return RequestType.LHO_TRANSFER;
-    }
-
-    @Override
-    public void processApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Processing Approval for LHO Transfer Batch: {}", request.getTargetId());
-
-        switch (request.getChangeType()) {
-            case ADD:
-                handleLhoApproval(request);
-                break;
-            default:
-                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported for LHO.");
-        }
-    }
-
-    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Constructing tailored Kafka payload for LHO targetId: {}", request.getTargetId());
-
-        // 1. Parse the original payload to extract Airflow-specific IDs
-        JsonNode originalPayload = objectMapper.readTree(request.getPayload());
-        Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
-        Long processId = originalPayload.has("processId") ? originalPayload.get("processId").asLong() : null;
-
-        // 2. Build the exact payload required by the consumer
-        Map<String, Object> customKafkaPayload = new HashMap<>();
-        customKafkaPayload.put("ID" , request.getId());
-        customKafkaPayload.put("processRunId", processRunId);
-        customKafkaPayload.put("processId", processId);
-        customKafkaPayload.put("user", request.getExecutorId());
-        customKafkaPayload.put("remarks", request.getExecutorRemarks());
-
-        // 3. Convert back to a JSON string
-        String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
-
-        // 4. Trigger the event (Currently running your Mock bypass)
-        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), finalPayloadString);
-
-        log.info("LHO Transfer Batch {} approval process completed successfully.", request.getTargetId());
-
-    }
-}
-
-package com.tcs.fincore.CommonRequestService.service.strategy;
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.stereotype.Service;
-
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class KafkaEventPublisherService {
-
-    private final KafkaTemplate<String, String> kafkaTemplate;
-
-    @Value("${app.kafka.topics.lho-transfer:lho-airflow-topic}")
-    private String lhoTopic;
-
-    public void publishLhoTransferEvent(String targetId, String payload) {
-        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
-
-
-        // Simulate an instant, successful Kafka publish
-        log.info("KAFKA EVENT SUCCESSFULLY TRIGGERED!");
-        log.info("Target ID : {}", targetId);
-        log.info("Topic     : {}", lhoTopic);
-        log.info("Payload   : {}", payload);
-    }
-}
-
+This is an excellent architectural evolution. Moving from a synchronous "Wait and See" model to an asynchronous Event-Driven pattern using Kafka is exactly how enterprise systems handle long-running Airflow tasks.
+Here is how we will structure this:
+ * The Enum: We add QUEUE("Q") to RequestStatus.
+ * The Publisher (Strategy): When the Checker approves the request, we intercept it. Before it saves to the database, we change the status from ACCEPTED to QUEUE and fire the event to Airflow.
+ * The Consumer (New Service): We create a brand new service that listens to two distinct topics (one for success, one for failure). It extracts the database ID from the Kafka message, looks up the record, and flips the status to either ACCEPTED or PENDING.
+Here are the complete files you need.
+1. [EXISTING FILE - COMPLETE UPDATED FILE] RequestStatus.java
+Location: com.tcs.fincore.CommonRequestService.model.enums
 package com.tcs.fincore.CommonRequestService.model.enums;
 
 /**
@@ -128,7 +39,14 @@ public enum RequestStatus {
      * The created request has been cancelled before execution.
      * Mapped to the database code "C".
      */
-    CANCELLED("C");
+    CANCELLED("C"),
+
+    /**
+     * The request has been approved and sent to a message broker (e.g., Kafka/Airflow).
+     * It is currently IN PROGRESS and waiting for an asynchronous callback.
+     * Mapped to the database code "Q".
+     */
+    QUEUE("Q");
 
     /**
      * The single-character code used to represent the status in the database or external systems.
@@ -154,15 +72,170 @@ public enum RequestStatus {
     }
 }
 
+2. [EXISTING FILE - COMPLETE UPDATED FILE] LhoTransferStrategy.java
+Location: com.tcs.fincore.CommonRequestService.service.strategy
+I have added the logic to mutate the request status to QUEUE right after the Kafka event is fired. Because RequestServiceImpl calls commonRequestRepository.save(request) after this strategy runs, it will save as "Q" in the database.
+package com.tcs.fincore.CommonRequestService.service.strategy;
 
-i hope u remmber we are creating this event now we need to create the code for the consuming the event we need to consume 2 evernt using 2 diff topices i will give that names aftr words for give name on own so that 
-i will do next things like 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
 
-if i get true or success then i want to marks that as a ACCEPTED
-if any of them getting fail or fails then we put it as PENDING
-and main thing is when we trigger the event end send at that time we need to change the status as IN_PROGRESS but here for status we are adding like QUEUE("Q") we need to add this in the RequestStatus i will mange from the frontend
-in the DB we need to store as Q it is in Queue something like this 
+import java.util.HashMap;
+import java.util.Map;
 
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class LhoTransferStrategy implements RequestTypeStrategy {
 
-calm down and understand the flow and give mi updated code and new files tell me 
+    private final KafkaEventPublisherService kafkaEventPublisherService;
+    private final ObjectMapper objectMapper; 
 
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.LHO_TRANSFER;
+    }
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Processing Approval for LHO Transfer Batch: {}", request.getTargetId());
+
+        switch (request.getChangeType()) {
+            case ADD:
+                handleLhoApproval(request);
+                break;
+            default:
+                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported for LHO.");
+        }
+    }
+
+    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Constructing tailored Kafka payload for LHO targetId: {}", request.getTargetId());
+
+        // 1. Parse the original payload to extract Airflow-specific IDs
+        JsonNode originalPayload = objectMapper.readTree(request.getPayload());
+        Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
+        Long processId = originalPayload.has("processId") ? originalPayload.get("processId").asLong() : null;
+
+        // 2. Build the exact payload required by the consumer
+        Map<String, Object> customKafkaPayload = new HashMap<>();
+        customKafkaPayload.put("ID" , request.getId()); // Passing the Primary Key so the consumer can find it later
+        customKafkaPayload.put("processRunId", processRunId);
+        customKafkaPayload.put("processId", processId);
+        customKafkaPayload.put("user", request.getExecutorId());
+        customKafkaPayload.put("remarks", request.getExecutorRemarks());
+
+        // 3. Convert back to a JSON string
+        String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
+
+        // 4. Trigger the event 
+        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), finalPayloadString);
+
+        // 5. Override the status to QUEUE (In Progress) so the database saves it as 'Q' instead of 'A'
+        request.setReqStatus(RequestStatus.QUEUE);
+        request.setExecutionRemarks("Event triggered. Request is currently IN PROGRESS (Queue).");
+
+        log.info("LHO Transfer Batch {} placed in QUEUE successfully.", request.getTargetId());
+    }
+}
+
+3. [NEW FILE] LhoKafkaConsumerService.java
+Location: com.tcs.fincore.CommonRequestService.service.kafka (Create the kafka package if it doesn't exist)
+This is your listener. It listens to the two separate topics. When a message arrives, it pulls out the "ID", finds the record in your database, applies the new status (ACCEPTED or PENDING), and saves it.
+package com.tcs.fincore.CommonRequestService.service.kafka;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Optional;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class LhoKafkaConsumerService {
+
+    private final CommonRequestRepository commonRequestRepository;
+    private final ObjectMapper objectMapper;
+
+    /**
+     * Listens to the SUCCESS topic.
+     * Updates the request status to ACCEPTED.
+     */
+    @KafkaListener(
+            topics = "${app.kafka.topics.lho-success:lho-airflow-success-topic}",
+            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
+    )
+    @Transactional
+    public void consumeSuccessEvent(String message) {
+        log.info("Received SUCCESS event from Kafka: {}", message);
+        processIncomingEvent(message, RequestStatus.ACCEPTED, "Airflow processing completed successfully.");
+    }
+
+    /**
+     * Listens to the FAILURE topic.
+     * Reverts the request status back to PENDING.
+     */
+    @KafkaListener(
+            topics = "${app.kafka.topics.lho-failure:lho-airflow-failure-topic}",
+            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
+    )
+    @Transactional
+    public void consumeFailureEvent(String message) {
+        log.error("Received FAILURE event from Kafka: {}", message);
+        processIncomingEvent(message, RequestStatus.PENDING, "Airflow processing failed. Reverted to PENDING.");
+    }
+
+    /**
+     * Core logic to extract ID, find the entity, and update the status.
+     */
+    private void processIncomingEvent(String message, RequestStatus targetStatus, String defaultRemark) {
+        try {
+            JsonNode payload = objectMapper.readTree(message);
+
+            if (!payload.has("ID") || payload.get("ID").isNull()) {
+                log.warn("Kafka event ignored: Missing 'ID' field in payload.");
+                return;
+            }
+
+            Long requestId = payload.get("ID").asLong();
+            Optional<CommonReq> requestOpt = commonRequestRepository.findById(requestId);
+
+            if (requestOpt.isPresent()) {
+                CommonReq request = requestOpt.get();
+                
+                // Update the status based on which topic it came from
+                request.setReqStatus(targetStatus);
+                
+                // If Airflow sends specific error remarks back, we can capture them here. Otherwise, use default.
+                String remarks = payload.has("responseRemarks") ? payload.get("responseRemarks").asText() : defaultRemark;
+                request.setExecutionRemarks(remarks);
+
+                commonRequestRepository.save(request);
+                log.info("Successfully updated Request ID: {} to status: {}", requestId, targetStatus);
+                
+            } else {
+                log.warn("Kafka event ignored: No CommonReq found with ID: {}", requestId);
+            }
+
+        } catch (Exception e) {
+            log.error("Failed to parse or process incoming Kafka event. Message: {}", message, e);
+        }
+    }
+}
+
+Would you like me to show you how to add the exact same topic variable definitions to your application.yml file so these @KafkaListener annotations can find the topic names you eventually decide to use?
