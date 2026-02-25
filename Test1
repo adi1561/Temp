@@ -1,27 +1,122 @@
-# ==========================================
-# 1. KAFKA BROKER CONNECTION (Mandatory)
-# ==========================================
-# Replace localhost:9092 with the actual IP address provided by your DevOps/Airflow team
-spring.kafka.bootstrap-servers=localhost:9092
+@Data
+public class TriggerRequestResponse {
 
-# ==========================================
-# 2. PRODUCER SERIALIZATION (Mandatory)
-# ==========================================
-# This tells Spring Boot how to convert your Java Strings into network bytes
-spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
-spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer
+    private Long requestId;
+    private Long processRunId;
+    private Boolean success;
+    private String message;
+    private DagRunResponseDTO triggerResponse;
 
-# ==========================================
-# 3. PRODUCER RELIABILITY (Recommended for Banking/Finance)
-# ==========================================
-# 'all' means the producer will wait for all Kafka replicas to acknowledge the message.
-# This guarantees no LHO Transfer events are lost if a broker crashes.
-spring.kafka.producer.acks=all
-# How many times to retry sending if there is a network blip
-spring.kafka.producer.retries=3
+}
 
-# ==========================================
-# 4. CUSTOM TOPIC CONFIGURATION
-# ==========================================
-# The topic your publisher will send the LHO Transfer event to
-app.kafka.topics.lho-transfer=lho-airflow-topic
+Request ID - Id that you will send me ,
+Process  Run Id - unique id related to that run 
+Success - true / false
+message - why it failed 
+triggerResponse - response from airflow 
+
+package com.tcs.fincore.CommonRequestService.service;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Optional;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class LhoKafkaConsumerService {
+
+    private final CommonRequestRepository commonRequestRepository;
+    private final ObjectMapper objectMapper;
+
+    /**
+     * TOPIC 1: trigger-events-responce-one
+     * Logic: If Fail -> PENDING. If Success -> Do Nothing .
+     */
+    @KafkaListener(
+            topics = "trigger-event-responses",
+            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
+    )
+    @Transactional
+    public void consumeResponseOne(String message) {
+        log.info("Received event on Topic 1 (trigger-events-response-one): {}", message);
+
+        try {
+            JsonNode payload = objectMapper.readTree(message);
+            Long requestId = extractRequestId(payload);
+            boolean isSuccess = evaluateSuccess(payload);
+
+            if (requestId == null) return;
+
+            if (isSuccess) {
+                log.info("Topic 1 Success received for Request ID: {}. Doing nothing. Record remains in QUEUE.", requestId);
+            } else {
+                log.warn("Topic 1 Failure received for Request ID: {}. Reverting to PENDING.", requestId);
+                updateRequestStatus(requestId, RequestStatus.PENDING, "Topic 1 reported failure. Reverted to PENDING.");
+            }
+
+        } catch (Exception e) {
+            log.error("Error processing Topic 1 message: {}", message, e);
+        }
+    }
+
+   
+
+    // --- HELPER METHODS ---
+
+    private Long extractRequestId(JsonNode payload) {
+        if (payload.has("requestId") && !payload.get("requestId").isNull()) {
+            return payload.get("requestId").asLong();
+        }
+        log.error("Kafka event ignored: Missing 'requestId' in payload.");
+        return null;
+    }
+
+    /**
+     * Helper to determine if the event indicates success.
+     * Looks for boolean "success", "isSuccess", or string "status" == "success".
+     */
+    private boolean evaluateSuccess(JsonNode payload) {
+        if (payload.has("success")) return payload.get("success").asBoolean();
+        if (payload.has("isSuccess")) return payload.get("isSuccess").asBoolean();
+
+        if (payload.has("status")) {
+            String statusStr = payload.get("status").asText().toLowerCase();
+            return statusStr.contains("success") || statusStr.equals("true");
+        }
+        return false; // Default to false if we can't determine
+    }
+
+    private void updateRequestStatus(Long requestId, RequestStatus newStatus, String remarks) {
+        Optional<CommonReq> requestOpt = commonRequestRepository.findById(requestId);
+
+        if (requestOpt.isPresent()) {
+            CommonReq request = requestOpt.get();
+            request.setReqStatus(newStatus);
+            request.setExecutionRemarks(remarks);
+            commonRequestRepository.save(request);
+            log.info("Database updated: Request ID {} is now {}", requestId, newStatus);
+        } else {
+            log.error("Database update failed: Could not find Request ID {} in COMMON_REQ table.", requestId);
+        }
+    }
+}
+
+
+
+lets focus on first after testing first one we will go for 2nd 
+
+i am giving the res accordingly change in the code comments in the code 
+
+what accepting where 
+
+do according the logic
+
