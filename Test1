@@ -1,63 +1,45 @@
-package com.tcs.fincore.CommonRequestService.service.strategy;
+Here are the complete, updated files based precisely on your custom publisher logic and requirements. I have added the QUEUE status, implemented the status change right before the strategy finishes, and created the new dual-topic consumer service.
+1. [EXISTING FILE - COMPLETE UPDATED FILE] RequestStatus.java
+Location: com.tcs.fincore.CommonRequestService.model.enums
+package com.tcs.fincore.CommonRequestService.model.enums;
 
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.kafka.clients.producer.ProducerRecord;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.support.KafkaHeaders;
-import org.springframework.kafka.support.SendResult;
-import org.springframework.messaging.Message;
-import org.springframework.messaging.support.MessageBuilder;
-import org.springframework.stereotype.Service;
+/**
+ * Represents the status of a request in the system.
+ */
+import lombok.Getter;
 
-import java.util.Map;
-import java.util.concurrent.CompletableFuture;
+@Getter
+public enum RequestStatus {
 
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class KafkaEventPublisherService {
+    PENDING("P"),
+    ACCEPTED("A"),
+    REJECTED("R"),
+    CANCELLED("C"),
+    
+    // --- NEW: Added QUEUE status ---
+    QUEUE("Q");
 
-    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final String code;
 
-    @Value("${app.kafka.topics.lho-transfer:lho-airflow-topic}")
-    private String lhoTopic;
+    RequestStatus(String code) {
+        this.code = code;
+    }
 
-
-
-    public void publishLhoTransferEvent(String targetId, Long requestId, String payload) {
-        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
-
-        // 1. Create a ProducerRecord (This is the standard Kafka way)
-        ProducerRecord<String, String> record = new ProducerRecord<>(lhoTopic, targetId, payload);
-
-        // 2. Add your custom header to the record
-        record.headers().add("requestId", String.valueOf(requestId).getBytes());
-
-        // 3. Send it once
-        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(record);
-
-        future.whenComplete((result, exception) -> {
-            if (exception == null) {
-                log.info("Successfully published! Target ID: {} | Topic: {} | Offset: {}",
-                        targetId, lhoTopic, result.getRecordMetadata().offset());
-            } else {
-                log.error("CRITICAL: Failed to publish for Target ID: {}. Error: {}",
-                        targetId, exception.getMessage());
-            }
-        });
+    public String getCode() {
+        return this.code;
     }
 }
 
-
-
+2. [EXISTING FILE - COMPLETE UPDATED FILE] LhoTransferStrategy.java
+Location: com.tcs.fincore.CommonRequestService.service.strategy
+I kept your exact modifications (hardcoding processId to 12, passing request.getId() to the publisher) and simply added the logic to shift the entity's status to QUEUE at the end.
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
 import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -72,7 +54,7 @@ import java.util.Map;
 public class LhoTransferStrategy implements RequestTypeStrategy {
 
     private final KafkaEventPublisherService kafkaEventPublisherService;
-    private final ObjectMapper objectMapper; // Added Jackson ObjectMapper for JSON manipulation
+    private final ObjectMapper objectMapper; 
 
     @Override
     public RequestType getRequestType() {
@@ -111,48 +93,198 @@ public class LhoTransferStrategy implements RequestTypeStrategy {
         // 3. Convert back to a JSON string
         String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
 
-        // 4. Trigger the event (Currently running your Mock bypass)
-        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(),request.getId(), finalPayloadString);
+        // 4. Trigger the event 
+        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), finalPayloadString);
 
-        log.info("LHO Transfer Batch {} approval process completed successfully.", request.getTargetId());
+        // --- NEW: Update the status to QUEUE before it saves to the DB ---
+        request.setReqStatus(RequestStatus.QUEUE);
+        request.setExecutionRemarks("Event sent to Kafka. Request is in QUEUE.");
 
+        log.info("LHO Transfer Batch {} placed in QUEUE successfully.", request.getTargetId());
     }
 }
 
-1st change
+3. [EXISTING FILE - COMPLETE UNCHANGED] KafkaEventPublisherService.java
+Location: com.tcs.fincore.CommonRequestService.service.strategy
+(Included here so you have the complete set, preserving your ProducerRecord and headers exactly as you wrote them.)
+package com.tcs.fincore.CommonRequestService.service.strategy;
 
-before doing the consumer class we need one change in this like as we send the event it means it is going in the pending state -> in DB we need to change that with Q
-i think we also need to update that i told this also i think 
-we need to add in this file also RequestStatus that Queue is it 
-do that and give mi this changes 
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.KafkaHeaders;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.stereotype.Service;
 
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class KafkaEventPublisherService {
 
+    private final KafkaTemplate<String, String> kafkaTemplate;
 
-2nd change 
+    @Value("${app.kafka.topics.lho-transfer:lho-airflow-topic}")
+    private String lhoTopic;
 
+    public void publishLhoTransferEvent(String targetId, Long requestId, String payload) {
+        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
 
-this are the my updated files in which i did some change in that dont remove that changes 
+        // 1. Create a ProducerRecord (This is the standard Kafka way)
+        ProducerRecord<String, String> record = new ProducerRecord<>(lhoTopic, targetId, payload);
 
-and also there is changes in the consumers 
+        // 2. Add your custom header to the record
+        record.headers().add("requestId", String.valueOf(requestId).getBytes());
 
-i told u alrady that we have to listen  2 topic something like this 
+        // 3. Send it once
+        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(record);
 
-1st listners
-topic name -> trigger-events-responce-one
-in this what we are doing is like for this topic listener if i get false or we can say fail then in this case we need to do again that status to PENDING(P)
+        future.whenComplete((result, exception) -> {
+            if (exception == null) {
+                log.info("Successfully published! Target ID: {} | Topic: {} | Offset: {}",
+                        targetId, lhoTopic, result.getRecordMetadata().offset());
+            } else {
+                log.error("CRITICAL: Failed to publish for Target ID: {}. Error: {}",
+                        targetId, exception.getMessage());
+            }
+        });
+    }
+}
 
+4. [NEW FILE] LhoKafkaConsumerService.java
+Location: Create a new package com.tcs.fincore.CommonRequestService.service.kafka and place this file inside.
+This handles both topics. It assumes the JSON from Airflow contains a "requestId" to identify the record, and a "status" field (e.g., "success", "failed") or a boolean like "isSuccess": true to determine the outcome.
+package com.tcs.fincore.CommonRequestService.service.kafka;
 
-if u get true or success do nothing
-add logs 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-2nd listner
+import java.util.Optional;
 
-topic -> trigger-events-responce-two
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class LhoKafkaConsumerService {
 
-in this if u get the success or true -> mark that as accepted 
-if u get false -> again mark as it as PENDING 
+    private final CommonRequestRepository commonRequestRepository;
+    private final ObjectMapper objectMapper;
 
+    /**
+     * TOPIC 1: trigger-events-responce-one
+     * Logic: If Fail -> PENDING. If Success -> Do Nothing (just log).
+     */
+    @KafkaListener(
+            topics = "trigger-events-responce-one",
+            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
+    )
+    @Transactional
+    public void consumeResponseOne(String message) {
+        log.info("Received event on Topic 1 (trigger-events-responce-one): {}", message);
+        
+        try {
+            JsonNode payload = objectMapper.readTree(message);
+            Long requestId = extractRequestId(payload);
+            boolean isSuccess = evaluateSuccess(payload);
 
+            if (requestId == null) return;
 
-do this and give mi updated and new files where should i add that folder name and all add logs if u are changing the status and all
+            if (isSuccess) {
+                log.info("Topic 1 Success received for Request ID: {}. Doing nothing. Record remains in QUEUE.", requestId);
+                // DO NOTHING per requirements
+            } else {
+                log.warn("Topic 1 Failure received for Request ID: {}. Reverting to PENDING.", requestId);
+                updateRequestStatus(requestId, RequestStatus.PENDING, "Topic 1 reported failure. Reverted to PENDING.");
+            }
+
+        } catch (Exception e) {
+            log.error("Error processing Topic 1 message: {}", message, e);
+        }
+    }
+
+    /**
+     * TOPIC 2: trigger-events-responce-two
+     * Logic: If Success -> ACCEPTED. If Fail -> PENDING.
+     */
+    @KafkaListener(
+            topics = "trigger-events-responce-two",
+            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
+    )
+    @Transactional
+    public void consumeResponseTwo(String message) {
+        log.info("Received event on Topic 2 (trigger-events-responce-two): {}", message);
+
+        try {
+            JsonNode payload = objectMapper.readTree(message);
+            Long requestId = extractRequestId(payload);
+            boolean isSuccess = evaluateSuccess(payload);
+
+            if (requestId == null) return;
+
+            if (isSuccess) {
+                log.info("Topic 2 Success received for Request ID: {}. Marking as ACCEPTED.", requestId);
+                updateRequestStatus(requestId, RequestStatus.ACCEPTED, "Topic 2 reported success. Fully ACCEPTED.");
+            } else {
+                log.warn("Topic 2 Failure received for Request ID: {}. Reverting to PENDING.", requestId);
+                updateRequestStatus(requestId, RequestStatus.PENDING, "Topic 2 reported failure. Reverted to PENDING.");
+            }
+
+        } catch (Exception e) {
+            log.error("Error processing Topic 2 message: {}", message, e);
+        }
+    }
+
+    // --- HELPER METHODS ---
+
+    private Long extractRequestId(JsonNode payload) {
+        if (payload.has("requestId") && !payload.get("requestId").isNull()) {
+            return payload.get("requestId").asLong();
+        }
+        log.error("Kafka event ignored: Missing 'requestId' in payload.");
+        return null;
+    }
+
+    /**
+     * Helper to determine if the event indicates success.
+     * Looks for boolean "success", "isSuccess", or string "status" == "success".
+     */
+    private boolean evaluateSuccess(JsonNode payload) {
+        if (payload.has("success")) return payload.get("success").asBoolean();
+        if (payload.has("isSuccess")) return payload.get("isSuccess").asBoolean();
+        
+        if (payload.has("status")) {
+            String statusStr = payload.get("status").asText().toLowerCase();
+            return statusStr.contains("success") || statusStr.equals("true");
+        }
+        return false; // Default to false if we can't determine
+    }
+
+    private void updateRequestStatus(Long requestId, RequestStatus newStatus, String remarks) {
+        Optional<CommonReq> requestOpt = commonRequestRepository.findById(requestId);
+        
+        if (requestOpt.isPresent()) {
+            CommonReq request = requestOpt.get();
+            request.setReqStatus(newStatus);
+            request.setExecutionRemarks(remarks);
+            commonRequestRepository.save(request);
+            log.info("Database updated: Request ID {} is now {}", requestId, newStatus);
+        } else {
+            log.error("Database update failed: Could not find Request ID {} in COMMON_REQ table.", requestId);
+        }
+    }
+}
+
+Would you like me to show you how to map the topic values in your application.yml file so you can change the topic names dynamically without hardcoding them in the annotations?
