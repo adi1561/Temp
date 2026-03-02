@@ -4,12 +4,12 @@ public ResponseEntity<ResponseVO<Map<String, Object>>> createNewRequest(UserRequ
     String targetUserId = dto.getTargetUserId();
     String requestType = dto.getRequestType();
 
-    // 1. User ID Format Validation (Number, V/v+7, or TCS/tcs+7)
+    // 1. User ID Format Validation
     if (!isValidUserId(targetUserId)) {
         return buildError(HttpStatus.BAD_REQUEST, "Invalid User Id format. Allowed: 7 digits, V+7 digits, or TCS+7 digits.");
     }
 
-    // 2. Conflict & Presence Checks
+    // 2. Conflict Checks
     if (userRequestRepository.countUserPendingRequests(targetUserId) > 0) {
         return buildError(HttpStatus.CONFLICT, "Pending request already exists");
     }
@@ -19,71 +19,77 @@ public ResponseEntity<ResponseVO<Map<String, Object>>> createNewRequest(UserRequ
         return buildError(HttpStatus.CONFLICT, "User already exists");
     }
 
-    // 3. Extract Payload
+    // 3. Payload Extraction (Already defined in your service)
     Map<String, Object> payloadMap;
+    String jsonPayload;
     try {
         Object payloadObj = dto.getRequestPayload();
+        if (payloadObj == null) payloadObj = new HashMap<>();
         if (payloadObj instanceof String) {
-            payloadMap = objectMapper.readValue((String) payloadObj, new TypeReference<Map<String, Object>>() {});
+            jsonPayload = (String) payloadObj;
+            payloadMap = objectMapper.readValue(jsonPayload, new TypeReference<Map<String, Object>>() {});
         } else {
             payloadMap = (Map<String, Object>) payloadObj;
+            jsonPayload = objectMapper.writeValueAsString(payloadMap);
         }
     } catch (Exception e) {
         return buildError(HttpStatus.BAD_REQUEST, "Invalid Payload format");
     }
 
     // 4. Email Domain Validation (@sbi.co.in)
-    String email = payloadMap.getOrDefault("email", "").toString().trim().toLowerCase();
-    if (email.isEmpty() || !email.endsWith("@sbi.co.in")) {
-        return buildError(HttpStatus.BAD_REQUEST, "Email must be present and belong to @sbi.co.in domain.");
+    if (!payloadMap.containsKey("email") || payloadMap.get("email") == null) {
+        return buildError(HttpStatus.BAD_REQUEST, "Email is mandatory");
+    }
+    String email = payloadMap.get("email").toString().trim().toLowerCase();
+    if (!email.endsWith("@sbi.co.in")) {
+        return buildError(HttpStatus.BAD_REQUEST, "Email must belong to the @sbi.co.in domain.");
     }
 
-    // 5. Role Existence Validation
+    // 5. Role Database Validation
     if (!payloadMap.containsKey("roleId") || payloadMap.get("roleId") == null) {
         return buildError(HttpStatus.BAD_REQUEST, "Role is mandatory");
     }
 
     int roleId = Integer.parseInt(payloadMap.get("roleId").toString());
     if (!roleRepository.existsById(roleId)) {
-        throw new RuntimeException("Invalid User Request: Role ID " + roleId + " not found in DB.");
+        throw new RuntimeException("Invalid User Request: Role ID " + roleId + " does not exist in the database.");
     }
 
-    // 6. Map to Entity and Save
+    // 6. Mandatory Field Check (Pattern from source 520)
+    if (!payloadMap.containsKey("firstName") || payloadMap.get("firstName") == null || payloadMap.get("firstName").toString().trim().isEmpty()) {
+        return buildError(HttpStatus.BAD_REQUEST, "First name is mandatory");
+    }
+
+    // 7. Save Entity
     UserRequest request = new UserRequest();
     request.setRequestType(requestType);
     request.setTargetUserId(targetUserId);
     request.setRequestorUserId(userId);
     request.setRequestStatus(Constant.PENDING);
     request.setRequestDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-
-    try {
-        request.setRequestPayload(objectMapper.writeValueAsString(payloadMap));
-    } catch (Exception e) {
-        return buildError(HttpStatus.INTERNAL_SERVER_ERROR, "Error processing payload");
-    }
+    request.setRequestPayload(jsonPayload);
 
     UserRequest saved = userRequestRepository.save(request);
 
-    // 7. Notification Logic
-    NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
+    // 8. Notification (Source 523-525)
     String notifMsg = String.format("New User Request (id: %s) for user %s (%s) is pending approval.",
             saved.getRequestId(), saved.getTargetUserId(), saved.getRequestType());
-
+    NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
+    
     createNotification(saved.getRequestorUserId(), config.getTargetRoles(), config.getTargetUrl(), notifMsg, String.valueOf(saved.getRequestId()));
 
     return ResponseEntity.status(HttpStatus.CREATED)
             .body(ResponseVO.<Map<String, Object>>builder()
                     .statusCode(HttpStatus.CREATED)
-                    .message("Request Created Successfully")
+                    .message("Request Created")
                     .result(Map.of("userRequest", saved))
                     .build());
 }
 
-// Fixed Helper Method
+// Fixed Case-Insensitive Helper
 private boolean isValidUserId(String userId) {
     if (userId == null) return false;
     String id = userId.toLowerCase();
-    
-    // Exactly 7 digits OR v+7 digits OR tcs+7 digits
+    // Regex for: 7 digits OR v + 7 digits OR tcs + 7 digits
     return id.matches("^\\d{7}$") || id.matches("^v\\d{7}$") || id.matches("^tcs\\d{7}$");
 }
