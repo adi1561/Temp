@@ -1,28 +1,121 @@
-in this service i want some validation like 
-below 
+To ensure your user creation process is strictly validated, we need to update the UserRequestServiceImpl to enforce the specific ID patterns, domain checks, and database role verification you've requested.
+Below are the specific changes required in each file.
+1. File: UserRequestServiceImpl.java
+You need to modify the createNewRequest method and update the isValidUserId helper method to include your new business rules.
+Updated Validation Logic
+ * User ID Pattern: Updated to match your 7-digit requirement for numbers, 'V', and 'TCS' prefixes.
+ * Email Domain: Enforced @sbi.co.in suffix.
+ * Role Validation: Added a check against the roleRepository to ensure the ID exists in the DB before proceeding.
+<!-- end list -->
+@Override
+@Transactional(rollbackFor = Exception.class)
+public ResponseEntity<ResponseVO<Map<String, Object>>> createNewRequest(UserRequestCreateDto dto, String userId) {
+    String targetUserId = dto.getTargetUserId();
+    String requestType = dto.getRequestType();
 
-when we creating the user in that i want some validation like 
-user id which they enter 
--> it should be 7 digit if that start with Number 
--> if it start with V or v after that it should 7 digit 
--> if it start with tcs after that it should be 7 digit 
+    // 1. User ID Format Validation
+    if (!isValidUserId(targetUserId)) {
+        return buildError(HttpStatus.BAD_REQUEST, 
+            "Invalid User Id format. Must be 7 digits, or V+7 digits, or TCS+7 digits.");
+    }
 
+    // 2. Existing User/Request Checks
+    if (userRequestRepository.countUserPendingRequests(targetUserId) > 0) {
+        return buildError(HttpStatus.CONFLICT, "Pending request already exists");
+    }
+    
+    // 3. Payload Parsing
+    Map<String, Object> payloadMap;
+    try {
+        Object payloadObj = dto.getRequestPayload();
+        if (payloadObj instanceof String) {
+            payloadMap = objectMapper.readValue((String) payloadObj, new TypeReference<Map<String, Object>>() {});
+        } else {
+            payloadMap = (Map<String, Object>) payloadObj;
+        }
+    } catch (Exception e) {
+        return buildError(HttpStatus.BAD_REQUEST, "Invalid Payload format");
+    }
 
-Email -> what ever he enter in that sbi.co.in this domain should be there cheak this also 
-role -> what ever he entered in this role match with DB permission table it is there or not 
+    // 4. Email Domain Validation (@sbi.co.in)
+    String email = payloadMap.getOrDefault("email", "").toString().trim();
+    if (!email.endsWith("@sbi.co.in")) {
+        return buildError(HttpStatus.BAD_REQUEST, "Email must belong to the sbi.co.in domain.");
+    }
 
-ROLE_ID	NUMBER(10,0)	No	NULL 	1	 Unique identifier for the role
-ROLE_NAME	VARCHAR2(255 CHAR)	No		2	 Name of the role
-DESCRIPTION	VARCHAR2(255 CHAR)	Yes		3	 Description of the role
-ROLE_STATUS	VARCHAR2(255 CHAR)	No	"'ACTIVE'
-   "	4	Status of the role ( Active/Blocked)
+    // 5. Role ID Validation (Check if exists in DB)
+    if (!payloadMap.containsKey("roleId") || payloadMap.get("roleId") == null) {
+        return buildError(HttpStatus.BAD_REQUEST, "Role is mandatory");
+    }
+    int roleId = Integer.parseInt(payloadMap.get("roleId").toString());
+    [span_3](start_span)if (!roleRepository.existsById(roleId)) { // Validating against ROLES table[span_3](end_span)
+        return buildError(HttpStatus.BAD_REQUEST, "The specified Role ID does not exist in the system.");
+    }
 
-   this table is already created there i mean models and DTO use that only
-   and cheak this 
-   
-  after addding this give mi api for testing all of this 
-  tell in which file what changes needs to be done
-  
-  
+    // 6. Proceed to Save Request...
+    // (Existing save and notification logic follows)
+}
 
-other then this dont allow anything as he hit for submit for creating the user cheak that above
+[span_4](start_span)// Updated Helper Method for ID Patterns[span_4](end_span)
+private boolean isValidUserId(String userId) {
+    if (userId == null) return false;
+    String id = userId.toLowerCase();
+    
+    // Pattern 1: Exactly 7 digits
+    if (id.matches("^\\d{7}$")) return true;
+    
+    // Pattern 2: 'v' + exactly 7 digits
+    if (id.matches("^v\\d{7}$")) return true;
+    
+    // Pattern 3: 'tcs' + exactly 7 digits
+    if (id.matches("^tcs\\d{7}$")) return true;
+
+    return false;
+}
+
+2. Testing the API
+Since this is a POST request to create a workflow entry, you should use an API client like Postman or cURL.
+Endpoint Details
+ * URL: http://<your-host>:<port>/api/user/create-request
+ * Method: POST
+ * Header: Authorization: Bearer <your_token>
+Test Case 1: Valid TCS User
+{
+    "requestType": "CREATE",
+    "targetUserId": "tcs1234567",
+    "requestPayload": {
+        "firstName": "Rahul",
+        "lastName": "Kumar",
+        "email": "rahul.k@sbi.co.in",
+        "roleId": 51,
+        "branch": 1024
+    }
+}
+
+Test Case 2: Invalid Email Domain (Should Fail)
+{
+    "requestType": "CREATE",
+    "targetUserId": "V1122334",
+    "requestPayload": {
+        "email": "user@gmail.com", 
+        "roleId": 51
+    }
+}
+// Response: 400 Bad Request - "Email must belong to the sbi.co.in domain."
+
+Test Case 3: Invalid ID Format (Should Fail)
+{
+    "requestType": "CREATE",
+    "targetUserId": "tcs123", 
+    "requestPayload": {
+        "email": "test@sbi.co.in",
+        "roleId": 51
+    }
+}
+// Response: 400 Bad Request - "Invalid User Id format..."
+
+Summary of Changes
+ * UserRequestServiceImpl: Updated isValidUserId with regex for \d{7}, v\d{7}, and tcs\d{7}.
+ * UserRequestServiceImpl: Added endsWith("@sbi.co.in") check to the email field.
+ * UserRequestServiceImpl: Integrated roleRepository.existsById(roleId) to verify the role against your existing database table before allowing the request to be raised.
+Would you like me to also implement the same strict validations for the Modify/Update user flow, or just the Create flow for now?
