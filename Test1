@@ -1,40 +1,41 @@
-As a Technical Lead, I completely respect this decision. By creating a separate endpoint and service method, you are following the Open-Closed Principle (Open for extension, Closed for modification).
-If there is another screen in your frontend that strictly expects only PENDING requests, changing the existing method would break that screen. Creating a separate flow is the safest, most robust way to handle this.
-Here is the complete, separate flow from top to bottom.
-1. The Repository (CommonRequestRepository.java)
-Add this new method. Keep your old findByCreatorIdNotAndReqStatusAndReqType method exactly as it is so you don't break existing code.
-    // --- NEW METHOD FOR COMBINED STATUSES ---
+Understood. We will skip the database indexing and stick strictly to the Java application layer.
+To answer your question directly: No, the response format will absolutely not change. The frontend will still receive the exact same JSON array of CommonReq objects. The only difference is that previously, every object in that array had "reqStatus": "PENDING". Now, some objects in that array will have "reqStatus": "QUEUE". Your frontend UI will just need to know how to render the QUEUE status (e.g., showing an "In Progress" chip).
+Here is how we integrate this into your existing /pending-requests API safely.
+To ensure we don't accidentally break your other screens (like Branch or Segment master) that might only expect PENDING requests, we can use a simple if condition. We will tell the code: "If this is an LHO Transfer, fetch PENDING and QUEUE. If it is anything else, just fetch PENDING."
+1. Update the Repository (CommonRequestRepository.java)
+We still need the In method so the database can search for a list of statuses. Replace your old method with this one:
+    // Replace the old findByCreatorIdNotAndReqStatusAndReqType with this:
     List<CommonReq> findByCreatorIdNotAndReqStatusInAndReqType(
             String creatorId, 
             List<RequestStatus> statuses, 
             RequestType reqType
     );
 
-2. The Service Interface (RequestService.java)
-Add the new contract to your interface.
-    // --- NEW METHOD SIGNATURE ---
-    List<CommonReq> getPendingAndQueueRequests(String userId, RequestType requestType);
-
-3. The Service Implementation (RequestServiceImpl.java)
-Implement the new method. This uses Arrays.asList() to pass both P and Q to the database query.
-    // --- NEW METHOD IMPLEMENTATION ---
+2. Update the Existing Service (RequestServiceImpl.java)
+Modify your existing getPendingRequests method. You do not need a new controller or a new interface method.
     @Override
-    public List<CommonReq> getPendingAndQueueRequests(String userId, RequestType requestType) {
+    public List<CommonReq> getPendingRequests(
+            String userId,
+            RequestType requestType
+    ) {
         if (requestType == null) {
-            log.error("Request type is missing. Cannot fetch pending/queue requests for user: {}", userId);
+            log.error("Request type is missing. Cannot fetch pending requests for user: {}", userId);
             throw new IllegalArgumentException(
-                    "Request type is missing, Please provide correct request type to fetch requests."
+                    "Request type is missing, Please provide correct request type to fetch pending requests."
             );
         }
-        
-        log.info("Fetching PENDING and QUEUE requests for user: {} with type: {}", userId, requestType);
-        
-        // Target both 'P' (Pending) and 'Q' (Queue) statuses
-        List<RequestStatus> targetStatuses = Arrays.asList(
-                RequestStatus.PENDING, 
-                RequestStatus.QUEUE
-        );
+        log.info("Fetching pending requests for user: {} with type: {}", userId, requestType);
 
+        List<RequestStatus> targetStatuses;
+
+        // Smart Routing: Only LHO gets both P and Q. Everything else stays exactly as it was.
+        if (requestType == RequestType.LHO_TRANSFER) {
+            targetStatuses = List.of(RequestStatus.PENDING, RequestStatus.QUEUE);
+        } else {
+            targetStatuses = List.of(RequestStatus.PENDING);
+        }
+
+        // Call the updated repository method
         return commonRequestRepository.findByCreatorIdNotAndReqStatusInAndReqType(
                 userId, 
                 targetStatuses, 
@@ -42,22 +43,5 @@ Implement the new method. This uses Arrays.asList() to pass both P and Q to the 
         );
     }
 
-4. The Controller (CommonRequestController.java)
-Create a brand new endpoint. I recommend naming it /pending-queue-requests or /actionable-requests so it is clearly distinct from your existing /pending-requests endpoint.
-    // --- NEW ENDPOINT ---
-    @PostMapping("/pending-queue-requests")
-    public List<CommonReq> getPendingAndQueueRequests(
-            @RequestHeader("Authorization") String authorizationHeader,
-            @RequestBody MyRequestFilterDto filterDto
-    ) {
-        String userId = jwtUtil.getUserIdFromToken(authorizationHeader);
-        log.info("Received request for pending and queue data for the request type: {}", filterDto.getRequestType());
-        
-        // Call the new service method
-        return requestService.getPendingAndQueueRequests(userId, filterDto.getRequestType());
-    }
-
-Why this is the perfect enterprise setup:
- * Zero Regression: Your existing /pending-requests API remains untouched and will continue working exactly as it did before.
- * Clean Data Fetching: The UI component handling LHO Transfers can now simply point to /pending-queue-requests to get both the rows waiting for the Checker and the rows waiting for Airflow, all in one efficient database hit.
-Would you like to move forward with drafting the logic for the second Kafka topic consumer (trigger-events-responce-two) now that the database querying is sorted?
+By doing this, your Controller stays exactly the same, your API endpoint (/pending-requests) stays exactly the same, the JSON response format stays exactly the same, and your other modules are completely protected.
+Would you like to move on to the final piece: creating the consumer listener for your second Kafka topic (trigger-events-responce-two)?
