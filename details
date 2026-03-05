@@ -20,7 +20,9 @@ const TRIGGER_API_URL = "/PS/airflow/trigger";
 const INITIAL_DATA_URL = "/PS/process/processes/data/7";
 const SUMMARY_BASE_URL = "/CM/lho-transfers/summary/";
 const CREATE_REQUEST_URL = "/CR/create-request";
-const DOWNLOAD_EXCEL_URL = "/dummy/excel-download"; 
+const DOWNLOAD_EXCEL_URL = "/dummy/excel-download";
+// NEW: Endpoint for checking if a Year End Transfer is allowed
+const ELIGIBILITY_API_URL = "/api/lho-transfers/year-end-eligibility"; 
 
 export default function YearEndProfitTransfer() {
   const theme = useTheme();
@@ -35,6 +37,9 @@ export default function YearEndProfitTransfer() {
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
+  
+  // NEW: State to track if the Transfer button should be enabled based on DB check
+  const [isEligibleToTransfer, setIsEligibleToTransfer] = useState(false);
 
   // Summary & Submission States
   const [summaryOpen, setSummaryOpen] = useState(false);
@@ -84,15 +89,36 @@ export default function YearEndProfitTransfer() {
     }
   };
 
+  /**
+   * ELIGIBILITY CHECK
+   */
+  const fetchEligibility = async () => {
+    try {
+      const response = await callApi(ELIGIBILITY_API_URL, null, "GET");
+      if (isMounted.current && response?.data) {
+        // Expecting the DTO: { isEligible: true/false }
+        setIsEligibleToTransfer(response.data.eligible); // Or response.data.isEligible depending on how Jackson serialized the boolean
+      }
+    } catch (error) {
+      if (error !== undefined) {
+         console.error("Failed to check eligibility:", error);
+         // Default to false on error for safety
+         if (isMounted.current) setIsEligibleToTransfer(false);
+      }
+    }
+  };
+
   useEffect(() => {
     isMounted.current = true;
     fetchInitialData();
+    fetchEligibility(); // Call on mount
     return () => { isMounted.current = false; };
   }, [page, rowsPerPage]);
 
   useEffect(() => {
     const pollInterval = setInterval(() => {
       fetchInitialData(true);
+      fetchEligibility(); // Call during polling to keep the button state fresh
     }, 10000); 
 
     return () => clearInterval(pollInterval);
@@ -106,6 +132,7 @@ export default function YearEndProfitTransfer() {
       await callApi(TRIGGER_API_URL, payload, "POST");
       showSnackBar("LHO Transfer triggered successfully", "success");
       fetchInitialData();
+      fetchEligibility(); // Refresh eligibility immediately after trigger
     } catch (error) {
       const errorMessage = error?.message || "Failed to trigger LHO Transfer";
       showSnackBar(errorMessage, "warning");
@@ -139,6 +166,7 @@ export default function YearEndProfitTransfer() {
       await callApi(CREATE_REQUEST_URL, finalRequestPayload, "POST");
       showSnackBar("LHO Transfer Request Submitted Successfully", "success");
       setSummaryOpen(false);
+      fetchEligibility(); // Refresh eligibility after successful submission
     } catch (error) {
       const errorMessage = error?.message || "Submission failed. Check network/payload";
       showSnackBar(errorMessage, "warning");
@@ -156,7 +184,6 @@ export default function YearEndProfitTransfer() {
     try {
       const response = await callApi(`${SUMMARY_BASE_URL}${row.processRunId}`, null, "GET");
       
-      // Navigate through the new response structure
       const responseData = response?.data || {};
       const rawMap = responseData.circleWiseDetails || {};
       
@@ -165,7 +192,6 @@ export default function YearEndProfitTransfer() {
         totalRecordCount: responseData.totalRecordCount || 0
       });
 
-      // Mapped name to circleName
       setSummaryData(Object.entries(rawMap).map(([name, balance]) => ({
         circleName: name, totalProfitLoss: balance
       })));
@@ -192,21 +218,25 @@ export default function YearEndProfitTransfer() {
     return <Chip label="Unknown" variant="outlined" size="small" />;
   };
 
-  // Check if any process is currently running
   const isAnyProcessRunning = tableData.some(row => row.status === 2);
 
   return (
     <Box p={3} width="100%">
       {/* Header Action */}
       <Box display="flex" justifyContent="flex-end" mb={2}>
-        <Button
-          variant="contained"
-          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
-          onClick={handleTransferLho}
-          disabled={isTransferring || isInitialLoading || isAnyProcessRunning}
-        >
-          {isTransferring ? "Transferring..." : "Transfer LHO"}
-        </Button>
+        <Tooltip title={!isEligibleToTransfer ? "A Year End Profit Transfer is already Accepted or in Queue." : ""}>
+            <span>
+                <Button
+                variant="contained"
+                startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
+                onClick={handleTransferLho}
+                // NEW: Disabled if not eligible based on DB check, OR existing conditions
+                disabled={!isEligibleToTransfer || isTransferring || isInitialLoading || isAnyProcessRunning}
+                >
+                {isTransferring ? "Transferring..." : "Transfer LHO"}
+                </Button>
+            </span>
+        </Tooltip>
       </Box>
 
       {/* Main Table */}
@@ -287,7 +317,6 @@ export default function YearEndProfitTransfer() {
                   <TableHead>
                     <TableRow>
                       <TableCell align="center" sx={{ bgcolor: theme.palette.action.hover }}><strong>Circle Name</strong></TableCell>
-                      {/* Changed to align Right */}
                       <TableCell align="right" sx={{ bgcolor: theme.palette.action.hover }}><strong>Balance</strong></TableCell>
                     </TableRow>
                   </TableHead>
@@ -295,7 +324,6 @@ export default function YearEndProfitTransfer() {
                     {summaryData.map((row, idx) => (
                       <TableRow key={idx}>
                         <TableCell align="center">{row.circleName}</TableCell>
-                        {/* Changed to align Right */}
                         <TableCell align="right" sx={{ fontWeight: 'bold' }}>
                           {Number(row.totalProfitLoss).toLocaleString('en-IN', { 
                             minimumFractionDigits: 2, 
