@@ -1,340 +1,122 @@
-import React, { useState, useRef, useEffect } from "react";
-import {
-  Box, Button, Typography, CircularProgress, Table, TableBody,
-  TableCell, TableContainer, TableHead, TableRow, Paper,
-  TablePagination, Dialog, DialogTitle, DialogContent, IconButton,
-  Tooltip, DialogActions, Chip, useTheme
-} from "@mui/material";
-import {
-  PlayArrow as PlayArrowIcon,
-  Close as CloseIcon,
-  Assessment as SummaryIcon,
-  Inbox as NoDataIcon,
-  Download as DownloadIcon // Added for Excel button
-} from "@mui/icons-material";
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
+package com.tcs.fincore.CommonMasterService.Controller;
 
-// --- API Constants ---
-const TRIGGER_API_URL = "/PS/airflow/trigger";
-const INITIAL_DATA_URL = "/PS/process/processes/data/7";
-const SUMMARY_BASE_URL = "/CM/lho-transfers/summary/";
-const CREATE_REQUEST_URL = "/CR/create-request";
-const DOWNLOAD_EXCEL_URL = "/dummy/excel-download"; // Dummy API
+import com.tcs.fincore.CommonMasterService.dto.ApiResponse;
+import com.tcs.fincore.CommonMasterService.dto.CommonRequestDto;
+import com.tcs.fincore.CommonMasterService.dto.PaginatedResponseDto;
+import com.tcs.fincore.CommonMasterService.dto.SearchRequest;
+import com.tcs.fincore.CommonMasterService.service.CommonMasterService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
 
-export default function TransferDataLho() {
-  const theme = useTheme();
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-  const isMounted = useRef(true);
+@Slf4j
+@RestController
+@RequestMapping("/api/lho-transfers")
+@RequiredArgsConstructor
+public class LhoTransferController {
 
-  // Table & Loading States
-  const [isTransferring, setIsTransferring] = useState(false);
-  const [tableData, setTableData] = useState([]);
-  const [totalElements, setTotalElements] = useState(0);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
-  const [page, setPage] = useState(0);
-  const [rowsPerPage, setRowsPerPage] = useState(10);
+    private final CommonMasterService service;
 
-  // Summary & Submission States
-  const [summaryOpen, setSummaryOpen] = useState(false);
-  const [summaryData, setSummaryData] = useState([]);
-  const [summaryTotals, setSummaryTotals] = useState({ totalAmount: 0, totalRecordCount: 0 });
-  const [summaryLoading, setSummaryLoading] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const [rowContext, setRowContext] = useState({ processRunId: null, processId: null, runId: null });
-  const [currentSelectedId, setCurrentSelectedId] = useState(null);
-
-  const getTodayFormatted = () => new Date().toISOString().split('T')[0];
-
-  const formatProcessTime = (dateString) => {
-    if (!dateString) return "-";
-    const date = new Date(dateString);
-    return new Intl.DateTimeFormat('en-GB', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true
-    }).format(date).replace(',', '');
-  };
-
-  /**
-   * DATA FETCHING
-   */
-  const fetchInitialData = async (isPolling = false) => {
-    if (!isPolling) setIsInitialLoading(true);
-    try {
-      const paginatedUrl = `${INITIAL_DATA_URL}`; 
-      const response = await callApi(paginatedUrl, null, "GET");
-      if (isMounted.current && response) {
-        setTableData(response.initialData || []);
-        setTotalElements(response.totalElements || (response.initialData?.length || 0));
-      }
-    } catch (error) {
-      if (!isPolling && error !== undefined) {
-        const errorMessage = error?.message || "Failed to load process data";
-        showSnackBar(errorMessage, "error");
-      }
-    } finally {
-      if (isMounted.current && !isPolling) setIsInitialLoading(false);
+    @PostMapping("/search")
+    public ResponseEntity<ApiResponse<PaginatedResponseDto<CommonRequestDto>>> searchLhoTransfers(
+            @RequestBody SearchRequest request) {
+        log.info("Received request to search LHO Transfers");
+        PaginatedResponseDto<CommonRequestDto> response = service.searchLhoTransfers(request);
+        return ResponseEntity.ok(ApiResponse.success(response, "LHO Transfers fetched successfully"));
     }
-  };
 
-  useEffect(() => {
-    isMounted.current = true;
-    fetchInitialData();
-    return () => { isMounted.current = false; };
-  }, [page, rowsPerPage]);
+    /**
+     * GET /api/lho-transfers/{id}
+     * Fetches details for a specific LHO Transfer.
+     */
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<CommonRequestDto>> getLhoTransferById(@PathVariable Long id) {
+        log.info("Received request to fetch LHO Transfer ID: {}", id);
+        CommonRequestDto response = service.getLhoTransferById(id);
+        return ResponseEntity.ok(ApiResponse.success(response));
+    }
 
-  useEffect(() => {
-    const pollInterval = setInterval(() => {
-      fetchInitialData(true);
-    }, 10000); 
-
-    return () => clearInterval(pollInterval);
-  }, [page, rowsPerPage]);
-
-  const handleTransferLho = async () => {
-    setIsTransferring(true);
-    const payload = { dagId: "cbs_wrap_dag", processId: 7, remarks: "testing 1" };
+    @GetMapping("/summary/{id}")
+    public ResponseEntity<ApiResponse<Object>> getSummary(@PathVariable Long id) {
+        log.info("API Request: Summary for ID {}", id);
+        Object data = service.getOrGenerateLhoSummary(id);
+        return ResponseEntity.ok(ApiResponse.success(data, "Summary retrieved successfully"));
+    }
     
-    try {
-      await callApi(TRIGGER_API_URL, payload, "POST");
-      showSnackBar("LHO Transfer triggered successfully", "success");
-      fetchInitialData();
-    } catch (error) {
-      const errorMessage = error?.message || "Failed to trigger LHO Transfer";
-      showSnackBar(errorMessage, "warning");
-    } finally {
-      setIsTransferring(false);
-    }
-  };
 
-  const handleSubmitLhoRequest = async () => {
-    setIsSubmitting(true);
-    const finalRequestPayload = {
-      requestType: "LHO_TRANSFER",
-      changeType: "ADD",
-      targetId: null, 
-      payload: {
-        processRunId: rowContext.processRunId,
-        processId: rowContext.processId,
-        batchId: String(rowContext.runId),
-        processDate: getTodayFormatted(),
-        totalAmount: summaryTotals.totalAmount,
-        totalRecordCount: summaryTotals.totalRecordCount,
-        circleWiseDetails: summaryData.map(item => ({
-          transferDate: getTodayFormatted(),
-          // Changed to circleName since we no longer have numeric codes
-          circleName: item.circleName, 
-          totalProfitLoss: Number(item.totalProfitLoss)
-        }))
-      }
-    };
-
-    try {
-      await callApi(CREATE_REQUEST_URL, finalRequestPayload, "POST");
-      showSnackBar("LHO Transfer Request Submitted Successfully", "success");
-      setSummaryOpen(false);
-    } catch (error) {
-      const errorMessage = error?.message || "Submission failed. Check network/payload";
-      showSnackBar(errorMessage, "warning");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const handleGetSummary = async (row) => {
-    setSummaryOpen(true);
-    setSummaryLoading(true);
-    setCurrentSelectedId(row.processRunId);
-    setRowContext({ processRunId: row.processRunId, processId: row.processId, runId: row.runId });
-    
-    try {
-      const response = await callApi(`${SUMMARY_BASE_URL}${row.processRunId}`, null, "GET");
-      
-      // Navigate through the new response structure
-      const responseData = response?.data || {};
-      const rawMap = responseData.circleWiseDetails || {};
-      
-      setSummaryTotals({
-        totalAmount: responseData.totalAmount || 0,
-        totalRecordCount: responseData.totalRecordCount || 0
-      });
-
-      // Mapped name to circleName
-      setSummaryData(Object.entries(rawMap).map(([name, balance]) => ({
-        circleName: name, totalProfitLoss: balance
-      })));
-    } catch (error) {
-      const errorMessage = error?.message || "Could not fetch summary data";
-      showSnackBar(errorMessage, "error");
-    } finally {
-      setSummaryLoading(false);
-    }
-  };
-
-  const handleDownloadExcel = async () => {
-    try {
-      // Dummy API call placeholder
-      // await callApi(DOWNLOAD_EXCEL_URL, null, "GET", { responseType: 'blob' });
-      showSnackBar("Excel download started.", "info");
-    } catch (error) {
-      showSnackBar("Failed to download Excel", "error");
-    }
-  };
-
-  const getStatusChip = (s) => {
-    if (s === 1) return <Chip label="In Progress" color="primary" variant="outlined" size="small" />;
-    if (s === 2) return <Chip label="Success" color="success" size="small" />;
-    if (s === 3) return <Chip label="Fail" color="error" size="small" />;
-    return <Chip label="Unknown" variant="outlined" size="small" />;
-  };
-
-  // Check if any process is currently running
-  const isAnyProcessRunning = tableData.some(row => row.status === 1);
-
-  return (
-    <Box p={3} width="100%">
-      {/* Header Action */}
-      <Box display="flex" justifyContent="flex-end" mb={2}>
-        <Button
-          variant="contained"
-          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
-          onClick={handleTransferLho}
-          // Disabled if currently transferring, loading, OR if status is In Progress
-          disabled={isTransferring || isInitialLoading || isAnyProcessRunning}
-        >
-          {isTransferring ? "Transferring..." : "Transfer LHO"}
-        </Button>
-      </Box>
-
-      {/* Main Table */}
-      <TableContainer component={Paper}>
-        <Table>
-          <TableHead sx={{ bgcolor: theme.palette.action.hover }}>
-            <TableRow>
-              <TableCell align="center"><strong>Process Name</strong></TableCell>
-              <TableCell align="center"><strong>Status</strong></TableCell>
-              <TableCell align="center"><strong>Start Time</strong></TableCell>
-              <TableCell align="center"><strong>End Time</strong></TableCell>
-              <TableCell align="center"><strong>Action</strong></TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {isInitialLoading ? (
-              <TableRow>
-                <TableCell colSpan={5} align="center" sx={{ py: 6 }}>
-                  <CircularProgress size={40} />
-                </TableCell>
-              </TableRow>
-            ) : tableData.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={5} align="center" sx={{ py: 6 }}>
-                  <NoDataIcon sx={{ fontSize: 48, color: "text.disabled", mb: 1 }} />
-                  <Typography variant="body1" color="text.secondary">
-                    There is no data to show.
-                  </Typography>
-                </TableCell>
-              </TableRow>
-            ) : (
-              tableData.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage).map((row) => (
-                <TableRow key={row.processRunId}>
-                  <TableCell align="center">{row.processType}</TableCell>
-                  <TableCell align="center">{getStatusChip(row.status)}</TableCell>
-                  <TableCell align="center">{formatProcessTime(row.processStartTime)}</TableCell>
-                  <TableCell align="center">{formatProcessTime(row.processEndTime)}</TableCell>
-                  <TableCell align="center">
-                    <Tooltip title={row.status === 2 ? "Get Summary" : "Not Available"}>
-                      <span>
-                        <IconButton 
-                          size="small" 
-                          disabled={row.status !== 2} 
-                          onClick={() => handleGetSummary(row)}
-                          color="primary"
-                        >
-                          <SummaryIcon />
-                        </IconButton>
-                      </span>
-                    </Tooltip>
-                  </TableCell>
-                </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-        <TablePagination 
-          component="div" 
-          count={totalElements} 
-          page={page} 
-          onPageChange={(e, p) => setPage(p)} 
-          rowsPerPage={rowsPerPage} 
-          onRowsPerPageChange={(e) => { setRowsPerPage(parseInt(e.target.value, 10)); setPage(0); }} 
-        />
-      </TableContainer>
-
-      {/* --- SUMMARY DIALOG --- */}
-      <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
-        <DialogTitle sx={{ m: 0, p: 2 }}>
-          Circle Wise Summary
-          <IconButton onClick={() => setSummaryOpen(false)} sx={{ position: 'absolute', right: 8, top: 8 }}><CloseIcon /></IconButton>
-        </DialogTitle>
-        <DialogContent dividers>
-          {summaryLoading ? <Box display="flex" justifyContent="center" py={5}><CircularProgress /></Box> : (
-            <>
-              <TableContainer component={Paper} sx={{ maxHeight: 400 }}>
-                <Table size="small" stickyHeader>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell align="center" sx={{ bgcolor: theme.palette.action.hover }}><strong>Circle Name</strong></TableCell>
-                      {/* Changed to align Right */}
-                      <TableCell align="right" sx={{ bgcolor: theme.palette.action.hover }}><strong>Balance</strong></TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {summaryData.map((row, idx) => (
-                      <TableRow key={idx}>
-                        <TableCell align="center">{row.circleName}</TableCell>
-                        {/* Changed to align Right */}
-                        <TableCell align="right" sx={{ fontWeight: 'bold' }}>
-                          {Number(row.totalProfitLoss).toLocaleString('en-IN', { 
-                            minimumFractionDigits: 2, 
-                            maximumFractionDigits: 2 
-                          })}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            </>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ p: 2, justifyContent: 'space-between' }}>
-          {/* Excel Download placed on the left, Submit on the right */}
-          <Button 
-            variant="outlined" 
-            startIcon={<DownloadIcon />} 
-            onClick={handleDownloadExcel}
-            disabled={summaryData.length === 0}
-          >
-            Download Excel
-          </Button>
-
-          <Button 
-            variant="contained" 
-            disabled={summaryData.length === 0 || isSubmitting} 
-            onClick={handleSubmitLhoRequest}
-            startIcon={isSubmitting && <CircularProgress size={16} color="inherit" />}
-          >
-            {isSubmitting ? "Submitting..." : "Submit Request"}
-          </Button>
-        </DialogActions>
-      </Dialog>
-    </Box>
-  );
 }
+
+this is controller file in which i want a one more api in which like 
+it will return true or false 
+there is common_req table in which REQ_TYPE and REQ_STATUS 2 filds are there on this bases i want like 
+req type should YEAR_END_PROFIT_TRANSFER and status for any of the Status is Q or A
+then return false 
+other wise return true 
+package com.tcs.fincore.CommonMasterService.model;
+
+import jakarta.persistence.*;
+import lombok.*;
+import org.hibernate.annotations.CreationTimestamp;
+import java.time.LocalDateTime;
+
+@Getter
+@Setter
+@Entity
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@Table(name = "COMMON_REQ")
+public class CommonRequest {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "common_req_seq")
+    @SequenceGenerator(name = "common_req_seq", sequenceName = "COMMON_REQ_SEQ", allocationSize = 1)
+    @Column(name = "REQ_ID")
+    private Long id;
+
+    @Column(name = "REQ_TYPE", length = 20, nullable = false)
+    private String requestType;
+
+    @Column(name = "CHANGE_TYPE", length = 2, nullable = false)
+    private String changeType;
+
+    @Column(name = "REQ_STATUS", length = 2, nullable = false)
+    private String status;
+
+    @CreationTimestamp
+    @Column(name = "REQ_DATE", nullable = false, updatable = false)
+    private LocalDateTime requestDate;
+
+    @Column(name = "CREATOR_ID", length = 12, nullable = false)
+    private String creatorId;
+
+    @Column(name = "EXECUTION_DATE")
+    private LocalDateTime executionDate;
+
+    @Lob
+    @Column(name = "EXECUTION_REMARKS")
+    private String executionRemarks;
+
+    @Column(name = "EXECUTOR_ID", length = 12)
+    private String executorId;
+
+    @Column(name = "EXECUTOR_REMARKS", length = 500)
+    private String executorRemarks;
+
+    @Lob
+    @Column(name = "PAYLOAD")
+    private String payload;
+
+    @Column(name = "TARGET_ID", length = 4000)
+    private String targetId;
+
+    @Column(name = "CREATOR_REMARKS", length = 500)
+    private String creatorRemarks;
+}
+
+
+i hope u will create DTO and all 
+use SOlid principle i will we are using thzat alredy
+give mi updated code files 
