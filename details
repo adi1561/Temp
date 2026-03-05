@@ -1,9 +1,117 @@
+As a Technical Lead, I agree that wrapping this in a proper DTO rather than returning a raw boolean is the best approach. It adheres to the Open/Closed Principle (OCP)—if we ever need to add a "reason" string or additional flags later, we just add fields to the DTO without breaking the frontend contract.
+Here is the complete, SOLID-compliant implementation from the database layer up to the Controller.
+1. Create the DTO (YearEndTransferEligibilityDto.java)
+Create this in your dto package. This wraps the boolean response cleanly.
+package com.tcs.fincore.CommonMasterService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class YearEndTransferEligibilityDto {
+    /**
+     * returns false if a YEAR_END_PROFIT_TRANSFER is already Accepted (A) or in Queue (Q).
+     * returns true otherwise.
+     */
+    private boolean isEligible;
+}
+
+2. Update the Repository (CommonRequestRepository.java)
+Spring Data JPA's existsBy... is highly optimized. Instead of fetching the entire row, it runs a fast SELECT 1 ... FETCH FIRST 1 ROWS ONLY query, which is extremely efficient for this kind of boolean check.
+package com.tcs.fincore.CommonMasterService.repository;
+
+import com.tcs.fincore.CommonMasterService.model.CommonRequest;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface CommonRequestRepository extends JpaRepository<CommonRequest, Long> {
+    
+    // ... your existing methods ...
+
+    /**
+     * Checks if any record exists for a specific Request Type and a list of Statuses.
+     * Highly optimized for boolean returns.
+     */
+    boolean existsByRequestTypeAndStatusIn(String requestType, List<String> statuses);
+}
+
+3. Update the Service Interface (CommonMasterService.java)
+Add the contract to your service interface.
+package com.tcs.fincore.CommonMasterService.service;
+
+import com.tcs.fincore.CommonMasterService.dto.YearEndTransferEligibilityDto;
+// ... your other imports ...
+
+public interface CommonMasterService {
+    
+    // ... your existing methods ...
+
+    /**
+     * Checks if a new Year End Profit Transfer can be initiated.
+     */
+    YearEndTransferEligibilityDto checkYearEndProfitTransferEligibility();
+}
+
+4. Update the Service Implementation (CommonMasterServiceImpl.java)
+This is where the business logic lives. We query the repository and invert the result as per your requirement.
+package com.tcs.fincore.CommonMasterService.service.impl;
+
+import com.tcs.fincore.CommonMasterService.dto.YearEndTransferEligibilityDto;
+import com.tcs.fincore.CommonMasterService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonMasterService.service.CommonMasterService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class CommonMasterServiceImpl implements CommonMasterService {
+
+    private final CommonRequestRepository commonRequestRepository;
+    
+    // ... your existing methods ...
+
+    @Override
+    public YearEndTransferEligibilityDto checkYearEndProfitTransferEligibility() {
+        log.info("Evaluating eligibility for YEAR_END_PROFIT_TRANSFER...");
+
+        // Check if ANY request exists that is either in Queue ('Q') or Accepted ('A')
+        boolean isAlreadyProcessingOrCompleted = commonRequestRepository.existsByRequestTypeAndStatusIn(
+                "YEAR_END_PROFIT_TRANSFER",
+                List.of("Q", "A") // Using modern Java List.of()
+        );
+
+        // Business Rule: If it exists in Q or A, return false (not eligible). Otherwise true.
+        boolean isEligible = !isAlreadyProcessingOrCompleted;
+        
+        log.info("Year End Profit Transfer Eligibility: {}", isEligible);
+
+        return YearEndTransferEligibilityDto.builder()
+                .isEligible(isEligible)
+                .build();
+    }
+}
+
+5. Update the Controller (LhoTransferController.java)
+Finally, expose the endpoint. I named it /year-end-eligibility to keep the REST contract clear and semantic.
 package com.tcs.fincore.CommonMasterService.Controller;
 
 import com.tcs.fincore.CommonMasterService.dto.ApiResponse;
 import com.tcs.fincore.CommonMasterService.dto.CommonRequestDto;
 import com.tcs.fincore.CommonMasterService.dto.PaginatedResponseDto;
 import com.tcs.fincore.CommonMasterService.dto.SearchRequest;
+import com.tcs.fincore.CommonMasterService.dto.YearEndTransferEligibilityDto; // <-- NEW IMPORT
 import com.tcs.fincore.CommonMasterService.service.CommonMasterService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -17,7 +125,6 @@ import org.springframework.web.bind.annotation.*;
 public class LhoTransferController {
 
     private final CommonMasterService service;
-
 
     @PostMapping("/search")
     public ResponseEntity<ApiResponse<PaginatedResponseDto<CommonRequestDto>>> searchLhoTransfers(
@@ -45,78 +152,20 @@ public class LhoTransferController {
         return ResponseEntity.ok(ApiResponse.success(data, "Summary retrieved successfully"));
     }
     
-
+    // --- NEW ENDPOINT ---
+    /**
+     * GET /api/lho-transfers/year-end-eligibility
+     * Checks if a Year End Profit Transfer is allowed to be initiated.
+     */
+    @GetMapping("/year-end-eligibility")
+    public ResponseEntity<ApiResponse<YearEndTransferEligibilityDto>> checkYearEndEligibility() {
+        log.info("Received request to check Year End Profit Transfer eligibility.");
+        YearEndTransferEligibilityDto response = service.checkYearEndProfitTransferEligibility();
+        return ResponseEntity.ok(ApiResponse.success(response, "Eligibility checked successfully"));
+    }
 }
 
-this is controller file in which i want a one more api in which like 
-it will return true or false 
-there is common_req table in which REQ_TYPE and REQ_STATUS 2 filds are there on this bases i want like 
-req type should YEAR_END_PROFIT_TRANSFER and status for any of the Status is Q or A
-then return false 
-other wise return true 
-package com.tcs.fincore.CommonMasterService.model;
-
-import jakarta.persistence.*;
-import lombok.*;
-import org.hibernate.annotations.CreationTimestamp;
-import java.time.LocalDateTime;
-
-@Getter
-@Setter
-@Entity
-@AllArgsConstructor
-@NoArgsConstructor
-@Builder
-@Table(name = "COMMON_REQ")
-public class CommonRequest {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "common_req_seq")
-    @SequenceGenerator(name = "common_req_seq", sequenceName = "COMMON_REQ_SEQ", allocationSize = 1)
-    @Column(name = "REQ_ID")
-    private Long id;
-
-    @Column(name = "REQ_TYPE", length = 20, nullable = false)
-    private String requestType;
-
-    @Column(name = "CHANGE_TYPE", length = 2, nullable = false)
-    private String changeType;
-
-    @Column(name = "REQ_STATUS", length = 2, nullable = false)
-    private String status;
-
-    @CreationTimestamp
-    @Column(name = "REQ_DATE", nullable = false, updatable = false)
-    private LocalDateTime requestDate;
-
-    @Column(name = "CREATOR_ID", length = 12, nullable = false)
-    private String creatorId;
-
-    @Column(name = "EXECUTION_DATE")
-    private LocalDateTime executionDate;
-
-    @Lob
-    @Column(name = "EXECUTION_REMARKS")
-    private String executionRemarks;
-
-    @Column(name = "EXECUTOR_ID", length = 12)
-    private String executorId;
-
-    @Column(name = "EXECUTOR_REMARKS", length = 500)
-    private String executorRemarks;
-
-    @Lob
-    @Column(name = "PAYLOAD")
-    private String payload;
-
-    @Column(name = "TARGET_ID", length = 4000)
-    private String targetId;
-
-    @Column(name = "CREATOR_REMARKS", length = 500)
-    private String creatorRemarks;
-}
-
-
-i hope u will create DTO and all 
-use SOlid principle i will we are using thzat alredy
-give mi updated code files 
+Why this design is enterprise-ready:
+ * Single Responsibility Principle (SRP): The Controller only handles HTTP routing. The Service handles the ! inversion logic. The Repository strictly executes the optimized database SQL.
+ * Performance: existsBy generates an EXISTS SQL clause. It stops scanning the database the millisecond it finds a single matching row, which is massively faster than doing a .count() or .findAll().
+Would you like me to walk you through how to write the React useEffect call to fetch this eligibility state on page load?
