@@ -1,12 +1,478 @@
-this are changes 
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import {
+  Box,
+  Button,
+  Typography,
+  CircularProgress,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  TablePagination,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  IconButton,
+  Tooltip,
+  DialogActions,
+  Chip,
+  useTheme,
+} from "@mui/material";
+import {
+  PlayArrow as PlayArrowIcon,
+  Close as CloseIcon,
+  Assessment as SummaryIcon,
+  Inbox as NoDataIcon,
+  Download as DownloadIcon, 
+} from "@mui/icons-material";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-export default function YearEndProfitTransfer({ fincoreDate }) {
-this passing date is not required 
+// --- API Constants ---
+const TRIGGER_API_URL = "/PS/airflow/trigger";
+const INITIAL_DATA_URL = "/PS/process/processes/data/7";
+const SUMMARY_BASE_URL = "/CM/lho-transfers/summary/";
+const CREATE_REQUEST_URL = "/CR/create-request";
+const DOWNLOAD_EXCEL_URL = "/dummy/excel-download";
+const ELIGIBILITY_API_URL = "/api/lho-transfers/year-end-eligibility";
 
-2) and i want createdDate also and Etl date also in the payload 
+export default function YearEndProfitTransfer() {
+  const theme = useTheme();
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
 
-3) circleWiseDetails -> here i just want that 
-circleName and totalProfitLoss no date 
+  // Table & Loading States
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [tableData, setTableData] = useState([]);
+  const [totalElements, setTotalElements] = useState(0);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
 
+  // State to track if the Transfer button should be enabled
+  const [isEligibleToTransfer, setIsEligibleToTransfer] = useState(false);
 
+  // Summary & Submission States
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [summaryData, setSummaryData] = useState([]);
+  const [summaryTotals, setSummaryTotals] = useState({
+    totalAmount: 0,
+    totalRecordCount: 0,
+  });
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
+  const [rowContext, setRowContext] = useState({
+    processRunId: null,
+    processId: null,
+    runId: null,
+  });
+  const [currentSelectedId, setCurrentSelectedId] = useState(null);
+
+  const getTodayFormatted = () => new Date().toISOString().split("T")[0];
+
+  const formatProcessTime = (dateString) => {
+    if (!dateString) return "-";
+    const date = new Date(dateString);
+    return new Intl.DateTimeFormat("en-GB", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true,
+    })
+      .format(date)
+      .replace(",", "");
+  };
+
+  /**
+   * DATA FETCHING
+   */
+  const fetchInitialData = useCallback(
+    async (isPolling = false) => {
+      if (!isPolling) setIsInitialLoading(true);
+      try {
+        const paginatedUrl = `${INITIAL_DATA_URL}`;
+        const response = await callApi(paginatedUrl, null, "GET");
+        if (isMounted.current && response) {
+          setTableData(response.initialData || []);
+          setTotalElements(
+            response.totalElements || response.initialData?.length || 0,
+          );
+        }
+      } catch (error) {
+        if (!isPolling && error !== undefined) {
+          const errorMessage = error?.message || "Failed to load process data";
+          showSnackBar(errorMessage, "error");
+        }
+      } finally {
+        if (isMounted.current && !isPolling) setIsInitialLoading(false);
+      }
+    },
+    [callApi, showSnackBar],
+  );
+
+  /**
+   * ELIGIBILITY CHECK
+   */
+  const fetchEligibility = useCallback(async () => {
+    try {
+      const response = await callApi(ELIGIBILITY_API_URL, null, "GET");
+      if (isMounted.current && response?.data) {
+        setIsEligibleToTransfer(response.data.eligible ?? response.data.isEligible ?? false);
+      }
+    } catch (error) {
+      if (error !== undefined) {
+        console.error("Failed to check eligibility:", error);
+        if (isMounted.current) setIsEligibleToTransfer(false);
+      }
+    }
+  }, [callApi]);
+
+  useEffect(() => {
+    isMounted.current = true;
+    fetchInitialData();
+    fetchEligibility(); 
+    return () => {
+      isMounted.current = false;
+    };
+  }, [fetchInitialData, fetchEligibility, page, rowsPerPage]);
+
+  useEffect(() => {
+    const pollInterval = setInterval(() => {
+      fetchInitialData(true);
+      fetchEligibility(); 
+    }, 10000);
+
+    return () => clearInterval(pollInterval);
+  }, [fetchInitialData, fetchEligibility, page, rowsPerPage]);
+
+  const handleTransferLho = async () => {
+    setIsTransferring(true);
+    const payload = {
+      dagId: "cbs_wrap_dag",
+      processId: 7,
+      remarks: "testing 1",
+    };
+
+    try {
+      await callApi(TRIGGER_API_URL, payload, "POST");
+      showSnackBar("LHO Transfer triggered successfully", "success");
+      fetchInitialData();
+      fetchEligibility(); 
+    } catch (error) {
+      const errorMessage = error?.message || "Failed to trigger LHO Transfer";
+      showSnackBar(errorMessage, "warning");
+    } finally {
+      setIsTransferring(false);
+    }
+  };
+
+  const handleSubmitLhoRequest = async () => {
+    setIsSubmitting(true);
+
+    const currentDate = getTodayFormatted();
+
+    const finalRequestPayload = {
+      requestType: "YEAR_END_PROFIT_TRANSFER",
+      changeType: "ADD",
+      targetId: null,
+      payload: {
+        processRunId: rowContext.processRunId,
+        processId: rowContext.processId,
+        batchId: String(rowContext.runId),
+        createdDate: currentDate,
+        etlDate: currentDate, 
+        totalAmount: summaryTotals.totalAmount,
+        totalRecordCount: summaryTotals.totalRecordCount,
+        circleWiseDetails: summaryData.map((item) => ({
+          circleName: item.circleName,
+          totalProfitLoss: Number(item.totalProfitLoss),
+        })),
+      },
+    };
+
+    try {
+      await callApi(CREATE_REQUEST_URL, finalRequestPayload, "POST");
+      showSnackBar("LHO Transfer Request Submitted Successfully", "success");
+      setSummaryOpen(false);
+      fetchEligibility(); 
+    } catch (error) {
+      const errorMessage =
+        error?.message || "Submission failed. Check network/payload";
+      showSnackBar(errorMessage, "warning");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleGetSummary = async (row) => {
+    setSummaryOpen(true);
+    setSummaryLoading(true);
+    setCurrentSelectedId(row.processRunId);
+    setRowContext({
+      processRunId: row.processRunId,
+      processId: row.processId,
+      runId: row.runId,
+    });
+
+    try {
+      const response = await callApi(
+        `${SUMMARY_BASE_URL}${row.processRunId}`,
+        null,
+        "GET",
+      );
+
+      const responseData = response?.data || {};
+      const rawMap = responseData.circleWiseDetails || {};
+
+      setSummaryTotals({
+        totalAmount: responseData.totalAmount || 0,
+        totalRecordCount: responseData.totalRecordCount || 0,
+      });
+
+      setSummaryData(
+        Object.entries(rawMap).map(([name, balance]) => ({
+          circleName: name,
+          totalProfitLoss: balance,
+        })),
+      );
+    } catch (error) {
+      const errorMessage = error?.message || "Could not fetch summary data";
+      showSnackBar(errorMessage, "error");
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
+  const handleDownloadExcel = async () => {
+    try {
+      showSnackBar("Excel download started.", "info");
+    } catch (error) {
+      console.error(error);
+      showSnackBar("Failed to download Excel", "error");
+    }
+  };
+
+  const getStatusChip = (s) => {
+    if (s === 1)
+      return (
+        <Chip
+          label="In Progress"
+          color="primary"
+          variant="outlined"
+          size="small"
+        />
+      );
+    if (s === 2) return <Chip label="Success" color="success" size="small" />;
+    if (s === 3) return <Chip label="Fail" color="error" size="small" />;
+    return <Chip label="Unknown" variant="outlined" size="small" />;
+  };
+
+  const isAnyProcessRunning = tableData.some((row) => row.status === 2);
+
+  return (
+    <Box p={3} width="100%">
+      {/* Header Action */}
+      <Box display="flex" justifyContent="flex-end" mb={2}>
+        <Tooltip title={!isEligibleToTransfer ? "A Year End Profit Transfer is already Accepted or in Queue." : ""}>
+          <span>
+            <Button
+              variant="contained"
+              startIcon={
+                isTransferring ? (
+                  <CircularProgress size={20} color="inherit" />
+                ) : (
+                  <PlayArrowIcon />
+                )
+              }
+              onClick={handleTransferLho}
+              disabled={!isEligibleToTransfer || isTransferring || isInitialLoading || isAnyProcessRunning}
+            >
+              {isTransferring ? "Transferring..." : "Transfer LHO"}
+            </Button>
+          </span>
+        </Tooltip>
+      </Box>
+
+      {/* Main Table */}
+      <TableContainer component={Paper}>
+        <Table>
+          <TableHead sx={{ bgcolor: theme.palette.action.hover }}>
+            <TableRow>
+              <TableCell align="center">
+                <strong>Process Name</strong>
+              </TableCell>
+              <TableCell align="center">
+                <strong>Status</strong>
+              </TableCell>
+              <TableCell align="center">
+                <strong>Start Time</strong>
+              </TableCell>
+              <TableCell align="center">
+                <strong>End Time</strong>
+              </TableCell>
+              <TableCell align="center">
+                <strong>Action</strong>
+              </TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {isInitialLoading ? (
+              <TableRow>
+                <TableCell colSpan={5} align="center" sx={{ py: 6 }}>
+                  <CircularProgress size={40} />
+                </TableCell>
+              </TableRow>
+            ) : tableData.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={5} align="center" sx={{ py: 6 }}>
+                  <NoDataIcon
+                    sx={{ fontSize: 48, color: "text.disabled", mb: 1 }}
+                  />
+                  <Typography variant="body1" color="text.secondary">
+                    There is no data to show.
+                  </Typography>
+                </TableCell>
+              </TableRow>
+            ) : (
+              tableData
+                .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                .map((row) => (
+                  <TableRow key={row.processRunId}>
+                    <TableCell align="center">{row.processType}</TableCell>
+                    <TableCell align="center">
+                      {getStatusChip(row.status)}
+                    </TableCell>
+                    <TableCell align="center">
+                      {formatProcessTime(row.processStartTime)}
+                    </TableCell>
+                    <TableCell align="center">
+                      {formatProcessTime(row.processEndTime)}
+                    </TableCell>
+                    <TableCell align="center">
+                      <Tooltip
+                        title={
+                          row.status === 2 ? "Get Summary" : "Not Available"
+                        }
+                      >
+                        <span>
+                          <IconButton
+                            size="small"
+                            disabled={row.status !== 1}
+                            onClick={() => handleGetSummary(row)}
+                            color="primary"
+                          >
+                            <SummaryIcon />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                    </TableCell>
+                  </TableRow>
+                ))
+            )}
+          </TableBody>
+        </Table>
+        <TablePagination
+          component="div"
+          count={totalElements}
+          page={page}
+          onPageChange={(e, p) => setPage(p)}
+          rowsPerPage={rowsPerPage}
+          onRowsPerPageChange={(e) => {
+            setRowsPerPage(parseInt(e.target.value, 10));
+            setPage(0);
+          }}
+        />
+      </TableContainer>
+
+      {/* --- SUMMARY DIALOG --- */}
+      <Dialog
+        open={summaryOpen}
+        onClose={() => setSummaryOpen(false)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle sx={{ m: 0, p: 2 }}>
+          Circle Wise Summary
+          <IconButton
+            onClick={() => setSummaryOpen(false)}
+            sx={{ position: "absolute", right: 8, top: 8 }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {summaryLoading ? (
+            <Box display="flex" justifyContent="center" py={5}>
+              <CircularProgress />
+            </Box>
+          ) : (
+            <>
+              <TableContainer component={Paper} sx={{ maxHeight: 400 }}>
+                <Table size="small" stickyHeader>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell
+                        align="center"
+                        sx={{ bgcolor: theme.palette.action.hover }}
+                      >
+                        <strong>Circle Name</strong>
+                      </TableCell>
+                      <TableCell
+                        align="right"
+                        sx={{ bgcolor: theme.palette.action.hover }}
+                      >
+                        <strong>Balance</strong>
+                      </TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {summaryData.map((row, idx) => (
+                      <TableRow key={idx}>
+                        <TableCell align="center">{row.circleName}</TableCell>
+                        <TableCell align="right" sx={{ fontWeight: "bold" }}>
+                          {Number(row.totalProfitLoss).toLocaleString("en-IN", {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2, justifyContent: "space-between" }}>
+          <Button
+            variant="outlined"
+            startIcon={<DownloadIcon />}
+            onClick={handleDownloadExcel}
+            disabled={summaryData.length === 0}
+          >
+            Download Excel
+          </Button>
+
+          <Button
+            variant="contained"
+            disabled={summaryData.length === 0 || isSubmitting}
+            onClick={handleSubmitLhoRequest}
+            startIcon={
+              isSubmitting && <CircularProgress size={16} color="inherit" />
+            }
+          >
+            {isSubmitting ? "Submitting..." : "Submit Request"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
