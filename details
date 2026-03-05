@@ -1,85 +1,34 @@
- @Override
-        public void processRejection(CommonReq request) {
-            log.info("Processing Rejection for LHO Transfer Batch: {}. Clearing GL_TRANSITION table.", request.getTargetId());
+import com.fasterxml.jackson.databind.JsonNode;
+// ... your other imports ...
 
-            try {
-                 String sql = "DELETE FROM TABLE P_L_TRANSFER WHERE TRANSFER_DATE == '31-01-2026'";
+@Override
+public void processRejection(CommonReq request) {
+    log.info("Processing Rejection for Year End Batch. Extracting etlDate to clear P_L_TRANSFER table.");
 
-                jdbcTemplate.execute(sql);
-
-
-                log.info("Successfully cleared table for rejected request: {}", request.getId());
-
-            } catch (Exception e) {
-                log.error("CRITICAL: Failed to clear table during rejection of request: {}", request.getId(), e);
-                throw new RuntimeException("Failed to clear table on rejection", e);
-            }
+    try {
+        // 1. Extract the etlDate from the JSON payload
+        JsonNode payloadNode = objectMapper.readTree(request.getPayload());
+        
+        // Safety check to ensure we don't accidentally delete everything if the date is missing
+        if (!payloadNode.has("etlDate") || payloadNode.get("etlDate").isNull()) {
+             throw new IllegalArgumentException("CRITICAL: etlDate is missing from the payload. Cannot safely delete records.");
         }
+        
+        String etlDate = payloadNode.get("etlDate").asText(); // Gets "2026-03-05"
+        log.info("Extracted etlDate: {}. Preparing to execute DELETE operation.", etlDate);
 
-in this i want that hard coded date replce with etl date with we are getting 
-req
-{
-  "requestType": "YEAR_END_PROFIT_TRANSFER",
-  "changeType": "ADD",
-  "targetId": null,
-  "payload": {
-    "processRunId": 85021,
-    "processId": 7,
-    "batchId": "1045",
-    "createdDate": "2026-03-05",
-    "etlDate": "2026-03-05", 
-    "totalAmount": 96049493.40,
-    "totalRecordCount": 2,
-    "circleWiseDetails": [
-      {
-        "circleName": "MUMBAI METRO",
-        "totalProfitLoss": 96044367.00
-      },
-      {
-        "circleName": "GUWAHATI",
-        "totalProfitLoss": 5126.40
-      }
-    ]
-  }
-}
+        // 2. Write the Safe SQL Query (Fixed syntax: removed "TABLE", changed "==" to "=")
+        // Using TRUNC ensures we match the date exactly, ignoring any HH:MM:SS timestamps in the DB
+        String sql = "DELETE FROM P_L_TRANSFER WHERE TRUNC(TRANSFER_DATE) = TO_DATE(?, 'YYYY-MM-DD')";
 
+        // 3. Execute using .update() which safely injects the etlDate into the '?'
+        int rowsAffected = jdbcTemplate.update(sql, etlDate);
 
+        log.info("Successfully cleared {} rows from P_L_TRANSFER table for rejected request: {} for date: {}", 
+                 rowsAffected, request.getId(), etlDate);
 
-res
-{
-    "success": true,
-    "message": "Operation completed successfully.",
-    "data": {
-        "id": 2662,
-        "reqType": "YEAR_END_PROFIT_TRANSFER",
-        "changeType": "ADD",
-        "reqStatus": "PENDING",
-        "reqDate": "2026-03-05T18:36:27.3527727",
-        "creatorId": "1021256",
-        "executionDate": null,
-        "executionRemarks": null,
-        "executorId": null,
-        "executorRemarks": null,
-        "payload": {
-            "processRunId": 85021,
-            "processId": 7,
-            "batchId": "1045",
-            "createdDate": "2026-03-05",
-            "etlDate": "2026-03-05",
-            "totalAmount": 96049493.40,
-            "totalRecordCount": 2,
-            "circleWiseDetails": [
-                {
-                    "circleName": "MUMBAI METRO",
-                    "totalProfitLoss": 96044367.00
-                },
-                {
-                    "circleName": "GUWAHATI",
-                    "totalProfitLoss": 5126.40
-                }
-            ]
-        },
-        "targetId": "1045"
-    },
-    "timestamp": "2026-03-05T13:06:27.469283900Z"
+    } catch (Exception e) {
+        log.error("CRITICAL: Failed to clear P_L_TRANSFER table during rejection of request: {}", request.getId(), e);
+        throw new RuntimeException("Failed to clear table on rejection", e);
+    }
 }
