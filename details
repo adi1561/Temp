@@ -1,24 +1,66 @@
+As a Lead, I can see exactly what is happening here. This is a classic Jackson Deserialization mismatch.
+Your React frontend is now sending the new, cleaner JSON structure (sending circleName and removing the dates), but your Java backend DTOs are still expecting the old fields (transferDate and circleBranchCode). Because Jackson can't find those old fields in the incoming JSON, it just fills them with null.
+To fix this and get your COMMON_REQ payload perfectly clean, we need to update your DTOs to match the new contract.
+Here are the updated files.
+1. Update the Detail DTO (ProfitLossSummaryDto.java)
+We need to remove the transferDate, change the circleBranchCode to a String named circleName, and keep the balance.
 package com.fincore.YearEndService.DTO;
+
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import java.math.BigDecimal;
-import java.time.LocalDate;
 
 @Data
 @AllArgsConstructor
 @NoArgsConstructor
 public class ProfitLossSummaryDto {
-    private LocalDate transferDate;
-    private Integer circleBranchCode;
+    // REMOVED: transferDate
+    
+    // CHANGED: From Integer circleBranchCode to String circleName
+    private String circleName; 
+    
     private BigDecimal totalProfitLoss;
 }
 
+2. Update your Main Payload DTO
+Note: You didn't paste the exact class name for the root payload (it might be called something like YearEndRequestPayloadDto or similar), but you need to update it to match the root fields we changed.
+Find the DTO that contains processRunId, processId, etc., and make sure it has createdDate and etlDate instead of processDate or date.
+// Inside whichever DTO maps to the root "payload" JSON:
+@Data
+public class YourMainPayloadDto {
+    private Long processRunId;
+    private Long processId;
+    private String batchId;
+    
+    // REMOVED: private LocalDate processDate; (or date)
+    
+    // ADDED: The new dates from the frontend
+    private String createdDate;
+    private String etlDate;
+    
+    private BigDecimal totalAmount;
+    private Integer totalRecordCount;
+    
+    // This points to the updated DTO above
+    private List<ProfitLossSummaryDto> circleWiseDetails; 
+}
+
+3. Optional: Update the Interface and Repository
+If you are still using ProfitLossRepository.findProfitLossSummaryGroupedByCircle() somewhere else in your code to generate summaries, you need to update it so it joins with CIRCLE_MASTER to get the name, just like we did earlier.
+Update the Interface (IProfitLossSummary.java):
+package com.fincore.YearEndService.DTO;
+import java.math.BigDecimal;
+
+public interface IProfitLossSummary {
+    String getCircleName(); // Changed from getCircleBranchCode()
+    BigDecimal getTotalProfitLoss();
+}
+
+Update the Repository (ProfitLossRepository.java):
 package com.fincore.YearEndService.Repository;
 
-
 import com.fincore.YearEndService.DTO.IProfitLossSummary;
-import com.fincore.YearEndService.DTO.ProfitLossSummaryDto;
 import com.fincore.YearEndService.Model.ProfitLossTransfer;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -29,293 +71,14 @@ import java.util.List;
 @Repository
 public interface ProfitLossRepository extends JpaRepository<ProfitLossTransfer, Long> {
 
-    @Query("SELECT p.transferDate as transferDate, " +
-            "p.circleBranchCode as circleBranchCode, " +
-            "SUM(p.profitLoss) as totalProfitLoss " +
-            "FROM ProfitLossTransfer p " +
-            "GROUP BY p.circleBranchCode, p.transferDate " +
-            "ORDER BY p.transferDate DESC")
+    // Updated to use the native LEFT JOIN query to fetch CIRCLE_NAME
+    @Query(value = "SELECT cm.CIRCLE_NAME as circleName, " +
+            "SUM(p.PROFIT_LOSS) as totalProfitLoss " +
+            "FROM PROFIT_LOSS_TRANSFER p " +
+            "LEFT JOIN CIRCLE_MASTER cm ON cm.BRANCH_CODE = LPAD(p.CIRCLE_BRANCH_CODE, 5, '0') " +
+            "GROUP BY cm.CIRCLE_NAME", nativeQuery = true)
     List<IProfitLossSummary> findProfitLossSummaryGroupedByCircle();
 }
 
-
-package com.tcs.fincore.CommonMasterService.Controller;
-
-import com.tcs.fincore.CommonMasterService.dto.*;
-import com.tcs.fincore.CommonMasterService.service.CommonMasterService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-@Slf4j
-@RestController
-@RequestMapping("/api/lho-transfers")
-@RequiredArgsConstructor
-public class LhoTransferController {
-
-    private final CommonMasterService service;
-
-
-    @PostMapping("/search")
-    public ResponseEntity<ApiResponse<PaginatedResponseDto<CommonRequestDto>>> searchLhoTransfers(
-            @RequestBody SearchRequest request) {
-        log.info("Received request to search LHO Transfers");
-        PaginatedResponseDto<CommonRequestDto> response = service.searchLhoTransfers(request);
-        return ResponseEntity.ok(ApiResponse.success(response, "LHO Transfers fetched successfully"));
-    }
-
-    /**
-     * GET /api/lho-transfers/{id}
-     * Fetches details for a specific LHO Transfer.
-     */
-    @GetMapping("/{id}")
-    public ResponseEntity<ApiResponse<CommonRequestDto>> getLhoTransferById(@PathVariable Long id) {
-        log.info("Received request to fetch LHO Transfer ID: {}", id);
-        CommonRequestDto response = service.getLhoTransferById(id);
-        return ResponseEntity.ok(ApiResponse.success(response));
-    }
-
-    @GetMapping("/summary/{id}")
-    public ResponseEntity<ApiResponse<Object>> getSummary(@PathVariable Long id) {
-        log.info("API Request: Summary for ID {}", id);
-        Object data = service.getOrGenerateLhoSummary(id);
-        return ResponseEntity.ok(ApiResponse.success(data, "Summary retrieved successfully"));
-    }
-    @GetMapping("/year-end-eligibility")
-    public ResponseEntity<ApiResponse<YearEndTransferEligibilityDto>> checkYearEndEligibility() {
-        log.info("Received request to check Year End Profit Transfer eligibility.");
-        YearEndTransferEligibilityDto response = service.checkYearEndProfitTransferEligibility();
-        return ResponseEntity.ok(ApiResponse.success(response, "Eligibility checked successfully"));
-    }
-
-}
-
-
-
-    @Override
-    public PaginatedResponseDto<CommonRequestDto> searchLhoTransfers(SearchRequest request) {
-        log.info("Searching Common Requests for REQ_TYPE: LHO_TRANSFER");
-
-        // Set up Pagination & Sorting
-        Sort.Direction direction = (request.getSortOrder() != null && request.getSortOrder().equalsIgnoreCase("DESC"))
-                ? Sort.Direction.DESC : Sort.Direction.ASC;
-        String sortField = (request.getSortField() != null) ? request.getSortField() : "requestDate";
-
-        PageRequest pageRequest = PageRequest.of(request.getPage(), request.getSize(), Sort.by(direction, sortField));
-
-        // Business Rule: Hard filter for LHO_TRANSFER
-        Specification<CommonRequest> lhoTypeSpec = (root, query, cb) ->
-                cb.equal(root.get("requestType"), "LHO_TRANSFER");
-
-        // Combine with dynamic UI filters using your GenericSpecification
-        Specification<CommonRequest> finalSpec = lhoTypeSpec.and(GenericSpecification.build(request.getFilters()));
-
-        Page<CommonRequest> page = commonRequestRepository.findAll(finalSpec, pageRequest);
-
-        if (page.isEmpty()) {
-            throw new NoDataFoundException("No LHO Transfer records found.");
-        }
-
-        List<CommonRequestDto> dtoList = page.getContent().stream()
-                .map(this::mapToRequestDto)
-                .toList();
-
-        return new PaginatedResponseDto<>(
-                page.getNumber(),
-                page.getTotalPages(),
-                page.getSize(),
-                page.getTotalElements(),
-                direction.name(),
-                dtoList
-        );
-    }
-
-    @Override
-    public CommonRequestDto getLhoTransferById(Long id) {
-        CommonRequest entity = commonRequestRepository.findById(id)
-                .orElseThrow(() -> new NoDataFoundException("Request " + id + " not found."));
-
-        // Enforce type check for security
-        if (!"LHO_TRANSFER".equalsIgnoreCase(entity.getRequestType())) {
-            throw new IllegalArgumentException("Access Denied: Record is not an LHO Transfer.");
-        }
-
-        return mapToRequestDto(entity);
-    }
-
-    /**
-     * Helper Mapper: Entity to DTO
-     */
-    private CommonRequestDto mapToRequestDto(CommonRequest entity) {
-        return CommonRequestDto.builder()
-                .id(entity.getId())
-                .requestType(entity.getRequestType())
-                .changeType(entity.getChangeType())
-                .status(entity.getStatus())
-                .requestDate(entity.getRequestDate())
-                .creatorId(entity.getCreatorId())
-                .creatorRemarks(entity.getCreatorRemarks())
-                .executionDate(entity.getExecutionDate())
-                .executionRemarks(entity.getExecutionRemarks())
-                .executorId(entity.getExecutorId())
-                .executorRemarks(entity.getExecutorRemarks())
-                .payload(entity.getPayload())
-                .targetId(entity.getTargetId())
-                .build();
-    }
-
-    @Override
-    @Transactional
-    public Object getOrGenerateLhoSummary(Long id) {
-        log.info("Processing LHO Summary request for ID: {}", id);
-
-        // --- STEP 1: CACHE CHECK ---
-        Optional<LhoTransferSummary> cached = lhoSummaryRepository.findById(id);
-        if (cached.isPresent()) {
-            try {
-                JsonNode node = objectMapper.readTree(cached.get().getPayload());
-                // Check if it's the new structure and has a valid totalAmount
-                if (node.has("circleWiseDetails") && node.get("totalAmount").asDouble() != 0) {
-                    return objectMapper.treeToValue(node, LhoSummaryResponseDto.class);
-                }
-            } catch (Exception e) {
-                log.warn("Refreshing cache for ID: {}", id);
-            }
-        }
-
-        // --- STEP 2: AGGREGATE USING NEW JOIN QUERY ---
-        List<Object[]> aggregatedData = plTransferRepository.getAggregatedSummary();
-        if (aggregatedData.isEmpty()) {
-            return LhoSummaryResponseDto.builder()
-                    .totalAmount(BigDecimal.ZERO.setScale(2, RoundingMode.HALF_UP))
-                    .totalRecordCount(0)
-                    .circleWiseDetails(Collections.emptyMap())
-                    .build();
-        }
-
-        // --- STEP 3: MAPPING & CALCULATION ---
-        Map<String, BigDecimal> summaryMap = new HashMap<>();
-        BigDecimal runningTotal = BigDecimal.ZERO;
-
-        for (Object[] row : aggregatedData) {
-            // row[0] is now the CIRCLE_NAME from the database (or null if LEFT JOIN missed)
-            String circleName = (row[0] != null) ? String.valueOf(row[0]) : "UNKNOWN_CIRCLE";
-
-            // Convert with high precision
-            BigDecimal totalPL = (row[1] != null)
-                    ? new BigDecimal(row[1].toString())
-                    : BigDecimal.ZERO;
-
-            runningTotal = runningTotal.add(totalPL);
-
-            // Put the Circle Name and the Balance into the map
-            summaryMap.put(circleName, totalPL.setScale(2, RoundingMode.HALF_UP));
-        }
-
-        // --- STEP 4: CONSTRUCT RESPONSE ---
-        LhoSummaryResponseDto responseDto = LhoSummaryResponseDto.builder()
-                .totalAmount(runningTotal.setScale(2, RoundingMode.HALF_UP))
-                .totalRecordCount(summaryMap.size()) // Count of unique circles
-                .circleWiseDetails(summaryMap)
-                .build();
-
-        // --- STEP 5: PERSIST ---
-        try {
-            String jsonPayload = objectMapper.writeValueAsString(responseDto);
-            LhoTransferSummary summaryEntity = LhoTransferSummary.builder()
-                    .id(id)
-                    .payload(jsonPayload)
-                    .build();
-
-            lhoSummaryRepository.save(summaryEntity);
-            return responseDto;
-        } catch (Exception e) {
-            log.error("Serialization failed: {}", e.getMessage());
-            throw new RuntimeException("Error persisting LHO Summary.");
-        }
-    }
-
-
-    @Override
-    public YearEndTransferEligibilityDto checkYearEndProfitTransferEligibility() {
-        log.info("Evaluating eligibility for YEAR_END_PROFIT_TRANSFER...");
-
-        // Check if ANY request exists that is either in Queue ('Q') or Accepted ('A')
-        boolean isAlreadyProcessingOrCompleted = commonRequestRepository.existsByRequestTypeAndStatusIn(
-                "YEAR_END_PROFIT_TRANSFER",
-                List.of("Q", "A") // Using modern Java List.of()
-        );
-
-        // Business Rule: If it exists in Q or A, return false (not eligible). Otherwise true.
-        boolean isEligible = !isAlreadyProcessingOrCompleted;
-
-        log.info("Year End Profit Transfer Eligibility: {}", isEligible);
-
-        return YearEndTransferEligibilityDto.builder()
-                .isEligible(isEligible)
-                .build();
-    }
-
-
-
-{
-    "success": true,
-    "message": "Summary retrieved successfully",
-    "data": {
-        "totalAmount": 564367.00,
-        "totalRecordCount": 4,
-        "circleWiseDetails": {
-            "PATNA": -190960000.00,
-            "GUWAHATI": 10252.80,
-            "THIRUVANANTHAPURAM": -10252.80,
-            "MUMBAI METRO": 191524367.00
-        }
-    },
-    "timestamp": "2026-03-05T12:49:11.880581500Z"
-}
-
-the process for the genrating summrey then we also need to update the how we are sending it 
-in the payload 
-in circle wise Details 
-we are sending the circle name and balance is it then update the DTo and other files accoridngly
-
-{
-    "success": true,
-    "message": "Operation completed successfully.",
-    "data": {
-        "id": 2660,
-        "reqType": "YEAR_END_PROFIT_TRANSFER",
-        "changeType": "ADD",
-        "reqStatus": "PENDING",
-        "reqDate": "2026-03-05T18:12:12.9752841",
-        "creatorId": "1021256",
-        "executionDate": null,
-        "executionRemarks": null,
-        "executorId": null,
-        "executorRemarks": null,
-        "payload": {
-            "processRunId": 85021,
-            "processId": 7,
-            "batchId": "1045",
-            "processDate": null,
-            "totalAmount": 96049493.40,
-            "totalRecordCount": 2,
-            "circleWiseDetails": [
-                {
-                    "transferDate": null,  -> Dont want 
-                    "circleBranchCode": null,
-                    "totalProfitLoss": 96044367.00
-                },
-                {
-                    "transferDate": null,
-                    "circleBranchCode": null,
-                    "totalProfitLoss": 5126.40
-                }
-            ]
-        },
-        "targetId": "1045"
-    },
-    "timestamp": "2026-03-05T12:42:13.184485400Z"
-}
-this is how the request is created 
+Once you update these DTOs and restart your Spring Boot application, your POST request will map the JSON perfectly, and you will see "circleName": "MUMBAI METRO" saved beautifully into the PAYLOAD column in your COMMON_REQ table without any null values!
+Would you like me to help draft the YearEndTransferStrategy class that handles this payload when the Checker clicks "Approve"?
