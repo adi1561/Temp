@@ -1,171 +1,335 @@
-As a Technical Lead, I agree that wrapping this in a proper DTO rather than returning a raw boolean is the best approach. It adheres to the Open/Closed Principle (OCP)—if we ever need to add a "reason" string or additional flags later, we just add fields to the DTO without breaking the frontend contract.
-Here is the complete, SOLID-compliant implementation from the database layer up to the Controller.
-1. Create the DTO (YearEndTransferEligibilityDto.java)
-Create this in your dto package. This wraps the boolean response cleanly.
-package com.tcs.fincore.CommonMasterService.dto;
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Box, Button, Typography, CircularProgress, Table, TableBody,
+  TableCell, TableContainer, TableHead, TableRow, Paper,
+  TablePagination, Dialog, DialogTitle, DialogContent, IconButton,
+  Tooltip, DialogActions, Chip, useTheme
+} from "@mui/material";
+import {
+  PlayArrow as PlayArrowIcon,
+  Close as CloseIcon,
+  Assessment as SummaryIcon,
+  Inbox as NoDataIcon,
+  Download as DownloadIcon // Added for Excel button
+} from "@mui/icons-material";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+// --- API Constants ---
+const TRIGGER_API_URL = "/PS/airflow/trigger";
+const INITIAL_DATA_URL = "/PS/process/processes/data/7";
+const SUMMARY_BASE_URL = "/CM/lho-transfers/summary/";
+const CREATE_REQUEST_URL = "/CR/create-request";
+const DOWNLOAD_EXCEL_URL = "/dummy/excel-download"; 
 
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class YearEndTransferEligibilityDto {
-    /**
-     * returns false if a YEAR_END_PROFIT_TRANSFER is already Accepted (A) or in Queue (Q).
-     * returns true otherwise.
-     */
-    private boolean isEligible;
-}
+export default function YearEndProfitTransfer() {
+  const theme = useTheme();
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
 
-2. Update the Repository (CommonRequestRepository.java)
-Spring Data JPA's existsBy... is highly optimized. Instead of fetching the entire row, it runs a fast SELECT 1 ... FETCH FIRST 1 ROWS ONLY query, which is extremely efficient for this kind of boolean check.
-package com.tcs.fincore.CommonMasterService.repository;
+  // Table & Loading States
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [tableData, setTableData] = useState([]);
+  const [totalElements, setTotalElements] = useState(0);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
 
-import com.tcs.fincore.CommonMasterService.model.CommonRequest;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
+  // Summary & Submission States
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [summaryData, setSummaryData] = useState([]);
+  const [summaryTotals, setSummaryTotals] = useState({ totalAmount: 0, totalRecordCount: 0 });
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-import java.util.List;
+  const [rowContext, setRowContext] = useState({ processRunId: null, processId: null, runId: null });
+  const [currentSelectedId, setCurrentSelectedId] = useState(null);
 
-@Repository
-public interface CommonRequestRepository extends JpaRepository<CommonRequest, Long> {
+  const getTodayFormatted = () => new Date().toISOString().split('T')[0];
+
+  const formatProcessTime = (dateString) => {
+    if (!dateString) return "-";
+    const date = new Date(dateString);
+    return new Intl.DateTimeFormat('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    }).format(date).replace(',', '');
+  };
+
+  /**
+   * DATA FETCHING
+   */
+  const fetchInitialData = async (isPolling = false) => {
+    if (!isPolling) setIsInitialLoading(true);
+    try {
+      const paginatedUrl = `${INITIAL_DATA_URL}`; 
+      const response = await callApi(paginatedUrl, null, "GET");
+      if (isMounted.current && response) {
+        setTableData(response.initialData || []);
+        setTotalElements(response.totalElements || (response.initialData?.length || 0));
+      }
+    } catch (error) {
+      if (!isPolling && error !== undefined) {
+        const errorMessage = error?.message || "Failed to load process data";
+        showSnackBar(errorMessage, "error");
+      }
+    } finally {
+      if (isMounted.current && !isPolling) setIsInitialLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    isMounted.current = true;
+    fetchInitialData();
+    return () => { isMounted.current = false; };
+  }, [page, rowsPerPage]);
+
+  useEffect(() => {
+    const pollInterval = setInterval(() => {
+      fetchInitialData(true);
+    }, 10000); 
+
+    return () => clearInterval(pollInterval);
+  }, [page, rowsPerPage]);
+
+  const handleTransferLho = async () => {
+    setIsTransferring(true);
+    const payload = { dagId: "cbs_wrap_dag", processId: 7, remarks: "testing 1" };
     
-    // ... your existing methods ...
+    try {
+      await callApi(TRIGGER_API_URL, payload, "POST");
+      showSnackBar("LHO Transfer triggered successfully", "success");
+      fetchInitialData();
+    } catch (error) {
+      const errorMessage = error?.message || "Failed to trigger LHO Transfer";
+      showSnackBar(errorMessage, "warning");
+    } finally {
+      setIsTransferring(false);
+    }
+  };
 
-    /**
-     * Checks if any record exists for a specific Request Type and a list of Statuses.
-     * Highly optimized for boolean returns.
-     */
-    boolean existsByRequestTypeAndStatusIn(String requestType, List<String> statuses);
-}
+  const handleSubmitLhoRequest = async () => {
+    setIsSubmitting(true);
+    const finalRequestPayload = {
+      requestType: "YEAR_END_PROFIT_TRANSFER",
+      changeType: "ADD",
+      targetId: null, 
+      payload: {
+        processRunId: rowContext.processRunId,
+        processId: rowContext.processId,
+        batchId: String(rowContext.runId),
+        processDate: getTodayFormatted(),
+        totalAmount: summaryTotals.totalAmount,
+        totalRecordCount: summaryTotals.totalRecordCount,
+        circleWiseDetails: summaryData.map(item => ({
+          transferDate: getTodayFormatted(),
+          circleName: item.circleName, 
+          totalProfitLoss: Number(item.totalProfitLoss)
+        }))
+      }
+    };
 
-3. Update the Service Interface (CommonMasterService.java)
-Add the contract to your service interface.
-package com.tcs.fincore.CommonMasterService.service;
+    try {
+      await callApi(CREATE_REQUEST_URL, finalRequestPayload, "POST");
+      showSnackBar("LHO Transfer Request Submitted Successfully", "success");
+      setSummaryOpen(false);
+    } catch (error) {
+      const errorMessage = error?.message || "Submission failed. Check network/payload";
+      showSnackBar(errorMessage, "warning");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
 
-import com.tcs.fincore.CommonMasterService.dto.YearEndTransferEligibilityDto;
-// ... your other imports ...
-
-public interface CommonMasterService {
+  const handleGetSummary = async (row) => {
+    setSummaryOpen(true);
+    setSummaryLoading(true);
+    setCurrentSelectedId(row.processRunId);
+    setRowContext({ processRunId: row.processRunId, processId: row.processId, runId: row.runId });
     
-    // ... your existing methods ...
+    try {
+      const response = await callApi(`${SUMMARY_BASE_URL}${row.processRunId}`, null, "GET");
+      
+      // Navigate through the new response structure
+      const responseData = response?.data || {};
+      const rawMap = responseData.circleWiseDetails || {};
+      
+      setSummaryTotals({
+        totalAmount: responseData.totalAmount || 0,
+        totalRecordCount: responseData.totalRecordCount || 0
+      });
 
-    /**
-     * Checks if a new Year End Profit Transfer can be initiated.
-     */
-    YearEndTransferEligibilityDto checkYearEndProfitTransferEligibility();
+      // Mapped name to circleName
+      setSummaryData(Object.entries(rawMap).map(([name, balance]) => ({
+        circleName: name, totalProfitLoss: balance
+      })));
+    } catch (error) {
+      const errorMessage = error?.message || "Could not fetch summary data";
+      showSnackBar(errorMessage, "error");
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
+  const handleDownloadExcel = async () => {
+    try {
+      showSnackBar("Excel download started.", "info");
+    } catch (error) {
+      showSnackBar("Failed to download Excel", "error");
+    }
+  };
+
+  const getStatusChip = (s) => {
+    if (s === 1) return <Chip label="In Progress" color="primary" variant="outlined" size="small" />;
+    if (s === 2) return <Chip label="Success" color="success" size="small" />;
+    if (s === 3) return <Chip label="Fail" color="error" size="small" />;
+    return <Chip label="Unknown" variant="outlined" size="small" />;
+  };
+
+  // Check if any process is currently running
+  const isAnyProcessRunning = tableData.some(row => row.status === 2);
+
+  return (
+    <Box p={3} width="100%">
+      {/* Header Action */}
+      <Box display="flex" justifyContent="flex-end" mb={2}>
+        <Button
+          variant="contained"
+          startIcon={isTransferring ? <CircularProgress size={20} color="inherit" /> : <PlayArrowIcon />}
+          onClick={handleTransferLho}
+          disabled={isTransferring || isInitialLoading || isAnyProcessRunning}
+        >
+          {isTransferring ? "Transferring..." : "Transfer LHO"}
+        </Button>
+      </Box>
+
+      {/* Main Table */}
+      <TableContainer component={Paper}>
+        <Table>
+          <TableHead sx={{ bgcolor: theme.palette.action.hover }}>
+            <TableRow>
+              <TableCell align="center"><strong>Process Name</strong></TableCell>
+              <TableCell align="center"><strong>Status</strong></TableCell>
+              <TableCell align="center"><strong>Start Time</strong></TableCell>
+              <TableCell align="center"><strong>End Time</strong></TableCell>
+              <TableCell align="center"><strong>Action</strong></TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {isInitialLoading ? (
+              <TableRow>
+                <TableCell colSpan={5} align="center" sx={{ py: 6 }}>
+                  <CircularProgress size={40} />
+                </TableCell>
+              </TableRow>
+            ) : tableData.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={5} align="center" sx={{ py: 6 }}>
+                  <NoDataIcon sx={{ fontSize: 48, color: "text.disabled", mb: 1 }} />
+                  <Typography variant="body1" color="text.secondary">
+                    There is no data to show.
+                  </Typography>
+                </TableCell>
+              </TableRow>
+            ) : (
+              tableData.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage).map((row) => (
+                <TableRow key={row.processRunId}>
+                  <TableCell align="center">{row.processType}</TableCell>
+                  <TableCell align="center">{getStatusChip(row.status)}</TableCell>
+                  <TableCell align="center">{formatProcessTime(row.processStartTime)}</TableCell>
+                  <TableCell align="center">{formatProcessTime(row.processEndTime)}</TableCell>
+                  <TableCell align="center">
+                    <Tooltip title={row.status === 2 ? "Get Summary" : "Not Available"}>
+                      <span>
+                        <IconButton 
+                          size="small" 
+                          disabled={row.status !== 1} 
+                          onClick={() => handleGetSummary(row)}
+                          color="primary"
+                        >
+                          <SummaryIcon />
+                        </IconButton>
+                      </span>
+                    </Tooltip>
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+        <TablePagination 
+          component="div" 
+          count={totalElements} 
+          page={page} 
+          onPageChange={(e, p) => setPage(p)} 
+          rowsPerPage={rowsPerPage} 
+          onRowsPerPageChange={(e) => { setRowsPerPage(parseInt(e.target.value, 10)); setPage(0); }} 
+        />
+      </TableContainer>
+
+      {/* --- SUMMARY DIALOG --- */}
+      <Dialog open={summaryOpen} onClose={() => setSummaryOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle sx={{ m: 0, p: 2 }}>
+          Circle Wise Summary
+          <IconButton onClick={() => setSummaryOpen(false)} sx={{ position: 'absolute', right: 8, top: 8 }}><CloseIcon /></IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {summaryLoading ? <Box display="flex" justifyContent="center" py={5}><CircularProgress /></Box> : (
+            <>
+              <TableContainer component={Paper} sx={{ maxHeight: 400 }}>
+                <Table size="small" stickyHeader>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell align="center" sx={{ bgcolor: theme.palette.action.hover }}><strong>Circle Name</strong></TableCell>
+                      {/* Changed to align Right */}
+                      <TableCell align="right" sx={{ bgcolor: theme.palette.action.hover }}><strong>Balance</strong></TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {summaryData.map((row, idx) => (
+                      <TableRow key={idx}>
+                        <TableCell align="center">{row.circleName}</TableCell>
+                        {/* Changed to align Right */}
+                        <TableCell align="right" sx={{ fontWeight: 'bold' }}>
+                          {Number(row.totalProfitLoss).toLocaleString('en-IN', { 
+                            minimumFractionDigits: 2, 
+                            maximumFractionDigits: 2 
+                          })}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2, justifyContent: 'space-between' }}>
+          <Button 
+            variant="outlined" 
+            startIcon={<DownloadIcon />} 
+            onClick={handleDownloadExcel}
+            disabled={summaryData.length === 0}
+          >
+            Download Excel
+          </Button>
+
+          <Button 
+            variant="contained" 
+            disabled={summaryData.length === 0 || isSubmitting} 
+            onClick={handleSubmitLhoRequest}
+            startIcon={isSubmitting && <CircularProgress size={16} color="inherit" />}
+          >
+            {isSubmitting ? "Submitting..." : "Submit Request"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
 }
-
-4. Update the Service Implementation (CommonMasterServiceImpl.java)
-This is where the business logic lives. We query the repository and invert the result as per your requirement.
-package com.tcs.fincore.CommonMasterService.service.impl;
-
-import com.tcs.fincore.CommonMasterService.dto.YearEndTransferEligibilityDto;
-import com.tcs.fincore.CommonMasterService.repository.CommonRequestRepository;
-import com.tcs.fincore.CommonMasterService.service.CommonMasterService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class CommonMasterServiceImpl implements CommonMasterService {
-
-    private final CommonRequestRepository commonRequestRepository;
-    
-    // ... your existing methods ...
-
-    @Override
-    public YearEndTransferEligibilityDto checkYearEndProfitTransferEligibility() {
-        log.info("Evaluating eligibility for YEAR_END_PROFIT_TRANSFER...");
-
-        // Check if ANY request exists that is either in Queue ('Q') or Accepted ('A')
-        boolean isAlreadyProcessingOrCompleted = commonRequestRepository.existsByRequestTypeAndStatusIn(
-                "YEAR_END_PROFIT_TRANSFER",
-                List.of("Q", "A") // Using modern Java List.of()
-        );
-
-        // Business Rule: If it exists in Q or A, return false (not eligible). Otherwise true.
-        boolean isEligible = !isAlreadyProcessingOrCompleted;
-        
-        log.info("Year End Profit Transfer Eligibility: {}", isEligible);
-
-        return YearEndTransferEligibilityDto.builder()
-                .isEligible(isEligible)
-                .build();
-    }
-}
-
-5. Update the Controller (LhoTransferController.java)
-Finally, expose the endpoint. I named it /year-end-eligibility to keep the REST contract clear and semantic.
-package com.tcs.fincore.CommonMasterService.Controller;
-
-import com.tcs.fincore.CommonMasterService.dto.ApiResponse;
-import com.tcs.fincore.CommonMasterService.dto.CommonRequestDto;
-import com.tcs.fincore.CommonMasterService.dto.PaginatedResponseDto;
-import com.tcs.fincore.CommonMasterService.dto.SearchRequest;
-import com.tcs.fincore.CommonMasterService.dto.YearEndTransferEligibilityDto; // <-- NEW IMPORT
-import com.tcs.fincore.CommonMasterService.service.CommonMasterService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-@Slf4j
-@RestController
-@RequestMapping("/api/lho-transfers")
-@RequiredArgsConstructor
-public class LhoTransferController {
-
-    private final CommonMasterService service;
-
-    @PostMapping("/search")
-    public ResponseEntity<ApiResponse<PaginatedResponseDto<CommonRequestDto>>> searchLhoTransfers(
-            @RequestBody SearchRequest request) {
-        log.info("Received request to search LHO Transfers");
-        PaginatedResponseDto<CommonRequestDto> response = service.searchLhoTransfers(request);
-        return ResponseEntity.ok(ApiResponse.success(response, "LHO Transfers fetched successfully"));
-    }
-
-    /**
-     * GET /api/lho-transfers/{id}
-     * Fetches details for a specific LHO Transfer.
-     */
-    @GetMapping("/{id}")
-    public ResponseEntity<ApiResponse<CommonRequestDto>> getLhoTransferById(@PathVariable Long id) {
-        log.info("Received request to fetch LHO Transfer ID: {}", id);
-        CommonRequestDto response = service.getLhoTransferById(id);
-        return ResponseEntity.ok(ApiResponse.success(response));
-    }
-
-    @GetMapping("/summary/{id}")
-    public ResponseEntity<ApiResponse<Object>> getSummary(@PathVariable Long id) {
-        log.info("API Request: Summary for ID {}", id);
-        Object data = service.getOrGenerateLhoSummary(id);
-        return ResponseEntity.ok(ApiResponse.success(data, "Summary retrieved successfully"));
-    }
-    
-    // --- NEW ENDPOINT ---
-    /**
-     * GET /api/lho-transfers/year-end-eligibility
-     * Checks if a Year End Profit Transfer is allowed to be initiated.
-     */
-    @GetMapping("/year-end-eligibility")
-    public ResponseEntity<ApiResponse<YearEndTransferEligibilityDto>> checkYearEndEligibility() {
-        log.info("Received request to check Year End Profit Transfer eligibility.");
-        YearEndTransferEligibilityDto response = service.checkYearEndProfitTransferEligibility();
-        return ResponseEntity.ok(ApiResponse.success(response, "Eligibility checked successfully"));
-    }
-}
-
-Why this design is enterprise-ready:
- * Single Responsibility Principle (SRP): The Controller only handles HTTP routing. The Service handles the ! inversion logic. The Repository strictly executes the optimized database SQL.
- * Performance: existsBy generates an EXISTS SQL clause. It stops scanning the database the millisecond it finds a single matching row, which is massively faster than doing a .count() or .findAll().
-Would you like me to walk you through how to write the React useEffect call to fetch this eligibility state on page load?
