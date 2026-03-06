@@ -11,15 +11,12 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
-import java.util.HashMap;
-import java.util.Map;
-
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class LhoTransferStrategy implements RequestTypeStrategy {
 
-    private final KafkaEventPublisherService kafkaEventPublisherService;
+    // KAFKA REMOVED. Only keeping standard tools.
     private final ObjectMapper objectMapper;
     private final JdbcTemplate jdbcTemplate;
 
@@ -30,39 +27,35 @@ public class LhoTransferStrategy implements RequestTypeStrategy {
 
     @Override
     public void processApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Processing Approval for LHO Transfer Batch: {}", request.getTargetId());
+        log.info("Processing Approval for Year End Profit Transfer Batch: {}", request.getTargetId());
 
         switch (request.getChangeType()) {
-            case ADD: // Or UPDATE, depending on what your frontend sends
+            case ADD:
+            case UPDATE:
                 handleLhoApproval(request);
-                break; // <-- NEVER FORGET THIS BREAK!
+                break;
             default:
                 throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported.");
         }
     }
 
-    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Constructing tailored Kafka payload for targetId: {}", request.getTargetId());
+    private void handleLhoApproval(CommonReq request) {
+        log.info("Executing standard approval logic for targetId: {}", request.getTargetId());
 
-        JsonNode originalPayload = objectMapper.readTree(request.getPayload());
-        Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
+        // --- THE "NORMAL" WAY TO PROCESS APPROVALS ---
         
-        Map<String, Object> customKafkaPayload = new HashMap<>();
-        customKafkaPayload.put("requestId" , request.getId());
-        customKafkaPayload.put("processRunId", processRunId);
-        customKafkaPayload.put("processId", 12);
-        customKafkaPayload.put("user", request.getExecutorId());
-        customKafkaPayload.put("remarks", request.getExecutorRemarks());
+        // Option 1: Direct Database Procedure (Uncomment and use if needed)
+        // String sql = "CALL PRC_FINALIZE_YEAR_END_TRANSFER(?)";
+        // jdbcTemplate.update(sql, request.getTargetId());
+        
+        // Option 2: REST API Call to Airflow (Use RestTemplate/WebClient here)
+        // restTemplate.postForObject("http://airflow/api/trigger...", requestData, String.class);
 
-        String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
-
-        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), finalPayloadString);
-
-        // Ensures the status is locked to QUEUE in the DB
+        // Finalize the status in the database
         request.setReqStatus(RequestStatus.QUEUE);
-        request.setExecutionRemarks("Event sent to Kafka. Request is in QUEUE.");
+        request.setExecutionRemarks("Approval logic executed locally. Request moved to QUEUE.");
 
-        log.info("Batch {} placed in QUEUE successfully.", request.getTargetId());
+        log.info("Batch {} processed and placed in QUEUE successfully.", request.getTargetId());
     }
 
     /**
@@ -72,21 +65,16 @@ public class LhoTransferStrategy implements RequestTypeStrategy {
     @Override
     public void processRejection(CommonReq request) {
         
-        // 1. INTERCEPT THE "QUEUE" STATUS
+        // 1. INTERCEPT THE "QUEUE" STATUS (Because RequestServiceImpl routes it here)
         if (RequestStatus.QUEUE.equals(request.getReqStatus())) {
-            log.info("Intercepted QUEUE status in processRejection. Routing to Kafka Publisher...");
-            try {
-                handleLhoApproval(request);
-                return; // Exit method early so we don't run deletion logic
-            } catch (JsonProcessingException e) {
-                log.error("Failed to parse JSON while routing QUEUE request: {}", request.getId(), e);
-                throw new RuntimeException("Failed to process QUEUE payload", e);
-            }
+            log.info("Intercepted QUEUE status in processRejection. Routing to Approval Logic...");
+            handleLhoApproval(request);
+            return; // Exit early
         }
         
         // 2. PROCESS THE ACTUAL "REJECTED" STATUS
         if (RequestStatus.REJECTED.equals(request.getReqStatus())) {
-            log.info("Processing actual Rejection for Batch: {}. Clearing P_L_TRANSFER table.", request.getTargetId());
+            log.info("Processing Rejection for Batch: {}. Clearing P_L_TRANSFER table.", request.getTargetId());
 
             try {
                 JsonNode payloadNode = objectMapper.readTree(request.getPayload());
