@@ -1,41 +1,54 @@
-P_L_TRANSFER use (date column as TRANSFER_DATE)
+    @Override
+    public void processRejection(CommonReq request) {
+        log.info("request payload {}", request.getPayload());
 
-TRANSFER_DATE	DATE	Yes		1	
-BRANCH_CODE	VARCHAR2(20 BYTE)	No		2	
-CIRCLE_BRANCH_CODE	NVARCHAR2(20 CHAR)	No		3	
-PROFIT_LOSS	NUMBER(25,4)	Yes		4	
+        if (RequestStatus.QUEUE.equals(request.getReqStatus())) {
+            log.info("Intercepted QUEUE status. Routing to Approval Logic...");
+            return;
+        }
 
+        if (RequestStatus.REJECTED.equals(request.getReqStatus())) {
+            log.info("Processing Rejection for Batch: {}.", request.getTargetId());
 
-P_L_TRANSFER_BALANCE (use date column as TRANSFER_DATE)
+            try {
+                JsonNode payloadNode = objectMapper.readTree(request.getPayload());
+                if (!payloadNode.has("etlDate") || payloadNode.get("etlDate").isNull()) {
+                    throw new IllegalArgumentException("CRITICAL: etlDate is missing.");
+                }
 
-CGL	VARCHAR2(255 BYTE)	No		1	
-BRANCH_CODE	VARCHAR2(255 BYTE)	Yes		2	
-CURRENCY	VARCHAR2(255 BYTE)	No		3	
-BALANCE	NUMBER(38,2)	Yes		4	
-BALANCE_DATE	DATE	Yes		5	
+                // 1. Extract the date string from JSON
+                String etlDateValue = payloadNode.get("etlDate").asText();
 
+                // 2. Map each table to its EXACT date column name based on your schema
+                Map<String, String> tablesAndColumns = Map.of(
+                        "P_L_TRANSFER", "TRANSFER_DATE",
+                        "P_L_TRANSFER_BALANCE", "BALANCE_DATE",      // Used BALANCE_DATE based on your DDL!
+                        "P_L_TRANSFER_TRANSACTIONS", "TRANSACTION_DATE"
+                );
 
+                int totalRowsDeleted = 0;
 
-P_L_TRANSFER_TRANSACTIONS (use date column as TRANSACTION_DATE)
+                // 3. Iterate through the Map
+                for (Map.Entry<String, String> entry : tablesAndColumns.entrySet()) {
+                    String tableName = entry.getKey();
+                    String columnName = entry.getValue();
 
+                    // 4. Inject both the Table Name and the Column Name dynamically
+                    String sql = String.format("DELETE FROM %s WHERE TRUNC(%s) = TO_DATE(?, 'YYYY-MM-DD')", tableName, columnName);
 
-CIRCLE_CODE	VARCHAR2(255 BYTE)	Yes		1	
-BATCH_ID	NUMBER(10,0)	No		2	
-NARRATION	VARCHAR2(255 BYTE)	No		3	
-TRANSACTION_COUNT	NUMBER(10,0)	No		4	
-BRANCH_CODE	VARCHAR2(255 BYTE)	Yes		5	
-CURRENCY	VARCHAR2(255 BYTE)	No		6	
-CGL	VARCHAR2(255 BYTE)	No		7	
-DEBIT_AMOUNT	NUMBER(35,2)	No		8	
-CREDIT_AMOUNT	NUMBER(35,2)	No		9	
-TRANSACTION_DATE	DATE	Yes		10	
-SOURCE_FLAG	VARCHAR2(255 BYTE)	No		11	
-JOURNAL_ID	NUMBER(10,0)	No		12	
+                    // 5. Execute the query using the etlDateValue
+                    int rowsAffected = jdbcTemplate.update(sql, etlDateValue);
+                    totalRowsDeleted += rowsAffected;
 
+                    log.info("Deleted {} rows from {} (using column {}) for ETL Date: {}", 
+                             rowsAffected, tableName, columnName, etlDateValue);
+                }
 
+                log.info("Successfully cleared a total of {} rows across {} tables", totalRowsDeleted, tablesAndColumns.size());
 
-this are the 3 tables in which u need to delete the data according like date change the according ly 
-use the etl date as a TRANSFER_DATE , TRANSFER_DATE , TRANSACTION_DATE
-
-
-give mi updated code 
+            } catch (Exception e) {
+                log.error("CRITICAL: Failed to clear tables for request: {}", request.getId(), e);
+                throw new RuntimeException("Failed to clear tables on rejection", e);
+            }
+        }
+    }
