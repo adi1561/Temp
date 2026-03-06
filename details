@@ -1,67 +1,3 @@
-package com.tcs.fincore.CommonRequestService.service.strategy;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Component;
-
-@Slf4j
-@Component
-@RequiredArgsConstructor
-public class LhoTransferStrategy implements RequestTypeStrategy {
-
-    // KAFKA REMOVED. Only keeping standard tools.
-    private final ObjectMapper objectMapper;
-    private final JdbcTemplate jdbcTemplate;
-
-    @Override
-    public RequestType getRequestType() {
-        return RequestType.YEAR_END_PROFIT_TRANSFER;
-    }
-
-    @Override
-    public void processApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Processing Approval for Year End Profit Transfer Batch: {}", request.getTargetId());
-
-        switch (request.getChangeType()) {
-            case ADD:
-            case UPDATE:
-                handleLhoApproval(request);
-                break;
-            default:
-                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported.");
-        }
-    }
-
-    private void handleLhoApproval(CommonReq request) {
-        log.info("Executing standard approval logic for targetId: {}", request.getTargetId());
-
-        // --- THE "NORMAL" WAY TO PROCESS APPROVALS ---
-        
-        // Option 1: Direct Database Procedure (Uncomment and use if needed)
-        // String sql = "CALL PRC_FINALIZE_YEAR_END_TRANSFER(?)";
-        // jdbcTemplate.update(sql, request.getTargetId());
-        
-        // Option 2: REST API Call to Airflow (Use RestTemplate/WebClient here)
-        // restTemplate.postForObject("http://airflow/api/trigger...", requestData, String.class);
-
-        // Finalize the status in the database
-        request.setReqStatus(RequestStatus.QUEUE);
-        request.setExecutionRemarks("Approval logic executed locally. Request moved to QUEUE.");
-
-        log.info("Batch {} processed and placed in QUEUE successfully.", request.getTargetId());
-    }
-
-    /**
-     * Intercepts the 'else' block from RequestServiceImpl.
-     * Routes QUEUE to Approval logic, and REJECTED to Database cleanup.
-     */
     @Override
     public void processRejection(CommonReq request) {
         
@@ -74,7 +10,7 @@ public class LhoTransferStrategy implements RequestTypeStrategy {
         
         // 2. PROCESS THE ACTUAL "REJECTED" STATUS
         if (RequestStatus.REJECTED.equals(request.getReqStatus())) {
-            log.info("Processing Rejection for Batch: {}. Clearing P_L_TRANSFER table.", request.getTargetId());
+            log.info("Processing Rejection for Batch: {}. Clearing related tables.", request.getTargetId());
 
             try {
                 JsonNode payloadNode = objectMapper.readTree(request.getPayload());
@@ -85,16 +21,24 @@ public class LhoTransferStrategy implements RequestTypeStrategy {
                 
                 String etlDate = payloadNode.get("etlDate").asText(); 
                 
-                // Safe, parameter-bound SQL to prevent SQL injection and syntax errors
-                String sql = "DELETE FROM P_L_TRANSFER WHERE TRUNC(TRANSFER_DATE) = TO_DATE(?, 'YYYY-MM-DD')";
-                int rowsAffected = jdbcTemplate.update(sql, etlDate);
+                // Define the SQL statements for all 3 tables
+                // (Assuming they all use TRANSFER_DATE as the column. Change the column name if needed!)
+                String sql1 = "DELETE FROM P_L_TRANSFER WHERE TRUNC(TRANSFER_DATE) = TO_DATE(?, 'YYYY-MM-DD')";
+                String sql2 = "DELETE FROM YOUR_SECOND_TABLE_NAME WHERE TRUNC(TRANSFER_DATE) = TO_DATE(?, 'YYYY-MM-DD')"; 
+                String sql3 = "DELETE FROM YOUR_THIRD_TABLE_NAME WHERE TRUNC(TRANSFER_DATE) = TO_DATE(?, 'YYYY-MM-DD')"; 
 
-                log.info("Successfully cleared {} rows for rejected request: {}", rowsAffected, request.getId());
+                // Execute the deletions sequentially
+                int rowsAffected1 = jdbcTemplate.update(sql1, etlDate);
+                int rowsAffected2 = jdbcTemplate.update(sql2, etlDate);
+                int rowsAffected3 = jdbcTemplate.update(sql3, etlDate);
+
+                log.info("Successfully cleared data for rejected request {}. Rows deleted -> P_L_TRANSFER: {}, Table2: {}, Table3: {}", 
+                         request.getId(), rowsAffected1, rowsAffected2, rowsAffected3);
 
             } catch (Exception e) {
-                log.error("CRITICAL: Failed to clear table during rejection of request: {}", request.getId(), e);
-                throw new RuntimeException("Failed to clear table on rejection", e);
+                log.error("CRITICAL: Failed to clear tables during rejection of request: {}", request.getId(), e);
+                // Throwing this ensures the @Transactional annotation rolls back ALL deletions if any single one fails
+                throw new RuntimeException("Failed to clear tables on rejection", e);
             }
         }
     }
-}
