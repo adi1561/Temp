@@ -1,39 +1,49 @@
-{
-    "success": true,
-    "message": "Operation completed successfully.",
-    "data": {
-        "id": 2662,
-        "reqType": "YEAR_END_PROFIT_TRANSFER",
-        "changeType": "ADD",
-        "reqStatus": "REJECTED",
-        "reqDate": "2026-03-05T18:36:27",
-        "creatorId": "1021256",
-        "executionDate": "2026-03-06T12:13:37.5415321",
-        "executionRemarks": "Request rejected by user.",
-        "executorId": "1021253",
-        "executorRemarks": "testing event ",
-        "payload": {
-            "processRunId": 85021,
-            "processId": 7,
-            "batchId": "1045",
-            "createdDate": "2026-03-05",
-            "etlDate": "2026-03-05",
-            "totalAmount": 96049493.40,
-            "totalRecordCount": 2,
-            "circleWiseDetails": [
-                {
-                    "circleName": "MUMBAI METRO",
-                    "totalProfitLoss": 96044367.00
-                },
-                {
-                    "circleName": "GUWAHATI",
-                    "totalProfitLoss": 5126.40
-                }
-            ]
-        },
-        "targetId": "1045"
-    },
-    "timestamp": "2026-03-06T06:43:37.721048100Z"
-}
+    @Override
+    public void processRejection(CommonReq request) {
+        
+        if (RequestStatus.QUEUE.equals(request.getReqStatus())) {
+            log.info("Intercepted QUEUE status in processRejection. Routing to Approval Logic...");
+            // handleLhoApproval(request); // Uncomment if using the synchronous/REST routing
+            return;
+        }
+        
+        if (RequestStatus.REJECTED.equals(request.getReqStatus())) {
+            log.info("Processing Rejection for Batch: {}. Clearing related tables based on etlDate.", request.getTargetId());
 
-from this u need to delete the data for the date etlDate not TRANSFER_DATE
+            try {
+                JsonNode payloadNode = objectMapper.readTree(request.getPayload());
+                
+                if (!payloadNode.has("etlDate") || payloadNode.get("etlDate").isNull()) {
+                     throw new IllegalArgumentException("CRITICAL: etlDate is missing. Cannot safely delete records.");
+                }
+                
+                String etlDate = payloadNode.get("etlDate").asText(); 
+                
+                // Maintainable List of Tables to clear
+                List<String> tablesToClear = List.of(
+                        "P_L_TRANSFER", 
+                        "YOUR_SECOND_TABLE_NAME", 
+                        "YOUR_THIRD_TABLE_NAME"
+                );
+
+                int totalRowsDeleted = 0;
+
+                for (String tableName : tablesToClear) {
+                    // UPDATED: Changed TRANSFER_DATE to ETL_DATE
+                    String sql = "DELETE FROM " + tableName + " WHERE TRUNC(ETL_DATE) = TO_DATE(?, 'YYYY-MM-DD')";
+                    
+                    int rowsAffected = jdbcTemplate.update(sql, etlDate);
+                    totalRowsDeleted += rowsAffected;
+                    
+                    log.info("Deleted {} rows from {} for ETL Date: {}", rowsAffected, tableName, etlDate);
+                }
+
+                log.info("Successfully cleared a total of {} rows across {} tables for rejected request {}", 
+                         totalRowsDeleted, tablesToClear.size(), request.getId());
+
+            } catch (Exception e) {
+                log.error("CRITICAL: Failed to clear tables during rejection of request: {}", request.getId(), e);
+                throw new RuntimeException("Failed to clear tables on rejection", e);
+            }
+        }
+    }
