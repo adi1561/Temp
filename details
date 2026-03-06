@@ -1,6 +1,67 @@
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class LhoTransferStrategy implements RequestTypeStrategy {
+
+    private final ObjectMapper objectMapper;
+    private final JdbcTemplate jdbcTemplate;
+
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.YEAR_END_PROFIT_TRANSFER;
+    }
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Processing Approval for Year End Profit Transfer Batch: {}", request.getTargetId());
+
+        switch (request.getChangeType()) {
+            case ADD:
+            case UPDATE:
+                handleLhoApproval(request);
+                break;
+            default:
+                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported.");
+        }
+    }
+
+    private void handleLhoApproval(CommonReq request) {
+
+
+        log.info("Executing standard approval logic for targetId: {}", request.getTargetId());
+
+
+        // Finalize the status in the database
+        request.setReqStatus(RequestStatus.QUEUE);
+        request.setExecutionRemarks("Approval logic executed locally. Request moved to QUEUE.");
+
+        log.info("Batch {} processed and placed in QUEUE successfully.", request.getTargetId());
+    }
+
+    /**
+     * Intercepts the 'else' block from RequestServiceImpl.
+     * Routes QUEUE to Approval logic, and REJECTED to Database cleanup.
+     */
+
+
+
     @Override
     public void processRejection(CommonReq request) {
-        log.info("request payload {}", request.getPayload());
 
         if (RequestStatus.QUEUE.equals(request.getReqStatus())) {
             log.info("Intercepted QUEUE status. Routing to Approval Logic...");
@@ -40,8 +101,8 @@
                     int rowsAffected = jdbcTemplate.update(sql, etlDateValue);
                     totalRowsDeleted += rowsAffected;
 
-                    log.info("Deleted {} rows from {} (using column {}) for ETL Date: {}", 
-                             rowsAffected, tableName, columnName, etlDateValue);
+                    log.info("Deleted {} rows from {} (using column {}) for ETL Date: {}",
+                            rowsAffected, tableName, columnName, etlDateValue);
                 }
 
                 log.info("Successfully cleared a total of {} rows across {} tables", totalRowsDeleted, tablesAndColumns.size());
@@ -52,3 +113,61 @@
             }
         }
     }
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.beans.factory.annotation.Value;
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Service;
+
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class KafkaEventPublisherService {
+
+    private final KafkaTemplate<String, String> kafkaTemplate;
+
+    @Value("${app.kafka.topics.lho-transfer:lho-airflow-topic}")
+    private String lhoTopic;
+
+
+
+    public void publishLhoTransferEvent(String targetId, Long requestId, String payload) {
+        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
+
+        // 1. Create a ProducerRecord
+        ProducerRecord<String, String> record = new ProducerRecord<>(lhoTopic, targetId, payload);
+
+        // 2. Add your custom header to the record
+        record.headers().add("requestId", String.valueOf(requestId).getBytes());
+
+        // 3. Send it once
+        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(record);
+
+        future.whenComplete((result, exception) -> {
+            if (exception == null) {
+                log.info("Successfully published! Target ID: {} | Topic: {} | Offset: {}",
+                        targetId, lhoTopic, result.getRecordMetadata().offset());
+            } else {
+                log.error("CRITICAL: Failed to publish for Target ID: {}. Error: {}",
+                        targetId, exception.getMessage());
+            }
+        });
+    }
+}
+
+i want to send a evernt id as we are sending before take referance for the prvious code 
+
+
+
+}
