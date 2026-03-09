@@ -1,8 +1,80 @@
-Why can't static methods be overridden in Java? What is it called when you define the same static method in a child class? How is that different from overriding?
+ // 2. Restored the Kafka logic and added the throws declaration
+    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Constructing tailored Kafka payload for targetId: {}", request.getTargetId());
 
-from this queation i understand like why static methods are cant be overide becose static methods are resolved at compile time and resolved using referance type
-if we override that it is not possible becose it follow comiple time poly... not run time Poly ...
+        // Extract required IDs from the original payload
+        JsonNode originalPayload = objectMapper.readTree(request.getPayload());
+        Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
+
+        // Build the specific payload for the Kafka consumer
+        Map<String, Object> customKafkaPayload = new HashMap<>();
+        customKafkaPayload.put("requestId" , request.getId());
+        customKafkaPayload.put("processRunId", processRunId);
+        customKafkaPayload.put("processId", 12);
+        customKafkaPayload.put("user", request.getExecutorId());
+        customKafkaPayload.put("remarks", request.getExecutorRemarks());
+
+        // Convert Map to JSON String
+        String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
+
+        // Fire the event to Kafka
+        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), finalPayloadString);
+
+        // Finalize the status in the database
+        request.setReqStatus(RequestStatus.QUEUE);
+        request.setExecutionRemarks("Event sent to Kafka. Request moved to QUEUE.");
+
+        log.info("Batch {} processed and placed in QUEUE successfully.", request.getTargetId());
+    }
 
 
-but my Queations is what it is like that why static are using compile time Poly ...
-it is becose it loads as the class loads or any other reson is there 
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.beans.factory.annotation.Value;
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Service;
+
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class KafkaEventPublisherService {
+
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    @Value("${app.kafka.topics.lho-transfer:trigger-events}")
+    private String lhoTopic;
+
+    public void publishLhoTransferEvent(String targetId, Long requestId, String payload) {
+        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
+
+        // 1. Create a ProducerRecord
+        ProducerRecord<String, Object> record = new ProducerRecord<>(lhoTopic, targetId, payload);
+
+        // 2. Add your custom header to the record
+        record.headers().add("requestId", String.valueOf(requestId).getBytes());
+
+        // 3. Send it once
+        CompletableFuture<SendResult<String, Object>> future = kafkaTemplate.send(record);
+
+        future.whenComplete((result, exception) -> {
+            if (exception == null) {
+                log.info("Successfully published! Target ID: {} | Topic: {} | Offset: {}",
+                        targetId, lhoTopic, result.getRecordMetadata().offset());
+            } else {
+                log.error("CRITICAL: Failed to publish for Target ID: {}. Error: {}",
+                        targetId, exception.getMessage());
+            }
+        });
+    }
+}
+
+
+i dont know what is the problem but where it conusume the event 
