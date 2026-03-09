@@ -1,12 +1,26 @@
- // 2. Restored the Kafka logic and added the throws declaration
+As a Technical Lead, I can tell you that when a Kafka message is successfully published (which your logs probably show) but the consumer completely ignores it or crashes silently, 95% of the time it is a Serialization or Type Header mismatch.
+Looking closely at your code, I see the classic Double Serialization Trap that happens often in Spring Boot Kafka.
+The Problem
+In your handleLhoApproval method, you are manually converting your Map into a JSON String:
+String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
+
+Then you pass that String to your KafkaTemplate<String, Object>.
+If your Spring Boot Kafka configuration is set up to use a JsonSerializer for the values (which is standard for <String, Object> templates), Spring will serialize your String again.
+Your consumer expects this:
+{"requestId": 123, "processId": 12}
+But because of double serialization, Kafka actually sends it wrapped in extra quotes with escaped characters, like this:
+"{\"requestId\": 123, \"processId\": 12}"
+When your consumer tries to read this, it fails to parse it as a valid JSON object and either throws a silent deserialization exception or drops the message.
+The Fix
+Stop manually converting the payload to a String! Pass the actual Map (or a DTO) directly to the KafkaEventPublisherService, and let Spring Kafka's JsonSerializer do the work.
+Here is how to update both files to fix the communication gap:
+1. Update LhoTransferStrategy (Remove manual JSON conversion)
     private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
         log.info("Constructing tailored Kafka payload for targetId: {}", request.getTargetId());
 
-        // Extract required IDs from the original payload
         JsonNode originalPayload = objectMapper.readTree(request.getPayload());
         Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
 
-        // Build the specific payload for the Kafka consumer
         Map<String, Object> customKafkaPayload = new HashMap<>();
         customKafkaPayload.put("requestId" , request.getId());
         customKafkaPayload.put("processRunId", processRunId);
@@ -14,27 +28,24 @@
         customKafkaPayload.put("user", request.getExecutorId());
         customKafkaPayload.put("remarks", request.getExecutorRemarks());
 
-        // Convert Map to JSON String
-        String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
+        // REMOVED: objectMapper.writeValueAsString(...)
+        
+        // Fire the event to Kafka - Pass the MAP directly!
+        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), customKafkaPayload);
 
-        // Fire the event to Kafka
-        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), finalPayloadString);
-
-        // Finalize the status in the database
         request.setReqStatus(RequestStatus.QUEUE);
         request.setExecutionRemarks("Event sent to Kafka. Request moved to QUEUE.");
 
         log.info("Batch {} processed and placed in QUEUE successfully.", request.getTargetId());
     }
 
-
+2. Update KafkaEventPublisherService (Accept Object instead of String)
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.springframework.beans.factory.annotation.Value;
-
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.stereotype.Service;
@@ -52,10 +63,11 @@ public class KafkaEventPublisherService {
     @Value("${app.kafka.topics.lho-transfer:trigger-events}")
     private String lhoTopic;
 
-    public void publishLhoTransferEvent(String targetId, Long requestId, String payload) {
+    // CHANGED: Accept 'Object' instead of 'String' for the payload
+    public void publishLhoTransferEvent(String targetId, Long requestId, Object payload) {
         log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
 
-        // 1. Create a ProducerRecord
+        // 1. Create a ProducerRecord using the Object payload
         ProducerRecord<String, Object> record = new ProducerRecord<>(lhoTopic, targetId, payload);
 
         // 2. Add your custom header to the record
@@ -76,5 +88,8 @@ public class KafkaEventPublisherService {
     }
 }
 
-
-i dont know what is the problem but where it conusume the event 
+Next Debugging Steps (If it still fails after this fix):
+If changing this still doesn't trigger your consumer, check these two things on the consumer side:
+ * Check Consumer Logs for Error: Is the consumer throwing a ValueDeserializationException? If so, the consumer might be strictly configured to only accept String formats, in which case we might need to change your KafkaTemplate to <String, String> and revert to manual string conversion.
+ * Topic Name: Double-check that the consumer is definitely listening to trigger-events (or whatever ${app.kafka.topics.lho-transfer} resolves to).
+Try passing the Map object directly first—that solves this issue the vast majority of the time!
