@@ -4,54 +4,46 @@
         String targetUserId = dto.getTargetUserId();
         String requestType = dto.getRequestType();
 
-        // ---------------------------------------------------------
-        // 1. Initial Validations (Merge of Old & New)
-        // ---------------------------------------------------------
-        
-        // Mandatory Check (Moved up from new code for efficiency)
+        // --- RETAINED FROM NEW CODE: Early validations for targetUserId ---
+        // Doing this before database calls saves resources (Fail-Fast)
         if (targetUserId == null || targetUserId.trim().isEmpty()) {
             return buildError(HttpStatus.BAD_REQUEST, "User Id is mandatory");
         }
 
-        // [NEW VALIDATION] Format Check from New Code
         if (!isValidUserId(targetUserId)) {
             return buildError(HttpStatus.BAD_REQUEST, "Invalid User Id format.");
         }
+        // ------------------------------------------------------------------
 
-        // ---------------------------------------------------------
-        // 2. Conflict & State Checks (Identical in both)
-        // ---------------------------------------------------------
+        // 1. Conflict Checks
         if (userRequestRepository.countUserPendingRequests(targetUserId) > 0) {
             return buildError(HttpStatus.CONFLICT, "Pending request already exists");
         }
         
         User existingUser = userRepository.findUserByUserId(targetUserId);
         
-        // Case: Create but User already exists
         if (Constant.CREATE.equalsIgnoreCase(requestType) && existingUser != null) {
             return buildError(HttpStatus.CONFLICT, "User already exists");
         }
+        
         // Case: Modify/Lock/Delete but User Not Found
         if (!Constant.CREATE.equalsIgnoreCase(requestType) && existingUser == null) {
             return buildError(HttpStatus.NOT_FOUND, "User does not exist");
         }
 
-        // Delete Check
+        // Case: Delete Validation
         if (Constant.DELETE.equalsIgnoreCase(requestType) &&
                 existingUser != null &&
                 "Y".equalsIgnoreCase(String.valueOf(existingUser.getIsDeleted()))) {
             return buildError(HttpStatus.CONFLICT, "User is already deleted");
         }
 
-        // ---------------------------------------------------------
-        // 3. Payload Parsing (Old Code Exception Handling)
-        // ---------------------------------------------------------
+        // 2. Parse Payload
         Map<String, Object> payloadMap;
         String jsonPayload;
         try {
             Object payloadObj = dto.getRequestPayload();
             if (payloadObj == null) payloadObj = new HashMap<>();
-            
             if (payloadObj instanceof String) {
                 jsonPayload = (String) payloadObj;
                 objectMapper.readTree(jsonPayload);
@@ -60,17 +52,12 @@
                 payloadMap = (Map<String, Object>) payloadObj;
                 jsonPayload = objectMapper.writeValueAsString(payloadMap);
             }
-        }
-        catch (JsonProcessingException e) {
-            // STRICT OLD HANDLER: Specific exception and message
+        } catch (JsonProcessingException e) { 
+            // RETAINED FROM OLD CODE: Strict JsonProcessingException catch
             return buildError(HttpStatus.BAD_REQUEST, "Invalid JSON format in payload");
         }
 
-        // ---------------------------------------------------------
-        // 4. Field Validations (Email & Role ID Parsing)
-        // ---------------------------------------------------------
-        
-        // Email
+        // 3. Field Validations
         if (!payloadMap.containsKey("email") ||
                 payloadMap.get("email") == null ||
                 payloadMap.get("email").toString().trim().isEmpty()) {
@@ -82,7 +69,7 @@
             return buildError(HttpStatus.BAD_REQUEST, "Email must be a valid @sbi.co.in address");
         }
 
-        // Role ID Parsing
+        // role id
         int roleId;
         if (!payloadMap.containsKey("roleId") || payloadMap.get("roleId") == null) {
             return buildError(HttpStatus.BAD_REQUEST, "Role is mandatory");
@@ -90,63 +77,60 @@
         try {
             roleId = Integer.parseInt(payloadMap.get("roleId").toString());
         } catch (NumberFormatException e) {
-            // STRICT OLD HANDLER: Specific exception and message
-            return buildError(HttpStatus.BAD_REQUEST, "Invalid roleId");
+            // RETAINED FROM OLD CODE: Exact error message
+            return buildError(HttpStatus.BAD_REQUEST, "Invalid roleId"); 
         }
 
-        // ---------------------------------------------------------
-        // 5. Business Logic & Constraints (Old Code Order)
-        // ---------------------------------------------------------
-        
-        // NOTE: Old code ran F1/BOG checks BEFORE checking if role exists in DB. 
-        // We preserve this order to ensure error message consistency.
-        
+        // 4. --- F1/BOG VALIDATION LOGIC ---
+        // RETAINED FROM OLD CODE: Order of execution (validateF1BogConstraints before Role DB check)
         ResponseEntity<ResponseVO<Map<String, Object>>> validationError = validateF1BogConstraints(requestType, payloadMap, existingUser, userId);
         if (validationError != null) {
             return validationError;
         }
 
         if (!roleRepository.existsById(roleId)) {
+            // RETAINED FROM OLD CODE: Exact error message
             return buildError(HttpStatus.BAD_REQUEST, "Role does not exist");
         }
 
-        // First Name
+        // firstname
         if (!payloadMap.containsKey("firstName") ||
                 payloadMap.get("firstName") == null ||
                 payloadMap.get("firstName").toString().trim().isEmpty()) {
             return buildError(HttpStatus.BAD_REQUEST, "First name is mandatory");
         }
 
-        // ---------------------------------------------------------
-        // 6. Save & Notify
-        // ---------------------------------------------------------
+        // 5. Create Entity & Save
         UserRequest request = new UserRequest();
         request.setRequestType(requestType);
         request.setTargetUserId(targetUserId);
         request.setRequestorUserId(userId);
         request.setRequestStatus(Constant.PENDING);
         request.setRequestDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-        request.setRequestPayload(jsonPayload); // Set parsed payload
+        request.setRequestPayload(jsonPayload);
 
         UserRequest saved = userRequestRepository.save(request);
 
+        // 6. Notification (To Approvers)
         String notifMsg = String.format("New User Request (id: %s) for user %s (%s) is pending approval.",
                 saved.getRequestId(), saved.getTargetUserId(), saved.getRequestType());
 
         NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
         String targetRoles = config.getTargetRoles();
+        
         createNotification(
-                saved.getRequestorUserId(), 
-                targetRoles, 
+                saved.getRequestorUserId(),
+                targetRoles,
                 config.getTargetUrl(),
                 notifMsg,
                 String.valueOf(saved.getRequestId())
         );
 
+        // 7. Success Response
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ResponseVO.<Map<String, Object>>builder()
                         .statusCode(HttpStatus.CREATED)
-                        .message("Request Created")
+                        .message("Request Created") // RETAINED FROM OLD CODE
                         .result(Map.of("userRequest", saved))
                         .build());
     }
