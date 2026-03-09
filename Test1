@@ -1,95 +1,136 @@
-As a Technical Lead, I can tell you that when a Kafka message is successfully published (which your logs probably show) but the consumer completely ignores it or crashes silently, 95% of the time it is a Serialization or Type Header mismatch.
-Looking closely at your code, I see the classic Double Serialization Trap that happens often in Spring Boot Kafka.
-The Problem
-In your handleLhoApproval method, you are manually converting your Map into a JSON String:
-String finalPayloadString = objectMapper.writeValueAsString(customKafkaPayload);
+first one 
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> createNewRequest(UserRequestCreateDto dto, String userId) {
+        String targetUserId = dto.getTargetUserId();
+        String requestType = dto.getRequestType();
 
-Then you pass that String to your KafkaTemplate<String, Object>.
-If your Spring Boot Kafka configuration is set up to use a JsonSerializer for the values (which is standard for <String, Object> templates), Spring will serialize your String again.
-Your consumer expects this:
-{"requestId": 123, "processId": 12}
-But because of double serialization, Kafka actually sends it wrapped in extra quotes with escaped characters, like this:
-"{\"requestId\": 123, \"processId\": 12}"
-When your consumer tries to read this, it fails to parse it as a valid JSON object and either throws a silent deserialization exception or drops the message.
-The Fix
-Stop manually converting the payload to a String! Pass the actual Map (or a DTO) directly to the KafkaEventPublisherService, and let Spring Kafka's JsonSerializer do the work.
-Here is how to update both files to fix the communication gap:
-1. Update LhoTransferStrategy (Remove manual JSON conversion)
-    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Constructing tailored Kafka payload for targetId: {}", request.getTargetId());
+        // 1. Conflict Checks
+        if (userRequestRepository.countUserPendingRequests(targetUserId) > 0) {
+            return buildError(HttpStatus.CONFLICT, "Pending request already exists");
+        }
+        User existingUser = userRepository.findUserByUserId(targetUserId);
+        if (Constant.CREATE.equalsIgnoreCase(requestType) && existingUser != null) {
+            return buildError(HttpStatus.CONFLICT, "User already exists");
+        }
+        // Case: Modify/Lock/Delete but User Not Found
+        if (!Constant.CREATE.equalsIgnoreCase(requestType) && existingUser == null) {
+            return buildError(HttpStatus.NOT_FOUND, "User does not exist");
+        }
 
-        JsonNode originalPayload = objectMapper.readTree(request.getPayload());
-        Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
+        // --- NEW LOGIC: Delete Validation ---
+        if (Constant.DELETE.equalsIgnoreCase(requestType) &&
+                existingUser != null &&
+                "Y".equalsIgnoreCase(String.valueOf(existingUser.getIsDeleted()))) {
+            return buildError(HttpStatus.CONFLICT, "User is already deleted");
+        }
 
-        Map<String, Object> customKafkaPayload = new HashMap<>();
-        customKafkaPayload.put("requestId" , request.getId());
-        customKafkaPayload.put("processRunId", processRunId);
-        customKafkaPayload.put("processId", 12);
-        customKafkaPayload.put("user", request.getExecutorId());
-        customKafkaPayload.put("remarks", request.getExecutorRemarks());
+        if (targetUserId == null || targetUserId.trim().isEmpty()) {
+            return buildError(HttpStatus.BAD_REQUEST, "User Id is mandatory");
+        }
 
-        // REMOVED: objectMapper.writeValueAsString(...)
-        
-        // Fire the event to Kafka - Pass the MAP directly!
-        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), customKafkaPayload);
+        // 2. Create Entity
+        UserRequest request = new UserRequest();
+        request.setRequestType(requestType);
+        request.setTargetUserId(targetUserId);
+        request.setRequestorUserId(userId);
+        request.setRequestStatus(Constant.PENDING);
+        request.setRequestDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
 
-        request.setReqStatus(RequestStatus.QUEUE);
-        request.setExecutionRemarks("Event sent to Kafka. Request moved to QUEUE.");
 
-        log.info("Batch {} processed and placed in QUEUE successfully.", request.getTargetId());
-    }
-
-2. Update KafkaEventPublisherService (Accept Object instead of String)
-package com.tcs.fincore.CommonRequestService.service.strategy;
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.kafka.clients.producer.ProducerRecord;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.support.SendResult;
-import org.springframework.stereotype.Service;
-
-import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class KafkaEventPublisherService {
-
-    private final KafkaTemplate<String, Object> kafkaTemplate;
-
-    @Value("${app.kafka.topics.lho-transfer:trigger-events}")
-    private String lhoTopic;
-
-    // CHANGED: Accept 'Object' instead of 'String' for the payload
-    public void publishLhoTransferEvent(String targetId, Long requestId, Object payload) {
-        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
-
-        // 1. Create a ProducerRecord using the Object payload
-        ProducerRecord<String, Object> record = new ProducerRecord<>(lhoTopic, targetId, payload);
-
-        // 2. Add your custom header to the record
-        record.headers().add("requestId", String.valueOf(requestId).getBytes());
-
-        // 3. Send it once
-        CompletableFuture<SendResult<String, Object>> future = kafkaTemplate.send(record);
-
-        future.whenComplete((result, exception) -> {
-            if (exception == null) {
-                log.info("Successfully published! Target ID: {} | Topic: {} | Offset: {}",
-                        targetId, lhoTopic, result.getRecordMetadata().offset());
+        // ----------------------------------------------
+        // 4. Field Validations
+        // 1. Parse Payload Early
+        Map<String, Object> payloadMap;
+        String jsonPayload;
+        try {
+            Object payloadObj = dto.getRequestPayload();
+            if (payloadObj == null) payloadObj = new HashMap<>();
+            if (payloadObj instanceof String) {
+                jsonPayload = (String) payloadObj;
+                objectMapper.readTree(jsonPayload);
+                payloadMap = objectMapper.readValue(jsonPayload, new TypeReference<Map<String, Object>>() {});
             } else {
-                log.error("CRITICAL: Failed to publish for Target ID: {}. Error: {}",
-                        targetId, exception.getMessage());
+                payloadMap = (Map<String, Object>) payloadObj;
+                jsonPayload = objectMapper.writeValueAsString(payloadMap);
             }
-        });
-    }
-}
+        }
+        catch (JsonProcessingException e) {
+            return buildError(HttpStatus.BAD_REQUEST, "Invalid JSON format in payload");
+        }
 
-Next Debugging Steps (If it still fails after this fix):
-If changing this still doesn't trigger your consumer, check these two things on the consumer side:
- * Check Consumer Logs for Error: Is the consumer throwing a ValueDeserializationException? If so, the consumer might be strictly configured to only accept String formats, in which case we might need to change your KafkaTemplate to <String, String> and revert to manual string conversion.
- * Topic Name: Double-check that the consumer is definitely listening to trigger-events (or whatever ${app.kafka.topics.lho-transfer} resolves to).
-Try passing the Map object directly first—that solves this issue the vast majority of the time!
+        if (!payloadMap.containsKey("email") ||
+                payloadMap.get("email") == null ||
+                payloadMap.get("email").toString().trim().isEmpty()) {
+            return buildError(HttpStatus.BAD_REQUEST, "Email is mandatory");
+        }
+
+        String email = payloadMap.get("email").toString().trim();
+        if (!email.matches("^[a-zA-Z0-9._%+-]+@sbi\\.co\\.in$")) {
+            return buildError(HttpStatus.BAD_REQUEST, "Email must be a valid @sbi.co.in address");
+        }
+
+        //role id
+        int roleId;
+        if (!payloadMap.containsKey("roleId") || payloadMap.get("roleId") == null) {
+            return buildError(HttpStatus.BAD_REQUEST, "Role is mandatory");
+        }
+        try {
+            roleId = Integer.parseInt(payloadMap.get("roleId").toString());
+
+        } catch (NumberFormatException e) {
+            return buildError(HttpStatus.BAD_REQUEST, "Invalid roleId");
+        }
+
+
+        // 3. --- NEW F1/BOG VALIDATION LOGIC ---
+        // Capture the validation result. If it returns a ResponseEntity, it means there was an error.
+        ResponseEntity<ResponseVO<Map<String, Object>>> validationError = validateF1BogConstraints(requestType, payloadMap, existingUser, userId);
+        if (validationError != null) {
+            return validationError;
+        }
+
+        if (!roleRepository.existsById(roleId)) {
+            return buildError(HttpStatus.BAD_REQUEST, "Role does not exist");
+        }
+
+        //firstname
+        if (!payloadMap.containsKey("firstName") ||
+                payloadMap.get("firstName") == null ||
+                payloadMap.get("firstName").toString().trim().isEmpty()) {
+            return buildError(HttpStatus.BAD_REQUEST, "First name is mandatory");
+        }
+
+        // 5. Save
+        request.setRequestPayload(jsonPayload);
+        UserRequest saved = userRequestRepository.save(request);
+
+        // 6. Notification (To Approvers)
+        // Msg: "New User Request (ID: 123) for User 1015698 (CREATE) is pending approval."
+        String notifMsg = String.format("New User Request (id: %s) for user %s (%s) is pending approval.",
+                saved.getRequestId(), saved.getTargetUserId(), saved.getRequestType());
+
+        // fetch permissions
+        NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
+        String targetRoles = config.getTargetRoles();
+        createNotification(
+                saved.getRequestorUserId(), // exclude creator id
+                targetRoles, // roles
+                config.getTargetUrl(),
+                notifMsg,
+                String.valueOf(saved.getRequestId())
+        );
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ResponseVO.<Map<String, Object>>builder()
+                        .statusCode(HttpStatus.CREATED)
+                        .message("Request Created")
+                        .result(Map.of("userRequest", saved))
+                        .build());
+    }
+
+above is 
+2nd one current file 
+
+
+your task is like there are some exception handled in the old code and in the new one not handled can u fix that and handle in a same as old one handle 
