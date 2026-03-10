@@ -1,64 +1,103 @@
-To implement the specific file naming and report types for your Maker and Checker screens, you need to update the handleDownload functions in both tab files.
-1. File: YearEndProfitTransferTab1.jsx (Maker)
-Update the handleDownload function to use the profit_transfer_report type and the specific filename format.
-  const handleDownload = async () => {
-    try {
-      const payload = {
-        // Change: Use specific report type
-        reportType: "profit_transfer_report", 
-        date: "31-03-2026"
-      };
-      
-      const responseData = await callApi(DOWNLOAD_URL, payload, "POST");
-      const { excelBase64 } = responseData;
+To implement a modern JWT setup, we move away from the default filters and create our own specialized "Chain." As a Senior Engineer would structure it, you need three main components: a Service to handle the token, a Filter to intercept requests, and a Config to tie it all together.
+Here is the complete setup for a Spring Security 6+ environment.
+1. The Token Specialist: JwtService.java
+This file is not a filter; it’s a helper that knows how to create and read the "digital passport" (JWT).
+@Service
+public class JwtService {
+    private static final String SECRET = "your_very_long_and_very_secure_secret_key_here_32_chars";
 
-      if (!excelBase64) {
-        showSnackBar("Failed to download file", "error");
-        return;
-      }
-
-      // Change: Specific format: Profit_Transfer_Report_2026-03-31
-      let fileName = "Profit_Transfer_Report_2026-03-31";
-      downloadFile(excelBase64, "excel", fileName, true);
-      
-      showSnackBar("File downloaded successfully", "success");
-    } catch (err) {
-      console.error(err);
-      showSnackBar("Error while downloading file", "error");
+    public String extractUsername(String token) {
+        return Jwts.parser().setSigningKey(SECRET).parseClaimsJws(token).getBody().getSubject();
     }
-  };
 
-2. File: YearEndProfitTransferTab2.jsx (Checker)
-Update the handleDownload function to use the profit_transactions type and its specific filename format.
-  const handleDownload = async (row) => {
-    try {
-      const payload = {
-        // Change: Use specific report type
-        reportType: "profit_transactions",
-        date: "31-03-2026", 
-      };
-      
-      const responseData = await callApi(DOWNLOAD_URL, payload, "POST");
-      const { excelBase64 } = responseData;
-
-      if (!excelBase64) {
-        showSnackBar("Failed to download file", "error");
-        return;
-      }
-
-      // Change: Specific format: Profit_Transactions_2026-03-31
-      let fileName = "Profit_Transactions_2026-03-31";
-      downloadFile(excelBase64, "excel", fileName, true);
-      
-      showSnackBar("File downloaded successfully", "success");
-    } catch (err) {
-      console.error(err);
-      showSnackBar("Error while downloading file", "error");
+    public boolean isTokenValid(String token, UserDetails userDetails) {
+        final String username = extractUsername(token);
+        return (username.equals(userDetails.getUsername()) && !isTokenExpired(token));
     }
-  };
 
-Key Changes Made:
- * Report Types: Maker sends profit_transfer_report and Checker sends profit_transactions.
- * Filenames: Hardcoded the exact string format you requested (Profit_Transfer_Report_2026-03-31 and Profit_Transactions_2026-03-31).
- * Utility Usage: Passed the excelBase64 directly to the downloadFile utility.
-Would you like me to make the date in the filename dynamic based on the current system date?
+    private boolean isTokenExpired(String token) {
+        return Jwts.parser().setSigningKey(SECRET).parseClaimsJws(token).getBody().getExpiration().before(new Date());
+    }
+}
+
+2. The Gatekeeper: JwtAuthenticationFilter.java
+This is your Custom Filter. It replaces the need for BasicAuthenticationFilter. It runs exactly once for every request to check for the "Bearer" token in the header.
+@Component
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtService jwtService;
+    private final UserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) 
+            throws ServletException, IOException {
+        
+        final String authHeader = request.getHeader("Authorization");
+        
+        // 1. Skip if no Bearer token
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        final String jwt = authHeader.substring(7);
+        final String username = jwtService.extractUsername(jwt);
+
+        // 2. If user is found and not already authenticated in this request context
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = this.userDetailsService.loadUserByUsername(username);
+            
+            if (jwtService.isTokenValid(jwt, userDetails)) {
+                // 3. Manually create the authentication token
+                UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                        userDetails, null, userDetails.getAuthorities());
+                
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                
+                // 4. Update the Security Context
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+        filterChain.doFilter(request, response);
+    }
+}
+
+3. The Orchestrator: SecurityConfig.java
+This is where we tell Spring: "Don't use the default Form Login or Basic Auth. Use my new JWT Filter instead."
+@Configuration
+@EnableWebSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtAuthenticationFilter jwtAuthFilter;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable()) // Disable CSRF for Stateless APIs
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/v1/auth/**").permitAll() // Public endpoints (Login/Register)
+                .anyRequest().authenticated()                  // Secure everything else
+            )
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS) // No JSESSIONID!
+            )
+            // THE IMPORTANT PART: Add our filter before the standard one
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+
+How it all works together (The Flow)
+ * Request Arrives: A client sends a request with Authorization: Bearer <token>.
+ * Filter Intercepts: JwtAuthenticationFilter grabs the header.
+ * Validation: JwtService checks if the token is forged or expired.
+ * Context Injection: If valid, the filter tells SecurityContextHolder: "This is Adesh, he has 'ADMIN' roles."
+ * Bypass: Because the SecurityContext is now full, the standard UsernamePasswordAuthenticationFilter later in the chain sees the user is already authenticated and does nothing.
+Would you like me to explain how the "Login" controller generates that first token to send back to the user?
+JWT Authentication with Spring Security Guide
+This video provides a comprehensive walkthrough of setting up the JWT filter, service, and security configuration in a Spring Boot 3 environment, making it a perfect visual companion to the code above.
+
+YouTube video views will be stored in your YouTube History, and your data will be stored and used by YouTube according to its Terms of Service
