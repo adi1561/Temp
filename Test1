@@ -1,43 +1,145 @@
-As a Lead, I will give you exactly the lines you need to change in those working files to inject the runId for reconciliation.
-Here are the precise changes required across the 3 files.
-1. Changes in LhoTransferStrategy.java
-Inside your handleLhoApproval method, you need to extract the batchId (which holds your runId from the frontend) and add it to both the payload and the publisher call.
-Add these lines right after you extract processRunId:
-// Extract runId (sent as 'batchId' from React)
-String runId = originalPayload.has("batchId") ? originalPayload.get("batchId").asText() : null;
+As a Lead, I totally understand. You just want the exact blocks to copy and paste without accidentally breaking anything else we just stabilized.
+Here are the complete, fully updated methods for all three files with only the runId reconciliation logic added. Everything else is untouched.
+1. In LhoTransferStrategy.java
+Replace your entire handleLhoApproval method with this:
+    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
+        log.info("Constructing tailored Kafka payload for targetId: {}", request.getTargetId());
 
-Add this line where you are putting items into customKafkaPayload:
-customKafkaPayload.put("runId", runId);
+        JsonNode originalPayload = objectMapper.readTree(request.getPayload());
+        Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
+        
+        // --- ADDED: Extract runId (sent as 'batchId' from React) ---
+        String runId = originalPayload.has("batchId") ? originalPayload.get("batchId").asText() : null;
 
-Update your publishLhoTransferEvent method call to pass the runId:
-// Pass the runId as the 3rd argument
-kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), runId, customKafkaPayload);
+        Map<String, Object> customKafkaPayload = new HashMap<>();
+        customKafkaPayload.put("requestId" , request.getId());
+        customKafkaPayload.put("processRunId", processRunId);
+        customKafkaPayload.put("processId", 12);
+        customKafkaPayload.put("runId", runId); // --- ADDED ---
+        customKafkaPayload.put("user", request.getExecutorId());
+        customKafkaPayload.put("remarks", request.getExecutorRemarks());
 
-2. Changes in KafkaEventPublisherService.java
-You need to update the method signature to accept the runId and attach it as a Kafka Header so downstream systems can read it without deserializing the payload.
-Update the method signature:
-public void publishLhoTransferEvent(String targetId, Long requestId, String runId, Object payload) {
+        // --- CHANGED: Pass runId as the 3rd argument ---
+        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), runId, customKafkaPayload);
 
-Add this right below where you add the requestId header:
-// Attach runId to headers for tracebility
-if (runId != null) {
-    record.headers().add("runId", runId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-}
+        request.setReqStatus(RequestStatus.QUEUE);
+        request.setExecutionRemarks("Event sent to Kafka. Request moved to QUEUE.");
 
-3. Changes in LhoKafkaConsumerService.java (Optional but Recommended)
-Since the whole point of sending the runId is reconciliation, Airflow will likely send it back to you in its response. You should extract it and log it so you can trace the exact run that succeeded or failed.
-Add this helper method at the bottom of the class:
-private String extractRunId(JsonNode payload) {
-    if (payload.has("runId") && !payload.get("runId").isNull()) {
-        return payload.get("runId").asText();
+        log.info("Batch {} processed and placed in QUEUE successfully.", request.getTargetId());
     }
-    return "UNKNOWN_RUN_ID";
-}
 
-Then, inside both consumeResponseOne and consumeResponseTwo, call it and add it to your logs:
-String runId = extractRunId(payload);
+2. In KafkaEventPublisherService.java
+Replace your entire publishLhoTransferEvent method with this:
+    // --- CHANGED: Added String runId to parameters ---
+    public void publishLhoTransferEvent(String targetId, Long requestId, String runId, Object payload) {
+        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
 
-// Update your log.info / log.warn statements to include it:
-log.info("Topic Success received for Request ID: {}. Run ID: {}. Marking as ACCEPTED.", requestId, runId);
+        // 1. Create a ProducerRecord using the Object payload
+        ProducerRecord<String, Object> record = new ProducerRecord<>(lhoTopic, targetId, payload);
 
-Make these surgical updates, and your event-driven architecture will have perfect traceability. Are you ready to trigger a test transfer from the UI to verify Airflow receives the runId?
+        // 2. Add your custom header to the record (using StandardCharsets to be safe)
+        record.headers().add("requestId", String.valueOf(requestId).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        
+        // --- ADDED: Attach runId to headers for traceability ---
+        if (runId != null) {
+            record.headers().add("runId", runId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+
+        // 3. Send it once
+        CompletableFuture<SendResult<String, Object>> future = kafkaTemplate.send(record);
+
+        future.whenComplete((result, exception) -> {
+            if (exception == null) {
+                // --- CHANGED: Added runId to the success log ---
+                log.info("Successfully published! Target ID: {} | Topic: {} | Run ID: {} | Offset: {}",
+                        targetId, lhoTopic, runId, result.getRecordMetadata().offset());
+            } else {
+                log.error("CRITICAL: Failed to publish for Target ID: {}. Error: {}",
+                        targetId, exception.getMessage());
+            }
+        });
+    }
+
+3. In LhoKafkaConsumerService.java
+Replace consumeResponseOne, consumeResponseTwo, and add the new extractRunId method at the bottom. The rest of your helper methods (extractRequestId, evaluateSuccess, etc.) stay exactly the same.
+    @KafkaListener(
+            topics = "trigger-event-responses",
+            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
+    )
+    @Transactional
+    public void consumeResponseOne(String payloadString) {
+        log.info("Received event on Topic 1 (trigger-event-responses): {}", payloadString);
+
+        try {
+            JsonNode payload = objectMapper.readTree(payloadString);
+
+            // Extract the fields mapped from TriggerRequestResponse
+            Long requestId = extractRequestId(payload);
+            boolean isSuccess = evaluateSuccess(payload);
+            String airflowMessage = extractMessage(payload);
+            
+            // --- ADDED: Extract runId for logging ---
+            String runId = extractRunId(payload);
+
+            if (requestId == null) {
+                log.warn("Cannot process Kafka event: 'requestId' is missing.");
+                return;
+            }
+
+            if (isSuccess) {
+                // ACCEPTING: success = true
+                log.info("Topic 1 Success received for Request ID: {}. Run ID: {}. Airflow Message: '{}'. Doing nothing. Record remains in QUEUE.", requestId, runId, airflowMessage);
+            } else {
+                // ACCEPTING: success = false
+                //  Mark as PENDING so the user can see it failed and try again.
+                log.warn("Topic 1 Failure received for Request ID: {}. Run ID: {}. Airflow Message: '{}'. Reverting to PENDING.", requestId, runId, airflowMessage);
+
+                String failureRemarks = "Airflow Trigger Failed: " + airflowMessage;
+                updateRequestStatus(requestId, RequestStatus.PENDING, failureRemarks);
+            }
+
+        } catch (Exception e) {
+            log.error("Error processing Topic 1 message: {}", payloadString, e);
+        }
+    }
+
+    @KafkaListener(
+            topics = "year-end-transfer-process-response-event",
+            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
+    )
+    @Transactional
+    public void consumeResponseTwo(String message) {
+        log.info("Received event on Topic 2 (trigger-events-response-two): {}", message);
+
+        try {
+            JsonNode payload = objectMapper.readTree(message);
+            Long requestId = extractRequestId(payload);
+            boolean isSuccess = evaluateSuccess(payload);
+            
+            // --- ADDED: Extract runId for logging ---
+            String runId = extractRunId(payload);
+
+            if (requestId == null) return;
+
+            if (isSuccess) {
+                log.info("Topic 2 Success received for Request ID: {}. Run ID: {}. Marking as ACCEPTED.", requestId, runId);
+                updateRequestStatus(requestId, RequestStatus.ACCEPTED, "Topic 2 reported success. Fully ACCEPTED.");
+            } else {
+                log.warn("Topic 2 Failure received for Request ID: {}. Run ID: {}. Reverting to PENDING.", requestId, runId);
+                updateRequestStatus(requestId, RequestStatus.PENDING, "Topic 2 reported failure. Reverted to PENDING.");
+            }
+
+        } catch (Exception e) {
+            log.error("Error processing Topic 2 message: {}", message, e);
+        }
+    }
+
+    // --- ADDED: New helper method (paste this at the bottom of the class) ---
+    private String extractRunId(JsonNode payload) {
+        if (payload.has("runId") && !payload.get("runId").isNull()) {
+            return payload.get("runId").asText();
+        }
+        return "UNKNOWN_RUN_ID";
+    }
+
+Copy those blocks exactly as they are, and your architecture will be perfectly tracking that runId from React, straight through Kafka, and back again!
