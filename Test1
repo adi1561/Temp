@@ -1,343 +1,43 @@
-package com.tcs.fincore.CommonRequestService.service.strategy;
+As a Lead, I will give you exactly the lines you need to change in those working files to inject the runId for reconciliation.
+Here are the precise changes required across the 3 files.
+1. Changes in LhoTransferStrategy.java
+Inside your handleLhoApproval method, you need to extract the batchId (which holds your runId from the frontend) and add it to both the payload and the publisher call.
+Add these lines right after you extract processRunId:
+// Extract runId (sent as 'batchId' from React)
+String runId = originalPayload.has("batchId") ? originalPayload.get("batchId").asText() : null;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Component;
+Add this line where you are putting items into customKafkaPayload:
+customKafkaPayload.put("runId", runId);
 
-import java.util.HashMap;
-import java.util.Map;
+Update your publishLhoTransferEvent method call to pass the runId:
+// Pass the runId as the 3rd argument
+kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), runId, customKafkaPayload);
 
-@Slf4j
-@Component
-@RequiredArgsConstructor
-public class LhoTransferStrategy implements RequestTypeStrategy {
+2. Changes in KafkaEventPublisherService.java
+You need to update the method signature to accept the runId and attach it as a Kafka Header so downstream systems can read it without deserializing the payload.
+Update the method signature:
+public void publishLhoTransferEvent(String targetId, Long requestId, String runId, Object payload) {
 
-    private final ObjectMapper objectMapper;
-    private final JdbcTemplate jdbcTemplate;
-    // 1. Injected the Kafka Publisher Service
-    private final KafkaEventPublisherService kafkaEventPublisherService;
-
-    @Override
-    public RequestType getRequestType() {
-        return RequestType.YEAR_END_PROFIT_TRANSFER;
-    }
-
-    @Override
-    public void processApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Processing Approval for Year End Profit Transfer Batch: {}", request.getTargetId());
-
-        switch (request.getChangeType()) {
-            case ADD:
-            case UPDATE:
-                handleLhoApproval(request);
-                break;
-            default:
-                throw new UnsupportedOperationException("Change type " + request.getChangeType() + " not supported.");
-        }
-    }
-
-
-    private void handleLhoApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Constructing tailored Kafka payload for targetId: {}", request.getTargetId());
-
-        JsonNode originalPayload = objectMapper.readTree(request.getPayload());
-        Long processRunId = originalPayload.has("processRunId") ? originalPayload.get("processRunId").asLong() : null;
-
-        Map<String, Object> customKafkaPayload = new HashMap<>();
-        customKafkaPayload.put("requestId" , request.getId());
-        customKafkaPayload.put("processRunId", processRunId);
-        customKafkaPayload.put("processId", 12);
-        customKafkaPayload.put("user", request.getExecutorId());
-        customKafkaPayload.put("remarks", request.getExecutorRemarks());
-
-
-        // Fire the event to Kafka - Pass the MAP directly!
-        kafkaEventPublisherService.publishLhoTransferEvent(request.getTargetId(), request.getId(), customKafkaPayload);
-
-        request.setReqStatus(RequestStatus.QUEUE);
-        request.setExecutionRemarks("Event sent to Kafka. Request moved to QUEUE.");
-
-        log.info("Batch {} processed and placed in QUEUE successfully.", request.getTargetId());
-    }
-
-    /**
-     * Intercepts the 'else' block from RequestServiceImpl.
-     * Routes QUEUE to Approval logic, and REJECTED to Database cleanup.
-     */
-    @Override
-    public void processRejection(CommonReq request) {
-
-        if (RequestStatus.QUEUE.equals(request.getReqStatus())) {
-            log.info("Intercepted QUEUE status. Routing to Approval Logic...");
-            try {
-                handleLhoApproval(request);
-            } catch (JsonProcessingException e) {
-                log.error("Failed to parse JSON while routing QUEUE request: {}", request.getId(), e);
-                throw new RuntimeException("Failed to process QUEUE payload", e);
-            }
-            return;
-        }
-
-        if (RequestStatus.REJECTED.equals(request.getReqStatus())) {
-            log.info("Processing Rejection for Batch: {}.", request.getTargetId());
-
-            try {
-                JsonNode payloadNode = objectMapper.readTree(request.getPayload());
-                if (!payloadNode.has("etlDate") || payloadNode.get("etlDate").isNull()) {
-                    throw new IllegalArgumentException("CRITICAL: etlDate is missing.");
-                }
-
-                // 1. Extract the date string from JSON
-                String etlDateValue = payloadNode.get("etlDate").asText();
-
-                // 2. Map each table to its EXACT date column name based on your schema
-                Map<String, String> tablesAndColumns = Map.of(
-                        "P_L_TRANSFER", "TRANSFER_DATE",
-                        "P_L_TRANSFER_BALANCE", "BALANCE_DATE",
-                        "P_L_TRANSFER_TRANSACTIONS", "TRANSACTION_DATE"
-                );
-
-                int totalRowsDeleted = 0;
-
-                // 3. Iterate through the Map
-                for (Map.Entry<String, String> entry : tablesAndColumns.entrySet()) {
-                    String tableName = entry.getKey();
-                    String columnName = entry.getValue();
-
-                    // 4. Inject both the Table Name and the Column Name dynamically
-                    String sql = String.format("DELETE FROM %s WHERE TRUNC(%s) = TO_DATE(?, 'YYYY-MM-DD')", tableName, columnName);
-
-                    // 5. Execute the query using the etlDateValue
-                    int rowsAffected = jdbcTemplate.update(sql, etlDateValue);
-                    totalRowsDeleted += rowsAffected;
-
-                    log.info("Deleted {} rows from {} (using column {}) for ETL Date: {}",
-                            rowsAffected, tableName, columnName, etlDateValue);
-                }
-
-                log.info("Successfully cleared a total of {} rows across {} tables", totalRowsDeleted, tablesAndColumns.size());
-
-            } catch (Exception e) {
-                log.error("CRITICAL: Failed to clear tables for request: {}", request.getId(), e);
-                throw new RuntimeException("Failed to clear tables on rejection", e);
-            }
-        }
-    }
+Add this right below where you add the requestId header:
+// Attach runId to headers for tracebility
+if (runId != null) {
+    record.headers().add("runId", runId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 }
 
-
-
-package com.tcs.fincore.CommonRequestService.service.strategy;
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.kafka.clients.producer.ProducerRecord;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.support.SendResult;
-import org.springframework.stereotype.Service;
-
-import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class KafkaEventPublisherService {
-
-    private final KafkaTemplate<String, Object> kafkaTemplate;
-
-    @Value("${app.kafka.topics.lho-transfer:trigger-events}")
-    private String lhoTopic;
-
-    // CHANGED: Accept 'Object' instead of 'String' for the payload
-    public void publishLhoTransferEvent(String targetId, Long requestId, Object payload) {
-        log.info("Attempting to publish LHO Transfer event for targetId: {} to topic: {}", targetId, lhoTopic);
-
-        // 1. Create a ProducerRecord using the Object payload
-        ProducerRecord<String, Object> record = new ProducerRecord<>(lhoTopic, targetId, payload);
-
-        // 2. Add your custom header to the record
-        record.headers().add("requestId", String.valueOf(requestId).getBytes());
-
-        // 3. Send it once
-        CompletableFuture<SendResult<String, Object>> future = kafkaTemplate.send(record);
-
-        future.whenComplete((result, exception) -> {
-            if (exception == null) {
-                log.info("Successfully published! Target ID: {} | Topic: {} | Offset: {}",
-                        targetId, lhoTopic, result.getRecordMetadata().offset());
-            } else {
-                log.error("CRITICAL: Failed to publish for Target ID: {}. Error: {}",
-                        targetId, exception.getMessage());
-            }
-        });
+3. Changes in LhoKafkaConsumerService.java (Optional but Recommended)
+Since the whole point of sending the runId is reconciliation, Airflow will likely send it back to you in its response. You should extract it and log it so you can trace the exact run that succeeded or failed.
+Add this helper method at the bottom of the class:
+private String extractRunId(JsonNode payload) {
+    if (payload.has("runId") && !payload.get("runId").isNull()) {
+        return payload.get("runId").asText();
     }
+    return "UNKNOWN_RUN_ID";
 }
 
+Then, inside both consumeResponseOne and consumeResponseTwo, call it and add it to your logs:
+String runId = extractRunId(payload);
 
+// Update your log.info / log.warn statements to include it:
+log.info("Topic Success received for Request ID: {}. Run ID: {}. Marking as ACCEPTED.", requestId, runId);
 
-
-package com.tcs.fincore.CommonRequestService.service.strategy;
-
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
-import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.Optional;
-
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class LhoKafkaConsumerService {
-
-    private final CommonRequestRepository commonRequestRepository;
-    private final ObjectMapper objectMapper;
-
-    /**
-     * TOPIC 1: trigger-event-responses
-     * Logic: If Airflow sends success=false -> Revert to PENDING.
-     * If Airflow sends success=true -> Do Nothing (remains in QUEUE).
-     */
-    @KafkaListener(
-            topics = "trigger-event-responses",
-            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
-    )
-    @Transactional
-    public void consumeResponseOne(String payloadString) {
-        log.info("Received event on Topic 1 (trigger-event-responses): {}", payloadString);
-
-        try {
-            JsonNode payload = objectMapper.readTree(payloadString);
-
-            // Extract the fields mapped from TriggerRequestResponse
-            Long requestId = extractRequestId(payload);
-            boolean isSuccess = evaluateSuccess(payload);
-            String airflowMessage = extractMessage(payload);
-
-            if (requestId == null) {
-                log.warn("Cannot process Kafka event: 'requestId' is missing.");
-                return;
-            }
-
-            if (isSuccess) {
-                // ACCEPTING: success = true
-                log.info("Topic 1 Success received for Request ID: {}. Airflow Message: '{}'. Doing nothing. Record remains in QUEUE.", requestId, airflowMessage);
-            } else {
-                // ACCEPTING: success = false
-                //  Mark as PENDING so the user can see it failed and try again.
-                log.warn("Topic 1 Failure received for Request ID: {}. Airflow Message: '{}'. Reverting to PENDING.", requestId, airflowMessage);
-
-                String failureRemarks = "Airflow Trigger Failed: " + airflowMessage;
-                updateRequestStatus(requestId, RequestStatus.PENDING, failureRemarks);
-            }
-
-        } catch (Exception e) {
-            log.error("Error processing Topic 1 message: {}", payloadString, e);
-        }
-    }
-
-    /**
-     * Extracts: private Long requestId;
-     */
-    private Long extractRequestId(JsonNode payload) {
-        if (payload.has("requestId") && !payload.get("requestId").isNull()) {
-            return payload.get("requestId").asLong();
-        }
-        return null;
-    }
-
-    /**
-     * Extracts: private Boolean success;
-     */
-    private boolean evaluateSuccess(JsonNode payload) {
-        if (payload.has("success") && !payload.get("success").isNull()) {
-            return payload.get("success").asBoolean();
-        }
-        log.warn("Payload is missing the 'success' boolean flag. Defaulting to false.");
-        return false;
-    }
-
-    /**
-     * Extracts: private String message;
-     */
-    private String extractMessage(JsonNode payload) {
-        // Specifically targeting the "message" field to capture the failure reason
-        if (payload.has("message") && !payload.get("message").isNull()) {
-            return payload.get("message").asText();
-        }
-        return "No message provided by Airflow"; // Fallback string
-    }
-
-    /**
-     * Finds the entity by ID and updates its status and execution remarks.
-     */
-    private void updateRequestStatus(Long requestId, RequestStatus newStatus, String remarks) {
-        Optional<CommonReq> requestOpt = commonRequestRepository.findById(requestId);
-
-        if (requestOpt.isPresent()) {
-            CommonReq request = requestOpt.get();
-            request.setReqStatus(newStatus);
-            request.setExecutionRemarks(remarks);
-            commonRequestRepository.save(request);
-            log.info("Database updated: Request ID {} is now {}", requestId, newStatus);
-        } else {
-            log.error("Database update failed: Could not find Request ID {} in COMMON_REQ table.", requestId);
-        }
-    }
-
-
-    /**
-     * TOPIC 2: year-end-transfer-process-response-event
-     * Logic: If Success -> ACCEPTED. If Fail -> PENDING.
-     */
-    @KafkaListener(
-            topics = "year-end-transfer-process-response-event",
-            groupId = "${spring.kafka.consumer.group-id:fincore-group}"
-    )
-    @Transactional
-    public void consumeResponseTwo(String message) {
-        log.info("Received event on Topic 2 (trigger-events-response-two): {}", message);
-
-        try {
-            JsonNode payload = objectMapper.readTree(message);
-            Long requestId = extractRequestId(payload);
-            boolean isSuccess = evaluateSuccess(payload);
-
-            if (requestId == null) return;
-
-            if (isSuccess) {
-                log.info("Topic 2 Success received for Request ID: {}. Marking as ACCEPTED.", requestId);
-                updateRequestStatus(requestId, RequestStatus.ACCEPTED, "Topic 2 reported success. Fully ACCEPTED.");
-            } else {
-                log.warn("Topic 2 Failure received for Request ID: {}. Reverting to PENDING.", requestId);
-                updateRequestStatus(requestId, RequestStatus.PENDING, "Topic 2 reported failure. Reverted to PENDING.");
-            }
-
-        } catch (Exception e) {
-            log.error("Error processing Topic 2 message: {}", message, e);
-        }
-    }
-}
-
-
-
-
-
-this is all files updated code which is working now in this tell me which code file what changes need to be done 
-just tell me the changes
-
+Make these surgical updates, and your event-driven architecture will have perfect traceability. Are you ready to trigger a test transfer from the UI to verify Airflow receives the runId?
