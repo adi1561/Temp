@@ -15,13 +15,9 @@ import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Lazy;
-import org.springframework.dao.DataAccessException;
-import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.redis.RedisSystemException;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.jdbc.CannotGetJdbcConnectionException;
 import org.springframework.jdbc.core.CallableStatementCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Async;
@@ -37,16 +33,14 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * PRODUCTION READY: High-Performance Journal Service Implementation.
- * Handles 600k+ row batches using Async execution, raw JDBC Batching, and Oracle Parallelism.
- * Refactored for specific exception handling, secure logging, and transaction integrity.
+ * High-Performance Implementation of Journal Service.
+ * Handles 600k+ row batches using Async execution, JDBC Batching, and Oracle Parallelism.
  */
 @Service
 @RequiredArgsConstructor
@@ -78,43 +72,37 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     private RedisTemplate<String, byte[]> redisTemplate;
 
     @Autowired
-    @Qualifier("bulkExecutor")
+    @Qualifier("bulkExecutor") // Using your specific ThreadPool
     private Executor bulkExecutor;
 
+    // Direct DataSource access for Raw JDBC performance
     @Autowired
     @Qualifier("oracleDataSource")
     private DataSource dataSource;
 
     // ==================================================================================
-    // 1. ASYNC BATCH CREATION (Logic fully preserved)
+    // 1. ASYNC BATCH CREATION (PARALLEL OPTIMIZATION)
     // ==================================================================================
-
     @Override
     @Transactional
     public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
         String lockKey = "LOCK_REQ_" + requestId;
-        Boolean acquired;
-        try {
-            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
-        } catch (RedisSystemException | DataAccessException e) {
-            log.error("REDIS_LOCK_FAILURE | ReqID: {} | Could not acquire concurrency lock", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
-        }
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
 
         if (Boolean.FALSE.equals(acquired)) {
-            log.warn("CONCURRENCY_BLOCK | ReqID: {} | Duplicate batch creation attempt", requestId);
+            log.warn("Duplicate creation attempt blocked for ReqID: {}", requestId);
             throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
         }
 
         try {
             String batchId = sequenceService.getNextBatchId();
+            // Start Progress
             progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
             self.executeAsyncBatchCreation(batchId, requestId, commonRemarks, creatorId, creatorRole);
             return batchId;
-        } catch (DataAccessException e) {
+        } catch (Exception e) {
             redisTemplate.delete(lockKey);
-            log.error("SEQUENCE_GENERATION_FAIL | ReqID: {} | Reason: {}", requestId, e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID", e);
+            throw e;
         }
     }
 
@@ -122,88 +110,114 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Async("bulkExecutor")
     @Transactional
     public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        // --- MDC TRACING START ---
         MDC.put("batchId", batchId);
         MDC.put("user", creatorId);
+        MDC.put("action", "CREATE");
 
-        log.info("ASYNC_BATCH_START | Batch: {} | SourceReq: {}", batchId, requestId);
+        log.info("ASYNC CREATE: Starting Batch {} (Source: {})", batchId, requestId);
+
         long start = System.currentTimeMillis();
 
         try {
             progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
 
-            List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-            
+            // 1. Fetch from Redis
+            List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+            if (cachedRows == null || cachedRows.isEmpty()) {
+                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
+                return;
+            }
+
+            // 2. Prepare Parallel Execution
             int totalRows = cachedRows.size();
-            int batchSize = 5000; // Optimal for Oracle packet sizes
+            // 5000 is optimal for Oracle JDBC batching (avoids packet fragmentation)
+            int batchSize = 5000;
+
             List<CompletableFuture<Void>> futures = new ArrayList<>();
             LongAdder totalDebit = new LongAdder();
             LongAdder totalCredit = new LongAdder();
+
             AtomicInteger completedChunks = new AtomicInteger(0);
             int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
 
+            // 3. Submit Chunks
             for (int i = 0; i < totalRows; i += batchSize) {
                 final int startIdx = i;
                 final int endIdx = Math.min(i + batchSize, totalRows);
-                final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
+                final List<ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
 
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
                                 processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
                         .thenRun(() -> {
+                            // Update Progress
                             int done = completedChunks.incrementAndGet();
-                            int percent = 5 + (done * 90 / totalChunks);
+                            int percent = 5 + (done * 90 / totalChunks); // Map 5% -> 95%
                             progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                                    String.format("Persisted %d/%d records...", Math.min(done * batchSize, totalRows), totalRows));
+                                    String.format("Created %d/%d records...", (done * batchSize), totalRows));
                         });
                 futures.add(future);
             }
-            
-            // Wait for all JDBC batches to complete
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
-            // Insert Master Record
+            // 5. Insert Master Record
             Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
             String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
             jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
                     BigDecimal.valueOf(totalDebit.sum()), BigDecimal.valueOf(totalCredit.sum()), "PENDING");
 
-            // Cleanup & Notifications
+            // 6. Clean & Log
             redisTemplate.delete("DATA_" + requestId);
             redisTemplate.delete("LOCK_REQ_" + requestId);
-            
-            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Batch " + batchId + " Created");
+            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Created Batch " + batchId);
+
+
+            // --- FINAL NOTIFICATIONS ---
+            // 1. Progress Bar Complete
             progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+
+            // 2. Persistent Notification to CREATOR (Success)
             sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
 
+            // 3. Persistent Notification to EXECUTORS (Action Required)
             NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
             if (config != null) {
                 String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
                 sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
             }
 
-            log.info("BATCH_CREATION_FINISHED | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
+            log.info(" Batch {} Created. Rows: {}. Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
 
-        } catch (CustomExceptions.CacheExpiredException e) {
-            log.error("CACHE_EXPIRED_FAIL | Batch: {} | Reason: Data lost in Redis", batchId);
-            handleBatchFailure(batchId, creatorId, requestId, "Data cache expired. Please re-upload.");
-        } catch (CompletionException | DataAccessException e) {
-            log.error("BATCH_PERSISTENCE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            handleBatchFailure(batchId, creatorId, requestId, "Database persistence failed.");
-        } catch (RuntimeException e) {
-            log.error("UNEXPECTED_BATCH_FAIL | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-            handleBatchFailure(batchId, creatorId, requestId, "Unexpected system error during creation.");
+        } catch (Exception e) {
+            // Log the REAL error to the server console so developers can debug it
+            log.error("Async Create Failed for Batch {}", batchId, e);
+            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Failed to create batch: System Error");
+            redisTemplate.delete("LOCK_REQ_" + requestId);
+
+            // 1. Delete partial child rows so they don't take up space
+            cleanupFailedBatch(batchId);
+
+            // 2. Clean, custom error message for the UI
+            String customUiMessage = "Failed to create the batch due to a system error. Please try again.";
+
+            // 3. Update the Master record to ERROR so it shows on UI with the custom message
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
+                    customUiMessage, batchId);
+
+            // 4. Send failure progress to UI
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", customUiMessage);
+
         } finally {
             MDC.clear();
         }
     }
 
-    private void handleBatchFailure(String batchId, String creatorId, String requestId, String message) {
-        cleanupFailedBatch(batchId);
-        redisTemplate.delete("LOCK_REQ_" + requestId);
-        jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", message, batchId);
-        progressService.sendProgress(batchId, creatorId, 0, "FAILED", message);
-    }
-
-    private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
+    /**
+     * RAW JDBC INSERT
+     * This bypasses Spring overhead and guarantees setAutoCommit(false) for true batching.
+     */
+    private void processChunkRaw(List<ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
         String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         try (Connection conn = dataSource.getConnection();
@@ -214,7 +228,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
 
             for (int i = 0; i < chunk.size(); i++) {
-                JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+                ExcelRowData r = chunk.get(i);
                 int globalIdx = globalOffset + i + 1;
                 String jId = batchId + "-" + globalIdx;
 
@@ -227,7 +241,12 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
                 LocalDate rDate = LocalDate.now();
                 if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                    try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); } catch (DateTimeParseException ignored) {}
+                    try {
+                        rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
+                    } catch (Exception ignored) {
+                        // Ignored intentionally. Fallback to LocalDate.now() is handled above.
+                        // Format validation in Stage 1 guarantees data integrity.
+                    }
                 }
 
                 ps.setString(1, "P");
@@ -248,56 +267,71 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
                 ps.addBatch();
             }
+
             ps.executeBatch();
             conn.commit();
+
         } catch (SQLException e) {
-            log.error("JDBC_BATCH_SQL_ERROR | Batch: {} | Offset: {} | SQLState: {}", batchId, globalOffset, e.getSQLState());
-            throw new CustomExceptions.DatabaseOperationException("Raw JDBC batch insert failed", e);
+            log.error("Raw JDBC Batch Insert Failed for chunk starting at " + globalOffset, e);
+            throw new CustomExceptions.DatabaseOperationException("Failed to persist batch chunk due to SQL error", e);
         }
     }
-
     private void cleanupFailedBatch(String batchId) {
         try {
             jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
             jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
-        } catch (DataAccessException e) {
-            log.warn("CLEANUP_WARN | Batch: {} | Failed to purge partial data", batchId);
+        } catch (Exception e) {
+            log.warn("Cleanup failed", e);
         }
     }
 
+
     // ==================================================================================
-    // 2. ASYNC APPROVAL (Oracle Procedure Integration)
+    // 2. ASYNC APPROVAL (With Parallel DB & HDFS Retry)
     // ==================================================================================
 
     @Override
     @Transactional
     public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+        // --- STEP 1: SYNCHRONOUS LOCKING  ---
+        // We update the status to 'QUEUED' *before* returning to the UI.
+        // If another user tries this, updated rows will be 0, and we throw error.
         String lockSql = "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS = 'PENDING'";
         int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
 
         if (updated == 0) {
-            log.warn("APPROVAL_LOCK_FAIL | Batch: {} | Status was not PENDING", dto.getBatchId());
-            throw new IllegalStateException("Batch is already being processed or is not in PENDING state.");
+            log.warn("Race Condition detected! Batch {} is already being processed.", dto.getBatchId());
+            throw new IllegalStateException("Batch " + dto.getBatchId() + " is already queued or processed by another user.");
         }
-        
+        // Start Progress for Executor
         progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
+
+        // --- STEP 2: Trigger Background Process ---
+        log.info("Batch {} Locked. Status set to QUEUED. Starting Async Process.", dto.getBatchId());
         self.executeAsyncBatchProcessing(dto, executorId);
     }
 
-    @Override
     @Async("bulkExecutor")
     @Transactional
+
     public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
         String batchId = dto.getBatchId();
-        MDC.put("batchId", batchId);
-        MDC.put("user", executorId);
         long start = System.currentTimeMillis();
 
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", executorId);
+        MDC.put("action", dto.getStatus().name());
+
         try {
+            // Fetch Creator ID to notify them later
             String creatorId = jdbcTemplate.queryForObject("SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
-            progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Executing Oracle Procedure...");
+            progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Processing on Database...");
 
             if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+
+                // 1. Call Oracle PL/SQL (Parallel Mode)
+                log.info("Calling Oracle Procedure for Batch {}", batchId);
                 List<HdfsSyncDto> syncData = jdbcTemplate.execute(
                         "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
                         (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
@@ -305,7 +339,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                             cs.setString(2, executorId);
                             cs.setString(3, dto.getRemarks());
                             cs.setString(4, "A");
-                            cs.registerOutParameter(5, -10); // Oracle Cursor
+                            cs.registerOutParameter(5, -10); // Cursor
                             cs.execute();
 
                             List<HdfsSyncDto> list = new ArrayList<>();
@@ -322,103 +356,144 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                         }
                 );
 
+                // 2. Update Summary Table
                 jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ACCEPTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
                         executorId, dto.getRemarks(), batchId);
 
-                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved");
+                // 3. Sync HDFS (With Retry Queue Safety)
+                // try {
+                //     hdfsSyncService.syncToDataLake(syncData);
+                // } catch (Exception e) {
+                //     log.error("HDFS Sync Failed for Batch {}. Queuing for Retry.", batchId, e);
+                //     // Insert into Retry Queue for Recovery Service
+                //     jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
+                // }
+
+                // --- NOTIFICATIONS ---
+                // 1. Progress Done (Executor)
+                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
+
+                // 2. Persistent Notification to EXECUTOR (Task Done)
                 sendNotification(executorId, null, "You approved Batch " + batchId, batchId);
+
+                // 3. Persistent Notification to CREATOR (Outcome)
                 if (creatorId != null && !creatorId.equals(executorId)) {
                     sendNotification(creatorId, null, "Your Batch " + batchId + " has been ACCEPTED.", batchId);
                 }
 
-                logAudit(executorId, "APPROVE_SUCCESS", "BATCH_ASYNC", "Batch " + batchId + " Accepted");
+                logAudit(executorId, "APPROVE_SUCCESS", "BATCH_ASYNC", "Approved Batch " + batchId);
+                log.info(" Batch {} Processed & ACCEPTED in {}ms", batchId, System.currentTimeMillis() - start);
 
             } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+                // Reject Rows
                 jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
                         executorId, dto.getRemarks(), batchId);
 
+                // Reject Summary
                 jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
                         executorId, dto.getRemarks(), batchId);
 
+                logAudit(executorId, "REJECT_OK", "BATCH_ASYNC", "Rejected Batch " + batchId);
+
+                // --- NOTIFICATIONS ---
                 progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
+
                 sendNotification(executorId, null, "You rejected Batch " + batchId, batchId);
                 if (creatorId != null && !creatorId.equals(executorId)) {
                     sendNotification(creatorId, null, "Your Batch " + batchId + " was REJECTED.", batchId);
                 }
 
-                logAudit(executorId, "REJECT_SUCCESS", "BATCH_ASYNC", "Batch " + batchId + " Rejected");
+                log.info(" Batch {} Processed & REJECTED in {}ms", batchId, System.currentTimeMillis() - start);
             }
-            log.info("BATCH_PROCESSING_DONE | Batch: {} | Status: {} | Time: {}ms", batchId, dto.getStatus(), System.currentTimeMillis() - start);
+        } catch (Exception e) {
+            log.error("Async Process Failed for Batch {}", batchId, e);
+            String safeMsg = "System Error: Failed to process batch safely. Please try again.";
 
-        } catch (DataAccessException e) {
-            log.error("ORACLE_PROC_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            handleAsyncProcessingError(batchId, executorId, "Database execution error during approval.");
-        } catch (RuntimeException e) {
-            log.error("ASYNC_PROCESS_CRASH | Batch: {} | Message: {}", batchId, e.getMessage());
-            handleAsyncProcessingError(batchId, executorId, "Unexpected system error during processing.");
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", safeMsg, batchId);
+            logAudit(executorId, "PROCESS_FAIL", "BATCH_ASYNC", "System Error processing batch");
+            progressService.sendProgress(batchId, executorId, 0, "FAILED", safeMsg);
         } finally {
             MDC.clear();
         }
-    }
 
-    private void handleAsyncProcessingError(String batchId, String executorId, String msg) {
-        jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", msg, batchId);
-        progressService.sendProgress(batchId, executorId, 0, "FAILED", msg);
     }
-
     // ==================================================================================
-    // 3. ASYNC CANCELLATION (Logic preserved)
+    // 3. ASYNC DELETION (Chunked & Safe +   (Progress + Notification))
     // ==================================================================================
 
     @Override
     @Transactional
     public void cancelMyRequestsByBatchIdAsync(String batchId, String userId) {
+        // Lock it immediately so user sees "Processing" and can't double click
         int updated = jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS IN ('PENDING', 'ERROR')", batchId);
+
         if (updated == 0) {
+            log.warn("Delete Race Condition: Batch {} already locked.", batchId);
             throw new IllegalStateException("Batch is already being processed or deleted.");
         }
+
         progressService.sendProgress(batchId, userId, 0, "PROCESSING", "Deleting Batch...");
         self.executeAsyncBatchCancellation(batchId, userId);
     }
 
+
     @Override
     @Async("bulkExecutor")
     public void executeAsyncBatchCancellation(String batchId, String userId) {
-        MDC.put("batchId", batchId);
-        MDC.put("user", userId);
         long start = System.currentTimeMillis();
 
-        try {
-            progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Oracle Data...");
-            jdbcTemplate.execute("{call PURGE_JOURNAL_BATCH(?, ?)}", (CallableStatementCallback<Object>) cs -> {
-                cs.setString(1, batchId);
-                cs.setString(2, userId);
-                cs.execute();
-                return null;
-            });
+        // --- MDC TRACING START ---
+        MDC.put("batchId", batchId);
+        MDC.put("user", userId);
+        MDC.put("action", "DELETE");
 
-            logAudit(userId, "CANCEL_SUCCESS", "BATCH_ASYNC", "Deleted Batch " + batchId);
+        try {
+            progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Data...");
+            log.info("Calling PURGE_JOURNAL_BATCH for {}", batchId);
+
+            jdbcTemplate.execute(
+                    "{call PURGE_JOURNAL_BATCH(?, ?)}",
+                    (CallableStatementCallback<Object>) cs -> {
+                        cs.setString(1, batchId);
+                        cs.setString(2, userId);
+                        cs.execute();
+                        return null;
+                    }
+            );
+
+            logAudit(userId, "CANCEL_SUCCESS", "BATCH_ASYNC", "Deleted " + batchId);
+
+            // Final Notifications
             progressService.sendProgress(batchId, userId, 100, "COMPLETED", "Batch Deleted");
             sendNotification(userId, null, "Batch " + batchId + " deleted successfully.", batchId);
-            log.info("BATCH_PURGE_COMPLETE | Batch: {} | Duration: {}ms", batchId, System.currentTimeMillis() - start);
 
-        } catch (DataAccessException e) {
-            log.error("PURGE_DB_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+            log.info(" Batch {} DELETED in {}ms", batchId, System.currentTimeMillis() - start);
+
+        } catch (Exception e) {
+            log.error("Delete Failed", e);
+            // VISIBILITY : Set to ERROR so it reappears in list
             jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", "Delete Failed: " + e.getMessage(), batchId);
-            progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: SQL Error");
+            progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: " + e.getMessage());
         } finally {
-            MDC.clear();
+            MDC.clear(); // --- MDC CLEANUP ---
         }
     }
 
+
     // ==================================================================================
-    // 4. QUERIES & PAYLOAD LOGIC (100% Logic Preservation)
+    // 4. OPTIMIZED SUMMARIES (Using Master Table)
     // ==================================================================================
 
     @Override
     public List<Map<String, Object>> getPendingBatchSummaries() {
-        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS " +
-                     "FROM JOURNAL_BATCH_MASTER WHERE BATCH_STATUS IN ('PENDING', 'ERROR') ORDER BY REQ_DATE DESC";
+        // Show 'ERROR' status too.
+        // This allows users to see failed background tasks (Creation, Accept, or Delete failures)
+        String sql = """
+            SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS
+            FROM JOURNAL_BATCH_MASTER 
+            WHERE BATCH_STATUS IN ('PENDING', 'ERROR') 
+            ORDER BY REQ_DATE DESC
+        """;
 
         return jdbcTemplate.query(sql, (rs, rowNum) -> {
             Map<String, Object> map = new HashMap<>();
@@ -430,15 +505,25 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
             map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
             map.put("requestStatus", rs.getString("BATCH_STATUS"));
-            if ("ERROR".equals(rs.getString("BATCH_STATUS"))) map.put("errorMessage", rs.getString("EXECUTOR_REMARKS"));
+
+            // Helpful for frontend to show why it failed
+            if ("ERROR".equals(rs.getString("BATCH_STATUS"))) {
+                map.put("errorMessage", rs.getString("EXECUTOR_REMARKS"));
+            }
             return map;
         });
     }
 
+
     @Override
     public List<Map<String, Object>> getAllBatchSummaries() {
-        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_ID, EXECUTOR_REMARKS " +
-                     "FROM JOURNAL_BATCH_MASTER ORDER BY REQ_DATE DESC FETCH FIRST 100 ROWS ONLY";
+        String sql = """
+                    SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, 
+                           BATCH_STATUS, EXECUTOR_ID, EXECUTOR_REMARKS 
+                    FROM JOURNAL_BATCH_MASTER 
+                    ORDER BY REQ_DATE DESC 
+                    FETCH FIRST 100 ROWS ONLY
+                """;
 
         return jdbcTemplate.query(sql, (rs, rowNum) -> {
             Map<String, Object> map = new HashMap<>();
@@ -456,7 +541,20 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         });
     }
 
-    private String buildJsonPayloadFast(JournalBulkValidationService.ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+    @Override
+    public long getRequestCountByBatchId(String batchId) {
+        try {
+            return jdbcTemplate.queryForObject("SELECT TOTAL_ROWS FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", Long.class, batchId);
+        } catch (Exception e) {
+            return 0; // Or fallback to count(*)
+        }
+    }
+
+
+    // ---------------------------------------------------------
+    // OPTIMIZED PAYLOAD GENERATION (Bulk)
+    // ---------------------------------------------------------
+    private String buildJsonPayloadFast(ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
         return "{\"csvDate\":\"" + pDate.format(fmt) + "\"," +
                 "\"branch\":\"" + row.branch + "\",\"currency\":\"" + row.currency + "\"," +
                 "\"cgl\":\"" + row.cgl + "\",\"amount\":" + amount + "," +
@@ -471,11 +569,23 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return s == null ? "" : s.replace("\"", "\\\"").replace("\\", "\\\\");
     }
 
+    private void createNotification(String batchId, String creatorId, int size) {
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            String message = String.format("Batch %s (%d rows) by %s pending.", batchId, size, creatorId);
+            notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
+        } catch (Exception e) {
+            log.error("Notification Failed", e);
+        }
+    }
+
     private void sendNotification(String userId, String roles, String message, String batchId) {
         try {
-            notificationWriterService.createNotification(userId, roles, message, "/journal-view/" + batchId, batchId, "JournalService");
-        } catch (RuntimeException e) {
-            log.warn("NOTIFICATION_WARN | Batch: {} | Message: Failed to send persistent alert", batchId);
+            // Using a generic URL or null if handled by FE routing
+            String url = "/journal-view/" + batchId;
+            notificationWriterService.createNotification(userId, roles, message, url, batchId, "JournalService");
+        } catch (Exception e) {
+            log.warn("Failed to send persistent notification for {}: {}", batchId, e.getMessage());
         }
     }
 
@@ -488,65 +598,132 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             l.setNewValue(val.length() > 3900 ? val.substring(0, 3900) : val);
             l.setActionTime(LocalDateTime.now());
             journalLogRepository.save(l);
-        } catch (DataAccessException e) {
-            log.error("AUDIT_LOG_FAILURE | User: {} | Reason: DB unreachable", user);
+        } catch (Exception e) {
+            log.error("Audit Failed", e);
         }
     }
 
+    // --- Legacy / Implementations ---
     @Override
     public LocalDate getCurrentPostingDate() {
         try {
             String sql = "SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY";
             return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> {
                 Timestamp ts = rs.getTimestamp("USERS_DATE");
-                return ts != null ? ts.toLocalDateTime().toLocalDate() : LocalDate.now();
+                if (ts != null) return ts.toLocalDateTime().toLocalDate();
+                return LocalDate.now();
             });
-        } catch (EmptyResultDataAccessException e) {
-            log.warn("POSTING_DATE_WARN | Table FINCORE_DATE is empty. Defaulting to system date.");
-            return LocalDate.now();
-        } catch (CannotGetJdbcConnectionException e) {
-            log.error("POSTING_DATE_DB_FAIL | Connection unavailable");
-            throw new CustomExceptions.DatabaseOperationException("Database connection failed", e);
-        }
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+        log.warn("FINCORE_DATE table is empty. Defaulting to System Date.");
+        return LocalDate.now();
+    } catch (org.springframework.jdbc.CannotGetJdbcConnectionException e) {
+        log.error("Database connection unavailable while fetching posting date");
+        throw new CustomExceptions.DatabaseOperationException("Database unavailable", e);
+    }
     }
 
-    // ==================================================================================
-    // 5. MANUAL BATCH CREATION (100% Logic Preservation)
-    // ==================================================================================
+    @Override
+    public Page<JournalRequest> getRequestsByBatchIdPaginated(String b, Pageable p) {
+        return journalRequestRepository.findByBatchIdPaginated(b, p);
+    }
+
+    @Override
+    public List<JournalRequest> getRequestsByBatchId(String b) {
+        return journalRequestRepository.findByBatchId(b);
+    }
+
+    @Override
+    public List<JournalRequest> getMyRequests(String u) {
+        return new ArrayList<>(); /* Optimized: Don't load 600k rows */
+    }
+
+    @Override
+    public List<JournalRequest> getPendingRequests(String u, Integer r) {
+        return new ArrayList<>();
+    }
+
+    @Override
+    public List<JournalRequestStatusDto> getJournalRequestStatusList() {
+        return new ArrayList<>();
+    }
 
     @Override
     @Transactional
+    public void cancelMyRequest(Long r, String u) {
+        journalRequestRepository.deleteById(r);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String b, String u) {
+        cancelMyRequestsByBatchIdAsync(b, u);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefixes(List<String> l, String u) {
+        journalRequestRepository.deleteJournalsNative(l, u);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String p, String u) {
+    }
+
+    @Override
+    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String u, Integer r) {
+        return Optional.empty();
+    }
+
+    // ---------------------------------------------------------
+    // MANUAL BATCH CREATION
+    // ---------------------------------------------------------
+    @Override
+    @Transactional
     public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+
+        // 1. Generate New Batch ID
         String batchId = sequenceService.getNextBatchId();
         Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        
+        ObjectMapper localMapper = new ObjectMapper();
+
         List<JournalRequest> entities = new ArrayList<>();
         BigDecimal totalDebit = BigDecimal.ZERO;
         BigDecimal totalCredit = BigDecimal.ZERO;
         int rowIndex = 1;
 
+        // 2. Iterate through DTO rows
         for (BatchRequestDto.JournalRequestRow row : dto.getRows()) {
             JournalRequest entity = new JournalRequest();
+
+            // --- Metadata ---
             entity.setRequestStatus(RequestStatus.PENDING);
             entity.setRequestDate(LocalDateTime.now());
             entity.setCreatorId(creatorId);
             entity.setCreatorRole(creatorRole);
             entity.setBatchId(batchId);
             entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
-            
+
+            // --- ID Generation ---
             String journalId = batchId + "-" + rowIndex;
             entity.setJournalId(journalId);
+
+            // --- Optimized Columns ---
             entity.setBranchCode(row.getBranch());
             entity.setCurrency(row.getCurrency());
             entity.setCgl(row.getCgl());
-            
+
+            // Amount Handling
             BigDecimal amount = row.getAmount();
             entity.setAmount(amount);
+
             entity.setCsvDate(row.getCsvDate() != null ? row.getCsvDate() : LocalDate.now());
             entity.setNarration(row.getRemarks());
             entity.setProductCode(row.getProductType());
 
+            // --- PAYLOAD GENERATION (Simplified) ---
             Map<String, Object> payloadMap = new HashMap<>();
+
             payloadMap.put("csvDate", entity.getCsvDate().toString());
             payloadMap.put("branch", row.getBranch());
             payloadMap.put("currency", row.getCurrency());
@@ -554,51 +731,84 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             payloadMap.put("amount", amount);
             payloadMap.put("productType", row.getProductType());
             payloadMap.put("remarks", row.getRemarks());
+
+            // Keep strictly necessary static flags if your system expects them defaults
             payloadMap.put("arFlag", "A");
             payloadMap.put("acClassification", "A");
+
             payloadMap.put("batchId", batchId);
             payloadMap.put("journalId", journalId);
             payloadMap.put("commonBatchRemarks", dto.getCommonBatchRemarks());
             payloadMap.put("transactionCount", rowIndex);
 
-            entity.setPayload(objectMapper.writeValueAsString(payloadMap));
+            // Generate JSON String (Cleaner now)
+            entity.setPayload(localMapper.writeValueAsString(payloadMap));
 
-            if (amount.compareTo(BigDecimal.ZERO) < 0) totalCredit = totalCredit.add(amount.abs());
-            else totalDebit = totalDebit.add(amount.abs());
+            // --- Totals Calculation ---
+            if (amount.compareTo(BigDecimal.ZERO) < 0) {
+                totalCredit = totalCredit.add(amount.abs());
+            } else {
+                totalDebit = totalDebit.add(amount.abs());
+            }
 
             entities.add(entity);
             rowIndex++;
         }
 
+        // 3. Save Details
         List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
 
-        jdbcTemplate.update("INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                batchId, creatorId, ts, dto.getCommonBatchRemarks(), entities.size(), totalDebit, totalCredit, "PENDING");
+        // 4. Save Summary
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
-        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Manual Batch " + batchId + " Created");
-        sendNotification(creatorId, null, "Manual Batch " + batchId + " created.", batchId);
+        jdbcTemplate.update(sumSql,
+                batchId,
+                creatorId,
+                ts,
+                dto.getCommonBatchRemarks(),
+                entities.size(),
+                totalDebit,
+                totalCredit,
+                "PENDING"
+        );
+
+        // 5. Audit & Notification
+        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Created Manual Batch " + batchId);
+
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            if (config != null) {
+                String msg = String.format("New Manual Batch %s by %s requires approval.", batchId, creatorId);
+                notificationWriterService.createNotification(
+                        null,
+                        config.getTargetRoles(),
+                        msg,
+                        "/journal-view/" + batchId,
+                        batchId,
+                        "JournalService"
+                );
+            }
+        } catch (Exception e) {
+            log.warn("Notification failed for manual batch {}", batchId, e);
+        }
 
         return savedEntities;
     }
 
-    // --- Standard Implementations & Overrides ---
 
-    @Override public long getRequestCountByBatchId(String batchId) {
-        try { return jdbcTemplate.queryForObject("SELECT TOTAL_ROWS FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", Long.class, batchId); }
-        catch (DataAccessException e) { return 0; }
+    @Override
+    public String createBulkBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException {
+        return "";
     }
 
-    @Override public Page<JournalRequest> getRequestsByBatchIdPaginated(String b, Pageable p) { return journalRequestRepository.findByBatchIdPaginated(b, p); }
-    @Override public List<JournalRequest> getRequestsByBatchId(String b) { return journalRequestRepository.findByBatchId(b); }
-    @Override public List<JournalRequest> getMyRequests(String u) { return new ArrayList<>(); }
-    @Override public List<JournalRequest> getPendingRequests(String u, Integer r) { return new ArrayList<>(); }
-    @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return new ArrayList<>(); }
-    @Override @Transactional public void cancelMyRequest(Long r, String u) { journalRequestRepository.deleteById(r); }
-    @Override @Transactional public void cancelMyRequestsByBatchId(String b, String u) { cancelMyRequestsByBatchIdAsync(b, u); }
-    @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> l, String u) { journalRequestRepository.deleteJournalsNative(l, u); }
-    @Override @Transactional public void cancelMyRequestsByJournalPrefix(String p, String u) {}
-    @Override public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String u, Integer r) { return Optional.empty(); }
-    @Override public String createBulkBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException { return ""; }
-    @Override public String createBatchFromCache(String r, String m, String u, Integer o) throws IOException { return createBatchFromCacheAsync(r, m, u, o); }
-    @Override public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto d, String u, Integer r) { processBulkRequestsAsync(d, u, r); return Collections.emptyList(); }
+    @Override
+    public String createBatchFromCache(String r, String m, String u, Integer o) throws IOException {
+        return createBatchFromCacheAsync(r, m, u, o);
+    }
+
+    @Override
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto d, String u, Integer r) {
+        processBulkRequestsAsync(d, u, r);
+        return Collections.emptyList();
+    }
 }
