@@ -1,95 +1,115 @@
-To eliminate generic exception handling and prevent "Internal Server Error" issues (ISD), we will refactor your core services. This ensures that the frontend receives specific error codes (like 409 Conflict or 410 Gone) instead of a generic 500.
-Below are the specific changes for each file to satisfy your first rule.
-1. File: com.fincore.JournalService.Exception.CustomExceptions
-We must add more granular exception types so the services have specific "tools" to throw.
-Add these classes inside CustomExceptions:
-// Add to existing CustomExceptions.java
-@ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
-public static class RedisOperationException extends RuntimeException {
-    public RedisOperationException(String message, Throwable cause) { super(message, cause); }
+I understand. Let's get very specific. To solve the "bugs from the screen" issue, we need to replace generic catch (Exception e) blocks with specific ones. This prevents the backend from swallowing critical errors or sending a generic "500 Internal Server Error" to the UI.
+Here are the exact line-by-line replacements for your service to meet Rule 1.
+📂 File: JournalBulkValidationService.java
+1. Method: saveStatusToRedis
+ * Location: Around Line 364.
+ * Original Code:
+   } catch (Exception e) {
+    log.error("Failed to save status to Redis for {}", reqId, e);
 }
 
-@ResponseStatus(HttpStatus.UNPROCESSABLE_ENTITY)
-public static class DataMappingException extends RuntimeException {
-    public DataMappingException(String message) { super(message); }
+ * Corrected Code:
+   } catch (org.springframework.data.redis.RedisSystemException | org.springframework.dao.DataAccessException e) {
+    log.error("Redis storage failure for ReqID: {}", reqId, e);
+    // Do not throw; let the process continue if possible, but log the specific DB error
 }
 
-@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
-public static class BatchProcessingException extends RuntimeException {
-    public BatchProcessingException(String message, Throwable cause) { super(message, cause); }
+2. Method: parseAmount
+ * Location: Around Line 457.
+ * Original Code:
+   } catch (Exception e) {
+    d.amount = BigDecimal.ZERO;
 }
 
-2. File: com.fincore.JournalService.Service.JournalBulkValidationService
-This file handles complex parsing where generic Exception blocks currently hide the root cause.
-| Method | Original Code (Catching Generic) | Corrected Code (Specific Exceptions) |
-|---|---|---|
-| saveStatusToRedis | catch (Exception e) | catch (org.springframework.dao.DataAccessException e) |
-| parseAmount | catch (Exception e) | catch (NumberFormatException | ArithmeticException e) |
-| processAsync | catch (Exception e) | catch (IOException | DataAccessException | CustomExceptions.CacheExpiredException e) |
-Updated processAsync Snippet:
-// Refactored logic for processAsync in JournalBulkValidationService
-try {
-    // ... existing parsing logic ...
-} catch (IOException e) {
-    log.error("File system error during parsing for ReqID: {}", requestId, e);
-    failRequest(requestId, new ArrayList<>(), "Internal File Error", 1, false);
-} catch (org.springframework.dao.DataAccessException e) {
-    log.error("Redis or Database unavailable during validation: {}", requestId, e);
-    updateState(requestId, s -> s.setStatus("ERROR").setMessage("Storage Service Unavailable"));
-} catch (CustomExceptions.CacheExpiredException e) {
-    log.warn("Cache expired during async processing: {}", requestId);
-    failRequest(requestId, new ArrayList<>(), e.getMessage(), 1, false);
+ * Corrected Code:
+   } catch (NumberFormatException | ArithmeticException e) {
+    log.warn("Invalid numeric format at row {}: {}", d.rowIndex, amountRaw);
+    d.amount = BigDecimal.ZERO;
+    d.formatErrors.add("Invalid amount format: " + amountRaw);
 }
 
-3. File: com.fincore.JournalService.Service.JournalRequestServiceImpl
-This service manages the heavy lifting. Catching Exception here often results in "hung" batches where the status never updates to ERROR.
-Change 1: executeAsyncBatchCreation
- * Original: catch (Exception e)
- * Changed to: ```java
+3. Method: validateSystemColumns
+ * Location: Around Line 477.
+ * Original Code:
+   } catch (Exception e) {
+    d.formatErrors.add("Invalid calendar date");
+}
+
+ * Corrected Code:
+   } catch (java.time.format.DateTimeParseException e) {
+    log.warn("Date parsing failed for row {}: {}", d.rowIndex, cDate);
+    d.formatErrors.add("Date must be in ddMMyyyy format");
+}
+
+📂 File: JournalRequestServiceImpl.java
+1. Method: executeAsyncBatchCreation
+ * Location: Around Line 608.
+ * Original Code:
+   } catch (Exception e) {
+    log.error("Async Create Failed for Batch {}", batchId, e);
+    // ... cleanup logic ...
+}
+
+ * Corrected Code:
    } catch (org.springframework.dao.DataAccessException e) {
-   log.error("Database integrity or connection error for Batch {}", batchId, e);
-   handleCreationFailure(batchId, creatorId, requestId, "Database Error: " + e.getMostSpecificCause().getMessage());
-   } catch (java.util.concurrent.CompletionException e) {
-   log.error("Parallel processing failed for Batch {}", batchId, e);
-   handleCreationFailure(batchId, creatorId, requestId, "Parallel processing failure");
-   }
-
-**Change 2: `executeAsyncBatchProcessing`**
-* **[span_9](start_span)Original:** `catch (Exception e)`[span_9](end_span)
-* **Changed to:**
-```java
-} catch (java.sql.SQLException e) {
-    log.error("Oracle PL/SQL Procedure Failed for Batch {}", batchId, e);
-    String errorMsg = "Database Procedure Error: " + e.getMessage();
-    jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", errorMsg, batchId);
-    progressService.sendProgress(batchId, executorId, 0, "FAILED", errorMsg);
-} catch (org.springframework.jdbc.CannotGetJdbcConnectionException e) {
-    log.error("Connection lost during approval of Batch {}", batchId, e);
-    // Logic to notify user the system is down
+    log.error("Database persistence failure for Batch {}: {}", batchId, e.getMostSpecificCause().getMessage());
+    handleCreationFailure(batchId, creatorId, requestId, "Database Error: " + e.getMostSpecificCause().getMessage());
+} catch (java.util.concurrent.CompletionException e) {
+    log.error("Parallel thread execution failed for Batch {}", batchId, e);
+    handleCreationFailure(batchId, creatorId, requestId, "Internal system processing error");
 }
 
-4. File: com.fincore.JournalService.Service.HdfsSyncService
-Generic error handling here prevents us from knowing if Hive is down or if the data format is wrong.
- * Original: catch (Exception e)
+2. Method: executeAsyncBatchProcessing
+ * Location: Around Line 666.
+ * Original Code:
+   } catch (Exception e) {
+    log.error("Async Process Failed for Batch {}", batchId, e);
+    // ... error update logic ...
+}
+
  * Corrected Code:
-// HdfsSyncService.java
-try {
-    // ... batchUpdate logic ...
+   } catch (java.sql.SQLException e) {
+    log.error("Oracle PL/SQL execution failed for Batch {}. SQL State: {}, Error: {}", batchId, e.getSQLState(), e.getMessage());
+    String safeMsg = "Database Procedure Error: " + e.getMessage();
+    jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", safeMsg, batchId);
+    progressService.sendProgress(batchId, executorId, 0, "FAILED", safeMsg);
 } catch (org.springframework.dao.DataAccessException e) {
-    log.error("HDFS SYNC FAILED: Hive/Thrift connection issue. Data may be out of sync for batch update.", e);
-    // Explicitly do NOT throw here if we want the main process to continue, 
-    // but the log must be specific for debugging.
+    log.error("Network or Connection failure during Batch {} processing", batchId, e);
+    // Handle specifically for connection drops
 }
 
-5. File: com.fincore.JournalService.Service.ProgressService
- * Original: catch (Exception e)
+3. Method: getCurrentPostingDate
+ * Location: Around Line 710.
+ * Original Code:
+   } catch (Exception e) {
+    log.error("Error fetching USERS_DATE. Using System Date.", e);
+    return LocalDate.now();
+}
+
  * Corrected Code:
-// ProgressService.java
-} catch (com.fasterxml.jackson.core.JsonProcessingException e) {
-    log.error("Progress Serialization Failed for task: {}", taskId, e);
-} catch (org.springframework.data.redis.RedisConnectionFailureException e) {
-    log.warn("Progress update skipped: Redis connection down.");
+   } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+    log.warn("FINCORE_DATE table is empty. Defaulting to System Date.");
+    return LocalDate.now();
+} catch (org.springframework.jdbc.CannotGetJdbcConnectionException e) {
+    log.error("Database connection unavailable while fetching posting date");
+    throw new CustomExceptions.DatabaseOperationException("Database unavailable", e);
 }
 
-Next Step for you:
-Would you like me to now move to Point 2: Descriptive Logging, and show you how to rewrite these log.error statements to include non-PII debugging info (like Row Numbers or Batch IDs) without logging actual financial amounts?
+📂 File: ProgressService.java
+1. Method: sendProgress
+ * Location: Around Line 776.
+ * Original Code:
+   } catch (Exception e) {
+    log.warn("Progress Notification Failed: {}", e.getMessage());
+}
+
+ * Corrected Code:
+   } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+    log.error("Failed to serialize progress for Task {}: {}", taskId, e.getMessage());
+} catch (org.springframework.data.redis.RedisConnectionFailureException e) {
+    log.warn("Redis connection lost. Throttling progress update for Task {}", taskId);
+}
+
+Why this fixes your stress:
+When a bug happens now, your logs won't just say java.lang.Exception. They will say exactly what happened (e.g., DateTimeParseException or EmptyResultDataAccessException). This allows you to fix the "screen errors" instantly because you'll know if the user sent a bad date or if the database is actually down.
+Would you like me to move to Point 2: Descriptive Logging and show you how to implement the "never log PII" rule for these specific blocks?
