@@ -1,10 +1,3 @@
-This issue is happening because of how the data is being extracted and passed from your "single API" response before it even reaches the Table.
-Your UI logic for the radio buttons in ProcessSummaryDialog.jsx and the dynamic table in ProcessDynamicSummaryTable.jsx is actually correct! The radio buttons successfully change the summaryType state.
-The bug is in ProcessStatusPage.js inside the handleOpenSummary function.
-Since you mentioned all the data is coming from a single API, your code is currently trying to extract summary from three different stages, and then trying to extract .summary again from those parsed objects. If the API returns all the data inside a single object, sibaSummary?.summary and suspenseSummary?.summary are likely evaluating to undefined, which falls back to an empty array []. So when you click the radio buttons, the table columns change, but the data is empty.
-Here is exactly where and how to fix it:
-1. Update ProcessStatusPage.js
-Find your handleOpenSummary function. You need to parse the single API payload correctly so that the data gets routed to the right arrays.
   const handleOpenSummary = (row) => {
     const safeParse = (jsonString) => {
       try {
@@ -15,51 +8,44 @@ Find your handleOpenSummary function. You need to parse the single API payload c
       }
     };
 
-    // 1. Locate where the single API payload is stored. 
-    // Assuming the main payload is stored in the 'balance_Compare_generated' stage
-    const mainSummaryStage = row?.stages?.find(
-      (s) => s.stageId === "balance_Compare_generated", // OR wherever the single API saves the payload
+    const stageBalComp = row?.stages?.find(
+      (s) => s.stageId === "balance_Compare_generated",
+    );
+    const stageSiba = row?.stages?.find(
+      (s) => s.stageId === "intr_summary_calculated",
+    );
+    const stageSuspense = row?.stages?.find(
+      (s) => s.stageId === "cntr_summary_calculated",
     );
 
-    // 2. Parse the single JSON payload
-    const parsedData = safeParse(mainSummaryStage?.summary);
+    if (
+      !stageBalComp?.summary &&
+      !stageSiba?.summary &&
+      !stageSuspense?.summary
+    ) {
+      snackbar("Summary not available", "warning");
+      return;
+    }
 
-    // 3. Extract the date
-    const recondate = parsedData?.date || "";
+    const differenceSummary = safeParse(stageBalComp?.summary);
+    const sibaSummary = safeParse(stageSiba?.summary);
+    const suspenseSummary = safeParse(stageSuspense?.summary);
 
-    // 4. Update the state by mapping the exact keys your API returns
-    // NOTE: Change 'differenceSummary', 'sibaSummary', etc., to exactly match 
-    // the keys coming from your backend JSON response!
+    const recondate =
+      differenceSummary?.date ??
+      sibaSummary?.date ??
+      suspenseSummary?.date ??
+      "";
+
+    setSummaryMeta(row);
+
     setSummaryData({
       RECON_RUN_DATE: recondate,
-      differenceSummary: parsedData?.differenceSummary || parsedData?.summary || [], 
-      sibaSummary: parsedData?.sibaSummary || [],       // Map to actual API key for SIBA
-      suspenseSummary: parsedData?.suspenseSummary || [], // Map to actual API key for Suspense
+      // FIX: It now checks if the single API returned the arrays under specific keys
+      // before falling back to the generic '.summary' array.
+      differenceSummary: differenceSummary?.differenceSummary || differenceSummary?.summary || [],
+      sibaSummary: sibaSummary?.sibaSummary || differenceSummary?.sibaSummary || sibaSummary?.summary || [],
+      suspenseSummary: suspenseSummary?.suspenseSummary || differenceSummary?.suspenseSummary || suspenseSummary?.summary || [],
       stages: row?.stages || [],
     });
   };
-
-2. Add a quick Debugger in ProcessSummaryDialog.jsx
-To confirm the data is flowing correctly when you click the radio buttons, add a quick console.log right above your return statement in ProcessSummaryDialog.jsx:
-  const activeSummary = useMemo(() => {
-    switch (summaryType) {
-      case "BALANCE":
-        return differenceSummary || [];
-      case "SIBA":
-        return sibaSummary || [];
-      case "SUSPENSE":
-        return suspenseSummary || [];
-      default:
-        return [];
-    }
-  }, [summaryType, differenceSummary, sibaSummary, suspenseSummary]);
-
-  // ADD THIS LINE TO DEBUG:
-  console.log(`Currently selected: ${summaryType}`, activeSummary);
-
-  /* ================= EXPORT PDF ================= */
-
-When you click the radio buttons, open your browser console. If activeSummary prints out as an empty array [], it means your mapping in Step 1 still doesn't match the exact keys sent by your backend API.
-3. Ensure Table Keys Match in ProcessSummaryTableConfig.js
-Finally, remember that the data feeding into your DynamicSummaryTable.jsx must perfectly match the field values defined in your config.
-For example, if you click "SIBA", your data objects must contain the exact, case-sensitive keys: cgl, currency, and amount. If the backend sends { "CGL": "...", "Amount": 100 } (uppercase), the table will render blank cells because it's looking for the lowercase fields.
