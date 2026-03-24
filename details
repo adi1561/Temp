@@ -1,373 +1,65 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Box,
-  Button,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogTitle,
-  Stack,
-  Typography,
-  Tooltip,
-  IconButton,
-} from "@mui/material";
-import useApi from "../../hooks/useApi";
-import CancelIcon from "@mui/icons-material/Cancel";
-import VisibilityIcon from "@mui/icons-material/Visibility";
-import CheckCircleIcon from "@mui/icons-material/CheckCircle";
-import PendingActionsIcon from "@mui/icons-material/PendingActions";
-import BlockFlippedIcon from "@mui/icons-material/BlockFlipped";
-import GppBadIcon from "@mui/icons-material/GppBad";
-import InfoIcon from "@mui/icons-material/Info";
-// --- CHANGED: Added DownloadIcon import ---
-import DownloadIcon from "@mui/icons-material/Download";
-import { DataGridStyles } from "./YearEndProfitTransferStyles";
-import { useSelector } from "react-redux";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-import {
-  getPermissions,
-  timeStampFormatter,
-} from "../../utils/CommonUtilities";
-import CustomChip from "../../utils/CustomChip";
-import { COMMON_REQ_SCREEN_CONFIGS } from "../common/CommonConstants";
-import ViewRequestDialog from "../common/ViewRequestDailog";
-// --- CHANGED: Imported downloadFile utility from utils ---
-import downloadFile from "../../utils/DownloadUtils";
+This issue is happening because of how the data is being extracted and passed from your "single API" response before it even reaches the Table.
+Your UI logic for the radio buttons in ProcessSummaryDialog.jsx and the dynamic table in ProcessDynamicSummaryTable.jsx is actually correct! The radio buttons successfully change the summaryType state.
+The bug is in ProcessStatusPage.js inside the handleOpenSummary function.
+Since you mentioned all the data is coming from a single API, your code is currently trying to extract summary from three different stages, and then trying to extract .summary again from those parsed objects. If the API returns all the data inside a single object, sibaSummary?.summary and suspenseSummary?.summary are likely evaluating to undefined, which falls back to an empty array []. So when you click the radio buttons, the table columns change, but the data is empty.
+Here is exactly where and how to fix it:
+1. Update ProcessStatusPage.js
+Find your handleOpenSummary function. You need to parse the single API payload correctly so that the data gets routed to the right arrays.
+  const handleOpenSummary = (row) => {
+    const safeParse = (jsonString) => {
+      try {
+        return jsonString ? JSON.parse(jsonString) : {};
+      } catch (e) {
+        console.error("JSON Parsing Error:", e);
+        return {};
+      }
+    };
 
-// --- CHANGED: Added DOWNLOAD_URL constant ---
-const DOWNLOAD_URL = "/RS/reports/generate/base64";
-
-export default function YearEndProfitTransferTab2() {
-  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
-  const requestType = selectedMenuItem?.requestType || "";
-  const permissions = getPermissions(selectedMenuItem);
-  const [rows, setRows] = useState([]);
-  const [confirmDialog, setConfirmDialog] = useState(false);
-  const [requestId, setRequestId] = useState(null);
-  const [viewOpen, setViewOpen] = useState(false);
-  const [viewData, setViewData] = useState(null);
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-  const screenConfig = COMMON_REQ_SCREEN_CONFIGS[selectedMenuItem?.id];
-  const { processViewData } = screenConfig || {};
-
-  function CustomNoRowsOverlay() {
-    return (
-      <Stack height="100%" alignItems="center" justifyContent="center">
-        <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
-        <Typography variant="h6">No Segment Requests Found</Typography>
-        <Typography>You have not created any Segment requests.</Typography>
-      </Stack>
+    // 1. Locate where the single API payload is stored. 
+    // Assuming the main payload is stored in the 'balance_Compare_generated' stage
+    const mainSummaryStage = row?.stages?.find(
+      (s) => s.stageId === "balance_Compare_generated", // OR wherever the single API saves the payload
     );
-  }
 
-  const fetchData = useCallback(async () => {
-    const payload = { requestType };
-    const response = await callApi("/CR/my-requests", payload, "POST");
-    if (response?.data) {
-      const result = response.data.map((row) => {
-        let parsedPayload = row.payload ? row.payload : {};
-        parsedPayload = {
-          ...parsedPayload,
-          ...row,
-        };
+    // 2. Parse the single JSON payload
+    const parsedData = safeParse(mainSummaryStage?.summary);
 
-        return {
-          ...parsedPayload,
-        };
-      });
+    // 3. Extract the date
+    const recondate = parsedData?.date || "";
 
-      setRows(result);
-    } else {
-      setRows([]);
-    }
-  }, [callApi, requestType]);
-
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
-
-  const handleCancelRequest = async () => {
-    try {
-      const payload = {
-        requestId,
-        remarks: "User canceled this Request",
-      };
-
-      const response = await callApi("/CR/cancel-request", payload, "PATCH");
-      if (response?.success) {
-        showSnackBar(
-          `Request Id ${requestId} Cancelled Successfully.`,
-          "success",
-        );
-      } else {
-        showSnackBar(
-          response?.message
-            ? response?.message
-            : "Failed to process your cancel request, Kindly try again",
-          "error",
-        );
-      }
-    } catch (error) {
-      console.error(error);
-    } finally {
-      fetchData();
-      setConfirmDialog(false);
-    }
+    // 4. Update the state by mapping the exact keys your API returns
+    // NOTE: Change 'differenceSummary', 'sibaSummary', etc., to exactly match 
+    // the keys coming from your backend JSON response!
+    setSummaryData({
+      RECON_RUN_DATE: recondate,
+      differenceSummary: parsedData?.differenceSummary || parsedData?.summary || [], 
+      sibaSummary: parsedData?.sibaSummary || [],       // Map to actual API key for SIBA
+      suspenseSummary: parsedData?.suspenseSummary || [], // Map to actual API key for Suspense
+      stages: row?.stages || [],
+    });
   };
 
-  const handleViewClick = (data) => {
-    console.log(data);
-    const view = processViewData ? processViewData(data) : data;
-    console.log(view);
-    delete view.payload.ShowDownload;
-    setViewData(view);
-    setViewOpen(true);
-  };
-
-  // --- CHANGED: Added handleDownload logic exactly as requested ---
-  const handleDownload = async (row) => {
-    try {
-      // Note: Kept the exact same payload as Tab1. 
-      // If you want to use the row's dynamic date in the future, you can swap it here using row.payload.etlDate
-      const payload = {
-        reportType: "profit_transfer_report",
-        date: "31-03-2026", 
-      };
-      const responseData = await callApi(DOWNLOAD_URL, payload, "POST");
-      const { reportName, reportDate, excelBase64 } = responseData;
-
-      if (!excelBase64) {
-        showSnackBar("Failed to download file", "error");
-        return;
-      }
-
-      let fileName = reportName + "_" + reportDate;
-      downloadFile(responseData?.excelBase64, "excel", fileName, true);
-    } catch (err) {
-      console.error(err);
-      showSnackBar("Error while downloading file", "error");
+2. Add a quick Debugger in ProcessSummaryDialog.jsx
+To confirm the data is flowing correctly when you click the radio buttons, add a quick console.log right above your return statement in ProcessSummaryDialog.jsx:
+  const activeSummary = useMemo(() => {
+    switch (summaryType) {
+      case "BALANCE":
+        return differenceSummary || [];
+      case "SIBA":
+        return sibaSummary || [];
+      case "SUSPENSE":
+        return suspenseSummary || [];
+      default:
+        return [];
     }
-  };
+  }, [summaryType, differenceSummary, sibaSummary, suspenseSummary]);
 
-  const columns = useMemo(
-    () => [
-      { field: "id", headerName: "Request Id", flex: 0.5 },
-      {
-        field: "Name",
-        headerName: "Process Name",
-        flex: 0.8,
-        sortable: true,
-        renderCell: () => "Year End Profit Transfer",
-      },
-      {
-        field: "reqDate",
-        headerName: "Requested Date",
-        flex: 1,
-        align: "center",
-        headerAlign: "center",
-        filterable: false,
-        disableColumnMenu: true,
-        renderCell: (params) => timeStampFormatter(params.value),
-      },
-      {
-        field: "reqStatus",
-        headerName: "Status",
-        flex: 1,
-        align: "center",
-        headerAlign: "center",
-        filterable: false,
-        sortable: false,
-        disableColumnMenu: true,
-        renderCell: (params) => (
-          <Box
-            sx={{
-              color:
-                params.value === "REJECTED"
-                  ? "error.main"
-                  : params.value === "ACCEPTED"
-                    ? "success.dark"
-                    : "warning.main",
-              fontWeight: "bold",
-            }}
-          >
-            <CustomChip
-              variant="outlined"
-              icon={
-                params.value === "REJECTED" ? (
-                  <BlockFlippedIcon />
-                ) : params.value === "ACCEPTED" ? (
-                  <CheckCircleIcon />
-                ) : params.value === "CANCELLED" ? (
-                  <GppBadIcon />
-                ) : (
-                  <PendingActionsIcon />
-                )
-              }
-              label={
-                params.value === "REJECTED"
-                  ? "Rejected"
-                  : params.value === "ACCEPTED"
-                    ? "Approved"
-                    : params.value === "CANCELLED"
-                      ? "Cancelled"
-                      : "Pending"
-              }
-              sx={{
-                color:
-                  params.value === "REJECTED"
-                    ? "error.dark"
-                    : params.value === "ACCEPTED"
-                      ? "success.dark"
-                      : params.value === "CANCELLED"
-                        ? "primary.dark"
-                        : "warning.light",
+  // ADD THIS LINE TO DEBUG:
+  console.log(`Currently selected: ${summaryType}`, activeSummary);
 
-                "& .MuiChip-icon": {
-                  color:
-                    params.value === "REJECTED"
-                      ? "error.dark"
-                      : params.value === "ACCEPTED"
-                        ? "success.dark"
-                        : params.value === "CANCELLED"
-                          ? "primary.dark"
-                          : "warning.light",
-                },
-              }}
-            />
-          </Box>
-        ),
-      },
-      {
-        field: "action",
-        headerName: "Action",
-        flex: 0.6,
-        justifyContent: "center",
-        align: "center",
-        headerAlign: "center",
-        filterable: false,
-        sortable: false,
-        disableColumnMenu: true,
-        renderCell: (params) => {
-          return (
-            <Stack
-              direction="row"
-              spacing={1}
-              justifyContent="center"
-              alignItems="center"
-              sx={{ ml: 2, mt: 0.5 }}
-            >
-              {permissions.view && (
-                <Tooltip title="View">
-                  <IconButton
-                    // color="primary"
-                    onClick={() => handleViewClick(params.row)}
-                  >
-                    <VisibilityIcon />
-                  </IconButton>
-                </Tooltip>
-              )}
+  /* ================= EXPORT PDF ================= */
 
-              {/* --- CHANGED: Added the Download Button logic here specifically for ACCEPTED requests --- */}
-              {params.row.reqStatus === "ACCEPTED" && (
-                <Tooltip title="Download Excel">
-                  <IconButton
-                    onClick={() => handleDownload(params.row)}
-                  >
-                    <DownloadIcon fontSize="inherit" />
-                  </IconButton>
-                </Tooltip>
-              )}
-
-              {params.row.reqStatus === "PENDING" && permissions.cancel && (
-                <Tooltip title={"Cancel Request"}>
-                  <IconButton
-                    onClick={() => {
-                      setConfirmDialog(true);
-                      setRequestId(params.row.id);
-                    }}
-                  >
-                    <CancelIcon fontSize="inherit" />
-                  </IconButton>
-                </Tooltip>
-              )}
-            </Stack>
-          );
-        },
-      },
-    ],
-    [permissions.cancel, permissions.view],
-  );
-
-  const filteredColumns = useMemo(() => {
-    if (permissions.view || permissions.cancel) {
-      return columns;
-    }
-    // Otherwise, filter out the column where field name is 'action'.
-    else {
-      return columns.filter((column) => column.field !== "action");
-    }
-  }, [columns, permissions]);
-
-  return (
-    <Box p={3}>
-      <DataGridStyles
-        rows={rows}
-        columns={filteredColumns}
-        disableRowSelectionOnClick
-        pageSizeOptions={[5, 10, 25, 50]}
-        initialState={{
-          pagination: { paginationModel: { pageSize: 10, page: 0 } },
-          // sorting: { sortModel: [{ field: "reqDate", sort: "desc" }] },
-        }}
-        getRowId={(row) => row.id}
-        slots={{
-          noRowsOverlay: CustomNoRowsOverlay,
-        }}
-      />
-
-      {/* View Request Dialog */}
-      <ViewRequestDialog
-        open={viewOpen}
-        handleClose={() => setViewOpen(false)}
-        data={viewData}
-      />
-
-      {/* Cancel Dialog */}
-      <Dialog
-        open={confirmDialog}
-        onClose={() => {
-          setConfirmDialog(false);
-        }}
-        maxWidth="sm"
-        fullWidth
-      >
-        <DialogTitle sx={{ fontWeight: 600 }}>
-          Cancel Request ID: {requestId}
-        </DialogTitle>
-        <DialogContent>
-          <Typography sx={{ p: 1 }}>
-            Are you sure you want to cancel this request Please confirm ?
-          </Typography>
-        </DialogContent>
-        <DialogActions>
-          <Button
-            onClick={() => {
-              setConfirmDialog(false);
-            }}
-            variant="outlined"
-          >
-            Cancel
-          </Button>
-          <Button
-            onClick={handleCancelRequest}
-            color="error"
-            variant="contained"
-          >
-            Confirm
-          </Button>
-        </DialogActions>
-      </Dialog>
-    </Box>
-  );
-}
+When you click the radio buttons, open your browser console. If activeSummary prints out as an empty array [], it means your mapping in Step 1 still doesn't match the exact keys sent by your backend API.
+3. Ensure Table Keys Match in ProcessSummaryTableConfig.js
+Finally, remember that the data feeding into your DynamicSummaryTable.jsx must perfectly match the field values defined in your config.
+For example, if you click "SIBA", your data objects must contain the exact, case-sensitive keys: cgl, currency, and amount. If the backend sends { "CGL": "...", "Amount": 100 } (uppercase), the table will render blank cells because it's looking for the lowercase fields.
