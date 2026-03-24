@@ -1,4 +1,95 @@
-1. Do not catch or throw generic exceptions (e.g., Exception, Throwable)to avoid Isd issues. Use specific exception types.
-2. Always include descriptive logs for debugging. Never log PII or sensitive data.
-3. Provide clear comments when adding code to new or existing modules.
-4. Include an @author tag for all new/existing code contribution for tracking
+To eliminate generic exception handling and prevent "Internal Server Error" issues (ISD), we will refactor your core services. This ensures that the frontend receives specific error codes (like 409 Conflict or 410 Gone) instead of a generic 500.
+Below are the specific changes for each file to satisfy your first rule.
+1. File: com.fincore.JournalService.Exception.CustomExceptions
+We must add more granular exception types so the services have specific "tools" to throw.
+Add these classes inside CustomExceptions:
+// Add to existing CustomExceptions.java
+@ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
+public static class RedisOperationException extends RuntimeException {
+    public RedisOperationException(String message, Throwable cause) { super(message, cause); }
+}
+
+@ResponseStatus(HttpStatus.UNPROCESSABLE_ENTITY)
+public static class DataMappingException extends RuntimeException {
+    public DataMappingException(String message) { super(message); }
+}
+
+@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+public static class BatchProcessingException extends RuntimeException {
+    public BatchProcessingException(String message, Throwable cause) { super(message, cause); }
+}
+
+2. File: com.fincore.JournalService.Service.JournalBulkValidationService
+This file handles complex parsing where generic Exception blocks currently hide the root cause.
+| Method | Original Code (Catching Generic) | Corrected Code (Specific Exceptions) |
+|---|---|---|
+| saveStatusToRedis | catch (Exception e) | catch (org.springframework.dao.DataAccessException e) |
+| parseAmount | catch (Exception e) | catch (NumberFormatException | ArithmeticException e) |
+| processAsync | catch (Exception e) | catch (IOException | DataAccessException | CustomExceptions.CacheExpiredException e) |
+Updated processAsync Snippet:
+// Refactored logic for processAsync in JournalBulkValidationService
+try {
+    // ... existing parsing logic ...
+} catch (IOException e) {
+    log.error("File system error during parsing for ReqID: {}", requestId, e);
+    failRequest(requestId, new ArrayList<>(), "Internal File Error", 1, false);
+} catch (org.springframework.dao.DataAccessException e) {
+    log.error("Redis or Database unavailable during validation: {}", requestId, e);
+    updateState(requestId, s -> s.setStatus("ERROR").setMessage("Storage Service Unavailable"));
+} catch (CustomExceptions.CacheExpiredException e) {
+    log.warn("Cache expired during async processing: {}", requestId);
+    failRequest(requestId, new ArrayList<>(), e.getMessage(), 1, false);
+}
+
+3. File: com.fincore.JournalService.Service.JournalRequestServiceImpl
+This service manages the heavy lifting. Catching Exception here often results in "hung" batches where the status never updates to ERROR.
+Change 1: executeAsyncBatchCreation
+ * Original: catch (Exception e)
+ * Changed to: ```java
+   } catch (org.springframework.dao.DataAccessException e) {
+   log.error("Database integrity or connection error for Batch {}", batchId, e);
+   handleCreationFailure(batchId, creatorId, requestId, "Database Error: " + e.getMostSpecificCause().getMessage());
+   } catch (java.util.concurrent.CompletionException e) {
+   log.error("Parallel processing failed for Batch {}", batchId, e);
+   handleCreationFailure(batchId, creatorId, requestId, "Parallel processing failure");
+   }
+
+**Change 2: `executeAsyncBatchProcessing`**
+* **[span_9](start_span)Original:** `catch (Exception e)`[span_9](end_span)
+* **Changed to:**
+```java
+} catch (java.sql.SQLException e) {
+    log.error("Oracle PL/SQL Procedure Failed for Batch {}", batchId, e);
+    String errorMsg = "Database Procedure Error: " + e.getMessage();
+    jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", errorMsg, batchId);
+    progressService.sendProgress(batchId, executorId, 0, "FAILED", errorMsg);
+} catch (org.springframework.jdbc.CannotGetJdbcConnectionException e) {
+    log.error("Connection lost during approval of Batch {}", batchId, e);
+    // Logic to notify user the system is down
+}
+
+4. File: com.fincore.JournalService.Service.HdfsSyncService
+Generic error handling here prevents us from knowing if Hive is down or if the data format is wrong.
+ * Original: catch (Exception e)
+ * Corrected Code:
+// HdfsSyncService.java
+try {
+    // ... batchUpdate logic ...
+} catch (org.springframework.dao.DataAccessException e) {
+    log.error("HDFS SYNC FAILED: Hive/Thrift connection issue. Data may be out of sync for batch update.", e);
+    // Explicitly do NOT throw here if we want the main process to continue, 
+    // but the log must be specific for debugging.
+}
+
+5. File: com.fincore.JournalService.Service.ProgressService
+ * Original: catch (Exception e)
+ * Corrected Code:
+// ProgressService.java
+} catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+    log.error("Progress Serialization Failed for task: {}", taskId, e);
+} catch (org.springframework.data.redis.RedisConnectionFailureException e) {
+    log.warn("Progress update skipped: Redis connection down.");
+}
+
+Next Step for you:
+Would you like me to now move to Point 2: Descriptive Logging, and show you how to rewrite these log.error statements to include non-PII debugging info (like Row Numbers or Batch IDs) without logging actual financial amounts?
