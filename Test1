@@ -1,115 +1,69 @@
-I understand. Let's get very specific. To solve the "bugs from the screen" issue, we need to replace generic catch (Exception e) blocks with specific ones. This prevents the backend from swallowing critical errors or sending a generic "500 Internal Server Error" to the UI.
-Here are the exact line-by-line replacements for your service to meet Rule 1.
-📂 File: JournalBulkValidationService.java
-1. Method: saveStatusToRedis
- * Location: Around Line 364.
+We will target JournalBulkValidationService.java. This file is the "gatekeeper" for all incoming data. Following Rule 2, we will make the logs descriptive enough to find a bug in seconds, but we will strictly exclude PII (Personally Identifiable Information) like financial amounts or specific remarks.
+📂 File: com.fincore.JournalService.Service.JournalBulkValidationService
+1. Request Initiation Logs
+Location: initiateValidation method, around lines 381–382.
  * Original Code:
-   } catch (Exception e) {
-    log.error("Failed to save status to Redis for {}", reqId, e);
-}
+   log.info("Validation Initiated. ReqID: {}, File: {}, Date: {}", requestId, filename, postingDate);
 
- * Corrected Code:
-   } catch (org.springframework.data.redis.RedisSystemException | org.springframework.dao.DataAccessException e) {
-    log.error("Redis storage failure for ReqID: {}", reqId, e);
-    // Do not throw; let the process continue if possible, but log the specific DB error
-}
+ * Replaceable Code Block (Descriptive & Safe):
+   // LOG_START: Tracks the incoming file without logging its contents
+log.info("VALIDATION_INIT | ReqID: {} | FileName: {} | PostingDate: {} | Action: UPLOAD_RECEIVED", 
+         requestId, filename, postingDate);
 
-2. Method: parseAmount
- * Location: Around Line 457.
+2. Async Processing Start & Failure
+Location: processAsync method, around lines 384–385 and the catch block at 403–404.
  * Original Code:
-   } catch (Exception e) {
-    d.amount = BigDecimal.ZERO;
-}
+   log.info("Starting Async Validation. TempFile: {}", tempFilePath);
+...
+log.error("CRITICAL: Async Validation Crashed.", e);
 
- * Corrected Code:
+ * Replaceable Code Block (Debugging Focus):
+   // Log the start of the background thread with tracing ID
+log.info("ASYNC_PROCESS_START | ReqID: {} | Thread: {} | Status: PARSING_INITIATED", 
+         requestId, Thread.currentThread().getName());
+
+// In the catch block (Line 403): Log the failure reason but NEVER the raw data
+} catch (Exception e) {
+    log.error("ASYNC_PROCESS_CRASH | ReqID: {} | ErrorType: {} | Message: {} | Status: ABORTED", 
+              requestId, e.getClass().getSimpleName(), e.getMessage());
+
+3. Parsing and Amount Handling (PII Safety)
+Location: parseAmount method, around line 457. This is where amount (Sensitive Data) is processed.
+ * Original Code: (No descriptive log currently exists).
+ * Replaceable Code Block (Strict PII Protection):
    } catch (NumberFormatException | ArithmeticException e) {
-    log.warn("Invalid numeric format at row {}: {}", d.rowIndex, amountRaw);
+    // We log the ROW INDEX to help the developer, but NOT the 'amountRaw' string to protect PII
+    log.warn("DATA_FORMAT_ERROR | ReqID: {} | Row: {} | Field: AMOUNT | Reason: NON_NUMERIC_VALUE", 
+             MDC.get("requestId"), d.rowIndex);
     d.amount = BigDecimal.ZERO;
-    d.formatErrors.add("Invalid amount format: " + amountRaw);
+    d.formatErrors.add("Invalid numeric format detected");
 }
 
-3. Method: validateSystemColumns
- * Location: Around Line 477.
+4. Validation Failure Summary
+Location: failRequest method, around line 485.
  * Original Code:
-   } catch (Exception e) {
-    d.formatErrors.add("Invalid calendar date");
-}
+   log.warn("Validation Failed: {} [ReqID: {}]", msg, reqId);
 
- * Corrected Code:
-   } catch (java.time.format.DateTimeParseException e) {
-    log.warn("Date parsing failed for row {}: {}", d.rowIndex, cDate);
-    d.formatErrors.add("Date must be in ddMMyyyy format");
-}
+ * Replaceable Code Block (Operational Insights):
+   // Provide total counts of errors so the dev knows the scale of the failure
+long errorRows = rows.stream().filter(ExcelRowData::hasErrors).count();
+log.error("VALIDATION_REJECTED | ReqID: {} | Stage: {} | TotalRows: {} | ErrorRows: {} | Reason: {}", 
+          reqId, stage, rows.size(), errorRows, msg);
 
-📂 File: JournalRequestServiceImpl.java
-1. Method: executeAsyncBatchCreation
- * Location: Around Line 608.
+5. Completion Success Logs
+Location: completeRequest method, around lines 492–500.
  * Original Code:
-   } catch (Exception e) {
-    log.error("Async Create Failed for Batch {}", batchId, e);
-    // ... cleanup logic ...
-}
+   log.info("Compressed and saved {} rows to Redis in {}ms [ReqID: {}]", rows.size(), System.currentTimeMillis() - start, requestId);
 
- * Corrected Code:
-   } catch (org.springframework.dao.DataAccessException e) {
-    log.error("Database persistence failure for Batch {}: {}", batchId, e.getMostSpecificCause().getMessage());
-    handleCreationFailure(batchId, creatorId, requestId, "Database Error: " + e.getMostSpecificCause().getMessage());
-} catch (java.util.concurrent.CompletionException e) {
-    log.error("Parallel thread execution failed for Batch {}", batchId, e);
-    handleCreationFailure(batchId, creatorId, requestId, "Internal system processing error");
-}
+ * Replaceable Code Block (Performance Monitoring):
+   long duration = System.currentTimeMillis() - startTime; // assuming startTime was captured
+log.info("VALIDATION_SUCCESS | ReqID: {} | FinalStatus: SUCCESS | TotalRows: {} | ProcessingTime: {}ms | RedisStatus: SAVED", 
+         reqId, rows.size(), duration);
 
-2. Method: executeAsyncBatchProcessing
- * Location: Around Line 666.
- * Original Code:
-   } catch (Exception e) {
-    log.error("Async Process Failed for Batch {}", batchId, e);
-    // ... error update logic ...
-}
-
- * Corrected Code:
-   } catch (java.sql.SQLException e) {
-    log.error("Oracle PL/SQL execution failed for Batch {}. SQL State: {}, Error: {}", batchId, e.getSQLState(), e.getMessage());
-    String safeMsg = "Database Procedure Error: " + e.getMessage();
-    jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", safeMsg, batchId);
-    progressService.sendProgress(batchId, executorId, 0, "FAILED", safeMsg);
-} catch (org.springframework.dao.DataAccessException e) {
-    log.error("Network or Connection failure during Batch {} processing", batchId, e);
-    // Handle specifically for connection drops
-}
-
-3. Method: getCurrentPostingDate
- * Location: Around Line 710.
- * Original Code:
-   } catch (Exception e) {
-    log.error("Error fetching USERS_DATE. Using System Date.", e);
-    return LocalDate.now();
-}
-
- * Corrected Code:
-   } catch (org.springframework.dao.EmptyResultDataAccessException e) {
-    log.warn("FINCORE_DATE table is empty. Defaulting to System Date.");
-    return LocalDate.now();
-} catch (org.springframework.jdbc.CannotGetJdbcConnectionException e) {
-    log.error("Database connection unavailable while fetching posting date");
-    throw new CustomExceptions.DatabaseOperationException("Database unavailable", e);
-}
-
-📂 File: ProgressService.java
-1. Method: sendProgress
- * Location: Around Line 776.
- * Original Code:
-   } catch (Exception e) {
-    log.warn("Progress Notification Failed: {}", e.getMessage());
-}
-
- * Corrected Code:
-   } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
-    log.error("Failed to serialize progress for Task {}: {}", taskId, e.getMessage());
-} catch (org.springframework.data.redis.RedisConnectionFailureException e) {
-    log.warn("Redis connection lost. Throttling progress update for Task {}", taskId);
-}
-
-Why this fixes your stress:
-When a bug happens now, your logs won't just say java.lang.Exception. They will say exactly what happened (e.g., DateTimeParseException or EmptyResultDataAccessException). This allows you to fix the "screen errors" instantly because you'll know if the user sent a bad date or if the database is actually down.
-Would you like me to move to Point 2: Descriptive Logging and show you how to implement the "never log PII" rule for these specific blocks?
+Summary of Rules Applied to this File:
+| Item | Change Made | Why? |
+|---|---|---|
+| Tracing | Added ReqID to every log. | Allows you to filter all logs for one specific user upload. |
+| PII Safety | Removed amountRaw and tempFilePath. | Protects financial data and server security. |
+| Clarity | Added Stage and ErrorCount. | Helps the UI team understand exactly where the validation stopped. |
+Would you like me to apply these same descriptive, PII-safe logging changes to the JournalRequestServiceImpl.java file next?
