@@ -45,15 +45,14 @@ import java.util.zip.GZIPOutputStream;
 
 /**
  * PRODUCTION READY: Journal Bulk Validation Service
- * Handles high-performance validation for 600k+ rows using streaming and parallel processing.
- * Implementation adheres to specific exception handling and secure logging standards.
+ * Handles 600k+ rows with streaming parsing and multi-stage validation.
+ * Features: GZIP compression, SXSSF for low-memory Excel, and specific error tracking.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class JournalBulkValidationService {
 
-    // --- REGEX PATTERNS (Compiled once for performance) ---
     private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
     private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
     private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
@@ -70,18 +69,16 @@ public class JournalBulkValidationService {
     @Lazy
     private JournalBulkValidationService self;
 
-    // ==================================================================================
-    // 1. REDIS STATE MANAGEMENT (Production Specific Exception Handling)
-    // ==================================================================================
+    // --- REDIS STATE MANAGEMENT ---
 
     private void saveStatusToRedis(String reqId, BulkUploadStateDto state) {
         try {
             byte[] json = objectMapper.writeValueAsBytes(state);
             redisTemplate.opsForValue().set("BULK_STATUS_" + reqId, json, 2, TimeUnit.HOURS);
         } catch (JsonProcessingException e) {
-            log.error("SERIALIZATION_ERROR | ReqID: {} | Component: BULK_STATUS | Reason: Failed to serialize state DTO", reqId);
+            log.error("SERIALIZATION_ERROR | ReqID: {} | Component: BULK_STATUS | Reason: JSON conversion failed", reqId);
         } catch (RedisSystemException | DataAccessException e) {
-            log.error("REDIS_STORAGE_FAILURE | ReqID: {} | Component: BULK_STATUS | Status: CRITICAL", reqId);
+            log.error("REDIS_STORAGE_FAILURE | ReqID: {} | Component: BULK_STATUS | Status: CONNECTION_ERROR", reqId);
         }
     }
 
@@ -91,10 +88,10 @@ public class JournalBulkValidationService {
             if (json == null) return null;
             return objectMapper.readValue(json, BulkUploadStateDto.class);
         } catch (IOException e) {
-            log.error("DESERIALIZATION_ERROR | ReqID: {} | Reason: Corrupted state data in Redis", reqId);
+            log.error("DESERIALIZATION_ERROR | ReqID: {} | Status: DATA_CORRUPTION_DETECTED", reqId);
             return null;
         } catch (DataAccessException e) {
-            log.error("REDIS_READ_FAILURE | ReqID: {} | Status: UNAVAILABLE", reqId);
+            log.error("REDIS_READ_FAILURE | ReqID: {} | Status: TIMEOUT_OR_DISCONNECT", reqId);
             return null;
         }
     }
@@ -107,7 +104,7 @@ public class JournalBulkValidationService {
         try {
             return redisTemplate.opsForValue().get("FILE_" + reqId + "_" + type);
         } catch (DataAccessException e) {
-            log.error("REDIS_FILE_FETCH_ERROR | ReqID: {} | Type: {} | Reason: {}", reqId, type, e.getMessage());
+            log.error("FILE_FETCH_ERROR | ReqID: {} | Type: {} | Reason: Redis unreachable", reqId, type);
             return null;
         }
     }
@@ -118,8 +115,7 @@ public class JournalBulkValidationService {
         try {
             compressed = redisTemplate.opsForValue().get("DATA_" + requestId);
         } catch (DataAccessException e) {
-            log.error("REDIS_DATA_FETCH_ERROR | ReqID: {} | Status: FAILED", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Failed to reach Redis cache", e);
+            throw new CustomExceptions.DatabaseOperationException("Redis cache connection failed during retrieval", e);
         }
 
         if (compressed == null) {
@@ -132,14 +128,12 @@ public class JournalBulkValidationService {
                     requestId, rows.size(), (System.currentTimeMillis() - start));
             return rows;
         } catch (IOException e) {
-            log.error("DECOMPRESSION_FAILURE | ReqID: {} | Status: DATA_CORRUPT", requestId);
+            log.error("DECOMPRESSION_FAILURE | ReqID: {} | Reason: GZIP stream error", requestId);
             throw new CustomExceptions.FileProcessingException("Failed to decompress cached data", e);
         }
     }
 
-    // ==================================================================================
-    // 2. STREAMING & ASYNC INITIALIZATION
-    // ==================================================================================
+    // --- STREAMING INIT ---
 
     public String initiateValidation(InputStream fileStream, String filename, LocalDate postingDate) throws IOException {
         String requestId = UUID.randomUUID().toString();
@@ -148,7 +142,7 @@ public class JournalBulkValidationService {
         try {
             Files.copy(fileStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
-            log.error("FILE_COPY_FAILURE | ReqID: {} | Exception: {}", requestId, e.getMessage());
+            log.error("DISK_WRITE_FAILURE | ReqID: {} | File: {}", requestId, filename);
             throw new CustomExceptions.FileProcessingException("Failed to save uploaded file to temporary storage", e);
         }
 
@@ -160,7 +154,7 @@ public class JournalBulkValidationService {
         state.setTotalRows(0);
         saveStatusToRedis(requestId, state);
 
-        log.info("VALIDATION_INITIATED | ReqID: {} | PostingDate: {}", requestId, postingDate);
+        log.info("VALIDATION_INITIATED | ReqID: {} | File: {} | PostingDate: {}", requestId, filename, postingDate);
         self.processAsync(requestId, tempFile.toString(), filename, postingDate);
         return requestId;
     }
@@ -177,13 +171,10 @@ public class JournalBulkValidationService {
             ParsingResult parsingResult;
             boolean isCsv = filename != null && (filename.toLowerCase().endsWith(".csv") || filename.toLowerCase().endsWith(".txt"));
 
-            long parseStart = System.currentTimeMillis();
             try (InputStream is = new FileInputStream(tempFile)) {
                 if (isCsv) parsingResult = parseCsvStream(is, postingDate);
                 else parsingResult = parseExcelStream(is, postingDate);
             }
-            log.info("PARSING_COMPLETE | ReqID: {} | Duration: {}ms | TotalRows: {}", 
-                    requestId, (System.currentTimeMillis() - parseStart), parsingResult.rows.size());
 
             List<ExcelRowData> parsedRows = parsingResult.rows;
             updateState(requestId, s -> {
@@ -192,10 +183,8 @@ public class JournalBulkValidationService {
             });
 
             // STAGE 1: FORMAT CHECK
-            long s1Start = System.currentTimeMillis();
             runFormatCheck(parsedRows);
             if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
-                log.warn("STAGE_1_FAIL | ReqID: {} | Duration: {}ms", requestId, (System.currentTimeMillis() - s1Start));
                 failRequest(requestId, parsedRows, "Format Validation Failed", 1, parsingResult.hasProductColumn);
                 return;
             }
@@ -205,10 +194,8 @@ public class JournalBulkValidationService {
                 s.setCurrentStage(2);
                 s.setMessage("Checking Database...");
             });
-            long s2Start = System.currentTimeMillis();
             runDbCheck(parsedRows);
             if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
-                log.warn("STAGE_2_FAIL | ReqID: {} | Duration: {}ms", requestId, (System.currentTimeMillis() - s2Start));
                 failRequest(requestId, parsedRows, "Database Validation Failed", 2, parsingResult.hasProductColumn);
                 return;
             }
@@ -218,26 +205,24 @@ public class JournalBulkValidationService {
                 s.setCurrentStage(3);
                 s.setMessage("Checking Balances...");
             });
-            long s3Start = System.currentTimeMillis();
             runBalanceCheck(parsedRows);
             if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
-                log.warn("STAGE_3_FAIL | ReqID: {} | Duration: {}ms", requestId, (System.currentTimeMillis() - s3Start));
                 failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3, parsingResult.hasProductColumn);
                 return;
             }
 
-            log.info("VALIDATION_SUCCESS | ReqID: {} | Total Duration: {}ms", requestId, (System.currentTimeMillis() - startTime));
+            log.info("VALIDATION_COMPLETE | ReqID: {} | Success Rows: {} | Time: {}ms", requestId, parsedRows.size(), (System.currentTimeMillis() - startTime));
             completeRequest(requestId, parsedRows, postingDate, isCsv);
 
         } catch (FileNotFoundException e) {
-            log.error("CRITICAL_FILE_ERROR | ReqID: {} | File lost during async transition", requestId);
-            handleAsyncFailure(requestId, "Temporary file not found.");
+            log.error("CRITICAL_IO_ERROR | ReqID: {} | Temp file missing: {}", requestId, tempFilePath);
+            handleSystemError(requestId, "System Error: File lost during processing.");
         } catch (IOException e) {
-            log.error("IO_PROCESSING_ERROR | ReqID: {} | Error: {}", requestId, e.getMessage());
-            handleAsyncFailure(requestId, "Failed to read file data.");
+            log.error("PARSING_IO_ERROR | ReqID: {} | Error reading file content", requestId);
+            handleSystemError(requestId, "System Error: Failed to parse file content.");
         } catch (RuntimeException e) {
-            log.error("UNEXPECTED_SYSTEM_FAILURE | ReqID: {} | Message: {}", requestId, e.getMessage());
-            handleAsyncFailure(requestId, "System Error: " + e.getMessage());
+            log.error("UNEXPECTED_VALIDATION_CRASH | ReqID: {} | Error: {}", requestId, e.getMessage());
+            handleSystemError(requestId, "Unexpected internal system error.");
         } finally {
             if (tempFile.exists() && !tempFile.delete()) {
                 log.warn("CLEANUP_FAILED | ReqID: {} | Path: {}", requestId, tempFilePath);
@@ -246,17 +231,14 @@ public class JournalBulkValidationService {
         }
     }
 
-    private void handleAsyncFailure(String requestId, String message) {
+    private void handleSystemError(String requestId, String message) {
         updateState(requestId, s -> {
             s.setStatus("ERROR");
             s.setMessage(message);
-            s.setHasErrorFile(false);
         });
     }
 
-    // ==================================================================================
-    // 3. PARSING UTILS (CSV & Excel)
-    // ==================================================================================
+    // --- PARSING UTILS ---
 
     private ParsingResult parseCsvStream(InputStream is, LocalDate postingDate) throws IOException {
         List<ExcelRowData> list = new ArrayList<>();
@@ -290,9 +272,7 @@ public class JournalBulkValidationService {
                     if (c.length > 4) d.branch = c[4].trim();
                     if (c.length > 5) d.currency = c[5].trim().toUpperCase();
                     if (c.length > 6) d.cgl = c[6].trim();
-                    String amtRaw = (c.length > 7) ? c[7].trim() : "";
-                    String txnRaw = (c.length > 8) ? c[8].trim() : "";
-                    parseAmount(d, amtRaw, txnRaw);
+                    parseAmount(d, (c.length > 7) ? c[7].trim() : "", (c.length > 8) ? c[8].trim() : "");
                     if (c.length > 9) d.remarks = c[9].trim();
 
                     if (c.length > 10) {
@@ -300,7 +280,7 @@ public class JournalBulkValidationService {
                         hasProductCol = true;
                     } else { d.productCode = "A"; }
 
-                    if (c.length != 14) d.formatErrors.add("Invalid Format: Row has " + c.length + " columns. Expected 14.");
+                    if (c.length != 14) d.formatErrors.add("Invalid CSV Format: Expected 14 columns, found " + c.length);
                     else validateSystemColumns(d, d.sysSite, d.sysDate, d.sysYear, d.sysPeriod, c[11].trim(), c[12].trim(), c[13].trim(), postingDate);
                 } else {
                     if (c.length > 0) d.branch = c[0].trim();
@@ -331,7 +311,6 @@ public class JournalBulkValidationService {
 
         for (Row r : sheet) {
             if (isRowEmpty(r)) continue;
-
             if (r.getRowNum() == 0) {
                 String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
                 if ((h.contains("branch") || h.contains("batch")) && !h.equals("01")) continue;
@@ -354,8 +333,7 @@ public class JournalBulkValidationService {
 
                 Cell prodCell = r.getCell(10);
                 if (prodCell != null || r.getLastCellNum() > 10) {
-                    d.productCode = parseCode(prodCell, fmt);
-                    hasProductCol = true;
+                    d.productCode = parseCode(prodCell, fmt); hasProductCol = true;
                 }
                 validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod, 
                     parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
@@ -365,11 +343,9 @@ public class JournalBulkValidationService {
                 d.cgl = parseCode(r.getCell(2), fmt);
                 parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
                 d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
-
                 Cell prodCell = r.getCell(6);
                 if (prodCell != null || r.getLastCellNum() > 6) {
-                    d.productCode = parseCode(prodCell, fmt);
-                    hasProductCol = true;
+                    d.productCode = parseCode(prodCell, fmt); hasProductCol = true;
                 }
             }
             if (d.productCode == null || d.productCode.isEmpty()) d.productCode = "A";
@@ -393,15 +369,13 @@ public class JournalBulkValidationService {
             boolean isCredit = typeRaw != null && (typeRaw.toUpperCase().contains("C") || typeRaw.toUpperCase().contains("CR"));
             d.txnType = isCredit ? "Credit" : "Debit";
             d.amount = v;
-        } catch (NumberFormatException e) {
+        } catch (NumberFormatException | ArithmeticException e) {
             d.amount = BigDecimal.ZERO;
-            d.formatErrors.add("Invalid numeric format detected in amount");
+            d.formatErrors.add("Invalid numeric format in amount column");
         }
     }
 
-    // ==================================================================================
-    // 4. VALIDATION STAGES (Format, DB, Balance)
-    // ==================================================================================
+    // --- VALIDATION STAGES ---
 
     private void runFormatCheck(List<ExcelRowData> rows) {
         rows.parallelStream().forEach(d -> {
@@ -409,17 +383,14 @@ public class JournalBulkValidationService {
                 d.formatErrors.add("Amount cannot be Zero or Null");
             else {
                 if (d.amount.signum() < 0) d.formatErrors.add("Amount cannot be negative");
-                if (d.amount.precision() > 20 || d.amount.scale() > 4)
-                    d.formatErrors.add("Amount exceeds format (Max 16.4)");
-                if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2)
-                    d.formatErrors.add("INR Amount > 2 decimal places");
+                if (d.amount.precision() > 20 || d.amount.scale() > 4) d.formatErrors.add("Amount exceeds format (Max 16.4)");
+                if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) d.formatErrors.add("INR Amount > 2 decimal places");
             }
             if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches())
                 d.formatErrors.add("Product Code must be 8 digits or Blank");
             if (d.remarks == null || d.remarks.trim().isEmpty()) d.formatErrors.add("Remarks is Mandatory");
             else if (d.remarks.length() > 30) d.formatErrors.add("Remarks length must be <= 30 chars");
-            if (d.currency == null || d.currency.length() != 3)
-                d.formatErrors.add("Currency must be exactly 3 characters");
+            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency must be exactly 3 characters");
             if (d.cgl == null || d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
             else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("CGL must be exactly 10 digits");
             if (d.branch == null || d.branch.trim().isEmpty()) d.formatErrors.add("Branch is Mandatory");
@@ -432,12 +403,9 @@ public class JournalBulkValidationService {
         Set<String> validCgls = validationMasterService.getAllActiveCgls();
 
         rows.parallelStream().forEach(d -> {
-            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
-                d.dbErrors.add("Branch Not Found/Inactive: " + d.branch);
-            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
-                d.dbErrors.add("Currency Not Found/Inactive: " + d.currency);
-            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
-                d.dbErrors.add("CGL Not Found/Inactive: " + d.cgl);
+            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found/Inactive: " + d.branch);
+            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found/Inactive: " + d.currency);
+            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found/Inactive: " + d.cgl);
         });
     }
 
@@ -459,8 +427,7 @@ public class JournalBulkValidationService {
             if (adder != null && adder.sum() != 0) {
                 BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"), 4, RoundingMode.HALF_UP);
                 synchronized (d.balErrors) {
-                    if (d.balErrors.isEmpty())
-                        d.balErrors.add(type + " Balance Mismatch: Total " + diff.toPlainString());
+                    if (d.balErrors.isEmpty()) d.balErrors.add(type + " Balance Mismatch: Total " + diff.toPlainString());
                 }
             }
         });
@@ -481,7 +448,7 @@ public class JournalBulkValidationService {
                 if (cMonth == null || !cMonth.trim().equals(expectedMonth)) d.formatErrors.add("Invalid Fin Month. Expected: " + expectedMonth);
             }
         } catch (DateTimeParseException e) {
-            d.formatErrors.add("Invalid Calendar Date (ddMMyyyy)");
+            d.formatErrors.add("Invalid Calendar Date format");
         }
         
         if (c11 == null || !"B".equalsIgnoreCase(c11.trim())) d.formatErrors.add("Col 12 must be 'B'");
@@ -489,12 +456,10 @@ public class JournalBulkValidationService {
         if (c13 == null || !"D".equalsIgnoreCase(c13.trim())) d.formatErrors.add("Col 14 must be 'D'");
     }
 
-    // ==================================================================================
-    // 5. UTILS, STORAGE & GENERATION
-    // ==================================================================================
+    // --- REPO & STORAGE ---
 
     private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage, boolean hasProductColumn) throws IOException {
-        log.warn("VALIDATION_FAIL | ReqID: {} | Stage: {} | Reason: {}", reqId, stage, msg);
+        log.warn("VALIDATION_FAILED | ReqID: {} | Reason: {}", reqId, msg);
         byte[] excel = generateErrorExcelFast(rows, hasProductColumn);
         redisTemplate.opsForValue().set("FILE_" + reqId + "_ERROR", excel, 30, TimeUnit.MINUTES);
         updateState(reqId, s -> {
@@ -518,11 +483,7 @@ public class JournalBulkValidationService {
             s.setStatus("SUCCESS");
             s.setMessage("Validation Successful");
             s.setHasSuccessFile(!isCsv);
-            try {
-                s.setPreviewDataJson(objectMapper.writeValueAsString(preview));
-            } catch (JsonProcessingException e) {
-                log.error("PREVIEW_JSON_ERROR | ReqID: {} | Message: Preview generation failed", reqId);
-            }
+            try { s.setPreviewDataJson(objectMapper.writeValueAsString(preview)); } catch (JsonProcessingException e) { log.error("PREVIEW_ERR | ReqID: {}", reqId); }
         });
     }
 
@@ -539,9 +500,9 @@ public class JournalBulkValidationService {
             objectMapper.writeValue(gos, rows);
             gos.finish();
             redisTemplate.opsForValue().set("DATA_" + requestId, baos.toByteArray(), 1, TimeUnit.HOURS);
-            log.info("CACHE_STORAGE_SUCCESS | ReqID: {} | Compressed Rows: {}", requestId, rows.size());
+            log.info("COMPRESSED_DATA_SAVED | ReqID: {} | Rows: {}", requestId, rows.size());
         } catch (IOException e) {
-            log.error("CACHE_STORAGE_FAILURE | ReqID: {} | Reason: {}", requestId, e.getMessage());
+            log.error("CACHE_SAVE_FAILURE | ReqID: {} | Error: {}", requestId, e.getMessage());
         }
     }
 
@@ -616,9 +577,7 @@ public class JournalBulkValidationService {
 
     private String sanitizeForCsvInjection(String value) {
         if (value == null) return "";
-        if (value.startsWith("=") || value.startsWith("+") || value.startsWith("-") || value.startsWith("@")) {
-            return "'" + value;
-        }
+        if (value.startsWith("=") || value.startsWith("+") || value.startsWith("-") || value.startsWith("@")) return "'" + value;
         return value;
     }
 
@@ -638,43 +597,28 @@ public class JournalBulkValidationService {
 
     private String parseCode(Cell c, DataFormatter f) {
         if (c == null) return "";
-        if (c.getCellType() == CellType.NUMERIC)
-            return BigDecimal.valueOf(c.getNumericCellValue()).toPlainString().split("\\.")[0];
+        if (c.getCellType() == CellType.NUMERIC) return BigDecimal.valueOf(c.getNumericCellValue()).toPlainString().split("\\.")[0];
         return f.formatCellValue(c).trim();
     }
 
     private boolean isRowEmpty(Row r) {
         if (r == null) return true;
         for (int c = r.getFirstCellNum(); c < r.getLastCellNum(); c++)
-            if (r.getCell(c) != null && r.getCell(c).getCellType() != CellType.BLANK && !r.getCell(c).toString().trim().isEmpty())
-                return false;
+            if (r.getCell(c) != null && r.getCell(c).getCellType() != CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false;
         return true;
     }
 
     private Map<String, Object> mapToPreview(ExcelRowData r) {
         Map<String, Object> m = new HashMap<>();
-        m.put("id", r.rowIndex);
-        m.put("branch", r.branch);
-        m.put("currency", r.currency);
-        m.put("cgl", r.cgl);
-        m.put("amount", r.amount != null ? r.amount.toString() : "");
-        m.put("txnType", r.txnType);
-        m.put("remarks", r.remarks);
-        m.put("productCode", r.productCode);
+        m.put("id", r.rowIndex); m.put("branch", r.branch); m.put("currency", r.currency);
+        m.put("cgl", r.cgl); m.put("amount", r.amount != null ? r.amount.toString() : "");
+        m.put("txnType", r.txnType); m.put("remarks", r.remarks); m.put("productCode", r.productCode);
         return m;
     }
 
-    // ==================================================================================
-    // 6. INNER CLASSES (Parsing Result & Data Model)
-    // ==================================================================================
-
     private static class ParsingResult {
-        List<ExcelRowData> rows;
-        boolean hasProductColumn;
-        public ParsingResult(List<ExcelRowData> rows, boolean hasProductColumn) {
-            this.rows = rows;
-            this.hasProductColumn = hasProductColumn;
-        }
+        List<ExcelRowData> rows; boolean hasProductColumn;
+        public ParsingResult(List<ExcelRowData> rows, boolean hasProductColumn) { this.rows = rows; this.hasProductColumn = hasProductColumn; }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -689,16 +633,10 @@ public class JournalBulkValidationService {
         public final List<String> formatErrors = Collections.synchronizedList(new ArrayList<>());
         public final List<String> dbErrors = Collections.synchronizedList(new ArrayList<>());
         public final List<String> balErrors = Collections.synchronizedList(new ArrayList<>());
-
-        public boolean hasErrors() {
-            return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty();
-        }
-
+        public boolean hasErrors() { return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty(); }
         @JsonIgnore
         public String getAllErrors() {
-            List<String> all = new ArrayList<>(formatErrors);
-            all.addAll(dbErrors);
-            all.addAll(balErrors);
+            List<String> all = new ArrayList<>(formatErrors); all.addAll(dbErrors); all.addAll(balErrors);
             return String.join("; ", all);
         }
     }
