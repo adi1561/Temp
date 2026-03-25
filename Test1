@@ -1,95 +1,102 @@
-The third file identified for production-readiness refactoring is ProgressService.java. This service is responsible for sending real-time task updates to the frontend via Redis Pub/Sub. Currently, the sendProgress method uses a generic Exception catch block that could mask serialization issues or Redis connectivity problems.
+The final file identified for production-readiness refactoring is AsyncConfig.java. This configuration manages the thread pool for all bulk operations and handles any exceptions thrown by @Async methods that return void.
+The existing logic for core pool sizes, burst capabilities, and queue limits remains exactly as you defined it [cite: 5-7] to ensure your performance tuning is preserved.
 1. Original Method Reference
-[cite_start]Original sendProgress catch block: [cite: 769-777]
+[cite_start]Original getAsyncUncaughtExceptionHandler block: [cite: 8-10]
 // 
-} catch (Exception e) {
-    log.warn("Progress Notification Failed: {}", e.getMessage());
+@Override
+public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+    return (Throwable ex, Method method, Object... params) -> {
+        log.error("CRITICAL ASYNC FAILURE in method: {}", method.getName(), ex);
+        // Ideally, you would update the Batch Status to 'ERROR' in the DB here
+        // so the user knows it failed.
+    };
 }
 
 2. Refactored Code (Production Ready)
-package com.fincore.JournalService.Service;
+package com.fincore.JournalService.config;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Dto.TaskProgressDto;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
+import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.AsyncConfigurer;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.lang.reflect.Method;
+import java.util.concurrent.Executor;
 
 /**
- * Service to manage and publish real-time task progress updates.
- * Uses Redis Pub/Sub to push updates to the frontend with built-in throttling 
- * to prevent overwhelming the network during high-volume batch operations.
+ * PRODUCTION READY: Asynchronous Configuration
+ * Configures the dedicated 'bulkExecutor' thread pool for 600k+ row processing.
+ * Implements global error handling for fire-and-forget async tasks.
  */
-@Service
-@RequiredArgsConstructor
+@Configuration
+@EnableAsync
 @Slf4j
-public class ProgressService {
-
-    private final StringRedisTemplate stringRedisTemplate;
-    private final ObjectMapper objectMapper;
-
-    @Value("${notification.progress.topic:notifications:progress}")
-    private String progressTopic;
-
-    // Local cache to track the last update time per task for throttling logic
-    private final ConcurrentHashMap<String, AtomicLong> throttleMap = new ConcurrentHashMap<>();
+public class AsyncConfig implements AsyncConfigurer {
 
     /**
-     * Publishes task progress asynchronously. 
-     * Applies a 500ms throttle for intermediate updates (0 < % < 100).
-     * Final states (100% or FAILED) are always published immediately.
+     * Dedicated executor for high-volume journal operations.
+     * Logic for pool sizing and queue capacity is preserved exactly as established.
      */
-    @Async("bulkExecutor")
-    public void sendProgress(String taskId, String userId, int percent, String status, String message) {
-        try {
-            // 1. Throttling: Skip intermediate updates if sent within the last 500ms
-            if (percent > 0 && percent < 100 && !"FAILED".equals(status)) {
-                AtomicLong lastTime = throttleMap.computeIfAbsent(taskId, k -> new AtomicLong(0));
-                long now = System.currentTimeMillis();
-                if (now - lastTime.get() < 500) {
-                    return; 
-                }
-                lastTime.set(now);
+    @Bean(name = "bulkExecutor")
+    public Executor bulkExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        
+        [cite_start]// Steady state: Maintains 5 threads for continuous processing[span_0](end_span)
+        executor.setCorePoolSize(5);   
+        
+        [span_1](start_span)// Burst capability: Scales up to 20 threads during peak load[span_1](end_span)
+        executor.setMaxPoolSize(20);
+        
+        [span_2](start_span)// Queueing: Holds up to 500 batches in memory if the database is under pressure[span_2](end_span)
+        executor.setQueueCapacity(500);
+        
+        executor.setThreadNamePrefix("JournalAsync-");
+        
+        // Ensures proper shutdown behavior and resource cleanup
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Global handler for uncaught exceptions in @Async methods that return void.
+     * Replaces generic catching with structured, descriptive logging.
+     */
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (Throwable ex, Method method, Object... params) -> {
+            
+            // Log only the method name and the exception type/message (Excludes params to prevent PII logging)
+            log.error("ASYNC_RUNTIME_CRASH | Method: {} | ExceptionType: {} | Message: {}", 
+                      method.getName(), 
+                      ex.getClass().getSimpleName(), 
+                      ex.getMessage());
+
+            // Specific handling logic for known production issues
+            if (ex instanceof org.springframework.dao.DataAccessException) {
+                log.error("ASYNC_DATABASE_FAILURE | Critical persistence error in background thread pool");
+            } else if (ex instanceof java.io.IOException) {
+                log.error("ASYNC_IO_FAILURE | File system or network stream failed in background");
+            } else {
+                log.error("ASYNC_UNEXPECTED_FAILURE | An unhandled exception escaped the async worker thread", ex);
             }
-
-            // 2. Build Progress DTO
-            TaskProgressDto dto = TaskProgressDto.builder()
-                    .taskId(taskId)
-                    .userId(userId)
-                    .percentage(percent)
-                    .status(status)
-                    .message(message)
-                    .build();
-
-            // 3. Serialize and Publish to Redis
-            String jsonPayload = objectMapper.writeValueAsString(dto);
-            stringRedisTemplate.convertAndSend(progressTopic, jsonPayload);
-
-            // 4. Cleanup throttle cache on task completion or failure
-            if (percent == 100 || "FAILED".equals(status)) {
-                throttleMap.remove(taskId);
-            }
-
-        } catch (JsonProcessingException e) {
-            // Specific exception for Jackson serialization failures
-            log.error("PROGRESS_SERIALIZATION_FAIL | Task: {} | Reason: Failed to convert DTO to JSON", taskId);
-        } catch (DataAccessException e) {
-            // Specific exception for Redis connectivity or command failures
-            log.error("PROGRESS_REDIS_PUBLISH_FAIL | Task: {} | Reason: Redis service unavailable", taskId);
-        }
+            
+            // Technical Note: For production reliability, ensure the specific Service 
+            // (e.g., JournalRequestServiceImpl) has its own try-catch to update 
+            // the Batch Status in the database before the thread terminates here.
+        };
     }
 }
 
 Changes Summary:
- * [cite_start]Replaced Generic Catch: The Exception block is replaced with JsonProcessingException to handle serialization errors and DataAccessException to handle Redis pub/sub failures [cite: 776-777].
- * Descriptive Logging: Added unique log tags (PROGRESS_SERIALIZATION_FAIL, PROGRESS_REDIS_PUBLISH_FAIL) to improve production traceability without logging user data.
- * [cite_start]Enhanced Documentation: Added Javadoc and comments clarifying the throttling logic (500ms window) and the Pub/Sub mechanism [cite: 769-772].
-Reply "next" when you are ready for the final file (AsyncConfig.java).
+ * Preserved Existing Logic: The pool sizes (5/20) and queue capacity (500) remain identical to your original settings [cite: 5-7].
+ * [cite_start]Resolved Redundant Imports: Removed the static joni logger import that conflicted with Lombok's @Slf4j.
+ * Structured Async Handling: Refactored the AsyncUncaughtExceptionHandler to log specific exception categories (DB, IO, or Unexpected) rather than a single generic trace.
+ * Secure Logging: Ensured that the method parameters (params) are not logged by default to prevent leaking PII (Personal Identifiable Information) such as user names or remarks.
+ * Shutdown Safety: Added setWaitForTasksToCompleteOnShutdown to ensure the service doesn't kill half-processed 600k row batches during a server restart.
+With these changes, all files in the Journal Service are now fully refactored to meet your production-ready requirements. Is there any other specific module or edge case you would like me to review?
