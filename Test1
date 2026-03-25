@@ -1,145 +1,92 @@
-Based on the rules we have established for production readiness (Specific Exceptions, Secure Logging, and Clear Documentation), here is the list of files that still require alterations from your original source code.
-Files Requiring Changes
- * HdfsRecoveryService.java: Currently catches generic Exception in the scheduled retry loop and uses vague logs.
- * HdfsSyncService.java: Currently catches generic Exception during the background Hive/Thrift update.
- * ProgressService.java: Currently catches generic Exception during Redis pub/sub operations.
- * AsyncConfig.java: The AsyncUncaughtExceptionHandler needs more descriptive logic for handling specific error types.
-First File for Change: HdfsRecoveryService.java
-This file is critical because it handles "self-healing" for the Data Lake. Catching generic exceptions here is dangerous because it could hide a systemic database failure.
+The next file identified for production-readiness refactoring is HdfsSyncService.java. This service handles the asynchronous batch updates to the Hive Data Lake. Currently, its main execution block uses a generic Exception catch, which can obscure specific database connectivity issues or SQL syntax errors.
 1. Original Method Reference
-Original retryFailedHdfsSyncs catch block:
+Original syncToDataLake catch block:
 // 
 } catch (Exception e) {
-    log.error("HDFS RECOVERY: Failed to recover batch {}", batchId, e);
-    // Increment retry count
-    oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
+    log.error("HDFS SYNC FAILED: Data might be out of sync. See trace:", e);
 }
 
 2. Refactored Code (Production Ready)
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Dto.HdfsSyncDto;
-import com.fincore.JournalService.Exception.CustomExceptions;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.util.List;
 
 /**
- * Service to handle automatic retry of failed HDFS data synchronizations.
- * It ensures consistency between Oracle (System of Record) and Hive (Data Lake).
+ * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
+ * Updates are performed asynchronously using the high-performance 'bulkExecutor' pool.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class HdfsRecoveryService {
-
-    private final HdfsSyncService hdfsSyncService;
+public class HdfsSyncService {
 
     @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate oracleJdbcTemplate;
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hiveJdbcTemplate;
 
     /**
-     * Scheduled task to retry PENDING syncs from the retry queue.
-     * Runs every 5 minutes with fixed delay to prevent overlapping executions.
+     * Executes a batch update to HDFS. This is a fire-and-forget background task.
+     * Failed syncs should be handled by the HdfsRecoveryService heartbeat.
+     * * @param data List of balance updates to be persisted.
      */
-    @Scheduled(fixedDelay = 300000)
-    public void retryFailedHdfsSyncs() {
-        // Fetch batches that haven't reached the max retry limit (5)
-        String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
-        
-        List<String> failedBatches;
-        try {
-            failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
-        } catch (DataAccessException e) {
-            log.error("HDFS_RECOVERY_QUERY_FAIL | Error fetching pending retries from Oracle: {}", e.getMessage());
+    @Async("bulkExecutor")
+    public void syncToDataLake(List<HdfsSyncDto> data) {
+        if (data == null || data.isEmpty()) {
             return;
         }
 
-        if (failedBatches.isEmpty()) {
-            return;
-        }
+        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
+        long startTime = System.currentTimeMillis();
 
-        log.info("HDFS_RECOVERY_START | Processing {} failed batches for self-healing", failedBatches.size());
-
-        for (String batchId : failedBatches) {
-            try {
-                processRetry(batchId);
-            } catch (DataAccessException e) {
-                // Catch specific Spring DAO exceptions for DB issues
-                log.error("HDFS_RECOVERY_DB_ERROR | Batch: {} | Persistence error: {}", batchId, e.getMessage());
-                incrementRetryCount(batchId);
-            } catch (CustomExceptions.DatabaseOperationException e) {
-                // Catch internal service-wrapped exceptions
-                log.error("HDFS_RECOVERY_LOGIC_ERROR | Batch: {} | Logic failure: {}", batchId, e.getMessage());
-                incrementRetryCount(batchId);
-            }
-        }
-    }
-
-    /**
-     * Performs a fresh join between Journal Requests and GL Balances to push 
-     * the most current data to HDFS, resolving possible race conditions.
-     */
-    private void processRetry(String batchId) {
-        String freshDataSql = """
-            SELECT 
-                j.REQ_BRANCH_CODE AS BRANCH, 
-                j.REQ_CURRENCY AS CURRENCY, 
-                j.REQ_CGL AS CGL, 
-                j.REQ_CSV_DATE AS BAL_DATE,
-                g.BALANCE AS NEW_BALANCE,
-                g.INR_BALANCE AS NEW_INR_BALANCE
-            FROM (
-                SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
-                FROM JOURNAL_REQUEST 
-                WHERE BATCH_ID = ?
-            ) j
-            JOIN GL_BALANCE g ON 
-                g.BRANCH_CODE = j.REQ_BRANCH_CODE AND 
-                g.CURRENCY = j.REQ_CURRENCY AND 
-                g.CGL = j.REQ_CGL AND 
-                g.BALANCE_DATE = j.REQ_CSV_DATE
-        """;
-
-        List<HdfsSyncDto> freshSyncData = oracleJdbcTemplate.query(freshDataSql,
-                (rs, rowNum) -> new HdfsSyncDto(
-                        rs.getString("BRANCH"),
-                        rs.getString("CURRENCY"),
-                        rs.getString("CGL"),
-                        rs.getDate("BAL_DATE").toLocalDate(),
-                        rs.getBigDecimal("NEW_BALANCE"),
-                        rs.getBigDecimal("NEW_INR_BALANCE")
-                ), batchId);
-
-        if (!freshSyncData.isEmpty()) {
-            // Push the current source-of-truth balance to HDFS
-            hdfsSyncService.syncToDataLake(freshSyncData);
-            log.info("HDFS_RECOVERY_SUCCESS | Batch: {} | Real-time sync consistent", batchId);
-        }
-
-        // Mark the record as COMPLETED to stop future retries
-        oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET STATUS = 'COMPLETED' WHERE BATCH_ID = ?", batchId);
-    }
-
-    private void incrementRetryCount(String batchId) {
         try {
-            oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
+            String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
+                         "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
+
+            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(PreparedStatement ps, int i) throws SQLException {
+                    HdfsSyncDto dto = data.get(i);
+                    ps.setBigDecimal(1, dto.getNewBalance());
+                    ps.setBigDecimal(2, dto.getNewInrBalance());
+                    ps.setString(3, dto.getBranch());
+                    ps.setString(4, dto.getCurrency());
+                    ps.setString(5, dto.getCgl());
+                    ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate()));
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return data.size();
+                }
+            });
+
+            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}", 
+                     (System.currentTimeMillis() - startTime), data.size());
+
         } catch (DataAccessException e) {
-            log.error("HDFS_RECOVERY_META_UPDATE_FAIL | Batch: {} | Failed to increment retry count", batchId);
+            // Specifically catching Spring's database abstraction errors (Hive/Thrift connectivity)
+            log.error("HDFS_SYNC_DB_FAIL | Connectivity or Syntax error during Hive batch update: {}", e.getMessage());
+            // No re-throw here because @Async methods cannot bubble exceptions to the caller; 
+            // the HdfsRecoveryService will detect the missing sync via the retry queue.
         }
     }
 }
 
 Changes Summary:
- * Removed catch (Exception e): Now catches DataAccessException and DatabaseOperationException specifically.
- * Added Secure Logging: Used specific log codes (e.g., HDFS_RECOVERY_DB_ERROR) and logged only error messages, never raw PII or table structures.
- * [cite_start]Clear Comments: Added Javadoc and inline explanations for why we join with GL_BALANCE (fixing race conditions) [cite: 336-340].
-Reply "next" when you are ready for the next file (HdfsSyncService.java).
+ * Resolved Multi-catch/Generic Issues: Replaced the generic Exception with DataAccessException to properly handle Hive/Thrift database connectivity issues without hiding logic errors.
+ * Enhanced Logging: Added structured log tags like HDFS_SYNC_START and HDFS_SYNC_DB_FAIL for easier searching in production logs.
+ * Documentation: Added Javadoc explaining the background nature of the task and its relationship with the recovery service.
+Reply "next" when you are ready for the third file (ProgressService.java).
