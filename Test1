@@ -1,143 +1,95 @@
-package com.fincore.JournalService.Exception;
+package com.fincore.JournalService.config;
 
-import com.fincore.JournalService.Dto.ApiErrorResponseDto;
-import jakarta.servlet.http.HttpServletRequest;
+import jakarta.persistence.EntityManagerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.boot.orm.jpa.EntityManagerFactoryBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.orm.jpa.JpaTransactionManager;
+import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataAccessException;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.multipart.MaxUploadSizeExceededException;
 
-import java.io.IOException;
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.stream.Collectors;
+import javax.sql.DataSource;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * PRODUCTION READY: Global Exception Handler
- * Centralizes error management to ensure consistent, secure API responses.
- * Refactored to eliminate generic Exception catching and provide descriptive, PII-free logs.
+ * PRODUCTION READY: Primary Datasource Configuration (Oracle)
+ * Ensures that all existing JPA Repositories and Entities are correctly mapped to the Oracle database.
+ * [span_3](start_span)Marking beans as @Primary ensures this datasource is the default for injection into existing services.[span_3](end_span)
  */
-@RestControllerAdvice
+@Configuration
+@EnableTransactionManagement
+@EnableJpaRepositories(
+        [span_4](start_span)basePackages = "com.fincore.JournalService.Repository", // Preserved repository location[span_4](end_span)
+        entityManagerFactoryRef = "oracleEntityManagerFactory", 
+        transactionManagerRef = "oracleTransactionManager"
+)
 @Slf4j
-public class GlobalExceptionHandler {
+public class OracleDbConfig {
 
     /**
-     * [cite_start]Handles JSR-303 validation failures for @Valid request payloads.[span_0](end_span)
+     * Configures the primary Oracle DataSource.
+     * [span_5](start_span)Connection properties are externalized with the prefix 'spring.datasource.oracle'.[span_5](end_span)
      */
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleValidation(MethodArgumentNotValidException ex, HttpServletRequest request) {
-        [span_1](start_span)// Build error list without logging potentially sensitive field values[span_1](end_span)
-        List<ApiErrorResponseDto.ValidationError> errors = ex.getBindingResult().getFieldErrors().stream()
-                .map(err -> ApiErrorResponseDto.ValidationError.builder()
-                        .field(err.getField())
-                        .message(err.getDefaultMessage())
-                        .build())
-                .collect(Collectors.toList());
-
-        log.warn("VALIDATION_FAILED | Path: {} | Errors: {}", request.getRequestURI(), errors.size());
-        return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed", "Input validation error", request.getRequestURI(), errors);
+    @Primary
+    @Bean(name = "oracleDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.oracle")
+    public DataSource oracleDataSource() {
+        log.info("ORACLE_DB_INIT | Initializing Primary Oracle DataSource");
+        return DataSourceBuilder.create().build();
     }
 
     /**
-     * [span_2](start_span)Handles cases where the uploaded file exceeds the maximum configured size.[span_2](end_span)
+     * Configures the EntityManagerFactory for Oracle using Hibernate as the JPA provider.
+     * [span_6](start_span)Preserves original dialect and ddl-auto properties.[span_6](end_span)
      */
-    @ExceptionHandler(MaxUploadSizeExceededException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleMaxSize(MaxUploadSizeExceededException ex, HttpServletRequest request) {
-        log.error("FILE_TOO_LARGE | Path: {} | Details: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.PAYLOAD_TOO_LARGE, "File Too Large", "Maximum upload size exceeded", request.getRequestURI(), null);
-    }
+    @Primary
+    @Bean(name = "oracleEntityManagerFactory")
+    public LocalContainerEntityManagerFactoryBean oracleEntityManagerFactory(
+            EntityManagerFactoryBuilder builder,
+            @Qualifier("oracleDataSource") DataSource dataSource) {
 
-    /**
-     * [span_3](start_span)Handles business logic failures during file parsing or data extraction.[span_3](end_span)
-     */
-    @ExceptionHandler(CustomExceptions.FileProcessingException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleFileProcessing(CustomExceptions.FileProcessingException ex, HttpServletRequest request) {
-        log.error("FILE_PROCESS_ERROR | Path: {} | Message: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.BAD_REQUEST, "File Error", ex.getMessage(), request.getRequestURI(), null);
-    }
+        log.info("ORACLE_EMF_INIT | Building EntityManagerFactory for com.fincore.JournalService.Models");
 
-    /**
-     * [span_4](start_span)Handles concurrency conflicts, such as duplicate batch creation attempts.[span_4](end_span)
-     */
-    @ExceptionHandler({CustomExceptions.ConcurrencyLockException.class, IllegalStateException.class})
-    public ResponseEntity<ApiErrorResponseDto> handleConcurrency(RuntimeException ex, HttpServletRequest request) {
-        log.warn("CONCURRENCY_CONFLICT | Path: {} | Message: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.CONFLICT, "Operation Conflict", ex.getMessage(), request.getRequestURI(), null);
-    }
+        Map<String, Object> properties = new HashMap<>();
+        [span_7](start_span)// Preserving exact logic for dialect and schema updates[span_7](end_span)
+        properties.put("hibernate.dialect", "org.hibernate.dialect.OracleDialect");
+        properties.put("hibernate.hbm2ddl.auto", "update");
 
-    /**
-     * [span_5](start_span)Handles requests for missing entities or resources.[span_5](end_span)
-     */
-    @ExceptionHandler(ResourceNotFoundException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleNotFound(ResourceNotFoundException ex, HttpServletRequest request) {
-        log.info("RESOURCE_NOT_FOUND | Path: {} | Resource: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.NOT_FOUND, "Not Found", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    /**
-     * [span_6](start_span)Handles cases where cached validation data has expired (TTL 1 Hour).[span_6](end_span)
-     */
-    @ExceptionHandler(CustomExceptions.CacheExpiredException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleCacheExpired(CustomExceptions.CacheExpiredException ex, HttpServletRequest request) {
-        log.warn("CACHE_EXPIRED | Path: {} | Details: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.GONE, "Session Expired", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    /**
-     * [cite_start]Handles database constraint violations specifically. [cite: 162-163]
-     */
-    @ExceptionHandler(DataIntegrityViolationException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleSqlIntegrity(DataIntegrityViolationException ex, HttpServletRequest request) {
-        // Do not log the raw exception object to prevent leaking SQL schema details
-        log.error("DB_INTEGRITY_VIOLATION | Path: {} | Type: Constraint violation", request.getRequestURI());
-        return buildResponse(HttpStatus.CONFLICT, "Data Integrity Error", "Constraint violation or duplicate entry.", request.getRequestURI(), null);
-    }
-
-    /**
-     * [cite_start]Handles technical database communication failures. [cite: 164-165]
-     */
-    @ExceptionHandler(DataAccessException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleDbError(DataAccessException ex, HttpServletRequest request) {
-        log.error("DATABASE_ACCESS_FAIL | Path: {} | Error: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Database Error", "A database error occurred.", request.getRequestURI(), null);
-    }
-
-    /**
-     * Handles Input/Output stream failures specifically (e.g., file upload interruptions).
-     */
-    @ExceptionHandler(IOException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleIoException(IOException ex, HttpServletRequest request) {
-        log.error("IO_STREAM_FAILURE | Path: {} | Reason: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "IO Error", "Failed to process file stream.", request.getRequestURI(), null);
-    }
-
-    /**
-     * Final safety net for unexpected runtime failures. 
-     * [cite_start]Replaces the generic Exception handler to ensure only technical runtimes are caught. [cite: 166-167]
-     */
-    @ExceptionHandler(RuntimeException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleGeneralRuntime(RuntimeException ex, HttpServletRequest request) {
-        log.error("UNEXPECTED_RUNTIME_FAIL | Path: {} | Type: {}", request.getRequestURI(), ex.getClass().getSimpleName());
-        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Internal Server Error", "An unexpected error occurred.", request.getRequestURI(), null);
-    }
-
-    /**
-     * [cite_start]Utility to build standardized response DTO. [cite: 168-169]
-     */
-    private ResponseEntity<ApiErrorResponseDto> buildResponse(HttpStatus status, String error, String message, String path, List<ApiErrorResponseDto.ValidationError> validationErrors) {
-        ApiErrorResponseDto response = ApiErrorResponseDto.builder()
-                .timestamp(LocalDateTime.now())
-                .status(status.value())
-                .error(error)
-                .message(message)
-                .path(path)
-                .validationErrors(validationErrors)
+        return builder
+                .dataSource(dataSource)
+                [span_8](start_span).packages("com.fincore.JournalService.Models") // Preserved entity location[span_8](end_span)
+                .persistenceUnit("oracle")
+                .properties(properties)
                 .build();
-        return new ResponseEntity<>(response, status);
+    }
+
+    /**
+     * [span_9](start_span)Configures the Transaction Manager for the primary Oracle database.[span_9](end_span)
+     */
+    @Primary
+    @Bean(name = "oracleTransactionManager")
+    public PlatformTransactionManager oracleTransactionManager(
+            @Qualifier("oracleEntityManagerFactory") EntityManagerFactory entityManagerFactory) {
+        log.info("ORACLE_TX_MANAGER_INIT | Initializing JpaTransactionManager");
+        return new JpaTransactionManager(entityManagerFactory);
+    }
+
+    /**
+     * [span_10](start_span)Provides a primary JdbcTemplate for direct SQL operations against Oracle.[span_10](end_span)
+     */
+    @Primary
+    @Bean(name = "oracleJdbcTemplate")
+    public JdbcTemplate oracleJdbcTemplate(@Qualifier("oracleDataSource") DataSource dataSource) {
+        log.info("ORACLE_JDBC_TEMPLATE_INIT | Providing primary JdbcTemplate bean");
+        return new JdbcTemplate(dataSource);
     }
 }
