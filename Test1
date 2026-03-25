@@ -1,92 +1,95 @@
-The next file identified for production-readiness refactoring is HdfsSyncService.java. This service handles the asynchronous batch updates to the Hive Data Lake. Currently, its main execution block uses a generic Exception catch, which can obscure specific database connectivity issues or SQL syntax errors.
+The third file identified for production-readiness refactoring is ProgressService.java. This service is responsible for sending real-time task updates to the frontend via Redis Pub/Sub. Currently, the sendProgress method uses a generic Exception catch block that could mask serialization issues or Redis connectivity problems.
 1. Original Method Reference
-Original syncToDataLake catch block:
+[cite_start]Original sendProgress catch block: [cite: 769-777]
 // 
 } catch (Exception e) {
-    log.error("HDFS SYNC FAILED: Data might be out of sync. See trace:", e);
+    log.warn("Progress Notification Failed: {}", e.getMessage());
 }
 
 2. Refactored Code (Production Ready)
 package com.fincore.JournalService.Service;
 
-import com.fincore.JournalService.Dto.HdfsSyncDto;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.TaskProgressDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.BatchPreparedStatementSetter;
-import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
-import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
- * Updates are performed asynchronously using the high-performance 'bulkExecutor' pool.
+ * Service to manage and publish real-time task progress updates.
+ * Uses Redis Pub/Sub to push updates to the frontend with built-in throttling 
+ * to prevent overwhelming the network during high-volume batch operations.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class HdfsSyncService {
+public class ProgressService {
 
-    @Autowired
-    @Qualifier("hiveJdbcTemplate")
-    private JdbcTemplate hiveJdbcTemplate;
+    private final StringRedisTemplate stringRedisTemplate;
+    private final ObjectMapper objectMapper;
+
+    @Value("${notification.progress.topic:notifications:progress}")
+    private String progressTopic;
+
+    // Local cache to track the last update time per task for throttling logic
+    private final ConcurrentHashMap<String, AtomicLong> throttleMap = new ConcurrentHashMap<>();
 
     /**
-     * Executes a batch update to HDFS. This is a fire-and-forget background task.
-     * Failed syncs should be handled by the HdfsRecoveryService heartbeat.
-     * * @param data List of balance updates to be persisted.
+     * Publishes task progress asynchronously. 
+     * Applies a 500ms throttle for intermediate updates (0 < % < 100).
+     * Final states (100% or FAILED) are always published immediately.
      */
     @Async("bulkExecutor")
-    public void syncToDataLake(List<HdfsSyncDto> data) {
-        if (data == null || data.isEmpty()) {
-            return;
-        }
-
-        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
-        long startTime = System.currentTimeMillis();
-
+    public void sendProgress(String taskId, String userId, int percent, String status, String message) {
         try {
-            String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
-                         "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
-
-            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(PreparedStatement ps, int i) throws SQLException {
-                    HdfsSyncDto dto = data.get(i);
-                    ps.setBigDecimal(1, dto.getNewBalance());
-                    ps.setBigDecimal(2, dto.getNewInrBalance());
-                    ps.setString(3, dto.getBranch());
-                    ps.setString(4, dto.getCurrency());
-                    ps.setString(5, dto.getCgl());
-                    ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate()));
+            // 1. Throttling: Skip intermediate updates if sent within the last 500ms
+            if (percent > 0 && percent < 100 && !"FAILED".equals(status)) {
+                AtomicLong lastTime = throttleMap.computeIfAbsent(taskId, k -> new AtomicLong(0));
+                long now = System.currentTimeMillis();
+                if (now - lastTime.get() < 500) {
+                    return; 
                 }
+                lastTime.set(now);
+            }
 
-                @Override
-                public int getBatchSize() {
-                    return data.size();
-                }
-            });
+            // 2. Build Progress DTO
+            TaskProgressDto dto = TaskProgressDto.builder()
+                    .taskId(taskId)
+                    .userId(userId)
+                    .percentage(percent)
+                    .status(status)
+                    .message(message)
+                    .build();
 
-            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}", 
-                     (System.currentTimeMillis() - startTime), data.size());
+            // 3. Serialize and Publish to Redis
+            String jsonPayload = objectMapper.writeValueAsString(dto);
+            stringRedisTemplate.convertAndSend(progressTopic, jsonPayload);
 
+            // 4. Cleanup throttle cache on task completion or failure
+            if (percent == 100 || "FAILED".equals(status)) {
+                throttleMap.remove(taskId);
+            }
+
+        } catch (JsonProcessingException e) {
+            // Specific exception for Jackson serialization failures
+            log.error("PROGRESS_SERIALIZATION_FAIL | Task: {} | Reason: Failed to convert DTO to JSON", taskId);
         } catch (DataAccessException e) {
-            // Specifically catching Spring's database abstraction errors (Hive/Thrift connectivity)
-            log.error("HDFS_SYNC_DB_FAIL | Connectivity or Syntax error during Hive batch update: {}", e.getMessage());
-            // No re-throw here because @Async methods cannot bubble exceptions to the caller; 
-            // the HdfsRecoveryService will detect the missing sync via the retry queue.
+            // Specific exception for Redis connectivity or command failures
+            log.error("PROGRESS_REDIS_PUBLISH_FAIL | Task: {} | Reason: Redis service unavailable", taskId);
         }
     }
 }
 
 Changes Summary:
- * Resolved Multi-catch/Generic Issues: Replaced the generic Exception with DataAccessException to properly handle Hive/Thrift database connectivity issues without hiding logic errors.
- * Enhanced Logging: Added structured log tags like HDFS_SYNC_START and HDFS_SYNC_DB_FAIL for easier searching in production logs.
- * Documentation: Added Javadoc explaining the background nature of the task and its relationship with the recovery service.
-Reply "next" when you are ready for the third file (ProgressService.java).
+ * [cite_start]Replaced Generic Catch: The Exception block is replaced with JsonProcessingException to handle serialization errors and DataAccessException to handle Redis pub/sub failures [cite: 776-777].
+ * Descriptive Logging: Added unique log tags (PROGRESS_SERIALIZATION_FAIL, PROGRESS_REDIS_PUBLISH_FAIL) to improve production traceability without logging user data.
+ * [cite_start]Enhanced Documentation: Added Javadoc and comments clarifying the throttling logic (500ms window) and the Pub/Sub mechanism [cite: 769-772].
+Reply "next" when you are ready for the final file (AsyncConfig.java).
