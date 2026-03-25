@@ -1,94 +1,42 @@
 package com.fincore.JournalService.config;
 
-import jakarta.persistence.EntityManagerFactory;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.boot.jdbc.DataSourceBuilder;
-import org.springframework.boot.orm.jpa.EntityManagerFactoryBuilder;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
-import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.orm.jpa.JpaTransactionManager;
-import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.annotation.EnableTransactionManagement;
-import lombok.extern.slf4j.Slf4j;
-
-import javax.sql.DataSource;
-import java.util.HashMap;
-import java.util.Map;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
 
 /**
- * PRODUCTION READY: Primary Datasource Configuration (Oracle)
- * Ensures that all existing JPA Repositories and Entities are correctly mapped to the Oracle database.
- * Marking beans as @Primary ensures this datasource is the default for injection into existing services.
+ * PRODUCTION READY: Redis Configuration
+ * Configures templates to handle compressed binary data (GZIP).
+ * This strategy prevents Out-Of-Memory (OOM) errors by offloading large 
+ * validation datasets to Redis rather than keeping them in the application heap.
  */
 @Configuration
-@EnableTransactionManagement
-@EnableJpaRepositories(
-        basePackages = "com.fincore.JournalService.Repository", 
-        entityManagerFactoryRef = "oracleEntityManagerFactory", 
-        transactionManagerRef = "oracleTransactionManager"
-)
 @Slf4j
-public class OracleDbConfig {
+public class RedisConfig {
 
     /**
-     * Configures the primary Oracle DataSource.
-     * Connection properties are externalized with the prefix 'spring.datasource.oracle'.
+     * Configures a RedisTemplate specifically for byte array values.
+     * Uses String serialization for keys to ensure they are readable in the Redis CLI,
+     * while keeping values as raw bytes to avoid the overhead of standard Java serialization.
      */
-    @Primary
-    @Bean(name = "oracleDataSource")
-    @ConfigurationProperties(prefix = "spring.datasource.oracle")
-    public DataSource oracleDataSource() {
-        log.info("ORACLE_DB_INIT | Initializing Primary Oracle DataSource");
-        return DataSourceBuilder.create().build();
-    }
+    @Bean(name = "byteArrayRedisTemplate")
+    public RedisTemplate<String, byte[]> byteArrayRedisTemplate(RedisConnectionFactory connectionFactory) {
+        log.info("REDIS_CONFIG_INIT | Initializing ByteArrayRedisTemplate for binary data storage");
 
-    /**
-     * Configures the EntityManagerFactory for Oracle using Hibernate as the JPA provider.
-     * Preserves original dialect and ddl-auto properties.
-     */
-    @Primary
-    @Bean(name = "oracleEntityManagerFactory")
-    public LocalContainerEntityManagerFactoryBean oracleEntityManagerFactory(
-            EntityManagerFactoryBuilder builder,
-            @Qualifier("oracleDataSource") DataSource dataSource) {
+        RedisTemplate<String, byte[]> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
 
-        log.info("ORACLE_EMF_INIT | Building EntityManagerFactory for com.fincore.JournalService.Models");
+        // Keys are Strings (e.g., "DATA_UUID") for easy debugging and TTL management
+        template.setKeySerializer(new StringRedisSerializer());
 
-        Map<String, Object> properties = new HashMap<>();
-        properties.put("hibernate.dialect", "org.hibernate.dialect.OracleDialect");
-        properties.put("hibernate.hbm2ddl.auto", "update");
+        // Values are kept as raw Byte Arrays (GZIP Compressed) to maximize performance
+        template.setEnableDefaultSerializer(false);
 
-        return builder
-                .dataSource(dataSource)
-                .packages("com.fincore.JournalService.Models")
-                .persistenceUnit("oracle")
-                .properties(properties)
-                .build();
-    }
-
-    /**
-     * Configures the Transaction Manager for the primary Oracle database.
-     */
-    @Primary
-    @Bean(name = "oracleTransactionManager")
-    public PlatformTransactionManager oracleTransactionManager(
-            @Qualifier("oracleEntityManagerFactory") EntityManagerFactory entityManagerFactory) {
-        log.info("ORACLE_TX_MANAGER_INIT | Initializing JpaTransactionManager for Oracle");
-        return new JpaTransactionManager(entityManagerFactory);
-    }
-
-    /**
-     * Provides a primary JdbcTemplate for direct SQL operations against Oracle.
-     */
-    @Primary
-    @Bean(name = "oracleJdbcTemplate")
-    public JdbcTemplate oracleJdbcTemplate(@Qualifier("oracleDataSource") DataSource dataSource) {
-        log.info("ORACLE_JDBC_TEMPLATE_INIT | Providing primary JdbcTemplate bean");
-        return new JdbcTemplate(dataSource);
+        log.info("REDIS_CONFIG_SUCCESS | ByteArrayRedisTemplate configured with StringKeySerializer and disabled value serialization");
+        
+        return template;
     }
 }
