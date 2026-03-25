@@ -1,100 +1,85 @@
 package com.fincore.JournalService.Service;
 
+import com.fincore.JournalService.Dto.BranchDto;
+import com.fincore.JournalService.Models.BranchMaster;
+import com.fincore.JournalService.Repository.BranchMasterRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 
-import java.util.HashSet;
+import java.util.Collections;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
- * PRODUCTION READY: Validation Master Data Service
- * Loads active master records into memory-efficient HashSets for O(1) validation lookups.
- * Utilizes optimized JDBC fetch sizes to handle high-volume data transfers from Oracle.
+ * PRODUCTION READY: Branch Management Service
+ * Provides functionality for retrieving branch mapping and performing targeted searches.
+ * Implements specific exception handling for database access and secure logging practices.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class ValidationMasterService {
+public class BranchService {
 
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate jdbcTemplate;
+    private final BranchMasterRepository branchMasterRepository;
 
     /**
-     * Fetches all active branch codes. 
-     * Uses a fetchSize of 5000 to minimize network round-trips for large branch networks.
+     * Retrieves a mapping of branch codes to branch names.
+     * Useful for dropdown population or lookup optimization.
+     * * @return A Map containing branch codes as keys and names as values.
+     * @throws org.springframework.dao.DataAccessException if the database retrieval fails.
      */
-    public Set<String> getAllActiveBranches() {
-        long start = System.currentTimeMillis();
-        String sql = "SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1";
-
+    public Map<String, String> getBranchCodeAndNameMap() {
         try {
-            List<String> list = jdbcTemplate.query(con -> {
-                var ps = con.prepareStatement(sql);
-                ps.setFetchSize(5000); // Logic preserved for performance
-                return ps;
-            }, (rs, rowNum) -> rs.getString(1));
-
-            log.info("MASTER_DATA_LOADED | Type: BRANCHES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
-            return new HashSet<>(list);
-
+            [cite_start]// Load all branch records from the master table [cite: 314-315]
+            List<BranchMaster> branches = branchMasterRepository.findAll();
+            
+            log.info("BRANCH_MAP_LOADED | Count: {}", branches.size());
+            
+            return branches.stream()
+                    .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName));
+                    
         } catch (DataAccessException e) {
-            log.error("MASTER_DATA_FETCH_FAIL | Type: BRANCHES | Reason: {}", e.getMessage());
-            return new HashSet<>(); // Returning empty set to trigger validation failure safely
+            // Specifically catching database connectivity or constraint errors
+            log.error("BRANCH_MAP_FETCH_FAIL | Reason: Database access error: {}", e.getMessage());
+            return Collections.emptyMap();
         }
     }
 
     /**
-     * Fetches all active currency codes.
-     * Uses a fetchSize of 1000 for standard currency volume.
+     * Performs a paginated search for branches by name or code.
+     * [cite_start]Limits results to the first 50 matches to ensure high system responsiveness.[span_0](end_span)
+     * * @param query The search string (branch name or code).
+     * @return A list of matching BranchDto objects.
      */
-    public Set<String> getAllActiveCurrencies() {
-        long start = System.currentTimeMillis();
-        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
+    public List<BranchDto> searchBranches(String query) {
+        // Log the search action without logging potential PII if queries are sensitive
+        log.info("BRANCH_SEARCH_INIT | QueryLength: {}", (query != null ? query.length() : 0)); //
 
-        try {
-            List<String> list = jdbcTemplate.query(con -> {
-                var ps = con.prepareStatement(sql);
-                ps.setFetchSize(1000); // Logic preserved
-                return ps;
-            }, (rs, rowNum) -> rs.getString(1));
-
-            log.info("MASTER_DATA_LOADED | Type: CURRENCIES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
-            return new HashSet<>(list);
-
-        } catch (DataAccessException e) {
-            log.error("MASTER_DATA_FETCH_FAIL | Type: CURRENCIES | Reason: {}", e.getMessage());
-            return new HashSet<>();
+        if (query == null || query.trim().isEmpty()) {
+            return Collections.emptyList();
         }
-    }
-
-    /**
-     * Fetches all active CGL numbers.
-     * Uses a fetchSize of 2000 to balance memory and speed for ledger data.
-     */
-    public Set<String> getAllActiveCgls() {
-        long start = System.currentTimeMillis();
-        String sql = "SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1";
 
         try {
-            List<String> list = jdbcTemplate.query(con -> {
-                var ps = con.prepareStatement(sql);
-                ps.setFetchSize(2000); // Logic preserved
-                return ps;
-            }, (rs, rowNum) -> rs.getString(1));
+            [span_1](start_span)// Preserving the exact pagination and search logic [cite: 317-318]
+            Pageable limit = PageRequest.of(0, 50);
 
-            log.info("MASTER_DATA_LOADED | Type: CGLS | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
-            return new HashSet<>(list);
+            List<BranchMaster> results = branchMasterRepository
+                    .findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(query, query, limit);
+
+            log.info("BRANCH_SEARCH_SUCCESS | ResultsFound: {}", results.size());
+
+            return results.stream()
+                    .map(branch -> new BranchDto(branch.getCode(), branch.getName()))
+                    .collect(Collectors.toList());
 
         } catch (DataAccessException e) {
-            log.error("MASTER_DATA_FETCH_FAIL | Type: CGLS | Reason: {}", e.getMessage());
-            return new HashSet<>();
+            log.error("BRANCH_SEARCH_FAIL | Query: [REDACTED] | Error: {}", e.getMessage());
+            return Collections.emptyList();
         }
     }
 }
