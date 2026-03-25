@@ -1,112 +1,100 @@
-The next file identified for production-readiness refactoring is PermissionConfigService.java. This service retrieves dynamic redirection URLs and target authorization roles from the database. Currently, it lacks specific exception handling for database failures and can benefit from more structured logging.
-1. Original Method Reference
-Original getConfig implementation: [cite: 759-765]
-// 
-    @Cacheable(value = "notification_configs", key = "#requestType")
-    public NotificationConfigDto getConfig(String requestType) {
-
-        log.info("Cache Miss: Fetching DB permissions for MOC notification type: {}", requestType);
-        List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
-
-        if (results.isEmpty()) {
-            log.warn("No notification config found for request type {}. Using defaults.", requestType);
-            return new NotificationConfigDto("/dashboard", null); // Default to no roles
-        }
-
-        String url = (String) results.get(0)[0];
-        if (url == null) url = "/dashboard";
-
-        String roles = results.stream()
-                .map(row -> String.valueOf(row[1])) // Role ID
-                .distinct()
-                .collect(Collectors.joining(","));
-        if (roles.isEmpty()) {
-             log.warn("No roles found for request type {}. Notification will not be sent to a group.", requestType);
-             return new NotificationConfigDto(url, null);
-        }
-        
-        log.info("Fetched Notification Config for {}: URL=[{}], Roles=[{}]", requestType, url, roles);
-        return new NotificationConfigDto(url, roles);
-    }
-
-2. Refactored Code (Production Ready)
 package com.fincore.JournalService.Service;
 
-import com.fincore.JournalService.Dto.NotificationConfigDto;
-import com.fincore.JournalService.Repository.PermissionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.annotation.Cacheable;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
+import java.util.HashSet;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Set;
 
 /**
- * PRODUCTION READY: Permission Configuration Service
- * Retrieves dynamic notification routing rules (URLs and Target Roles) from the database.
- * Results are cached locally to minimize database overhead during high-volume batch processing.
+ * PRODUCTION READY: Validation Master Data Service
+ * Loads active master records into memory-efficient HashSets for O(1) validation lookups.
+ * Utilizes optimized JDBC fetch sizes to handle high-volume data transfers from Oracle.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class PermissionConfigService {
+public class ValidationMasterService {
 
-    private final PermissionRepository permissionRepository;
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
 
     /**
-     * Fetches the routing configuration for a specific request type.
-     * Uses Spring Caching to prevent frequent database joins on the permission tables.
-     * * @param requestType The identifier for the operation (e.g., 'JOURNAL_AUTH').
-     * @return A configuration DTO containing the redirection URL and authorized roles.
+     * Fetches all active branch codes. 
+     * Uses a fetchSize of 5000 to minimize network round-trips for large branch networks.
      */
-    @Cacheable(value = "notification_configs", key = "#requestType")
-    public NotificationConfigDto getConfig(String requestType) {
-
-        log.info("PERMISSION_CACHE_MISS | Fetching routing metadata for: {}", requestType); [cite_start]//[span_0](end_span)
+    public Set<String> getAllActiveBranches() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1";
 
         try {
-            [span_1](start_span)// 1. Database Retrieval via native join query[span_1](end_span)
-            List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(5000); // Logic preserved for performance
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
 
-            if (results.isEmpty()) {
-                log.warn("PERMISSION_CONFIG_NOT_FOUND | No mapping exists for: {}. Applying defaults.", requestType); [span_2](start_span)//[span_2](end_span)
-                return new NotificationConfigDto("/dashboard", null); 
-            }
-
-            [span_3](start_span)// 2. Extract Redirection URL[span_3](end_span)
-            String url = (String) results.get(0)[0];
-            if (url == null || url.isBlank()) {
-                url = "/dashboard";
-            }
-
-            [span_4](start_span)// 3. Aggregate unique Role IDs into a CSV format string[span_4](end_span)
-            String roles = results.stream()
-                    .map(row -> String.valueOf(row[1])) 
-                    .distinct()
-                    .collect(Collectors.joining(","));
-
-            if (roles.isEmpty()) {
-                log.warn("PERMISSION_ROLES_EMPTY | Mapping exists for {} but no roles are assigned.", requestType); [span_5](start_span)//[span_5](end_span)
-                return new NotificationConfigDto(url, null);
-            }
-
-            log.info("PERMISSION_CONFIG_LOADED | RequestType: {} | RedirectionPath: {}", requestType, url); [span_6](start_span)//[span_6](end_span)
-            return new NotificationConfigDto(url, roles);
+            log.info("MASTER_DATA_LOADED | Type: BRANCHES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
 
         } catch (DataAccessException e) {
-            // Specific exception for database connectivity or SQL syntax issues
-            log.error("PERMISSION_DB_FAIL | Could not retrieve metadata for {}: {}", requestType, e.getMessage());
-            // Fail safely by returning the default dashboard path without target roles
-            return new NotificationConfigDto("/dashboard", null);
+            log.error("MASTER_DATA_FETCH_FAIL | Type: BRANCHES | Reason: {}", e.getMessage());
+            return new HashSet<>(); // Returning empty set to trigger validation failure safely
+        }
+    }
+
+    /**
+     * Fetches all active currency codes.
+     * Uses a fetchSize of 1000 for standard currency volume.
+     */
+    public Set<String> getAllActiveCurrencies() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(1000); // Logic preserved
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CURRENCIES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CURRENCIES | Reason: {}", e.getMessage());
+            return new HashSet<>();
+        }
+    }
+
+    /**
+     * Fetches all active CGL numbers.
+     * Uses a fetchSize of 2000 to balance memory and speed for ledger data.
+     */
+    public Set<String> getAllActiveCgls() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(2000); // Logic preserved
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CGLS | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CGLS | Reason: {}", e.getMessage());
+            return new HashSet<>();
         }
     }
 }
-
-Changes Summary:
- * Resolved Generic Handling: Wrapped the database call in a DataAccessException catch block to handle Spring-level data persistence issues without masking logic bugs.
- * Secure Logging: Updated the final success log to include only the RequestType and RedirectionPath, removing the raw role list from standard production output to maintain privacy.
- * [cite_start]Comments: Added Javadoc to the class and method level to document the purpose of the cache and the structure of the returned DTO [cite: 758-759].
- * [cite_start]Logic Preservation: Maintained the exact fallback logic for the /dashboard URL and the role aggregation stream [cite: 761-764].
-Reply "next" for the next file (ValidationMasterService.java).
