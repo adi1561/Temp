@@ -1,102 +1,109 @@
-The final file identified for production-readiness refactoring is AsyncConfig.java. This configuration manages the thread pool for all bulk operations and handles any exceptions thrown by @Async methods that return void.
-The existing logic for core pool sizes, burst capabilities, and queue limits remains exactly as you defined it [cite: 5-7] to ensure your performance tuning is preserved.
+The next file identified for production-readiness refactoring is SequenceService.java. This service is responsible for generating the unique IDs (Batch ID and Journal ID) required for all transactions. Since it uses native database queries, it is susceptible to specific database failures that should be handled explicitly rather than allowed to bubble up as generic internal errors.
 1. Original Method Reference
-[cite_start]Original getAsyncUncaughtExceptionHandler block: [cite: 8-10]
+[cite_start]Original getNextBatchId and getNextJournalIdPrefix: [cite: 782-785]
 // 
-@Override
-public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
-    return (Throwable ex, Method method, Object... params) -> {
-        log.error("CRITICAL ASYNC FAILURE in method: {}", method.getName(), ex);
-        // Ideally, you would update the Batch Status to 'ERROR' in the DB here
-        // so the user knows it failed.
-    };
-}
-
-2. Refactored Code (Production Ready)
-package com.fincore.JournalService.config;
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.scheduling.annotation.AsyncConfigurer;
-import org.springframework.scheduling.annotation.EnableAsync;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-
-import java.lang.reflect.Method;
-import java.util.concurrent.Executor;
-
-/**
- * PRODUCTION READY: Asynchronous Configuration
- * Configures the dedicated 'bulkExecutor' thread pool for 600k+ row processing.
- * Implements global error handling for fire-and-forget async tasks.
- */
-@Configuration
-@EnableAsync
-@Slf4j
-public class AsyncConfig implements AsyncConfigurer {
-
-    /**
-     * Dedicated executor for high-volume journal operations.
-     * Logic for pool sizing and queue capacity is preserved exactly as established.
-     */
-    @Bean(name = "bulkExecutor")
-    public Executor bulkExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        
-        [cite_start]// Steady state: Maintains 5 threads for continuous processing[span_0](end_span)
-        executor.setCorePoolSize(5);   
-        
-        [span_1](start_span)// Burst capability: Scales up to 20 threads during peak load[span_1](end_span)
-        executor.setMaxPoolSize(20);
-        
-        [span_2](start_span)// Queueing: Holds up to 500 batches in memory if the database is under pressure[span_2](end_span)
-        executor.setQueueCapacity(500);
-        
-        executor.setThreadNamePrefix("JournalAsync-");
-        
-        // Ensures proper shutdown behavior and resource cleanup
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(60);
-        
-        executor.initialize();
-        return executor;
+    @Transactional
+    public String getNextBatchId() {
+        Number nextId = (Number) entityManager
+                .createNativeQuery("select BATCH_SEQ.nextval from dual")
+                .getSingleResult();
+        return padToSevenDigits(nextId.longValue());
     }
 
     /**
-     * Global handler for uncaught exceptions in @Async methods that return void.
-     * Replaces generic catching with structured, descriptive logging.
+     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
      */
-    @Override
-    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
-        return (Throwable ex, Method method, Object... params) -> {
-            
-            // Log only the method name and the exception type/message (Excludes params to prevent PII logging)
-            log.error("ASYNC_RUNTIME_CRASH | Method: {} | ExceptionType: {} | Message: {}", 
-                      method.getName(), 
-                      ex.getClass().getSimpleName(), 
-                      ex.getMessage());
+    @Transactional
+    public String getNextJournalIdPrefix() {
+        Number nextId = (Number) entityManager
+                .createNativeQuery("select JRNL_SEQ.nextval from dual")
+                .getSingleResult();
+        return padToSevenDigits(nextId.longValue());
+    }
 
-            // Specific handling logic for known production issues
-            if (ex instanceof org.springframework.dao.DataAccessException) {
-                log.error("ASYNC_DATABASE_FAILURE | Critical persistence error in background thread pool");
-            } else if (ex instanceof java.io.IOException) {
-                log.error("ASYNC_IO_FAILURE | File system or network stream failed in background");
-            } else {
-                log.error("ASYNC_UNEXPECTED_FAILURE | An unhandled exception escaped the async worker thread", ex);
-            }
+2. Refactored Code (Production Ready)
+package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Exception.CustomExceptions;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import jakarta.persistence.PersistenceException;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
+
+/**
+ * PRODUCTION READY: Sequence Generation Service
+ * Provides unique, zero-padded identifiers for batches and journals.
+ * Interacts directly with Oracle Sequences via native queries for maximum reliability.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class SequenceService {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    /**
+     * Pads the given number with leading zeros to a total length of 7.
+     * Logic preserved exactly as defined.
+     */
+    private String padToSevenDigits(Long id) {
+        if (id == null) {
+            log.error("SEQUENCE_PADING_FAIL | Status: NULL_ID_RECEIVED");
+            throw new IllegalStateException("Sequence query returned null");
+        }
+        return String.format("%07d", id);
+    }
+
+    /**
+     * Gets the next BATCH_ID from the BATCH_SEQ sequence.
+     * Wrapped in specific error handling for database persistence issues.
+     */
+    @Transactional
+    public String getNextBatchId() {
+        try {
+            Number nextId = (Number) entityManager
+                    .createNativeQuery("select BATCH_SEQ.nextval from dual")
+                    .getSingleResult();
             
-            // Technical Note: For production reliability, ensure the specific Service 
-            // (e.g., JournalRequestServiceImpl) has its own try-catch to update 
-            // the Batch Status in the database before the thread terminates here.
-        };
+            String paddedId = padToSevenDigits(nextId.longValue());
+            log.info("SEQUENCE_GENERATED | Type: BATCH_ID | Value: {}", paddedId);
+            return paddedId;
+
+        } catch (PersistenceException e) {
+            // Specifically catching JPA/Oracle sequence access errors
+            log.error("SEQUENCE_FETCH_FAIL | Type: BATCH_ID | Reason: Oracle BATCH_SEQ unavailable: {}", e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Critical failure: Could not generate Batch ID sequence", e);
+        }
+    }
+
+    /**
+     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
+     */
+    @Transactional
+    public String getNextJournalIdPrefix() {
+        try {
+            Number nextId = (Number) entityManager
+                    .createNativeQuery("select JRNL_SEQ.nextval from dual")
+                    .getSingleResult();
+            
+            String paddedId = padToSevenDigits(nextId.longValue());
+            log.info("SEQUENCE_GENERATED | Type: JRNL_ID | Value: {}", paddedId);
+            return paddedId;
+
+        } catch (PersistenceException e) {
+            log.error("SEQUENCE_FETCH_FAIL | Type: JRNL_ID | Reason: Oracle JRNL_SEQ unavailable: {}", e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Critical failure: Could not generate Journal ID sequence", e);
+        }
     }
 }
 
 Changes Summary:
- * Preserved Existing Logic: The pool sizes (5/20) and queue capacity (500) remain identical to your original settings [cite: 5-7].
- * [cite_start]Resolved Redundant Imports: Removed the static joni logger import that conflicted with Lombok's @Slf4j.
- * Structured Async Handling: Refactored the AsyncUncaughtExceptionHandler to log specific exception categories (DB, IO, or Unexpected) rather than a single generic trace.
- * Secure Logging: Ensured that the method parameters (params) are not logged by default to prevent leaking PII (Personal Identifiable Information) such as user names or remarks.
- * Shutdown Safety: Added setWaitForTasksToCompleteOnShutdown to ensure the service doesn't kill half-processed 600k row batches during a server restart.
-With these changes, all files in the Journal Service are now fully refactored to meet your production-ready requirements. Is there any other specific module or edge case you would like me to review?
+ * [cite_start]Added Specific Exception Handling: Replaced generic bubbling with PersistenceException catches to provide clear context when Oracle sequences are unreachable or exhausted [cite: 782-785].
+ * Secure & Descriptive Logs: Added SEQUENCE_GENERATED and SEQUENCE_FETCH_FAIL tags. Logged only the generated ID and error messages, ensuring no sensitive transaction data is included.
+ * [cite_start]Full Logic Preservation: Maintained the exact sequence names (BATCH_SEQ, JRNL_SEQ) and the zero-padding logic (7 digits) [cite: 780-785].
+ * Comments: Added Javadoc for each method to clarify the reliance on dual sequences for ID consistency.
+Reply "next" for the next file (NotificationWriterService.java).
