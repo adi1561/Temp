@@ -1,42 +1,100 @@
-package com.fincore.JournalService.config;
+package com.fincore.JournalService.Repository;
 
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.boot.jdbc.DataSourceBuilder;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.jdbc.core.JdbcTemplate;
-import lombok.extern.slf4j.Slf4j;
+import java.util.List;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.stereotype.Repository;
+import org.springframework.data.repository.query.Param;
 
-import javax.sql.DataSource;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
 
 /**
- * PRODUCTION READY: Secondary Datasource Configuration (Hive/Thrift)
- * Configures the connection to the Data Lake (Delta Lake).
- * Uses JdbcTemplate for direct SQL execution, suitable for high-volume analytics.
+ * PRODUCTION READY: Journal Request Repository
+ * Handles data access for journal entries with optimized native queries for batch processing.
+ * Includes specialized queries for high-volume summaries and chunked deletions.
  */
-@Configuration
-@Slf4j
-public class HiveDbConfig {
+@Repository
+public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> {
 
     /**
-     * Configures the Hive/Thrift DataSource for Data Lake synchronization.
-     * Connection properties are externalized with the prefix 'spring.datasource.hive'.
+     * FETCH PENDING BATCH SUMMARIES
+     * Aggregates individual journal rows into a batch summary for the Authorization screen.
+     * Calculates total Debit/Credit by parsing JSON amounts:
+     * - Debit: Positive values in the 'amount' field.
+     * - Credit: Negative values in the 'amount' field (displayed as absolute).
      */
-    @Bean(name = "hiveDataSource")
-    @ConfigurationProperties(prefix = "spring.datasource.hive")
-    public DataSource hiveDataSource() {
-        log.info("HIVE_DB_INIT | Initializing Secondary Hive/Thrift DataSource for Data Lake");
-        return DataSourceBuilder.create().build();
-    }
+    @Query(value = """
+        SELECT 
+            BATCH_ID, 
+            MAX(CREATOR_ID) as CREATOR, 
+            MAX(REQ_DATE) as RDATE, 
+            MAX(COMMON_BATCH_REMARKS) as REM,
+            COUNT(*) as CNT,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR
+        FROM JOURNAL_REQUEST 
+        WHERE TRIM(REQ_STATUS) IN ('P', 'PENDING')
+        GROUP BY BATCH_ID
+        ORDER BY MAX(REQ_DATE) DESC
+    """, nativeQuery = true)
+    List<Object[]> findPendingBatchSummariesNative();
 
     /**
-     * Provides a dedicated JdbcTemplate for interacting with the Hive Data Lake.
-     * The @Qualifier ensures the correct secondary datasource is injected.
+     * FETCH ALL BATCH HISTORY
+     * Provides a historical view of all batches (Accepted, Rejected, Pending, Error).
+     * Includes executor details and remarks for audit transparency.
      */
-    @Bean(name = "hiveJdbcTemplate")
-    public JdbcTemplate hiveJdbcTemplate(@Qualifier("hiveDataSource") DataSource dataSource) {
-        log.info("HIVE_JDBC_TEMPLATE_INIT | Providing dedicated Hive JdbcTemplate bean");
-        return new JdbcTemplate(dataSource);
-    }
+    @Query(value = """
+        SELECT 
+            BATCH_ID, 
+            MAX(CREATOR_ID) as CREATOR, 
+            MAX(REQ_DATE) as RDATE, 
+            MAX(COMMON_BATCH_REMARKS) as REM,
+            COUNT(*) as CNT,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR,
+            MAX(REQ_STATUS) as STATUS,
+            MAX(EXECUTOR_ID) as EXEC_ID,
+            MAX(EXECUTOR_REMARKS) as EXEC_REM
+        FROM JOURNAL_REQUEST 
+        GROUP BY BATCH_ID
+        ORDER BY MAX(REQ_DATE) DESC
+    """, nativeQuery = true)
+    List<Object[]> findAllBatchSummariesNative();
+
+    /**
+     * PAGINATED DETAIL FETCH
+     * Retrieves specific rows for a batch with stable ordering for UI consistency.
+     */
+    @Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId ORDER BY JOURNAL_ID ASC",
+            countQuery = "SELECT COUNT(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
+            nativeQuery = true)
+    Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
+
+    /**
+     * FAST BATCH DELETE
+     * Directly removes all pending rows for a batch. Used for cancellation operations.
+     */
+    @Modifying
+    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(:userId)) AND TRIM(REQ_STATUS) IN ('P', 'PENDING')", nativeQuery = true)
+    void deleteBatchNative(@Param("batchId") String batchId, @Param("userId") String userId);
+
+    /**
+     * MULTI-ROW SPECIFIC DELETE
+     * Purges specific journal IDs from a batch.
+     */
+    @Modifying
+    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE JOURNAL_ID IN (:journalIds) AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(:userId)) AND TRIM(REQ_STATUS) IN ('P', 'PENDING')", nativeQuery = true)
+    void deleteJournalsNative(@Param("journalIds") List<String> journalIds, @Param("userId") String userId);
+
+    // Standard Finder Methods
+    List<JournalRequest> findByBatchId(String batchId);
+    List<JournalRequest> findByCreatorId(String creatorId);
+    List<JournalRequest> findByRequestStatus(RequestStatus status);
+    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
 }
