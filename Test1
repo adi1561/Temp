@@ -1,109 +1,109 @@
-The next file identified for production-readiness refactoring is SequenceService.java. This service is responsible for generating the unique IDs (Batch ID and Journal ID) required for all transactions. Since it uses native database queries, it is susceptible to specific database failures that should be handled explicitly rather than allowed to bubble up as generic internal errors.
+The next file for production-readiness refactoring is NotificationWriterService.java. This service handles the persistence of persistent alerts into the database. A key feature is its use of Propagation.MANDATORY, which ensures that notifications are only saved if a transaction is already active (preventing "orphan" notifications if a batch process fails).
 1. Original Method Reference
-[cite_start]Original getNextBatchId and getNextJournalIdPrefix: [cite: 782-785]
+Original createNotification implementation: [cite: 750-757]
 // 
-    @Transactional
-    public String getNextBatchId() {
-        Number nextId = (Number) entityManager
-                .createNativeQuery("select BATCH_SEQ.nextval from dual")
-                .getSingleResult();
-        return padToSevenDigits(nextId.longValue());
-    }
+    @Transactional(propagation = Propagation.MANDATORY) 
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
 
-    /**
-     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
-     */
-    @Transactional
-    public String getNextJournalIdPrefix() {
-        Number nextId = (Number) entityManager
-                .createNativeQuery("select JRNL_SEQ.nextval from dual")
-                .getSingleResult();
-        return padToSevenDigits(nextId.longValue());
-    }
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        Notifications notification = Notifications.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .build();
+        notificationRepository.save(notification);
+// ...
 
 2. Refactored Code (Production Ready)
 package com.fincore.JournalService.Service;
 
-import com.fincore.JournalService.Exception.CustomExceptions;
-import jakarta.persistence.EntityManager;
-import jakarta.persistence.PersistenceContext;
-import jakarta.persistence.PersistenceException;
+import com.fincore.JournalService.Models.Notifications;
+import com.fincore.JournalService.Repository.NotificationRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Service;
-import jakarta.transaction.Transactional;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
- * PRODUCTION READY: Sequence Generation Service
- * Provides unique, zero-padded identifiers for batches and journals.
- * Interacts directly with Oracle Sequences via native queries for maximum reliability.
+ * PRODUCTION READY: Notification Writer Service
+ * Responsible for persisting system-wide alerts and user-specific notifications.
+ * Enforces transactional integrity via mandatory propagation.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class SequenceService {
+public class NotificationWriterService {
 
-    @PersistenceContext
-    private EntityManager entityManager;
+    private final NotificationRepository notificationRepository;
 
     /**
-     * Pads the given number with leading zeros to a total length of 7.
-     * Logic preserved exactly as defined.
+     * Persists a notification event.
+     * Requires an existing transaction (Propagation.MANDATORY) to ensure notification
+     * consistency with the business operation (e.g., batch creation).
+     * * @throws IllegalArgumentException if validation fails.
+     * @throws org.springframework.dao.DataAccessException if database persistence fails.
      */
-    private String padToSevenDigits(Long id) {
-        if (id == null) {
-            log.error("SEQUENCE_PADING_FAIL | Status: NULL_ID_RECEIVED");
-            throw new IllegalStateException("Sequence query returned null");
+    @Transactional(propagation = Propagation.MANDATORY) 
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        [cite_start]// 1. Validation Logic: Ensure at least one recipient type is provided [cite: 751-752]
+        if (userId == null && targetRole == null) {
+            log.warn("NOTIFICATION_SKIPPED | Reason: Recipient missing | AggregateID: {}", aggregateId);
+            return;
         }
-        return String.format("%07d", id);
-    }
 
-    /**
-     * Gets the next BATCH_ID from the BATCH_SEQ sequence.
-     * Wrapped in specific error handling for database persistence issues.
-     */
-    @Transactional
-    public String getNextBatchId() {
-        try {
-            Number nextId = (Number) entityManager
-                    .createNativeQuery("select BATCH_SEQ.nextval from dual")
-                    .getSingleResult();
-            
-            String paddedId = padToSevenDigits(nextId.longValue());
-            log.info("SEQUENCE_GENERATED | Type: BATCH_ID | Value: {}", paddedId);
-            return paddedId;
-
-        } catch (PersistenceException e) {
-            // Specifically catching JPA/Oracle sequence access errors
-            log.error("SEQUENCE_FETCH_FAIL | Type: BATCH_ID | Reason: Oracle BATCH_SEQ unavailable: {}", e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Critical failure: Could not generate Batch ID sequence", e);
+        [cite_start]// 2. Validation Logic: Ensure message content exists[span_1](end_span)
+        if (message == null || message.isBlank()) {
+            log.error("NOTIFICATION_VALIDATION_FAIL | Status: BLANK_MESSAGE | AggregateID: {}", aggregateId);
+            throw new IllegalArgumentException("Notification message content is required.");
         }
-    }
 
-    /**
-     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
-     */
-    @Transactional
-    public String getNextJournalIdPrefix() {
         try {
-            Number nextId = (Number) entityManager
-                    .createNativeQuery("select JRNL_SEQ.nextval from dual")
-                    .getSingleResult();
-            
-            String paddedId = padToSevenDigits(nextId.longValue());
-            log.info("SEQUENCE_GENERATED | Type: JRNL_ID | Value: {}", paddedId);
-            return paddedId;
+            [span_2](start_span)// 3. Build and Persist Notification Entity [cite: 754-755]
+            Notifications notification = Notifications.builder()
+                    .userId(userId)
+                    .targetRole(targetRole)
+                    .message(message)
+                    .linkUrl(linkUrl)
+                    .aggregateId(aggregateId)
+                    .eventSource(eventSource)
+                    .build();
 
-        } catch (PersistenceException e) {
-            log.error("SEQUENCE_FETCH_FAIL | Type: JRNL_ID | Reason: Oracle JRNL_SEQ unavailable: {}", e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Critical failure: Could not generate Journal ID sequence", e);
+            notificationRepository.save(notification);
+
+            [cite_start]// 4. Secure Logging: Exclude PII (names/remarks) and log only identifiers [cite: 756-757]
+            if (userId != null) {
+                log.info("NOTIFICATION_SAVED | Type: DIRECT | UserID: {} | Ref: {}", userId, aggregateId);
+            } else {
+                log.info("NOTIFICATION_SAVED | Type: BROADCAST | Role: {} | Ref: {}", targetRole, aggregateId);
+            }
+
+        } catch (DataAccessException e) {
+            // Specifically catching Spring's data access exceptions for production stability
+            log.error("NOTIFICATION_DB_FAIL | AggregateID: {} | Reason: {}", aggregateId, e.getMessage());
+            // Re-throwing to allow the parent transaction to roll back if the notification is critical
+            throw e;
         }
     }
 }
 
 Changes Summary:
- * [cite_start]Added Specific Exception Handling: Replaced generic bubbling with PersistenceException catches to provide clear context when Oracle sequences are unreachable or exhausted [cite: 782-785].
- * Secure & Descriptive Logs: Added SEQUENCE_GENERATED and SEQUENCE_FETCH_FAIL tags. Logged only the generated ID and error messages, ensuring no sensitive transaction data is included.
- * [cite_start]Full Logic Preservation: Maintained the exact sequence names (BATCH_SEQ, JRNL_SEQ) and the zero-padding logic (7 digits) [cite: 780-785].
- * Comments: Added Javadoc for each method to clarify the reliance on dual sequences for ID consistency.
-Reply "next" for the next file (NotificationWriterService.java).
+ * [cite_start]Resolved Multi-catch/Generic Issues: Integrated a specific DataAccessException catch block around the repository.save() call to handle database-level failures during the notification write process.
+ * Secure Logging: Updated log messages to use clear status tags (NOTIFICATION_SAVED, NOTIFICATION_DB_FAIL) and ensured that the sensitive message content is never logged to production files [cite: 756-757].
+ * [cite_start]Comments: Added technical Javadoc explaining the mandatory transaction requirement and why a rollback is necessary on database failure.
+ * [cite_start]Full Logic Preservation: All recipient validation and entity building logic remains identical to your original code [cite: 751-755].
+Reply "next" for the next file (PermissionConfigService.java).
