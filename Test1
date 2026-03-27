@@ -1,200 +1,386 @@
-package com.fincore.JournalService.Service;
+import React, { useEffect, useRef, useState } from "react";
+import axios from "axios";
+import { Box, InputAdornment } from "@mui/material";
+import PersonIcon from "@mui/icons-material/Person";
+import LogoImg from "../../../assets/Logos/Fincore_transperent.svg";
+import LoginErrorDialog from "./LoginErrorDialog";
+import LoginWithPassword from "./LoginWithPassword";
+import UpdatePassword from "./UpdatePassword";
+import {
+  Root,
+  ContainerInner,
+  Content,
+  LeftCol,
+  RightCol,
+  LogoWrap,
+  BrandTitle,
+  BrandSub,
+  BigHeading,
+  SubText,
+  FeatureList,
+  FeatureItem,
+  Bullet,
+  GlassCard,
+  FormTitle,
+  StyledTextField,
+  PrimaryButton,
+} from "./LoginStyles";
+import { resolveConfig } from "../../../config/EnvironmentConfig";
+import Copyright from "../../../components/Copyright";
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Dto.*;
-import com.fincore.JournalService.Exception.CustomExceptions;
-import com.fincore.JournalService.Models.JournalLog;
-import com.fincore.JournalService.Models.JournalRequest;
-import com.fincore.JournalService.Models.enums.RequestStatus;
-import com.fincore.JournalService.Repository.JournalLogRepository;
-import com.fincore.JournalService.Repository.JournalRequestRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.slf4j.MDC;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.jdbc.core.CallableStatementCallback;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+export default function LoginPort() {
+  const [content, setContent] = useState(null);
 
-import javax.sql.DataSource;
-import java.math.BigDecimal;
-import java.sql.*;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.LongAdder;
+  useEffect(() => {
+    const loadContent = async () => {
+      try {
+        const res = await axios.get("/loginContent.json");
+        setContent(res.data);
+      } catch (err) {
+        console.error("Failed to load content JSON:", err);
+      }
+    };
+    loadContent();
+  }, []);
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-@SuppressWarnings("SqlNoDataSourceInspection") // Removes SQL warnings at the class level
-public class JournalRequestServiceImpl implements JournalRequestService {
+  // === STATES ===
+  const [userId, setUserId] = useState("");
+  const [error, setError] = useState("");
+  const [page, setPage] = useState("HOME"); // HOME | PASSWORD | UPDATE
+  const [dialogHeading, setDialogHeading] = useState("");
+  const [dialogContent, setDialogContent] = useState("");
+  const [showErrorDialog, setShowErrorDialog] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [userIdDisabled, setUserIdDisabled] = useState(false);
+  const [publicKey, setPublicKey] = useState(null);
 
-    private final JournalRequestRepository journalRequestRepository;
-    private final JournalLogRepository journalLogRepository;
-    private final SequenceService sequenceService;
-    private final NotificationWriterService notificationWriterService;
-    private final PermissionConfigService permissionConfigService;
-    private final JournalBulkValidationService journalBulkValidationService;
-    private final HdfsSyncService hdfsSyncService;
-    private final ProgressService progressService;
+  const userIdInputRef = useRef(null);
 
-    @Autowired
-    private ObjectMapper objectMapper;
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (userIdInputRef.current) {
+        userIdInputRef.current.focus();
+      }
+    }, 100); // 100ms is usually safe and unnoticeable
 
-    @Autowired
-    @Lazy
-    private JournalRequestService self;
+    return () => clearTimeout(timer);
+  }, []);
 
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate jdbcTemplate;
+  // === DIALOG HANDLERS ===
+  const handleDialogClose = () => {
+    setShowErrorDialog(false);
+    setDialogHeading("");
+    setDialogContent("");
+  };
 
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
+  const openLoginErrorDialog = (heading, content) => {
+    setDialogHeading(heading);
+    setDialogContent(content);
+    setShowErrorDialog(true);
+  };
 
-    @Autowired
-    @Qualifier("bulkExecutor")
-    private Executor bulkExecutor;
+  // === VALIDATION ===
+  const validateId = (id) => {
+    if (!id) return false;
+    const v = id.trim().toLowerCase();
+    const regex = /^(?:\d{7}|v\d{7}|tcs\d{7}|tcsv\d{7})$/;
+    return regex.test(v);
+  };
 
-    @Autowired
-    @Qualifier("oracleDataSource")
-    private DataSource dataSource;
+  // === INPUT RESTRICTIONS ===
+  const handleUserIdChange = (raw) => {
+    if (userIdDisabled) return;
+    let val = (raw || "").replace(/\s+/g, "");
+    const m = val.match(/^([A-Za-z]*)(.*)$/);
+    let prefixCandidate = (m && m[1]) || "";
+    let rest = (m && m[2]) || "";
 
-    // ==================================================================================
-    // SECURITY & WARNINGS REFACTOR
-    // ==================================================================================
-
-    @Override
-    @Async("bulkExecutor")
-    @Transactional
-    public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
-        String batchId = dto.getBatchId();
-        MDC.put("batchId", batchId);
-        
-        try {
-            // 1. Fetch Creator ID
-            String creatorId = jdbcTemplate.queryForObject("SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
-            
-            // 2. SECURITY VALIDATION: Maker-Checker Rule
-            [span_0](start_span)[span_1](start_span)[span_2](start_span)// Prevents a user from approving their own batch [cite: 701-703]
-            if (executorId.equalsIgnoreCase(creatorId) && RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-                log.error("SECURITY_VIOLATION | User: {} attempted to self-approve batch: {}", executorId, batchId);
-                throw new IllegalStateException("Security Rule Violated: Maker cannot be the Checker.");
-            }
-
-            progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Executing Approval Logic...");
-
-            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-                [cite_start]// Logic for Oracle Procedure remains preserved [cite: 705-712]
-                jdbcTemplate.execute("{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}", (CallableStatementCallback<Void>) cs -> {
-                    cs.setString(1, batchId);
-                    cs.setString(2, executorId);
-                    cs.setString(3, dto.getRemarks());
-                    cs.setString(4, "A");
-                    cs.registerOutParameter(5, -10); 
-                    cs.execute();
-                    return null;
-                });
-
-                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ACCEPTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
-                        executorId, dto.getRemarks(), batchId);
-
-                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
-                sendNotification(executorId, null, "You approved Batch " + batchId, batchId);
-                sendNotification(creatorId, null, "Your Batch " + batchId + " has been ACCEPTED.", batchId);
-
-            } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
-                [cite_start]// Reject logic preserved [cite: 722-723]
-                jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
-                        executorId, dto.getRemarks(), batchId);
-                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
-                        executorId, dto.getRemarks(), batchId);
-                
-                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
-                sendNotification(creatorId, null, "Your Batch " + batchId + " was REJECTED.", batchId);
-            }
-
-        } catch (DataAccessException | RuntimeException e) {
-            log.error("BATCH_PROCESS_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", "System error during processing", batchId);
-            progressService.sendProgress(batchId, executorId, 0, "FAILED", "System Error");
-        } finally {
-            MDC.clear();
-        }
+    const prefixLow = prefixCandidate.toLowerCase();
+    const allowedPrefixList = ["", "t", "tc", "tcs", "tcsv", "v"];
+    if (!allowedPrefixList.some((p) => prefixLow.startsWith(p))) {
+      prefixCandidate = "";
     }
 
-    /**
-     * SECURITY REFACTOR: JSON Safety
-     * [cite_start]Uses Map and ObjectMapper to prevent JSON Injection [cite: 757-759]
-     */
-    private String buildJsonPayloadFast(JournalBulkValidationService.ExcelRowData row, BigDecimal amount, LocalDate pDate, String bId, String jId, String rem, int cnt, DateTimeFormatter fmt) {
-        try {
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("csvDate", pDate.format(fmt));
-            payload.put("branch", row.branch);
-            payload.put("currency", row.currency);
-            payload.put("cgl", row.cgl);
-            payload.put("amount", amount);
-            payload.put("productType", row.productCode != null ? row.productCode : "A");
-            payload.put("remarks", row.remarks != null ? row.remarks : "");
-            payload.put("arFlag", "A");
-            payload.put("acClassification", "A");
-            payload.put("batchId", bId);
-            payload.put("journalId", jId);
-            payload.put("commonBatchRemarks", rem != null ? rem : "");
-            payload.put("transactionCount", cnt);
+    const prefix = prefixCandidate;
+    let digitsPart = rest.replace(/\D/g, "");
+    if (digitsPart.length > 7) digitsPart = digitsPart.slice(0, 7);
 
-            return objectMapper.writeValueAsString(payload);
-        } catch (JsonProcessingException e) {
-            log.error("JSON_SERIALIZATION_FAIL | Batch: {} | Journal: {}", bId, jId);
-            return "{}";
-        }
+    const newVal = prefix + digitsPart;
+    if (
+      digitsPart.length < 8 &&
+      allowedPrefixList.some((p) => p.startsWith(prefix))
+    ) {
+      setUserId(newVal);
     }
 
-    // ==================================================================================
-    // CLEANUP OF REDUNDANT WARNINGS
-    // ==================================================================================
+    if (error) setError("");
+  };
 
-    private void logAudit(String user, String action, String type, String val) {
-        try {
-            // FIXED: Removed redundant null checks that triggered "Condition always true" warnings
-            JournalLog l = new JournalLog();
-            l.setUserId(user);
-            l.setActionType(action);
-            l.setChangeType(type);
-            l.setNewValue(val != null && val.length() > 3900 ? val.substring(0, 3900) : val);
-            l.setActionTime(LocalDateTime.now());
-            journalLogRepository.save(l);
-        } catch (DataAccessException e) {
-            log.error("AUDIT_LOG_FAIL | User: {} | Error: {}", user, e.getMessage());
-        }
+  const handleUserIdPaste = (e) => {
+    e.preventDefault();
+    const paste = (e.clipboardData || window.clipboardData).getData("text");
+    handleUserIdChange(paste);
+  };
+
+  // === API CALL: CHECK USER ===
+  const checkUser = async () => {
+    setError("");
+    if (!validateId(userId)) {
+      setError("Invalid User ID");
+      userIdInputRef.current?.focus();
+      return;
     }
 
-    private void sendNotification(String userId, String roles, String message, String batchId) {
-        // FIXED: Removed redundant null checks at lines 360/375
-        try {
-            notificationWriterService.createNotification(userId, roles, message, "/journal-view/" + batchId, batchId, "JournalService");
-        } catch (RuntimeException e) {
-            log.warn("NOTIFICATION_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-        }
-    }
+    try {
+      setLoading(true);
+      const payloadUserId = userId.trim();
+      const res = await axios.post(`${resolveConfig("/LS")}/auth/check-user`, {
+        userId: payloadUserId,
+      });
 
-    [cite_start]// Standard business logic methods (createBatchFromCacheAsync, processChunkRaw, etc.) remain untouched [cite: 638-694]
-    // ...
-    @Override public String createBatchFromCacheAsync(String r, String m, String c, Integer cr) { /* Logic Intact */ return null; }
-    @Override public void executeAsyncBatchCreation(String b, String r, String m, String c, Integer cr) { /* Logic Intact */ }
+      const result = res?.data?.data || {};
+
+      if (result?.userStatus == "RESTRICTED") {
+        setError("");
+        openLoginErrorDialog(
+          "Access Restricted",
+          "This system is restricted to use FinCore, Please contact the administrator.",
+        );
+        return;
+      }
+      if (result?.userStatus === "INVALID") {
+        setError("User ID does not exist");
+        return;
+      }
+
+      if (result?.passwordLoginStatus === "INACTIVE") {
+        openLoginErrorDialog(
+          "Password Locked!",
+          "You cannot login using password currently. Please contact the administrator.",
+        );
+        return;
+      }
+
+      if (result?.updatePassword === true) {
+        setPublicKey(result?.publicKey);
+        setPage("UPDATE");
+        setUserIdDisabled(true);
+        return;
+      }
+
+      if (
+        result?.userStatus == "ACTIVE" &&
+        result?.passwordLoginStatus == "ACTIVE"
+      ) {
+        setPublicKey(result?.publicKey);
+        setPage("PASSWORD");
+        setUserIdDisabled(true);
+        return;
+      }
+
+      openLoginErrorDialog(
+        "Login Not Allowed",
+        result?.message || "Please contact the administrator.",
+      );
+    } catch (err) {
+      console.error("checkUser error:", err);
+      openLoginErrorDialog(
+        "Login Error",
+        "Something went wrong, please try again later.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // === FORM SUBMIT ===
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (page === "HOME") checkUser();
+  };
+
+  // === CALLBACKS ===
+  const handlePasswordUpdateSuccess = () => {
+    setPage("PASSWORD");
+
+    setUserIdDisabled(true);
+  };
+
+  const enableEditingBackToHome = () => {
+    setPage("HOME");
+    setUserIdDisabled(false);
+    setError("");
+    setUserId("");
+  };
+
+  if (!content) return null;
+
+  return (
+    <Root>
+      <ContainerInner>
+        <Content>
+          <LeftCol>
+            <LogoWrap>
+              <img src={LogoImg} alt="FinCore Logo" width={100} height="auto" />
+              <div>
+                <BrandTitle>{content?.brand?.title}</BrandTitle>
+                <BrandSub>{content?.brand?.subtitle}</BrandSub>
+              </div>
+            </LogoWrap>
+          </LeftCol>
+        </Content>
+        <Content>
+          {/* LEFT COLUMN */}
+          <LeftCol>
+            <BigHeading>{content?.hero?.welcomeTitle}</BigHeading>
+            <SubText>{content?.hero?.subText}</SubText>
+
+            <BigHeading>{content?.legal?.title}</BigHeading>
+            <FeatureList>
+              {content?.legal?.items.map((item, idx) => (
+                <FeatureItem key={idx}>
+                  <Bullet /> {item}
+                </FeatureItem>
+              ))}
+            </FeatureList>
+          </LeftCol>
+
+          {/* RIGHT COLUMN */}
+          <RightCol>
+            <GlassCard elevation={3}>
+              <FormTitle>{content?.form?.signIn}</FormTitle>
+
+              <form onSubmit={handleSubmit} noValidate>
+                <StyledTextField
+                  fullWidth
+                  inputRef={userIdInputRef}
+                  label="User ID"
+                  placeholder={content?.form?.userIdPlaceholder}
+                  margin="dense"
+                  value={userId}
+                  onChange={(e) => handleUserIdChange(e.target.value)}
+                  onPaste={handleUserIdPaste}
+                  error={Boolean(error)}
+                  helperText={error || " "}
+                  disabled={userIdDisabled}
+                  InputProps={{
+                    startAdornment: (
+                      <InputAdornment position="start">
+                        <PersonIcon />
+                      </InputAdornment>
+                    ),
+                  }}
+                />
+
+                {page === "HOME" && (
+                  <PrimaryButton
+                    type="submit"
+                    variant="contained"
+                    disabled={loading}
+                  >
+                    {loading
+                      ? content?.form?.checking
+                      : content?.form?.signInButton}
+                  </PrimaryButton>
+                )}
+
+                {page === "PASSWORD" && (
+                  <Box>
+                    <LoginWithPassword
+                      userId={userId}
+                      publicKey={publicKey}
+                      openLoginErrorDialog={openLoginErrorDialog}
+                      onBackToHome={enableEditingBackToHome}
+                    />
+                  </Box>
+                )}
+
+                {page === "UPDATE" && (
+                  <Box>
+                    <UpdatePassword
+                      userId={userId}
+                      publicKey={publicKey}
+                      openLoginErrorDialog={openLoginErrorDialog}
+                      onUpdateSuccess={handlePasswordUpdateSuccess}
+                    />
+                  </Box>
+                )}
+              </form>
+            </GlassCard>
+          </RightCol>
+        </Content>
+      </ContainerInner>
+
+      <LoginErrorDialog
+        showErrorDialog={showErrorDialog}
+        title={dialogHeading}
+        content={dialogContent}
+        onDialogClose={handleDialogClose}
+      />
+      <Box sx={{ position: "absolute", left: 0, bottom: 0, right: 0 }}>
+        <Copyright />
+      </Box>
+    </Root>
+  );
 }
+
+
+{
+  "brand": {
+    "title": "FinCore",
+    "subtitle": "Insight Driven General Ledger"
+  },
+  "hero": {
+    "welcomeTitle": "Welcome to FinCore application - enabling trusted and centralized GL reporting",
+    "subText": "FinCore Application provides a centralized platform for seamless access to and generation of critical financial reports, delivering secure, reliable and high-integrity financial data"
+  },
+  "legal": {
+    "title": "Legal Warning",
+    "items": [
+      "This application is for the use of authorized users only.",
+      "All activities on this application may be recorded and monitored.",
+      "Individuals using this application without authority or in excess of their authority are subject to disciplinary action and/or criminal prosecution."
+    ]
+  },
+  "form": {
+    "signIn": "SIGN IN",
+    "checking": "Checking...",
+    "userIdPlaceholder": "Enter your User ID",
+    "signInButton": "Sign In",
+    "enterPasswordTitle": "Enter password",
+    "loginWithPassword": {
+      "title": "Enter Password",
+      "passwordLabel": "Password",
+      "passwordPlaceholder": "Enter your password",
+      "signInButton": "Sign In",
+      "checkingLabel": "Checking..."
+    },
+    "updatePassword": {
+      "title": "Update Password",
+      "newPasswordLabel": "New Password",
+      "newPasswordPlaceholder": "Enter new password",
+      "confirmPasswordLabel": "Confirm Password",
+      "confirmPasswordPlaceholder": "Re-enter your password",
+      "updateButton": "Update Password",
+      "requirementsTitle": "Password must meet the following criteria:",
+      "requirements": [
+        { "key": "length", "text": "Between 8 and 16 characters long" },
+        { "key": "uppercase", "text": "Include at least one uppercase letter" },
+        { "key": "lowercase", "text": "Include at least one lowercase letter" },
+        { "key": "number", "text": "Include at least one number" },
+        {
+          "key": "specialChar",
+          "text": "Include at least one special character"
+        }
+      ]
+    }
+  }
+}
+
+
+
+this is the page in which i have a problem with Design related to the just 
+Welcome to FinCore application - enabling trusted and centralized GL reporting
+FinCore Application provides a centralized platform for seamless access to and generation of critical financial reports, delivering secure, reliable and high-integrity financial data
+this text this is 2 much long text Dont touch other things can u add same style so that it looks profational and dont add inline style add a saprate function in the same file 
+and dont give mi full code just give mi new code and where i need add what 
