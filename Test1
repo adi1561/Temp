@@ -1,74 +1,173 @@
-To keep all your existing functionality safe while adding the new look, follow these three specific steps. I’ll show you exactly where to find the "old" code and what to replace it with.
-Step 1: Update LoginStyles.js (The Style File)
-Find these two functions (they are usually in the middle of the file) and replace them. Then, paste the new one at the very bottom.
-Find and Replace these:
-// Find BigHeading and replace with this:
-export const BigHeading = styled(Typography)(({ theme }) => ({
-  fontWeight: 700,
-  fontSize: 28,
-  lineHeight: 1.1,
-  color: theme.palette.text.primary,
-  marginBottom: 0, // Removed margin to close the gap
-  [theme.breakpoints.down("sm")]: { fontSize: 24 },
-}));
+Adesh, as a Lead, I’m going to give you the "cleanest" architectural answer. In a professional system, you don't create a different event for every person you want to notify. Instead, you follow the "Single Source of Truth" event pattern.
+For the task creation process, you should create one single event, but design it so that multiple services can use it.
+🏛️ 1. The "One Event, Many Listeners" Strategy
+Instead of creating a NotificationEvent and a LoggingEvent, you create one TASK_CREATED event.
+Think of it like a newspaper. The journalist (your Task Service) writes one story. The readers (Notification Service, Search Indexer, Analytics Service) all read the same story but do different things with it.
+🏛️ 2. What exactly goes in the Event?
+To make this event "detailed" enough for everyone, your TaskCreatedEvent DTO should look like this:
+@Data
+@Builder
+public class TaskCreatedEvent {
+    // 1. Core IDs (For database lookups)
+    private Long taskId;
+    private Long projectId;
+    
+    // 2. Display Info (So the consumer doesn't HAVE to call the DB)
+    private String title;
+    private String priority;
+    
+    // 3. People Involved
+    private Long assigneeId;
+    private String assigneeEmail;
+    private String reporterName;
+    
+    // 4. Metadata
+    private LocalDateTime createdAt;
+}
 
-// Find SubText and replace with this:
-export const SubText = styled(Typography)(({ theme }) => ({
-  fontSize: 16,
-  color: theme.palette.text.secondary,
-  lineHeight: 1.6,
-  marginTop: theme.spacing(1), // Adds a small gap before the long paragraph
-}));
+🏛️ 3. The Step-by-Step Execution Flow
+Here is exactly how the data should move from the user's click to the Kafka pipe:
+ * Frontend: User hits "Create Task."
+ * Controller: Receives the DTO, validates the JWT.
+ * Service (The Transaction):
+   * Starts a @Transactional block.
+   * Saves the Task to MySQL.
+   * Crucial: Fetches the Assignee and Reporter details (names/emails) because you need them for the event.
+ * Producer Trigger: Right before the method returns (but after the save()), you call the producer.
+ * Kafka Topic: The message sits in the task-events topic.
+🏛️ 4. How to Send them "In Detail" (The Pro Way)
+If you want to be a top-tier engineer, don't just "fire and forget." You should handle the Success and Failure of the Kafka send.
+Update your TaskEventProducer to handle callbacks:
+public void sendTaskCreatedEvent(TaskCreatedEvent event) {
+    CompletableFuture<SendResult<String, Object>> future = 
+        kafkaTemplate.send("task-events", event.getTaskId().toString(), event);
 
-Paste this at the very bottom of the file:
-export const SubHeadingText = styled(Typography)(({ theme }) => ({
-  fontSize: "20px",    // Your requested size
-  fontWeight: 500,     // Your requested weight
-  color: theme.palette.text.secondary,
-  lineHeight: 1.2,
-  marginTop: 0,
-  marginBottom: theme.spacing(1),
-  display: "block",
-}));
+    future.whenComplete((result, ex) -> {
+        if (ex == null) {
+            log.info("Event sent successfully for Task: {} [Offset: {}]", 
+                     event.getTaskId(), result.getRecordMetadata().offset());
+        } else {
+            log.error("Failed to send event for Task: {}", event.getTaskId(), ex);
+            // In a real PBC, you might trigger a 'retry' or log this to an error table
+        }
+    });
+}
 
-Step 2: Update the Imports in LoginPort.js
-Go to the top of your LoginPort.js where you see the long list of imports from ./LoginStyles. Add SubHeadingText to that list.
-import {
-  Root,
-  ContainerInner,
-  // ... other imports
-  BigHeading,
-  SubHeadingText, // <--- Add this line here
-  SubText,
-  // ...
-} from "./LoginStyles";
+📊 Summary: How many events?
+| Event Name | Frequency | Purpose |
+|---|---|---|
+| TASK_CREATED | Once per Task | Notifies Assignee, updates Search index, logs history. |
+| TASK_UPDATED | Every edit | Notifies of status changes (e.g., TODO -> DONE). |
+| TASK_DELETED | Every delete | Removes from search index and alerts team. |
+🏛️ The Verdict
+For now, Adesh, stick to one event for the creation process. It keeps your code clean and follows the DRY (Don't Repeat Yourself) principle. One well-structured JSON object in Kafka can power 10 different notification types.
+Does this "Single Event" approach make sense to you? If you're ready to see it in action, would you like me to help you write a "Test Consumer" so you can prove the event is actually arriving with all the correct details?
 
-Step 3: Update the JSX in LoginPort.js
-Scroll down to the second <LeftCol> (the one inside the second <Content> block).
-Find these two lines:
-<BigHeading>{content?.hero?.welcomeTitle}</BigHeading>
-<SubText>{content?.hero?.subText}</SubText>
 
-Replace ONLY those two lines with this:
-{/* Grouping these in a Box overrides the large gap between them */}
-<Box sx={{ mb: 1 }}>
-  <BigHeading>
-    {(content?.hero?.welcomeTitle || "").split(" - ")[0]}
-  </BigHeading>
 
-  {content?.hero?.welcomeTitle?.includes(" - ") && (
-    <SubHeadingText>
-      {content?.hero?.welcomeTitle.split(" - ")[1]}
-    </SubHeadingText>
-  )}
-</Box>
 
-<SubText>
-  {content?.hero?.subText}
-</SubText>
 
-Why this preserves your work:
- * Safety: By only changing the code inside the second <LeftCol>, you ensure the Logo, the Right Column (Login Form), and all your API logic remain exactly as they were.
- * No Blank Screen: Using the Box wrapper and the split logic with || "" handles the text safely even if the JSON is still loading.
- * Tighter Design: The Box wrapper around the two title pieces is the key to removing that unwanted large distance.
-Would you like me to show you how to add a very subtle bottom border under that new "enabling..." line to make it look even more professional?
+
+
+Adesh, as your Lead, I’m going to show you how to implement this using the "Separate Folder" architecture we just discussed. This keeps your TaskService focused on the database, while the new messaging package handles the "shouting" to Kafka.
+Here is the step-by-step implementation to notify the assigned user.
+🏛️ Step 1: Create the "Envelope" (The Event DTO)
+We don't send the entire Tasks entity because it contains too much internal database info. We create a lightweight Event object that has exactly what the notification system needs.
+Create com.example.devcollab.messaging.dto.TaskCreatedEvent.java:
+package com.example.devcollab.messaging.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class TaskCreatedEvent {
+    private Long taskId;
+    private String taskTitle;
+    private String assigneeEmail; // The most important field for notifications
+    private String assigneeName;
+    private String reporterName;  // "Adesh assigned you a task"
+}
+
+🏛️ Step 2: Create the "Worker" (The Producer)
+This class has one job: taking that envelope and dropping it into the Kafka pipe.
+Create com.example.devcollab.messaging.producer.TaskEventProducer.java:
+package com.example.devcollab.messaging.producer;
+
+import com.example.devcollab.messaging.dto.TaskCreatedEvent;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class TaskEventProducer {
+
+    // We use Object here so we can send different types of events later
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+    
+    // Define the topic name as a constant
+    private static final String TOPIC = "task-notifications";
+
+    public void sendTaskCreatedEvent(TaskCreatedEvent event) {
+        log.info("Sending notification event for Task ID: {} to Assignee: {}", 
+                 event.getTaskId(), event.getAssigneeEmail());
+                 
+        // This sends the message to the Kafka Topic
+        kafkaTemplate.send(TOPIC, event);
+    }
+}
+
+🏛️ Step 3: Trigger the Event in TaskService
+Now, we go back to your TaskService.java. We inject the TaskEventProducer and call it after the task is successfully saved to the database.
+Update your TaskService.java:
+// 1. Inject the producer at the top
+@Autowired
+private TaskEventProducer taskEventProducer;
+
+@Override
+@Transactional
+public TaskResDto createTasks(TaskReqDto taskReqDto) {
+    // ... all your existing logic to save the task ...
+    
+    Tasks SavedTasks = tasksRepository.save(tasks);
+
+    // 2. TRIGGER THE KAFKA EVENT
+    // We do this after save so we are sure the task exists in the DB
+    TaskCreatedEvent event = new TaskCreatedEvent(
+        SavedTasks.getId(),
+        SavedTasks.getTitle(),
+        SavedTasks.getAssignee().getEmail(),
+        SavedTasks.getAssignee().getName(), // Assuming your User model has 'name'
+        currentuser.getName()               // The person who created the task
+    );
+
+    taskEventProducer.sendTaskCreatedEvent(event);
+
+    // ... return your DTO ...
+}
+
+🏛️ Step 4: The "Glue" (Configuration)
+Since you are sending a Java Object (TaskCreatedEvent) instead of a simple String, you need to tell Spring to convert it to JSON before sending it to Kafka.
+Add this to your application.yml:
+spring:
+  kafka:
+    producer:
+      bootstrap-servers: localhost:9092
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # This is the "Magic" that turns your Java Object into JSON for the pipe
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+📊 Why this is the "Senior" Architecture
+ * Reliability: If you add log.info in your producer, you can check the console to see exactly what was sent without digging through your whole TaskService.
+ * Safety: If the Kafka server is down, the @Transactional on your service will ensure the task isn't "half-saved." (Though we usually handle Kafka errors separately so the user's task still saves even if the notification fails).
+ * Scalability: When you want to add a notification for "Task Updated" or "Task Deleted," you just add one more method to your TaskEventProducer!
+🏛️ The Verdict
+You’ve now successfully linked your Jira Core (Tasks) to your Message Bus (Kafka). This is how high-scale companies like LinkedIn or Uber handle their background tasks.
+Does this structure make sense to you? Once you’ve added the code, would you like me to give you the Consumer code so you can see the message being "received" and printed to the console?
+
+
