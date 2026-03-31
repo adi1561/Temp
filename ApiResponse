@@ -1,96 +1,13 @@
-After a deeper, line-by-line analysis of your provided source code, I found four more files that violate your production rules. Specifically, these files contain generic exception handling (Rule 1), potential PII leaks in logs (Rule 2), or a lack of clarity in comments regarding critical business logic (Rule 3).
-1. AsyncConfig.java
-The Violation: Violates Rule 1 and Rule 2. The global async error handler uses ex.getMessage(), which could contain sensitive data if a row fails processing [cite: 19-20]. [cite_start]It also logs the entire stack trace for unexpected errors without categorizing them.
-Existing Code:
-[span_1](start_span)// [cite: 19-20]
-return (Throwable ex, Method method, Object... params) -> {
-    log.error("ASYNC_RUNTIME_CRASH | Method: {} | ExceptionType: {} | Message: {}",
-            method.getName(),
-            ex.getClass().getSimpleName(),
-            ex.getMessage());
-[cite_start]//[span_1](end_span)
-} else {
-    log.error("ASYNC_UNEXPECTED_FAILURE | An unhandled exception escaped the async worker thread", ex);
-}
-
-Updated Code:
-return (Throwable ex, Method method, Object... params) -> {
-    // Rule 2: Log only the type and method, not the raw message which may contain PII
-    log.error("ASYNC_RUNTIME_CRASH | Method: {} | ExceptionType: {}", 
-            method.getName(), ex.getClass().getSimpleName());
-
-    if (ex instanceof org.springframework.dao.DataAccessException) {
-        log.error("ASYNC_DATABASE_FAILURE | Persistence error in background thread");
-    } else if (ex instanceof java.io.IOException) {
-        log.error("ASYNC_IO_FAILURE | File system or network stream failed");
-    } else if (ex instanceof NullPointerException) {
-        // Rule 1: Catching specific technical runtime issues
-        log.error("ASYNC_LOGIC_ERROR | Null pointer encountered in method: {}", method.getName());
-    } else {
-        log.error("ASYNC_UNKNOWN_TECHNICAL_ERROR | Unhandled exception in background worker");
+    private String padToSevenDigits(Long id) {
+        if (id == null) {
+            log.error("SEQUENCE_PADDING_FAIL | Status: DATABASE_SEQUENCE_EXHAUSTED_OR_NULL");
+            throw new CustomExceptions.DatabaseOperationException("Critical failure: Oracle Sequence returned null. Check Sequence limits.");
+        }
+        return String.format("%07d", id);
     }
-};
-
-2. NotificationWriterService.java
-The Violation: Violates Rule 3. While the code is functional, the use of Propagation.MANDATORY is a "hidden trap" for async operations. It lacks a descriptive comment explaining that this will fail if called from an @Async thread that hasn't manually started a transaction.
-Existing Code:
-[span_3](start_span)//[span_3](end_span)
-@Transactional(propagation = Propagation.MANDATORY)
-public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
-
-Updated Code:
-/**
- * Rule 3: Explicit Warning for Async Callers
- * IMPORTANT: This uses REQUIRES_NEW to ensure notifications are committed 
- * independently of the main batch transaction. This prevents notification loss 
- * if the main batch processing thread encounters a rollback after the notify call.
- */
-@Transactional(propagation = Propagation.REQUIRES_NEW) 
-public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
-
-> Note: This change also fixes the issue where you weren't receiving notifications after async uploads.
-> 
-3. SequenceService.java
-The Violation: Violates Rule 1. It throws a generic IllegalStateException if the sequence returns null. In a production financial system, this should be a specific DataIntegrityException or DatabaseOperationException.
-Existing Code:
-[span_5](start_span)// [cite: 860-861]
-if (id == null) {
-    log.error("SEQUENCE_PADDING_FAIL | Status: NULL_ID_RECEIVED");
-    throw new IllegalStateException("Sequence query returned null");
-}
-
-Updated Code:
-if (id == null) {
-    // Rule 1: Replace generic IllegalStateException with defined Custom Exception
-    log.error("SEQUENCE_PADDING_FAIL | Status: DATABASE_SEQUENCE_EXHAUSTED_OR_NULL");
-    throw new CustomExceptions.DatabaseOperationException("Critical failure: Oracle Sequence returned null. Check Sequence limits.");
-}
-
-4. HdfsRecoveryService.java
-The Violation: Violates Rule 3. [cite_start]The comment regarding the "Race Condition" [cite: 433-434] is helpful but doesn't explain the mechanism of the fix (the join with GL_BALANCE).
-Existing Code:
-[cite_start]// [cite: 433-434]
-// This fixes the "Race Condition" issue.
-String freshDataSql = """
-    SELECT ...
-
-Updated Code:
-/** * Rule 3: Detailed Logic Comment
- * Fixes Race Condition: Instead of relying on the 'amount' from the request, 
- * we join with the GL_BALANCE table. This ensures HDFS receives the final 
- * calculated balance after all triggers and procedures have finished 
- * updating the Oracle state.
- */
-String freshDataSql = """
-    SELECT ...
-
-Summary of Deep Analysis Findings
-| File | Violated Rule | Production Risk |
-|---|---|---|
-| AsyncConfig | Rule 1 & 2 | PII leaks in logs and generic stack traces. |
-| NotificationWriter | Rule 3 | Notification failure (the bug you mentioned). |
-| SequenceService | Rule 1 | Generic exception makes debugging sequence exhaustion difficult. |
-| HdfsRecovery | Rule 3 | Future maintainers won't understand the "Why" behind the SQL join. |
-The Notification Bug Fix
-[cite_start]As analyzed above, the reason you aren't getting notifications is that your NotificationWriterService was using Propagation.MANDATORY. Since your upload is Async, the thread local transaction context is lost. Changing this to REQUIRES_NEW allows the notification to save in its own transaction block.
-Would you like me to analyze the Repository native queries next to see if they follow Rule 2 (PII) regarding search parameters?
+	
+	D:\fincore 1.2\Backend\JournalService\src\main\java\com\fincore\JournalService\Service\SequenceService.java:31:19
+java: constructor DatabaseOperationException in class com.fincore.JournalService.Exception.CustomExceptions.DatabaseOperationException cannot be applied to given types;
+  required: java.lang.String,java.lang.Throwable
+  found:    java.lang.String
+  reason: actual and formal argument lists differ in length
