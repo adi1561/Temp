@@ -1,3 +1,6 @@
+Here are the complete, updated files for your production-ready backend. I have implemented the Notification Bug Fix by changing the transaction propagation and resolved the Compilation Error by adding the missing constructor to your custom exception.
+1. Updated: NotificationWriterService.java
+The propagation is updated to REQUIRES_NEW to ensure that notifications triggered from background @Async threads (which don't have an existing transaction) are successfully saved to the database.
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Models.Notifications;
@@ -11,7 +14,8 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Responsible for persisting system-wide alerts and user-specific notifications.
- * Enforces transactional integrity via mandatory propagation.
+ * Rule 3: Uses REQUIRES_NEW to ensure notifications are committed independently.
+ * This is critical for @Async operations where a parent transaction is not present.
  */
 @Service
 @RequiredArgsConstructor
@@ -22,29 +26,29 @@ public class NotificationWriterService {
 
     /**
      * Persists a notification event.
-     * Requires an existing transaction (Propagation.MANDATORY) to ensure notification
-     * consistency with the business operation (e.g., batch creation).
+     * Rule 3: Propagation changed from MANDATORY to REQUIRES_NEW to fix the notification 
+     * [span_0](start_span)[span_1](start_span)loss bug occurring during asynchronous batch processing[span_0](end_span)[span_1](end_span).
      * * @throws IllegalArgumentException if validation fails.
      * @throws org.springframework.dao.DataAccessException if database persistence fails.
      */
-    @Transactional(propagation = Propagation.MANDATORY)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
 
-        // 1. Validation Logic: Ensure at least one recipient type is provided [cite: 751-752]
+        [span_2](start_span)// 1. Validation Logic: Ensure at least one recipient type is provided[span_2](end_span)
         if (userId == null && targetRole == null) {
             log.warn("NOTIFICATION_SKIPPED | Reason: Recipient missing | AggregateID: {}", aggregateId);
             return;
         }
 
-        // 2. Validation Logic: Ensure message content exists[span_1](end_span)
+        [span_3](start_span)// 2. Validation Logic: Ensure message content exists[span_3](end_span)
         if (message == null || message.isBlank()) {
             log.error("NOTIFICATION_VALIDATION_FAIL | Status: BLANK_MESSAGE | AggregateID: {}", aggregateId);
             throw new IllegalArgumentException("Notification message content is required.");
         }
 
         try {
-            // 3. Build and Persist Notification Entity [cite: 754-755]
-                    Notifications notification = Notifications.builder()
+            [span_4](start_span)// 3. Build and Persist Notification Entity[span_4](end_span)
+            Notifications notification = Notifications.builder()
                     .userId(userId)
                     .targetRole(targetRole)
                     .message(message)
@@ -55,6 +59,7 @@ public class NotificationWriterService {
 
             notificationRepository.save(notification);
 
+            // Rule 2: Descriptive logging without leaking sensitive message content
             if (userId != null) {
                 log.info("NOTIFICATION_SAVED | Type: DIRECT | UserID: {} | Ref: {}", userId, aggregateId);
             } else {
@@ -62,21 +67,25 @@ public class NotificationWriterService {
             }
 
         } catch (DataAccessException e) {
-            // Specifically catching Spring's data access exceptions for production stability
-            log.error("NOTIFICATION_DB_FAIL | AggregateID: {} | Reason: {}", aggregateId, e.getMessage());
-            // Re-throwing to allow the parent transaction to roll back if the notification is critical
+            [span_5](start_span)// Rule 1: Specifically catching Spring's data access exceptions[span_5](end_span)
+            // Rule 2: Log descriptive error but avoid e.getMessage() to prevent PII leaks
+            log.error("NOTIFICATION_DB_FAIL | AggregateID: {} | Reason: Database persistence failure", aggregateId);
             throw e;
         }
     }
 }
 
-
-
+2. Updated: CustomExceptions.java
+The DatabaseOperationException now includes a single-argument constructor to resolve your compilation error, allowing other services to throw it with just a message string. All other existing exceptions remain untouched to ensure compatibility across your project.
 package com.fincore.JournalService.Exception;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.ResponseStatus;
 
+/**
+ * Centralized custom exception definitions for the Journal Service.
+ * Rule 1: Ensures specific HTTP status codes are mapped to business failures.
+ */
 public class CustomExceptions {
 
     @ResponseStatus(HttpStatus.BAD_REQUEST)
@@ -97,8 +106,11 @@ public class CustomExceptions {
 
     @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
     public static class DatabaseOperationException extends RuntimeException {
+        // Rule 1: Added single-argument constructor to fix compilation errors in SequenceService
+        public DatabaseOperationException(String message) { super(message); }
         public DatabaseOperationException(String message, Throwable cause) { super(message, cause); }
     }
+
     @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
     public static class RedisOperationException extends RuntimeException {
         public RedisOperationException(String message, Throwable cause) { super(message, cause); }
@@ -115,7 +127,9 @@ public class CustomExceptions {
     }
 }
 
-
-this are 2 files give mi this 2 file complate i will just copy paste 
-and dont remove the existing logic 
-THAT CUSTOM  exception also used by other files
+Summary of Changes
+ * Notification Fix: Changed NotificationWriterService from MANDATORY to REQUIRES_NEW. This allows the background threads to create their own transaction to save notifications even if the main controller transaction is absent or closed.
+ * Compilation Fix: Added public DatabaseOperationException(String message) in CustomExceptions. This permits the use of throw new CustomExceptions.DatabaseOperationException("message") without needing a second Throwable argument.
+ * Production Rules:
+   * Maintained descriptive logs but removed generic e.getMessage() calls in NotificationWriterService to avoid accidental PII logging.
+   * Added comments explaining the "Why" behind the transaction changes (Rule 3).
