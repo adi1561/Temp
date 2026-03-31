@@ -1,13 +1,91 @@
-    private String padToSevenDigits(Long id) {
-        if (id == null) {
-            log.error("SEQUENCE_PADDING_FAIL | Status: DATABASE_SEQUENCE_EXHAUSTED_OR_NULL");
-            throw new CustomExceptions.DatabaseOperationException("Critical failure: Oracle Sequence returned null. Check Sequence limits.");
-        }
-        return String.format("%07d", id);
+The compilation error you encountered is because the DatabaseOperationException in your CustomExceptions class is currently defined to require both a String and a Throwable. To follow Rule 1 (Specific Exceptions) properly while fixing the build, we should update the exception class itself to support single-argument messages and then update the service.
+Below are the updated files for the build fix and the Notification Bug Fix.
+1. Update: CustomExceptions.java (Fixing the Compilation Error)
+We need to add a single-argument constructor to DatabaseOperationException so it can be thrown when there is no underlying Throwable (like a null check).
+Updated Code:
+[span_2](start_span)//[span_2](end_span)
+@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+public static class DatabaseOperationException extends RuntimeException {
+    [span_3](start_span)// Existing constructor[span_3](end_span)
+    public DatabaseOperationException(String message, Throwable cause) { 
+        super(message, cause); 
     }
-	
-	D:\fincore 1.2\Backend\JournalService\src\main\java\com\fincore\JournalService\Service\SequenceService.java:31:19
-java: constructor DatabaseOperationException in class com.fincore.JournalService.Exception.CustomExceptions.DatabaseOperationException cannot be applied to given types;
-  required: java.lang.String,java.lang.Throwable
-  found:    java.lang.String
-  reason: actual and formal argument lists differ in length
+    
+    // Rule 1: Added this constructor to handle logic-based DB failures without a cause
+    public DatabaseOperationException(String message) { 
+        super(message); 
+    }
+}
+
+2. Update: SequenceService.java (Now Compiles)
+Now that the constructor exists, the code you were trying to use will compile perfectly.
+Updated Code:
+[span_4](start_span)// [cite: 859-861]
+private String padToSevenDigits(Long id) {
+    if (id == null) {
+        // Rule 2: Masking technical details, logging clear status
+        log.error("SEQUENCE_PADDING_FAIL | Status: DATABASE_SEQUENCE_EXHAUSTED_OR_NULL");
+        
+        // Rule 1: Using the new specific constructor
+        throw new CustomExceptions.DatabaseOperationException("Critical failure: Oracle Sequence returned null. Check Sequence limits.");
+    }
+    return String.format("%07d", id);
+}
+
+3. Notification Bug Fix: NotificationWriterService.java
+[cite_start]The reason notifications were not being delivered during async processing is that Propagation.MANDATORY requires an active transaction on the current thread. Since @Async methods run on a separate thread pool (bulkExecutor), they do not inherit the transaction from the controller.
+Updated Code:
+/**
+ * Rule 3: This service uses REQUIRES_NEW to fix the "Async Notification Bug".
+ * Because batch creation happens in a background @Async thread, Propagation.MANDATORY 
+ * would fail as there is no transaction bound to the new thread. 
+ * REQUIRES_NEW ensures the notification is saved even if the main thread 
+ * hasn't committed yet.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+
+    [span_7](start_span)// Rule 1 & 3: Changed from MANDATORY to REQUIRES_NEW for Async compatibility[span_7](end_span)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        if (userId == null && targetRole == null) {
+            log.warn("NOTIFICATION_SKIPPED | Reason: Recipient missing | AggregateID: {}", aggregateId);
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+            // Rule 2: Descriptive log without logging the context of the blank message
+            log.error("NOTIFICATION_VALIDATION_FAIL | Status: BLANK_MESSAGE | AggregateID: {}", aggregateId);
+            throw new IllegalArgumentException("Notification message content is required.");
+        }
+
+        try {
+            Notifications notification = Notifications.builder()
+                    .userId(userId)
+                    .targetRole(targetRole)
+                    .message(message)
+                    .linkUrl(linkUrl)
+                    .aggregateId(aggregateId)
+                    .eventSource(eventSource)
+                    .build();
+            notificationRepository.save(notification);
+
+            log.info("NOTIFICATION_SAVED | Ref: {} | User: {}", aggregateId, userId != null ? userId : targetRole);
+
+        } catch (DataAccessException e) {
+            [span_8](start_span)// Rule 1 & 2: Catching specific Spring DAO exception and logging safely[span_8](end_span)
+            log.error("NOTIFICATION_DB_FAIL | AggregateID: {} | Reason: Database persistence failed", aggregateId);
+            throw e;
+        }
+    }
+}
+
+Why this fixes your issue:
+ * Build Error: The constructor addition in CustomExceptions resolves the actual and formal argument lists differ in length error.
+ * Notification Bug: By using Propagation.REQUIRES_NEW, the notification logic no longer waits for a transaction that doesn't exist on the async thread. It creates its own small transaction, saves the notification, and commits immediately.
+Shall we move to the JournalRequestServiceImpl file to fix the generic RuntimeException catches next?
