@@ -1,50 +1,175 @@
-To ensure the system is secure for production next week, we will address the four accepted security violations starting with SQL Injection.
-Security Violation #1: SQL Injection (SQLi) Audit
-The system currently uses JdbcTemplate and PreparedStatement, which are the primary defenses against SQLi because they use bind variables (?). However, to be "production-ready," we must ensure that no dynamic strings are built for native queries and that database-level errors do not leak table structures.
-1. Repository Layer: JournalRequestRepository.java
-The native queries in this repository must strictly use named parameters (:paramName) and @Param annotations. Using string concatenation inside a @Query annotation is a high-level vulnerability.
-Updated Safe Code:
-@Repository
-public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long> {
+process journal batch
 
-    // Rule 1 & Security: Using Named Parameters prevents SQL Injection
-    @Modifying
-    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE JOURNAL_ID IN (:journalIds) AND CREATOR_ID = :userId", nativeQuery = true)
-    void deleteJournalsNative(@Param("journalIds") List<String> journalIds, @Param("userId") String userId);
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2, 
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+BEGIN
+    -- Enable Parallel DML for High-Speed Bulk Processing
+    EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
 
-    @Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId", 
-           countQuery = "SELECT count(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId", 
-           nativeQuery = true)
-    Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
-}
+    -- ==========================================================
+    -- 0. PRE-CHECK: INTEGRITY GUARD
+    -- ==========================================================
+    SELECT COUNT(*)
+    INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY 
+        FROM JOURNAL_REQUEST 
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm 
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND cm.CURRENCY_RATE IS NULL;
 
-2. Service Layer: JournalRequestServiceImpl.java
-In the processChunkRaw and executeAsyncBatchProcessing methods, the code uses ? bind variables. While this is safe from injection, the Logging of these errors currently violates security best practices (Rule 2).
-The Risk: If a query fails, logging the raw exception message can expose parts of the SQL query or the values that failed validation, which helps an attacker understand the database schema.
-Updated Safe Code (processChunkRaw):
-// Rule 2 & Security: Masking SQL details in logs
-try (Connection conn = dataSource.getConnection();
-     PreparedStatement ps = conn.prepareStatement(sql)) {
-    // ... logic ...
-} catch (SQLException e) {
-    // SECURITY: Do not log e.getMessage() here. SQLState and ErrorCode are safe for debugging
-    // without exposing the raw query or PII values to the log files.
-    log.error("JDBC_SQL_FAIL | Batch: {} | SQLState: {} | ErrorCode: {}", 
-              batchId, e.getSQLState(), e.getErrorCode());
-    throw new CustomExceptions.DatabaseOperationException("Database integrity error during batch insert");
-}
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'CRITICAL: Active Exchange Rate missing for foreign currency in Batch. Operation Aborted.');
+    END IF;
 
-3. Critical Warning: Database-Level Procedures
-The Java code calls the Oracle procedure: {call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}.
-The Vulnerability: Even if the Java side is safe, if the PL/SQL code inside Oracle uses EXECUTE IMMEDIATE with string concatenation (e.g., v_sql := 'SELECT ... WHERE id = ' || p_batch_id), the system is VULNERABLE to SQL Injection via the batchId or remarks.
-Action Required:
- * Verify that the Oracle procedure PROCESS_JOURNAL_BATCH uses Bind Variables internally.
- * Example of Safe PL/SQL: EXECUTE IMMEDIATE 'UPDATE GL_BALANCE SET BAL = :1 WHERE ID = :2' USING v_bal, v_id;
-Summary of SQL Injection Resolution
-| Component | Resolution Action | Status |
-|---|---|---|
-| Native Queries | Enforced @Param named binding in Repository. | Resolved |
-| JDBC Template | Verified ? bind variables in all Service methods. | Verified |
-| Error Logging | Removed e.getMessage() from SQL catch blocks to prevent schema leakage. | Resolved |
-| PL/SQL Procedures | Requirement: Ensure internal Oracle code uses bind variables. | Pending DB Review |
-Are you ready to move to Security Violation #2: Information Leakage (PII in logs)?
+    -- BEGIN ATOMIC TRANSACTION
+    BEGIN
+        -- ==========================================================
+        -- 1. Insert into GL_TRANSACTIONS
+        -- ==========================================================
+        INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+            TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+            BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
+        )
+        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+            GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID, NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, 
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, 
+            'J'
+        FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+        -- ==========================================================
+        -- 2. Insert into MASTER_JOURNAL 
+        -- ==========================================================
+        INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
+            JOURNAL_ID,             -- 1
+            JOURNAL_AMT,            -- 2
+            AR_FLAG,                -- 3
+            BATCH_ID,               -- 4
+            JOURNAL_BRANCH,         -- 5
+            JOURNAL_CGL,            -- 6
+            COMMON_BATCH_REMARKS,   -- 7
+            CURRENCY,               -- 8
+            JOURNAL_ID_REF,         -- 9
+            JOURNAL_PDATE,          -- 10
+            PRODUCT_TYPE,           -- 11
+            REMARKS,                -- 12
+            TXN_TYPE                -- 13
+        )
+        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+            MASTER_JOURNAL_SEQ.nextval,                 -- 1. Uses your Master sequence
+            ABS(REQ_AMOUNT),                            -- 2. JOURNAL_AMT (Absolute value ensures no negative amounts)
+            'A',                                        -- 3. AR_FLAG ('A' for Approved)
+            BATCH_ID,                                   -- 4. BATCH_ID
+            REQ_BRANCH_CODE,                            -- 5. JOURNAL_BRANCH
+            REQ_CGL,                                    -- 6. JOURNAL_CGL
+            p_remarks,                                  -- 7. COMMON_BATCH_REMARKS (Using the Approval remarks)
+            REQ_CURRENCY,                               -- 8. CURRENCY
+            JOURNAL_ID,                                 -- 9. JOURNAL_ID_REF (The string ID from request)
+            NVL(REQ_CSV_DATE, TRUNC(SYSDATE)),          -- 10. JOURNAL_PDATE (Falls back to today if missing)
+            REQ_PRODUCT,                                -- 11. PRODUCT_TYPE
+            REQ_NARRATION,                              -- 12. REMARKS
+            CASE WHEN REQ_AMOUNT > 0 THEN 'Debit' 
+                 ELSE 'Credit' END                      -- 13. TXN_TYPE (Dynamically calculated)
+        FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+        -- ==========================================================
+        -- 3. Merge Balances (STRICT RATE LOGIC)
+        -- ==========================================================
+        MERGE /*+ PARALLEL(target, 8) */ INTO GL_BALANCE target
+        USING (
+            SELECT /*+ PARALLEL(j, 8) */
+                j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+                CASE 
+                    WHEN j.REQ_CURRENCY = 'INR' THEN 1 
+                    ELSE MAX(c.CURRENCY_RATE) 
+                END as EXCH_RATE 
+            FROM JOURNAL_REQUEST j
+            LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1 
+            WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+            GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+        ) source
+        ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE AND target.CURRENCY = source.REQ_CURRENCY AND target.CGL = source.REQ_CGL AND target.BALANCE_DATE = source.BAL_DATE)
+        WHEN MATCHED THEN
+            UPDATE SET target.BALANCE = target.BALANCE + source.TXN_AMOUNT, target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+        WHEN NOT MATCHED THEN
+            INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+            VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE, source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT, (source.TXN_AMOUNT * source.EXCH_RATE));
+
+        -- ==========================================================
+        -- 4. Update Status in Request Table
+        -- ==========================================================
+        UPDATE /*+ PARALLEL(JOURNAL_REQUEST, 8) */ JOURNAL_REQUEST
+        SET REQ_STATUS = p_status, EXECUTOR_ID = p_executor_id, EXECUTION_DATE = SYSDATE, EXECUTOR_REMARKS = p_remarks
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+        COMMIT; 
+
+        -- ==========================================================
+        -- 5. Return Cursor to Java
+        -- ==========================================================
+        OPEN o_cursor FOR
+        SELECT 
+            j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL, j.REQ_CSV_DATE AS BAL_DATE,
+            g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+        FROM (SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id) j
+        JOIN GL_BALANCE g ON g.BRANCH_CODE = j.REQ_BRANCH_CODE AND g.CURRENCY = j.REQ_CURRENCY AND g.CGL = j.REQ_CGL AND g.BALANCE_DATE = j.REQ_CSV_DATE;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE; 
+    END;
+END;
+
+
+
+2ND ONE purge JOUNRAL BATCH
+create or replace PROCEDURE PURGE_JOURNAL_BATCH(
+    p_batch_id IN VARCHAR2,
+    p_user_id IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+BEGIN
+    -- 1. Security Check
+    SELECT BATCH_STATUS INTO v_status
+    FROM JOURNAL_BATCH_MASTER
+    WHERE BATCH_ID = p_batch_id AND CREATOR_ID = p_user_id;
+
+    -- ALLOW 'PENDING' OR 'QUEUED' (Locked by Java)
+    IF v_status NOT IN ('PENDING', 'QUEUED', 'ERROR') THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+    END IF;
+
+    -- 2. Fast Chunked Delete
+    LOOP
+        DELETE FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id
+          AND REQ_STATUS IN ('P', 'R') -- Clean PENDING or REJECTED
+          AND ROWNUM <= 50000;
+
+        EXIT WHEN SQL%ROWCOUNT = 0;
+        COMMIT; 
+    END LOOP;
+
+    -- 3. Delete Master
+    DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
+    COMMIT;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+END;
