@@ -1,101 +1,58 @@
-After a deep dive into the three controllers, I’ve found three specific "Senior Lead" level issues that could cause production crashes or performance bottlenecks.
-These aren't syntax errors, but rather "edge cases" that happen when real users start hitting your API with bad data or high volume.
-1. The "Open Search" Performance Risk
-Controller: CglController
-The Problem: The query parameter has a defaultValue = "".
- * The Scenario: If a user (or an automated bot) hits /api/cgl-journal/search without a query, the code calls cglService.searchCgls("").
- * The Risk: Depending on your SQL logic, a blank search often translates to LIKE '%%', which will attempt to fetch all 600,000+ CGL records from Oracle. This will hang the database connection and likely crash the JVM with an OutOfMemoryError.
-> The Fix: Return an empty list immediately if the query is blank, just like you did in the BranchController.
-> 
-2. The Date-Format Crash
-Controller: JournalRequestController (Method: initiateValidation)
-The Problem: You are using LocalDate.parse(date) directly on a RequestParam.
- * The Scenario: If the frontend sends the date in the wrong format (e.g., DD-MM-YYYY instead of YYYY-MM-DD), this line will throw a DateTimeParseException.
- * The Risk: If your GlobalExceptionHandler isn't specifically catching this, it will return a messy 500 Internal Server Error with a stack trace, which is a Security Violation (Information Leakage).
-> The Fix: Use a try-catch to wrap it in a CustomExceptions.InvalidDataException or use Spring's @DateTimeFormat to handle the parsing safely.
-> 
-3. The "Checked Exception" Leak
-Controller: JournalRequestController
-The Problem: Methods like createBatchRequest and createBatchFromCache throw JsonProcessingException or IOException in the method signature.
- * The Risk: In production, if these exceptions are thrown, they escape the controller and are handled by the default Spring Error Controller. This often leaks the internal file path or the exact JSON field that failed.
-> The Fix: Wrap these in your CustomExceptions so the user only gets a sanitized "Reference: ORA-code" or "Data Mapping Error."
-> 
-Final Hardened Controller Logic
-Here are the specific updates for CglController and JournalRequestController. I have kept your existing business logic and endpoint names exactly as they were.
-CglController.java (Hardened Search)
-@GetMapping("/search")
-public ResponseEntity<List<CglDto>> searchCgl(@RequestParam(value = "query", required = false, defaultValue = "") String query) {
-    // Rule 3: Guard against "Fetch All" attacks. 
-    // Prevents performance degradation if a blank query is sent.
-    if (query == null || query.trim().isEmpty()) {
-        return ResponseEntity.ok(Collections.emptyList());
-    }
-
-    log.info("CGL_CONTROLLER_SEARCH_INIT | Query: {}", query);
-    List<CglDto> results = cglService.searchCgls(query);
-    return ResponseEntity.ok(results);
-}
-
-JournalRequestController.java (Safe Date & Exception Handling)
-@PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-public ResponseEntity<Map<String, Object>> initiateValidation(
-        @RequestParam("file") MultipartFile file,
-        @RequestParam("postingDate") String date,
-        HttpServletRequest request) {
-
-    if (file == null || file.isEmpty()) {
-        throw new CustomExceptions.FileProcessingException("File is missing or empty");
-    }
-
-    try {
-        // Rule 3: Safe Date Parsing. 
-        // Prevents raw DateTimeParseException from leaking to the frontend.
-        LocalDate parsedDate = LocalDate.parse(date);
-        
-        log.info("VALIDATION_INIT | File: {} | Date: {}", file.getOriginalFilename(), parsedDate);
-
-        String reqId = journalBulkValidationService.initiateValidation(
-                file.getInputStream(),
-                file.getOriginalFilename(),
-                parsedDate
-        );
-        return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
-    } catch (java.time.format.DateTimeParseException e) {
-        log.error("VALIDATION_DATE_FAIL | RawDate: {}", date);
-        throw new CustomExceptions.InvalidDataException("Invalid date format. Use YYYY-MM-DD.");
-    } catch (IOException e) {
-        log.error("VALIDATION_IO_FAIL | File: {}", file.getOriginalFilename());
-        throw new CustomExceptions.FileProcessingException("Failed to read uploaded file.");
+That's my bad—I suggested using InvalidDataException to harden the controller, but we haven't added that specific inner class to your CustomExceptions.java file yet.
+To fix the "Can't resolve symbol" error, you need to add the following static inner class to your CustomExceptions file. This allows the controller to throw a clean 400 Bad Request when a user sends a malformed date or invalid field.
+Update: CustomExceptions.java
+Add this block inside your CustomExceptions class:
+/**
+ * Rule 1: Specific Exception Types.
+ * Added InvalidDataException to handle 400 Bad Request scenarios 
+ * like malformed dates or invalid field values from the frontend.
+ */
+@ResponseStatus(HttpStatus.BAD_REQUEST)
+public static class InvalidDataException extends RuntimeException {
+    public InvalidDataException(String message) {
+        super(message);
     }
 }
 
-@PostMapping("/create-batch")
-public ResponseEntity<List<JournalRequest>> createBatchRequest(
-        @Valid @RequestBody BatchRequestDto batchDto,
-        @RequestHeader("Authorization") String token) {
+Full Context for CustomExceptions.java
+Your file should now look like this to support all the "Hardened" logic we've implemented:
+package com.fincore.JournalService.Exception;
 
-    try {
-        String userId = jwtUtil.getUserIdFromToken(token);
-        log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
 
-        List<JournalRequest> created = journalRequestService.createBatchRequest(
-                batchDto,
-                userId,
-                jwtUtil.getUserRoleFromToken(token)
-        );
-        return ResponseEntity.status(HttpStatus.CREATED).body(created);
-    } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
-        // Rule 2: Masking JSON structure details in logs
-        log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
-        throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
+public class CustomExceptions {
+
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public static class CacheExpiredException extends RuntimeException {
+        public CacheExpiredException(String message) { super(message); }
+    }
+
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public static class FileProcessingException extends RuntimeException {
+        public FileProcessingException(String message) { super(message); }
+        public FileProcessingException(String message, Throwable cause) { super(message, cause); }
+    }
+
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public static class BatchProcessingException extends RuntimeException {
+        public BatchProcessingException(String message) { super(message); }
+        public BatchProcessingException(String message, Throwable cause) { super(message, cause); }
+    }
+
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public static class DataMappingException extends RuntimeException {
+        public DataMappingException(String message) { super(message); }
+    }
+
+    // NEW: Resolves the "Can't resolve symbol" error
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public static class InvalidDataException extends RuntimeException {
+        public InvalidDataException(String message) { super(message); }
     }
 }
 
-Summary of Controller Readiness
-| Controller | Status | Technical Check |
-|---|---|---|
-| BranchController | DONE | Standardized with ResponseEntity. |
-| CglController | DONE | Added blank query guard to prevent OOM. |
-| JournalRequest | DONE | Added Date parsing safety and IO Exception wrapping. |
-With these changes, your controller layer is now Senior Lead ready. It prevents common "crash" scenarios and maintains strict PII protection in the logs.
-Is there any other file you want to review, or should we consider this audit Complete?
+Why this is the correct "Lead" approach:
+By mapping this to HttpStatus.BAD_REQUEST, your GlobalExceptionHandler will automatically return a 400 status code to the frontend. This is much better than a 500 error because it tells the user (and the mobile/web developers) that the mistake was on their side (wrong date format), not a server crash.
+Once you add this, the red lines in your JournalRequestController will disappear.
+Is there anything else throwing a compilation error, or are we clear to run the server?
