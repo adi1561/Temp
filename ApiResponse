@@ -1,12 +1,11 @@
-You're totally right—my apologies. Simply logging it is a "silent fail" for the user, which is exactly what we’re trying to avoid in a professional system.
-Since the validation runs in an @Async thread, the initial HTTP request has already finished and returned a 202 QUEUED status to the user. Throwing a standard exception inside processAsync won't reach the user's screen; it will only hit the AsyncUncaughtExceptionHandler and stay in the server logs [cite: 15-16].
-To actually show this error in the UI, we must use your handleAsyncCrash logic. [cite_start]This updates the status in Redis so that when the frontend polls the bulk-status endpoint, it sees the "ERROR" state and the specific message.
-The Professional Fix: User-Facing Async Error
-Update your processAsync method in JournalBulkValidationService.java to explicitly update the Redis state before returning.
+/**
+ * Rule 3: Logical Integrity Check.
+ * Bug Fix: Prevents "Ghost Batches" by throwing an exception if 
+ * the file contains headers but zero data rows.
+ */
 @Async("bulkExecutor")
 public void processAsync(String requestId, String tempFilePath, String filename, LocalDate postingDate) {
     MDC.put("requestId", requestId);
-    long startTime = System.currentTimeMillis();
     File tempFile = new File(tempFilePath);
 
     try {
@@ -21,13 +20,9 @@ public void processAsync(String requestId, String tempFilePath, String filename,
 
         List<ExcelRowData> parsedRows = parsingResult.rows;
 
-        // HARD FIX: Stop processing and inform the USER via Redis/UI
+        [cite_start]// STEP 1: Throw the exception if data is missing[span_0](end_span)
         if (parsedRows == null || parsedRows.isEmpty()) {
-            log.warn("EMPTY_DATA_UPLOAD | ReqID: {} | Status: Header-only file detected", requestId);
-            
-            [span_4](start_span)// This method updates the Redis state to 'ERROR', which the UI displays[span_4](end_span)
-            handleAsyncCrash(requestId, "Validation Failed: The file contains headers but no actual data rows.");
-            return; 
+            throw new CustomExceptions.InvalidDataException("File data is empty. No transaction rows found.");
         }
 
         updateState(requestId, s -> {
@@ -35,14 +30,20 @@ public void processAsync(String requestId, String tempFilePath, String filename,
             s.setMessage("Validating Formats...");
         });
 
-        [span_5](start_span)// ... continue with validation[span_5](end_span)
+        // ... [Rest of the validation logic] ...
 
-Why this works for the User:
- * Polling Mechanism: The user's browser is calling /api/journals/bulk-status/{requestId} every few seconds.
- * State Update: By calling handleAsyncCrash, you change the status in Redis from PROCESSING to ERROR and set the message to "The file contains headers but no actual data rows".
- * UI Response: The next time the browser polls, it receives that ERROR state and displays your message to the user instead of spinning forever or showing a false "Success."
-Summary of the "Empty File" Logic:
- * 0 Bytes / Missing File: Caught by the Controller immediately (Returns 400 Bad Request).
- * Headers Only (No Rows): Caught by this new processAsync check (Updates Redis to ERROR).
- * Valid Data: Proceeds to stage 1 validation.
-Does this meet the professional standard you're looking for, or should we also trigger a specific "Empty File" notification to the user's inbox?
+    } catch (CustomExceptions.InvalidDataException e) {
+        // STEP 2: Catch it and send the message to the User's UI via Redis
+        log.warn("EMPTY_DATA_REJECTED | ReqID: {} | Reason: {}", requestId, e.getMessage());
+        handleAsyncCrash(requestId, e.getMessage());
+    } catch (FileNotFoundException e) {
+        handleAsyncCrash(requestId, "System Error: File not found.");
+    } 
+    // ... [Other catch blocks] ...
+    finally {
+        if (tempFile.exists() && !tempFile.delete()) {
+            [span_1](start_span)log.warn("CLEANUP_WARN | Path: {} | Status: Temp file purge failed", tempFilePath); [cite: 257-258]
+        }
+        [cite_start]MDC.clear();[span_1](end_span)
+    }
+}
