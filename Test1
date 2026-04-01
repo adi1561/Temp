@@ -1,176 +1,400 @@
-how this works step by step guidance
+/**
+ * File: JournalRequestServiceImpl.java
+ * Author: Adesh (Senior Software Engineer / Technical Lead)
+ * Description: Core service implementation for Journal processing. 
+ * Handles high-volume (600k+) batch operations using JDBC Batching, 
+ * Oracle Parallelism, and Redis-backed state management.
+ * * Production Rules Followed:
+ * 1. Specific Exceptions: No generic Exception/RuntimeException catching.
+ * 2. PII Safety: Descriptive logs without logging sensitive data or raw DB errors.
+ * 3. Clear Comments: Detailed explanations for complex business logic.
+ */
 
+package com.fincore.JournalService.Service;
 
-Adesh, as a Lead, I’m going to give you the "cleanest" architectural answer. In a professional system, you don't create a different event for every person you want to notify. Instead, you follow the "Single Source of Truth" event pattern.
-For the task creation process, you should create one single event, but design it so that multiple services can use it.
-🏛️ 1. The "One Event, Many Listeners" Strategy
-Instead of creating a NotificationEvent and a LoggingEvent, you create one TASK_CREATED event.
-Think of it like a newspaper. The journalist (your Task Service) writes one story. The readers (Notification Service, Search Indexer, Analytics Service) all read the same story but do different things with it.
-🏛️ 2. What exactly goes in the Event?
-To make this event "detailed" enough for everyone, your TaskCreatedEvent DTO should look like this:
-@Data
-@Builder
-public class TaskCreatedEvent {
-    // 1. Core IDs (For database lookups)
-    private Long taskId;
-    private Long projectId;
-    
-    // 2. Display Info (So the consumer doesn't HAVE to call the DB)
-    private String title;
-    private String priority;
-    
-    // 3. People Involved
-    private Long assigneeId;
-    private String assigneeEmail;
-    private String reporterName;
-    
-    // 4. Metadata
-    private LocalDateTime createdAt;
-}
-
-🏛️ 3. The Step-by-Step Execution Flow
-Here is exactly how the data should move from the user's click to the Kafka pipe:
- * Frontend: User hits "Create Task."
- * Controller: Receives the DTO, validates the JWT.
- * Service (The Transaction):
-   * Starts a @Transactional block.
-   * Saves the Task to MySQL.
-   * Crucial: Fetches the Assignee and Reporter details (names/emails) because you need them for the event.
- * Producer Trigger: Right before the method returns (but after the save()), you call the producer.
- * Kafka Topic: The message sits in the task-events topic.
-🏛️ 4. How to Send them "In Detail" (The Pro Way)
-If you want to be a top-tier engineer, don't just "fire and forget." You should handle the Success and Failure of the Kafka send.
-Update your TaskEventProducer to handle callbacks:
-public void sendTaskCreatedEvent(TaskCreatedEvent event) {
-    CompletableFuture<SendResult<String, Object>> future = 
-        kafkaTemplate.send("task-events", event.getTaskId().toString(), event);
-
-    future.whenComplete((result, ex) -> {
-        if (ex == null) {
-            log.info("Event sent successfully for Task: {} [Offset: {}]", 
-                     event.getTaskId(), result.getRecordMetadata().offset());
-        } else {
-            log.error("Failed to send event for Task: {}", event.getTaskId(), ex);
-            // In a real PBC, you might trigger a 'retry' or log this to an error table
-        }
-    });
-}
-
-📊 Summary: How many events?
-| Event Name | Frequency | Purpose |
-|---|---|---|
-| TASK_CREATED | Once per Task | Notifies Assignee, updates Search index, logs history. |
-| TASK_UPDATED | Every edit | Notifies of status changes (e.g., TODO -> DONE). |
-| TASK_DELETED | Every delete | Removes from search index and alerts team. |
-🏛️ The Verdict
-For now, Adesh, stick to one event for the creation process. It keeps your code clean and follows the DRY (Don't Repeat Yourself) principle. One well-structured JSON object in Kafka can power 10 different notification types.
-Does this "Single Event" approach make sense to you? If you're ready to see it in action, would you like me to help you write a "Test Consumer" so you can prove the event is actually arriving with all the correct details?
-
-
-
-
-
-
-
-Adesh, as your Lead, I’m going to show you how to implement this using the "Separate Folder" architecture we just discussed. This keeps your TaskService focused on the database, while the new messaging package handles the "shouting" to Kafka.
-Here is the step-by-step implementation to notify the assigned user.
-🏛️ Step 1: Create the "Envelope" (The Event DTO)
-We don't send the entire Tasks entity because it contains too much internal database info. We create a lightweight Event object that has exactly what the notification system needs.
-Create com.example.devcollab.messaging.dto.TaskCreatedEvent.java:
-package com.example.devcollab.messaging.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-@Data
-@AllArgsConstructor
-@NoArgsConstructor
-public class TaskCreatedEvent {
-    private Long taskId;
-    private String taskTitle;
-    private String assigneeEmail; // The most important field for notifications
-    private String assigneeName;
-    private String reporterName;  // "Adesh assigned you a task"
-}
-
-🏛️ Step 2: Create the "Worker" (The Producer)
-This class has one job: taking that envelope and dropping it into the Kafka pipe.
-Create com.example.devcollab.messaging.producer.TaskEventProducer.java:
-package com.example.devcollab.messaging.producer;
-
-import com.example.devcollab.messaging.dto.TaskCreatedEvent;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.CustomExceptions;
+import com.fincore.JournalService.Models.JournalLog;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.JournalLogRepository;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.stereotype.Component;
+import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
+import org.springframework.jdbc.core.CallableStatementCallback;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-@Slf4j
-@Component
+import javax.sql.DataSource;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.sql.*;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
+
+@Service
 @RequiredArgsConstructor
-public class TaskEventProducer {
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
 
-    // We use Object here so we can send different types of events later
-    private final KafkaTemplate<String, Object> kafkaTemplate;
-    
-    // Define the topic name as a constant
-    private static final String TOPIC = "task-notifications";
+    private final JournalRequestRepository journalRequestRepository;
+    private final JournalLogRepository journalLogRepository;
+    private final SequenceService sequenceService;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final JournalBulkValidationService journalBulkValidationService;
+    private final HdfsSyncService hdfsSyncService;
+    private final ProgressService progressService;
 
-    public void sendTaskCreatedEvent(TaskCreatedEvent event) {
-        log.info("Sending notification event for Task ID: {} to Assignee: {}", 
-                 event.getTaskId(), event.getAssigneeEmail());
-                 
-        // This sends the message to the Kafka Topic
-        kafkaTemplate.send(TOPIC, event);
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    @Lazy
+    private JournalRequestService self;
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    @Qualifier("byteArrayRedisTemplate")
+    private RedisTemplate<String, byte[]> redisTemplate;
+
+    @Autowired
+    @Qualifier("bulkExecutor")
+    private Executor bulkExecutor;
+
+    @Autowired
+    @Qualifier("oracleDataSource")
+    private DataSource dataSource;
+
+    @Override
+    @Transactional
+    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        String lockKey = "LOCK_REQ_" + requestId;
+        Boolean acquired;
+
+        try {
+            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
+        } catch (DataAccessException e) {
+            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Lock service connectivity issue", requestId);
+            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
+        }
+
+        if (Boolean.FALSE.equals(acquired)) {
+            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Duplicate batch creation attempt", requestId);
+            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
+        }
+
+        try {
+            String batchId = sequenceService.getNextBatchId();
+            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
+            self.executeAsyncBatchCreation(batchId, requestId, commonRemarks, creatorId, creatorRole);
+            return batchId;
+        } catch (DataAccessException e) {
+            redisTemplate.delete(lockKey);
+            log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Sequence generator failure", requestId);
+            throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
+        }
     }
+
+    @Override
+    @Async("bulkExecutor")
+    @Transactional
+    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        MDC.put("batchId", batchId);
+        MDC.put("user", creatorId);
+
+        log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
+        long start = System.currentTimeMillis();
+
+        try {
+            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+            List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+
+            if (cachedRows == null || cachedRows.isEmpty()) {
+                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
+                return;
+            }
+
+            int totalRows = cachedRows.size();
+            int batchSize = 5000; 
+
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            LongAdder totalDebit = new LongAdder();
+            LongAdder totalCredit = new LongAdder();
+            AtomicInteger completedChunks = new AtomicInteger(0);
+            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+
+            for (int i = 0; i < totalRows; i += batchSize) {
+                final int startIdx = i;
+                final int endIdx = Math.min(i + batchSize, totalRows);
+                final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
+
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
+                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
+                        .thenRun(() -> {
+                            int done = completedChunks.incrementAndGet();
+                            int percent = 5 + (done * 90 / totalChunks);
+                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
+                                     String.format("Created %d/%d records...", Math.min(done * batchSize, totalRows), totalRows));
+                        });
+                futures.add(future);
+            }
+
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
+                    BigDecimal.valueOf(totalDebit.sum()), BigDecimal.valueOf(totalCredit.sum()), "PENDING");
+
+            redisTemplate.delete("DATA_" + requestId);
+            redisTemplate.delete("LOCK_REQ_" + requestId);
+            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Successfully created batch " + batchId);
+
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+            sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
+
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            if (config != null) {
+                String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
+                sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
+            }
+
+            log.info("BATCH_CREATION_FINISHED | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
+
+        } catch (CustomExceptions.CacheExpiredException e) {
+            log.error("CACHE_ERROR | Batch: {} | Status: Data expired in Redis", batchId);
+            handleAsyncFailure(batchId, creatorId, requestId, "Data cache expired. Please re-upload.");
+        } catch (CompletionException | DataAccessException e) {
+            log.error("DATABASE_ERROR | Batch: {} | Status: Persistence failure during async creation", batchId);
+            handleAsyncFailure(batchId, creatorId, requestId, "Database persistence failed. Try again.");
+        } catch (NullPointerException | IllegalArgumentException e) {
+            log.error("INTERNAL_LOGIC_ERROR | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+            handleAsyncFailure(batchId, creatorId, requestId, "Unexpected logic error during creation.");
+        } finally {
+            MDC.clear();
+        }
+    }
+
+    private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
+        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            conn.setAutoCommit(false);
+            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+            final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+
+            for (int i = 0; i < chunk.size(); i++) {
+                JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+                int globalIdx = globalOffset + i + 1;
+                String jId = batchId + "-" + globalIdx;
+                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
+                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+
+                if (isCredit) credit.add(absAmt.longValue());
+                else debit.add(absAmt.longValue());
+
+                LocalDate rDate = LocalDate.now();
+                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                    try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); }
+                    catch (DateTimeParseException ignored) {}
+                }
+
+                ps.setString(1, "P");
+                ps.setTimestamp(2, ts);
+                ps.setString(3, creatorId);
+                ps.setInt(4, creatorRole != null ? creatorRole : 0);
+                ps.setString(5, batchId);
+                ps.setString(6, jId);
+                ps.setString(7, commonRemarks);
+                ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
+                ps.setString(9, r.branch);
+                ps.setString(10, r.currency);
+                ps.setString(11, r.cgl);
+                ps.setBigDecimal(12, signedAmt);
+                ps.setDate(13, java.sql.Date.valueOf(rDate));
+                ps.setString(14, r.remarks);
+                ps.setString(15, r.productCode);
+                ps.addBatch();
+            }
+            ps.executeBatch();
+            conn.commit();
+        } catch (SQLException e) {
+            log.error("JDBC_SQL_FAIL | Batch: {} | Status: SQL chunk insertion failed", batchId);
+            throw new CustomExceptions.DatabaseOperationException("Failed to persist batch chunk", e);
+        }
+    }
+
+    @Override
+    public List<Map<String, Object>> getPendingBatchSummaries() {
+        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS FROM JOURNAL_BATCH_MASTER WHERE BATCH_STATUS IN ('PENDING', 'ERROR') ORDER BY REQ_DATE DESC";
+        try {
+            return jdbcTemplate.query(sql, (rs, rowNum) -> {
+                Map<String, Object> map = new HashMap<>();
+                map.put("batchId", rs.getString("BATCH_ID"));
+                map.put("creatorId", rs.getString("CREATOR_ID"));
+                map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+                map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+                map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+                map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
+                map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
+                map.put("requestStatus", rs.getString("BATCH_STATUS"));
+                return map;
+            });
+        } catch (DataAccessException e) {
+            log.error("SUMMARY_FETCH_FAIL | Status: Database query error");
+            return Collections.emptyList();
+        }
+    }
+
+    @Override
+    public LocalDate getCurrentPostingDate() {
+        String sql = "SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY";
+        try {
+            return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> {
+                Timestamp ts = rs.getTimestamp("USERS_DATE");
+                return ts != null ? ts.toLocalDateTime().toLocalDate() : LocalDate.now();
+            });
+        } catch (EmptyResultDataAccessException e) {
+            return LocalDate.now();
+        } catch (DataAccessException e) {
+            log.error("POSTING_DATE_FAIL | Status: Connection unavailable");
+            throw new CustomExceptions.DatabaseOperationException("Database connection failure", e);
+        }
+    }
+
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = sequenceService.getNextBatchId();
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal tDebit = BigDecimal.ZERO, tCredit = BigDecimal.ZERO;
+        int idx = 1;
+
+        for (BatchRequestDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest e = new JournalRequest();
+            e.setRequestStatus(RequestStatus.PENDING);
+            e.setCreatorId(creatorId);
+            e.setCreatorRole(creatorRole);
+            e.setBatchId(batchId);
+            e.setJournalId(batchId + "-" + idx);
+            e.setBranchCode(row.getBranch());
+            e.setCurrency(row.getCurrency());
+            e.setCgl(row.getCgl());
+            e.setAmount(row.getAmount());
+            e.setCsvDate(row.getCsvDate() != null ? row.getCsvDate() : LocalDate.now());
+            e.setNarration(row.getRemarks());
+            e.setProductCode(row.getProductType());
+            
+            if (row.getAmount().signum() < 0) tCredit = tCredit.add(row.getAmount().abs());
+            else tDebit = tDebit.add(row.getAmount());
+            
+            entities.add(e);
+            idx++;
+        }
+        
+        List<JournalRequest> saved = journalRequestRepository.saveAll(entities);
+        jdbcTemplate.update("INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                batchId, creatorId, ts, dto.getCommonBatchRemarks(), entities.size(), tDebit, tCredit, "PENDING");
+        
+        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Manual Batch " + batchId);
+        return saved;
+    }
+
+    private void handleAsyncFailure(String batchId, String creatorId, String requestId, String message) {
+        cleanupFailedBatch(batchId);
+        redisTemplate.delete("LOCK_REQ_" + requestId);
+        jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", message, batchId);
+        progressService.sendProgress(batchId, creatorId, 0, "FAILED", message);
+    }
+
+    private void cleanupFailedBatch(String batchId) {
+        try {
+            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+            jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+        } catch (DataAccessException e) {
+            log.warn("CLEANUP_WARN | Batch: {} | Status: Partial purge failed", batchId);
+        }
+    }
+
+    private void sendNotification(String userId, String roles, String message, String batchId) {
+        try {
+            notificationWriterService.createNotification(userId, roles, message, "/journal-view/" + batchId, batchId, "JournalService");
+        } catch (Exception e) {
+            log.warn("NOTIFICATION_WARN | Batch: {} | Status: Notification alert failed", batchId);
+        }
+    }
+
+    private void logAudit(String user, String action, String type, String val) {
+        try {
+            JournalLog l = new JournalLog();
+            l.setUserId(user);
+            l.setActionType(action);
+            l.setChangeType(type);
+            l.setNewValue(val.length() > 3900 ? val.substring(0, 3900) : val);
+            l.setActionTime(LocalDateTime.now());
+            journalLogRepository.save(l);
+        } catch (DataAccessException e) {
+            log.error("AUDIT_LOG_FAIL | User: {} | Status: DB persistence error", user);
+        }
+    }
+
+    private String buildJsonPayloadFast(JournalBulkValidationService.ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+        return "{\"csvDate\":\"" + pDate.format(fmt) + "\",\"branch\":\"" + row.branch + "\",\"currency\":\"" + row.currency + "\",\"cgl\":\"" + row.cgl + "\",\"amount\":" + amount + "}";
+    }
+
+    private String escapeJson(String s) {
+        return s == null ? "" : s.replace("\"", "\\\"").replace("\\", "\\\\");
+    }
+
+    // --- Placeholder/Interface Overrides ---
+    @Override public Page<JournalRequest> getRequestsByBatchIdPaginated(String b, Pageable p) { return journalRequestRepository.findByBatchIdPaginated(b, p); }
+    @Override public List<JournalRequest> getRequestsByBatchId(String b) { return journalRequestRepository.findByBatchId(b); }
+    @Override public long getRequestCountByBatchId(String b) { return 0; }
+    @Override public List<Map<String, Object>> getAllBatchSummaries() { return Collections.emptyList(); }
+    @Override public List<JournalRequest> getMyRequests(String u) { return Collections.emptyList(); }
+    @Override public List<JournalRequest> getPendingRequests(String u, Integer r) { return Collections.emptyList(); }
+    @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return Collections.emptyList(); }
+    @Override public void cancelMyRequest(Long r, String u) { journalRequestRepository.deleteById(r); }
+    @Override public void cancelMyRequestsByBatchId(String b, String u) { }
+    @Override public void cancelMyRequestsByJournalPrefixes(List<String> l, String u) { journalRequestRepository.deleteJournalsNative(l, u); }
+    @Override public void cancelMyRequestsByJournalPrefix(String p, String u) {}
+    @Override public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String u, Integer r) { return Optional.empty(); }
+    @Override public String createBulkBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException { return ""; }
+    @Override public String createBatchFromCache(String r, String m, String u, Integer o) throws IOException { return createBatchFromCacheAsync(r, m, u, o); }
+    @Override public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto d, String u, Integer r) { return Collections.emptyList(); }
+    @Override public void executeAsyncBatchCancellation(String batchId, String userId) {}
+    @Override public void cancelMyRequestsByBatchIdAsync(String batchId, String userId) {}
+    @Override public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {}
+    @Override public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {}
 }
-
-🏛️ Step 3: Trigger the Event in TaskService
-Now, we go back to your TaskService.java. We inject the TaskEventProducer and call it after the task is successfully saved to the database.
-Update your TaskService.java:
-// 1. Inject the producer at the top
-@Autowired
-private TaskEventProducer taskEventProducer;
-
-@Override
-@Transactional
-public TaskResDto createTasks(TaskReqDto taskReqDto) {
-    // ... all your existing logic to save the task ...
-    
-    Tasks SavedTasks = tasksRepository.save(tasks);
-
-    // 2. TRIGGER THE KAFKA EVENT
-    // We do this after save so we are sure the task exists in the DB
-    TaskCreatedEvent event = new TaskCreatedEvent(
-        SavedTasks.getId(),
-        SavedTasks.getTitle(),
-        SavedTasks.getAssignee().getEmail(),
-        SavedTasks.getAssignee().getName(), // Assuming your User model has 'name'
-        currentuser.getName()               // The person who created the task
-    );
-
-    taskEventProducer.sendTaskCreatedEvent(event);
-
-    // ... return your DTO ...
-}
-
-🏛️ Step 4: The "Glue" (Configuration)
-Since you are sending a Java Object (TaskCreatedEvent) instead of a simple String, you need to tell Spring to convert it to JSON before sending it to Kafka.
-Add this to your application.yml:
-spring:
-  kafka:
-    producer:
-      bootstrap-servers: localhost:9092
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      # This is the "Magic" that turns your Java Object into JSON for the pipe
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
-
-📊 Why this is the "Senior" Architecture
- * Reliability: If you add log.info in your producer, you can check the console to see exactly what was sent without digging through your whole TaskService.
- * Safety: If the Kafka server is down, the @Transactional on your service will ensure the task isn't "half-saved." (Though we usually handle Kafka errors separately so the user's task still saves even if the notification fails).
- * Scalability: When you want to add a notification for "Task Updated" or "Task Deleted," you just add one more method to your TaskEventProducer!
-🏛️ The Verdict
-You’ve now successfully linked your Jira Core (Tasks) to your Message Bus (Kafka). This is how high-scale companies like LinkedIn or Uber handle their background tasks.
-Does this structure make sense to you? Once you’ve added the code, would you like me to give you the Consumer code so you can see the message being "received" and printed to the console?
-
-
