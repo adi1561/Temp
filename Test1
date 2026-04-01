@@ -1,93 +1,62 @@
-/**
- * File: HdfsSyncService.java
- * Author: Adesh (Senior Software Engineer / Technical Lead)
- * Description: Service for synchronizing aggregated GL balances to the HDFS Data Lake.
- * * Production Rules Followed:
- * 1. Specific Exceptions: Uses DataAccessException to catch Hive/Thrift specific failures.
- * 2. PII Safety: Logs sanitized to remove e.getMessage(), preventing balance data leakage.
- * 3. Logic Clarity: Comments added for the asynchronous batching and recovery mechanism.
- */
+The first critical issue to address is the Lock Expiry Race Condition. In a production environment with 600,000+ rows, the processing time can easily exceed the current 5-minute Redis TTL. If the lock expires while the background thread is still writing to Oracle, a user could accidentally trigger a second parallel upload for the same Request ID, leading to duplicate data.
+Here are the specific code changes for JournalRequestServiceImpl.java.
+File: JournalRequestServiceImpl.java
+1. Update: createBatchFromCacheAsync
+We will increase the TTL to 60 minutes. This provides a massive safety buffer for extremely large files or periods of high database latency.
+Existing Code:
+acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
 
-package com.fincore.JournalService.Service;
+Updated Code:
+// Rule 3: Increased TTL to 60 minutes to account for high-volume (600k+) processing times
+// that may exceed the previous 5-minute limit under heavy DB load.
+acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
 
-import com.fincore.JournalService.Dto.HdfsSyncDto;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.BatchPreparedStatementSetter;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
+2. Update: executeAsyncBatchCreation
+The lock deletion must be moved to the finally block. Currently, if the code hits an unexpected error before the try block finishes, the lock might stay in Redis until it expires, preventing the user from retrying. Moving it to finally ensures the lock is released as soon as the thread stops, regardless of success or failure.
+Existing Code (Inside try and finally):
+try {
+    // ... logic ...
+    redisTemplate.delete("LOCK_REQ_" + requestId); // Deletes here on success
+    // ... logic ...
+} catch (DataAccessException e) {
+    handleAsyncFailure(batchId, creatorId, requestId, "Database persistence failed.");
+} finally {
+    MDC.clear();
+}
 
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
-import java.util.List;
+Updated Code:
+@Override
+@Async("bulkExecutor")
+@Transactional
+public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+    String lockKey = "LOCK_REQ_" + requestId; // Define here for cleanup access
+    MDC.put("batchId", batchId);
+    // ... [Logic remains identical] ...
 
-/**
- * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
- * Updates are performed asynchronously using the high-performance 'bulkExecutor' pool.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class HdfsSyncService {
+    try {
+        // ... [Row processing and master insert logic] ...
 
-    @Autowired
-    @Qualifier("hiveJdbcTemplate")
-    private JdbcTemplate hiveJdbcTemplate;
+        // REMOVED: redisTemplate.delete(lockKey) from here
+        log.info("BATCH_CREATION_FINISHED | Batch: {} | Duration: {}ms", batchId, System.currentTimeMillis() - start);
 
-    /**
-     * Executes a batch update to HDFS. 
-     * Rule 3: This is a fire-and-forget background task. Because Hive updates can be high-latency, 
-     * we offload this to the 'bulkExecutor' pool. If this fails, the HdfsRecoveryService 
-     * (heartbeat) will detect the inconsistency and trigger a retry.
-     * * @param data List of balance updates to be persisted.
-     */
-    @Async("bulkExecutor")
-    public void syncToDataLake(List<HdfsSyncDto> data) {
-        if (data == null || data.isEmpty()) {
-            return;
-        }
-
-        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
-        long startTime = System.currentTimeMillis();
-
-        try {
-            // Rule 3: Standardizing the Hive SQL for batch updates to the Data Lake landing zone.
-            String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
-                    "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
-
-            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(PreparedStatement ps, int i) throws SQLException {
-                    HdfsSyncDto dto = data.get(i);
-                    ps.setBigDecimal(1, dto.getNewBalance());
-                    ps.setBigDecimal(2, dto.getNewInrBalance());
-                    ps.setString(3, dto.getBranch());
-                    ps.setString(4, dto.getCurrency());
-                    ps.setString(5, dto.getCgl());
-                    ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate()));
-                }
-
-                @Override
-                public int getBatchSize() {
-                    return data.size();
-                }
-            });
-
-            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
-                    (System.currentTimeMillis() - startTime), data.size());
-
-        } catch (DataAccessException e) {
-            /**
-             * Rule 1: Specifically catching Spring's DataAccessException for Hive/Thrift issues.
-             * Rule 2: ISD Compliance - Removed e.getMessage() because Hive error messages 
-             * often contain the raw values (PII) from the PreparedStatement in the log.
-             */
-            log.error("HDFS_SYNC_DB_FAIL | Status: Connectivity or Syntax error during Hive batch update | Type: {}", 
-                      e.getClass().getSimpleName());
-        }
+    } catch (DataAccessException e) {
+        log.error("DATABASE_ERROR | Batch: {} | Status: Persistence failure", batchId);
+        handleAsyncFailure(batchId, creatorId, requestId, "Database persistence failed.");
+    } catch (Exception e) {
+        log.error("SYSTEM_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+        handleAsyncFailure(batchId, creatorId, requestId, "Internal system error.");
+    } finally {
+        // Rule 3: Lock cleanup moved to finally block. This ensures that even if a 
+        // technical crash occurs, the lock is released immediately so the user can retry.
+        redisTemplate.delete(lockKey); 
+        redisTemplate.delete("DATA_" + requestId); // Clean up cache as well
+        MDC.clear();
     }
 }
+
+Why this change is necessary for Production
+This ensures Mutual Exclusion. By extending the TTL and moving the deletion to the finally block, you create a "Self-Cleaning" lock.
+ * If the process is fast, the lock is deleted immediately.
+ * If the process is slow (10+ minutes), the 60-minute TTL prevents a second process from starting.
+ * If the server restarts or the thread crashes, the finally block (or eventually the TTL) prevents the Request ID from being permanently "stuck."
+Would you like to move to the second bug: The "Ghost Completion" (Silent Async Failure) and how to handle partial commits?
