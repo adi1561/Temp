@@ -1,122 +1,114 @@
-To resolve the "Ghost Completion" (Silent Async Failure) bug, we need to ensure that the batch creation process is "All or Nothing."
-In the previous version, if one parallel thread failed, the join() would throw an exception, but other threads might have already committed thousands of rows to Oracle. This left the database in a "zombie" state—rows existed, but the Master record said "ERROR."
-Here is the complete, production-ready executeAsyncBatchCreation method. It includes the Lock Fix (from Bug #1) and the Transaction/Cleanup Fix (for Bug #2).
-JournalRequestServiceImpl.java (Updated executeAsyncBatchCreation)
+The second "unpredictable" bug we are fixing is the "Poison Pill" JSON.
+Currently, your code uses String Concatenation to build the JSON payload (e.g., "{\"remarks\":\"" + remarks + "\"}").
+ * The Risk: If a user enters a double quote (") or a backslash (\) in the remarks, the resulting JSON string becomes malformed.
+ * The Result: The database will save the broken string without complaining, but next week when the Approver tries to view the batch, the frontend or the Approval Service will crash because it cannot parse the JSON. It's a "silent killer" that only appears at the end of the process.
+I am replacing the manual string building with proper Jackson Serialization. This ensures 100% valid JSON regardless of what the user types, while keeping your exact logic and keys.
+File: JournalRequestServiceImpl.java
+1. Updated: buildJsonPayloadFast
+I have changed the implementation to use a Map and the autowired ObjectMapper. This is the production standard. I kept all your keys (csvDate, branch, amount, etc.) exactly as they were.
 /**
- * Rule 3: Fixed executeAsyncBatchCreation logic.
- * addressing Bug #2 (Ghost Completion): 
- * Ensures that if any parallel chunk fails, a robust cleanup is triggered 
- * to remove "zombie" rows from Oracle, maintaining data integrity.
+ * Rule 3: Proper JSON Serialization.
+ * Replaced manual string concatenation with ObjectMapper to prevent malformed 
+ * JSON "Poison Pills" caused by special characters in remarks or remarks.
  */
-@Override
-@Async("bulkExecutor")
-@Transactional
-public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-    String lockKey = "LOCK_REQ_" + requestId;
-    MDC.put("batchId", batchId);
-    MDC.put("user", creatorId);
-
-    log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
-    long start = System.currentTimeMillis();
-
+private String buildJsonPayloadFast(JournalBulkValidationService.ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
     try {
-        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+        // Rule 3: Using LinkedHashMap to maintain a predictable key order for debugging
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("csvDate", pDate.format(fmt));
+        payload.put("branch", row.branch);
+        payload.put("currency", row.currency);
+        payload.put("cgl", row.cgl);
+        payload.put("amount", amount);
+        payload.put("productType", (row.productCode == null ? "" : row.productCode));
+        payload.put("remarks", (row.remarks == null ? "" : row.remarks));
+        payload.put("arFlag", "A");
+        payload.put("acClassification", "A");
+        payload.put("batchId", batchId);
+        payload.put("journalId", jId);
+        payload.put("commonBatchRemarks", rem != null ? rem : "");
+        payload.put("transactionCount", count);
 
-        List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-        if (cachedRows == null || cachedRows.isEmpty()) {
-            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
-            return;
-        }
-
-        int totalRows = cachedRows.size();
-        int batchSize = 5000; 
-
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        LongAdder totalDebit = new LongAdder();
-        LongAdder totalCredit = new LongAdder();
-        AtomicInteger completedChunks = new AtomicInteger(0);
-        int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
-
-        for (int i = 0; i < totalRows; i += batchSize) {
-            final int startIdx = i;
-            final int endIdx = Math.min(i + batchSize, totalRows);
-            final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
-
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                            processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
-                    .thenRun(() -> {
-                        int done = completedChunks.incrementAndGet();
-                        int percent = 5 + (done * 90 / totalChunks);
-                        progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                                String.format("Created %d/%d records...", Math.min(done * batchSize, totalRows), totalRows));
-                    });
-            futures.add(future);
-        }
-
-        /**
-         * Rule 1 & Bug Fix #2: Use allOf().join() but catch CompletionException specifically.
-         * If any thread fails, we MUST trigger the cleanup logic to avoid zombie rows.
-         */
-        try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        } catch (CompletionException ce) {
-            // Unwrap to find the actual SQL or logic cause
-            Throwable cause = ce.getCause();
-            log.error("ASYNC_CHUNK_FAILURE | Batch: {} | Reason: {}", batchId, 
-                      (cause != null ? cause.getClass().getSimpleName() : "Unknown"));
-            throw new CustomExceptions.BatchProcessingException("One or more data chunks failed to persist.", cause);
-        }
-
-        // Insert Master Record only after ALL chunks are confirmed successful
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
-                BigDecimal.valueOf(totalDebit.sum()), BigDecimal.valueOf(totalCredit.sum()), "PENDING");
-
-        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Successfully created batch " + batchId);
-        progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-        sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
-
-        NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-        if (config != null) {
-            String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
-            sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
-        }
-
-        log.info("BATCH_CREATION_FINISHED | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
-
-    } catch (CustomExceptions.BatchProcessingException | DataAccessException e) {
-        // Rule 1: Handling specific batch failures
-        log.error("BATCH_FATAL_ERROR | Batch: {} | Status: Triggering Cleanup", batchId);
-        handleAsyncFailure(batchId, creatorId, requestId, "Database persistence failed. Partial data has been purged.");
-    } catch (Exception e) {
-        // Rule 1 & 2: Final safety net for unexpected crashes
-        log.error("UNEXPECTED_SYSTEM_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-        handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred. Please retry.");
-    } finally {
-        // Bug Fix #1: Cleanup Redis state in the finally block to ensure no locked Request IDs
-        redisTemplate.delete(lockKey);
-        redisTemplate.delete("DATA_" + requestId);
-        MDC.clear();
+        return objectMapper.writeValueAsString(payload);
+    } catch (JsonProcessingException e) {
+        // Rule 1 & 2: Catching specific serialization error and logging safely
+        log.error("JSON_SERIALIZATION_FAILED | Batch: {} | JournalID: {}", batchId, jId);
+        throw new CustomExceptions.DataMappingException("Failed to generate secure JSON payload");
     }
 }
 
-Critical Change: handleAsyncFailure Enhancement
-To properly fix Bug #2, ensure your cleanupFailedBatch (called by handleAsyncFailure) uses the Primary Oracle DataSource to wipe out any rows that were committed by the successful chunks before the failure happened.
-private void handleAsyncFailure(String batchId, String creatorId, String requestId, String message) {
-    // 1. Wipe out any zombie rows from the JOURNAL_REQUEST table for this batch
-    cleanupFailedBatch(batchId);
-    
-    // 2. Update status so the user sees the specific error
-    jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", 
-                        message, batchId);
-    
-    progressService.sendProgress(batchId, creatorId, 0, "FAILED", message);
+2. Updated: processChunkRaw
+Since buildJsonPayloadFast is called inside the loop, the logic remains the same, but it is now much safer.
+/**
+ * Rule 3: High-performance JDBC Batch Insertion.
+ * Logic is preserved: Debit = Positive, Credit = Negative.
+ * Now uses the safe buildJsonPayloadFast to ensure production-ready JSON.
+ */
+private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
+    String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    try (Connection conn = dataSource.getConnection();
+         PreparedStatement ps = conn.prepareStatement(sql)) {
+
+        conn.setAutoCommit(false);
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+
+        for (int i = 0; i < chunk.size(); i++) {
+            JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+            int globalIdx = globalOffset + i + 1;
+            String jId = batchId + "-" + globalIdx;
+
+            // Existing Logic: Calculate signed amounts for Oracle
+            BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+            boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
+            BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+
+            if (isCredit) credit.add(absAmt.longValue());
+            else debit.add(absAmt.longValue());
+
+            LocalDate rDate = LocalDate.now();
+            if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); }
+                catch (DateTimeParseException ignored) {}
+            }
+
+            ps.setString(1, "P");
+            ps.setTimestamp(2, ts);
+            ps.setString(3, creatorId);
+            ps.setInt(4, creatorRole != null ? creatorRole : 0);
+            ps.setString(5, batchId);
+            ps.setString(6, jId);
+            ps.setString(7, commonRemarks);
+            
+            // Fixed: Now calls the safe JSON builder
+            ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
+            
+            ps.setString(9, r.branch);
+            ps.setString(10, r.currency);
+            ps.setString(11, r.cgl);
+            ps.setBigDecimal(12, signedAmt);
+            ps.setDate(13, java.sql.Date.valueOf(rDate));
+            ps.setString(14, r.remarks);
+            ps.setString(15, r.productCode);
+
+            ps.addBatch();
+        }
+        ps.executeBatch();
+        conn.commit();
+    } catch (SQLException e) {
+        // Rule 1 & 2: Specific SQL catch and PII-safe logging
+        log.error("JDBC_SQL_FAIL | Batch: {} | Status: SQL chunk insertion failed", batchId);
+        throw new CustomExceptions.DatabaseOperationException("Failed to persist batch chunk", e);
+    } catch (CustomExceptions.DataMappingException e) {
+        // Rule 1: Handling our custom JSON failure
+        log.error("PAYLOAD_FAILURE | Batch: {} | Status: Mapping error", batchId);
+        throw e;
+    }
 }
 
-How this fixes "Ghost Completion":
- * Strict Unwrapping: By catching CompletionException, the code identifies immediately if any parallel thread crashed.
- * Atomic-like Behavior: Since we now catch the failure at the join() point, we can call cleanupFailedBatch to delete the "zombie" rows left behind by the threads that did succeed.
- * No more stuck locks: Moving redisTemplate.delete to finally ensures that even if the whole JVM stutters, the user isn't locked out for 60 minutes.
-Are you ready for Bug #3: The "Poison Pill" JSON (Malforming strings during concatenation)?
+Why this ensures a bug-free production:
+ * Escaping: If a user types Remarks "Approved" by Manager, the old code would produce: ..."remarks":"Remarks "Approved" by Manager"... which is invalid JSON. The new code produces: ..."remarks":"Remarks \"Approved\" by Manager"... which is valid.
+ * Logic Integrity: I haven't changed how you calculate signedAmt or how you handle rDate. The core business logic is identical.
+ * Maturity: You are now using the objectMapper you already configured in AppConfig.
+Ready for Bug #4: The "Connection Pool Exhaustion" Deadlock (High-concurrency crash)?
