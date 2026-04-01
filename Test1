@@ -1,15 +1,55 @@
+This compilation error is happening because your BatchProcessingException class currently only has one constructor that requires both a Message and a Throwable cause. Since we are throwing a new error based on a timeout or a generic failure, we need to add a single-argument constructor.
+Here are the two updated files to fix this error immediately.
+1. Updated: CustomExceptions.java
+Add the single-argument constructor to BatchProcessingException so it matches the pattern we used for DatabaseOperationException.
+package com.fincore.JournalService.Exception;
 
-            try {
-                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                        .get(30, TimeUnit.MINUTES);
-            } catch (java.util.concurrent.TimeoutException te) {
-                log.error("BATCH_TIMEOUT | Batch: {} | Status: Processing exceeded 30 minutes", batchId);
-      Expected 2 arguments but found 1 ->          throw new CustomExceptions.BatchProcessingException("Batch creation timed out. Check Oracle performance.");
-            } catch (CompletionException | InterruptedException | java.util.concurrent.ExecutionException e) {
-                log.error("ASYNC_EXECUTION_ERROR | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-         Expected 2 arguments but found 1 ->       throw new CustomExceptions.BatchProcessingException("Parallel execution failed.");
-            }
-            
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
 
+public class CustomExceptions {
 
-this is giving error
+    // ... (keep other exceptions as they are)
+
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public static class BatchProcessingException extends RuntimeException {
+        // Rule 1: Added single-argument constructor to fix the "Expected 2 arguments" error
+        public BatchProcessingException(String message) { 
+            super(message); 
+        }
+
+        public BatchProcessingException(String message, Throwable cause) { 
+            super(message, cause); 
+        }
+    }
+    
+    // ...
+}
+
+2. Updated Catch Block in JournalRequestServiceImpl.java
+Now that the constructor is added, your code will compile. I have also refined the ExecutionException catch to properly pass the "cause" to the exception, which satisfies the 2-argument requirement for that specific case.
+/**
+ * Rule 1: Specific Exception Handling.
+ * Fixed the argument count error by providing the cause where available 
+ * and using the new single-argument constructor for timeouts.
+ */
+try {
+    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .get(30, TimeUnit.MINUTES);
+} catch (java.util.concurrent.TimeoutException te) {
+    log.error("BATCH_TIMEOUT | Batch: {} | Status: Processing exceeded 30 minutes", batchId);
+    // Now works with 1 argument
+    throw new CustomExceptions.BatchProcessingException("Batch creation timed out. Check Oracle performance.");
+} catch (InterruptedException | java.util.concurrent.ExecutionException e) {
+    log.error("ASYNC_EXECUTION_ERROR | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+    // Uses 2 arguments (Message + Cause) to preserve the original error stack
+    throw new CustomExceptions.BatchProcessingException("Parallel execution failed.", e.getCause());
+} catch (CompletionException e) {
+    log.error("ASYNC_COMPLETION_ERROR | Batch: {} | Status: Thread join failure", batchId);
+    throw new CustomExceptions.BatchProcessingException("Background task interrupted.", e.getCause());
+}
+
+Why this fixes it:
+ * TimeoutException: This is a logical timeout, not a code crash, so there is no "cause" (Throwable) to pass. The new 1-argument constructor handles this.
+ * ExecutionException: This happens when a worker thread actually crashes. By using e.getCause(), we pass the real error (like a SqlException) into our custom exception, which helps with debugging.
+Are you ready for Bug #5: The "Serialization Version" Crash, or are there any other compilation errors appearing?
