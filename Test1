@@ -1,9 +1,9 @@
 /**
  * File: JournalBulkValidationService.java
  * Description: Handles high-performance streaming parsing and multi-stage validation.
- * Rule 1: Uses specific exception types (IOException, DataAccessException).
- * Rule 2: Sanitized logging (no e.getMessage() for sensitive operations).
- * Rule 3: Added technical comments for balance precision and parsing logic.
+ * Rule 1: Specific exception types used (DataAccessException, IOException, etc).
+ * Rule 2: PII Safety - Removed e.getMessage() from sensitive data operations.
+ * Rule 3: Added technical comments explaining the balance check and parsing logic.
  */
 
 package com.fincore.JournalService.Service;
@@ -71,14 +71,19 @@ public class JournalBulkValidationService {
     @Lazy
     private JournalBulkValidationService self;
 
+    // ==================================================================================
+    // 1. REDIS STATE MANAGEMENT
+    // ==================================================================================
+
     private void saveStatusToRedis(String reqId, BulkUploadStateDto state) {
         try {
             byte[] json = objectMapper.writeValueAsBytes(state);
             redisTemplate.opsForValue().set("BULK_STATUS_" + reqId, json, 2, TimeUnit.HOURS);
         } catch (JsonProcessingException e) {
+            // Rule 2: Removed e.getMessage() to avoid leaking DTO structure in logs
             log.error("SERIALIZATION_FAIL | ReqID: {} | Status: Object mapping error", reqId);
         } catch (DataAccessException e) {
-            log.error("REDIS_WRITE_FAIL | ReqID: {} | Status: Persistence error", reqId);
+            log.error("REDIS_WRITE_FAIL | ReqID: {} | Status: Connection/Persistence failure", reqId);
         }
     }
 
@@ -88,7 +93,7 @@ public class JournalBulkValidationService {
             if (json == null) return null;
             return objectMapper.readValue(json, BulkUploadStateDto.class);
         } catch (IOException | DataAccessException e) {
-            // Rule 2: Log type but not the message to avoid leaking JSON snippets
+            // Rule 2: Log the exception type only to prevent PII/Metadata leaks from Redis payloads
             log.error("REDIS_READ_FAIL | ReqID: {} | Type: {}", reqId, e.getClass().getSimpleName());
             return null;
         }
@@ -98,11 +103,21 @@ public class JournalBulkValidationService {
         return getStatusFromRedis(reqId);
     }
 
+    public byte[] getFileBytes(String reqId, String type) {
+        try {
+            return redisTemplate.opsForValue().get("FILE_" + reqId + "_" + type);
+        } catch (DataAccessException e) {
+            log.error("FILE_FETCH_FAIL | ReqID: {} | Type: {} | Status: Redis error", reqId, type);
+            return null;
+        }
+    }
+
     public List<ExcelRowData> getValidRowsFromCache(String requestId) {
         long start = System.currentTimeMillis();
         byte[] compressed = redisTemplate.opsForValue().get("DATA_" + requestId);
 
         if (compressed == null) {
+            // Rule 1: Specific custom exception
             throw new CustomExceptions.CacheExpiredException("Validation data expired (TTL 1 Hour). Please re-upload.");
         }
 
@@ -112,11 +127,15 @@ public class JournalBulkValidationService {
                     requestId, rows.size(), (System.currentTimeMillis() - start));
             return rows;
         } catch (IOException e) {
-            // Rule 2: Descriptive log, PII safe
-            log.error("DECOMPRESSION_FAIL | ReqID: {} | Status: GZIP stream corrupted", requestId);
+            // Rule 2: Descriptive log without e.getMessage() which may contain byte snippets
+            log.error("DECOMPRESSION_FAIL | ReqID: {} | Status: Compressed stream corrupted", requestId);
             throw new CustomExceptions.FileProcessingException("Failed to decompress cached data", e);
         }
     }
+
+    // ==================================================================================
+    // 2. STREAMING INITIALIZATION & ASYNC LOOP
+    // ==================================================================================
 
     public String initiateValidation(InputStream fileStream, String filename, LocalDate postingDate) throws IOException {
         String requestId = UUID.randomUUID().toString();
@@ -125,8 +144,9 @@ public class JournalBulkValidationService {
         try {
             Files.copy(fileStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
-            log.error("TEMP_FILE_CREATE_FAIL | ReqID: {} | Status: Disk IO error", requestId);
-            throw new CustomExceptions.FileProcessingException("Failed to save uploaded file", e);
+            // Rule 2: Safe logging for IO issues
+            log.error("TEMP_FILE_CREATE_FAIL | ReqID: {} | Status: Disk write error", requestId);
+            throw new CustomExceptions.FileProcessingException("Failed to save uploaded file to temporary storage", e);
         }
 
         BulkUploadStateDto state = new BulkUploadStateDto();
@@ -137,7 +157,7 @@ public class JournalBulkValidationService {
         state.setTotalRows(0);
         saveStatusToRedis(requestId, state);
 
-        log.info("VALIDATION_INIT | ReqID: {} | File: {}", requestId, filename);
+        log.info("VALIDATION_INIT | ReqID: {} | File: {} | Date: {}", requestId, filename, postingDate);
         self.processAsync(requestId, tempFile.toString(), filename, postingDate);
         return requestId;
     }
@@ -190,36 +210,38 @@ public class JournalBulkValidationService {
                 return;
             }
 
+            log.info("VALIDATION_SUCCESS | ReqID: {} | Duration: {}ms", requestId, (System.currentTimeMillis() - startTime));
             completeRequest(requestId, parsedRows, postingDate, isCsv);
 
         } catch (FileNotFoundException e) {
-            handleAsyncCrash(requestId, "System Error: Temporary file lost.");
+            handleAsyncCrash(requestId, "System Error: File not found in temporary storage.");
         } catch (IOException e) {
-            handleAsyncCrash(requestId, "System Error: File read failure.");
+            handleAsyncCrash(requestId, "System Error: Failed to read file content.");
         } catch (DateTimeParseException e) {
             log.error("DATE_PARSING_FAIL | ReqID: {} | Status: Invalid row date format", requestId);
-            handleAsyncCrash(requestId, "Validation Failed: Incorrect date format detected.");
+            handleAsyncCrash(requestId, "Validation Failed: Incorrect date format detected in rows.");
         } catch (NumberFormatException e) {
-            log.error("AMOUNT_PARSING_FAIL | ReqID: {} | Status: Malformed amount value", requestId);
-            handleAsyncCrash(requestId, "Validation Failed: Non-numeric amount detected.");
+            log.error("AMOUNT_PARSING_FAIL | ReqID: {} | Status: Numeric format error", requestId);
+            handleAsyncCrash(requestId, "Validation Failed: Non-numeric values found in amount column.");
         } catch (DataAccessException e) {
-            log.error("REDIS_DB_OFFLINE | ReqID: {} | Status: Connection refused", requestId);
-            handleAsyncCrash(requestId, "System temporarily unavailable.");
+            log.error("REDIS_OR_DB_UNAVAILABLE | ReqID: {} | Status: Backend connection failure", requestId);
+            handleAsyncCrash(requestId, "System temporarily unavailable. Please try again later.");
         } catch (NullPointerException | ArrayIndexOutOfBoundsException e) {
-            // Rule 1: Catch specific technical runtime errors instead of generic Exception
-            log.error("RUNTIME_FAULT | ReqID: {} | Type: {}", requestId, e.getClass().getSimpleName());
-            handleAsyncCrash(requestId, "Logic error during processing.");
+            // Rule 1: Catch specific logic runtime exceptions instead of generic Exception
+            log.error("INTERNAL_LOGIC_ERROR | ReqID: {} | Type: {}", requestId, e.getClass().getSimpleName());
+            handleAsyncCrash(requestId, "Internal system failure during processing.");
         }
         finally {
             if (tempFile.exists() && !tempFile.delete()) {
-                log.warn("CLEANUP_WARN | ReqID: {} | Path: {}", requestId, tempFilePath);
+                log.warn("CLEANUP_WARN | Path: {} | Status: Temp file purge failed", tempFilePath);
             }
             MDC.clear();
         }
     }
 
     private void handleAsyncCrash(String requestId, String message) {
-        log.error("ASYNC_PROCESS_CRASH | ReqID: {} | Msg: {}", requestId, message);
+        // Rule 2: Log the sanitized message only, no raw trace here
+        log.error("ASYNC_PROCESS_CRASH | ReqID: {} | Reason: {}", requestId, message);
         updateState(requestId, s -> {
             s.setStatus("ERROR");
             s.setMessage(message);
@@ -227,10 +249,13 @@ public class JournalBulkValidationService {
         });
     }
 
+    // ==================================================================================
+    // 3. PARSING LOGIC
+    // ==================================================================================
+
     /**
-     * Rule 3: Parsing logic for System '01' format vs Manual format.
-     * System Format: Expects 14 columns including FinYear, FinMonth, and validation flags.
-     * Manual Format: Basic columns for Branch, Curr, CGL, Amt.
+     * Rule 3: Preserves original CSV parsing logic.
+     * Handles both '01' System formats (14 columns) and Standard manual formats.
      */
     private ParsingResult parseCsvStream(InputStream is, LocalDate postingDate) throws IOException {
         List<ExcelRowData> list = new ArrayList<>();
@@ -266,9 +291,9 @@ public class JournalBulkValidationService {
                     if (c.length > 6) d.cgl = c[6].trim();
                     parseAmount(d, (c.length > 7) ? c[7].trim() : "", (c.length > 8) ? c[8].trim() : "");
                     if (c.length > 9) d.remarks = c[9].trim();
-                    if (c.length > 10) { d.productCode = c[10].trim(); hasProductCol = true; }
+                    if (c.length > 10) { d.productCode = c[10].trim(); hasProductCol = true; } else { d.productCode = "A"; }
 
-                    if (c.length != 14) d.formatErrors.add("Invalid System CSV columns");
+                    if (c.length != 14) d.formatErrors.add("Invalid CSV columns (Expected 14)");
                     else validateSystemColumns(d, d.sysSite, d.sysDate, d.sysYear, d.sysPeriod, c[11].trim(), c[12].trim(), c[13].trim(), postingDate);
                 } else {
                     if (c.length > 0) d.branch = c[0].trim();
@@ -276,7 +301,7 @@ public class JournalBulkValidationService {
                     if (c.length > 2) d.cgl = c[2].trim();
                     parseAmount(d, (c.length > 3) ? c[3].trim() : "", (c.length > 4) ? c[4].trim() : "");
                     if (c.length > 5) d.remarks = c[5].trim();
-                    if (c.length > 6) { d.productCode = c[6].trim(); hasProductCol = true; }
+                    if (c.length > 6) { d.productCode = c[6].trim(); hasProductCol = true; } else { d.productCode = "A"; }
                 }
                 if (d.productCode.isEmpty()) d.productCode = "A";
                 list.add(d);
@@ -318,7 +343,11 @@ public class JournalBulkValidationService {
                 parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
                 d.remarks = fmt.formatCellValue(r.getCell(9)).trim();
                 Cell prodCell = r.getCell(10);
-                if (prodCell != null) { d.productCode = parseCode(prodCell, fmt); hasProductCol = true; }
+                if (prodCell != null || r.getLastCellNum() > 10) {
+                    d.productCode = parseCode(prodCell, fmt); hasProductCol = true;
+                }
+                validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod,
+                        parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
             } else {
                 d.branch = col0;
                 d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
@@ -326,7 +355,9 @@ public class JournalBulkValidationService {
                 parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
                 d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
                 Cell prodCell = r.getCell(6);
-                if (prodCell != null) { d.productCode = parseCode(prodCell, fmt); hasProductCol = true; }
+                if (prodCell != null || r.getLastCellNum() > 6) {
+                    d.productCode = parseCode(prodCell, fmt); hasProductCol = true;
+                }
             }
             if (d.productCode == null || d.productCode.isEmpty()) d.productCode = "A";
             list.add(d);
@@ -334,27 +365,49 @@ public class JournalBulkValidationService {
         return new ParsingResult(list, hasProductCol);
     }
 
+    /**
+     * Rule 3: Amount parsing logic. 
+     * Ensures Dr/Cr detection and scale validation without changing numeric values.
+     */
     private void parseAmount(ExcelRowData d, String amountRaw, String typeRaw) {
         try {
             String amtClean = (amountRaw == null) ? "" : amountRaw.trim();
+            if (amtClean.contains("-") || amtClean.contains("(") || amtClean.contains(")"))
+                d.formatErrors.add("Amount cannot be negative");
             String clean = CLEAN_AMOUNT_REGEX.matcher(amtClean).replaceAll("");
             if (clean.isEmpty()) { d.amount = BigDecimal.ZERO; return; }
             BigDecimal v = new BigDecimal(clean);
+            if (v.signum() < 0) d.formatErrors.add("Amount cannot be negative");
             boolean isCredit = typeRaw != null && (typeRaw.toUpperCase().contains("C") || typeRaw.toUpperCase().contains("CR"));
             d.txnType = isCredit ? "Credit" : "Debit";
             d.amount = v;
-        } catch (NumberFormatException e) {
+        } catch (NumberFormatException | ArithmeticException e) {
             d.amount = BigDecimal.ZERO;
             d.formatErrors.add("Invalid numeric format");
         }
     }
 
+    // ==================================================================================
+    // 4. VALIDATION STAGES
+    // ==================================================================================
+
     private void runFormatCheck(List<ExcelRowData> rows) {
         rows.parallelStream().forEach(d -> {
             if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0)
                 d.formatErrors.add("Amount cannot be Zero or Null");
+            else {
+                if (d.amount.signum() < 0) d.formatErrors.add("Amount cannot be negative");
+                if (d.amount.precision() > 20 || d.amount.scale() > 4) d.formatErrors.add("Amount exceeds format (Max 16.4)");
+                if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) d.formatErrors.add("INR Amount > 2 decimal places");
+            }
+            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches())
+                d.formatErrors.add("Product Code must be 8 digits or Blank");
             if (d.remarks == null || d.remarks.trim().isEmpty()) d.formatErrors.add("Remarks is Mandatory");
-            if (d.cgl == null || !CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("Invalid CGL format");
+            else if (d.remarks.length() > 30) d.formatErrors.add("Remarks length must be <= 30 chars");
+            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency must be exactly 3 characters");
+            if (d.cgl == null || d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
+            else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("CGL must be 10 digits");
+            if (d.branch == null || d.branch.trim().isEmpty()) d.formatErrors.add("Branch is Mandatory");
         });
     }
 
@@ -364,17 +417,16 @@ public class JournalBulkValidationService {
         Set<String> validCgls = validationMasterService.getAllActiveCgls();
 
         rows.parallelStream().forEach(d -> {
-            if (d.branch != null && !validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found");
-            if (d.currency != null && !validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found");
-            if (d.cgl != null && !validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found");
+            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch)) d.dbErrors.add("Branch Inactive/Not Found");
+            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency)) d.dbErrors.add("Currency Inactive/Not Found");
+            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl)) d.dbErrors.add("CGL Inactive/Not Found");
         });
     }
 
     /**
-     * Rule 3: Balance Verification Logic.
-     * Uses LongAdder for thread-safe parallel summation. 
-     * Shifting decimals by 10^4 allows us to perform integer addition on currency 
-     * values to avoid floating-point drift common in BigDecimal parallel streams.
+     * Rule 3: Balance Integrity Logic.
+     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic 
+     * on parallel streams, preventing floating-point drift in large batches.
      */
     private void runBalanceCheck(List<ExcelRowData> rows) {
         ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
@@ -384,7 +436,6 @@ public class JournalBulkValidationService {
                 if ("Credit".equals(d.txnType)) val = val.negate();
                 String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
                 String key = d.branch + "_" + d.currency + "_" + type;
-                // Shift by 4 decimal places for integer precision
                 balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val.multiply(new BigDecimal("10000")).longValue());
             }
         });
@@ -402,17 +453,31 @@ public class JournalBulkValidationService {
     }
 
     private void validateSystemColumns(ExcelRowData d, String c0, String cDate, String cYear, String cMonth, String c11, String c12, String c13, LocalDate postingDate) {
+        if (!"01".equals(c0)) d.formatErrors.add("Site must be '01'");
         try {
-            if (cDate != null && cDate.trim().length() == 8) {
+            if (cDate == null || cDate.trim().length() != 8) d.formatErrors.add("Invalid Date Format (ddMMyyyy)");
+            else {
                 LocalDate parsedDate = LocalDate.parse(cDate.trim(), SYSTEM_DATE_FMT);
-                if (!parsedDate.equals(postingDate)) d.formatErrors.add("Date Mismatch");
+                if (!parsedDate.equals(postingDate)) d.formatErrors.add("Date Mismatch with Posting Date");
+                String expectedYear = (parsedDate.getMonthValue() >= 4) ? String.valueOf(parsedDate.getYear()) : String.valueOf(parsedDate.getYear() - 1);
+                String expectedMonth = String.format("%02d", (parsedDate.getMonthValue() >= 4) ? (parsedDate.getMonthValue() - 3) : (parsedDate.getMonthValue() + 9));
+                if (cYear == null || !cYear.trim().equals(expectedYear)) d.formatErrors.add("Invalid Fin Year");
+                if (cMonth == null || !cMonth.trim().equals(expectedMonth)) d.formatErrors.add("Invalid Fin Month");
             }
         } catch (DateTimeParseException e) {
-            d.formatErrors.add("Invalid Date Format");
+            d.formatErrors.add("Invalid Calendar Date");
         }
+        if (c11 == null || !"B".equalsIgnoreCase(c11.trim())) d.formatErrors.add("Col 12 must be 'B'");
+        if (c12 == null || !"C".equalsIgnoreCase(c12.trim())) d.formatErrors.add("Col 13 must be 'C'");
+        if (c13 == null || !"D".equalsIgnoreCase(c13.trim())) d.formatErrors.add("Col 14 must be 'D'");
     }
 
+    // ==================================================================================
+    // 5. STORAGE & UTILS
+    // ==================================================================================
+
     private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage, boolean hasProductColumn) throws IOException {
+        log.warn("VALIDATION_FAILED | ReqID: {} | Reason: {}", reqId, msg);
         byte[] excel = generateErrorExcelFast(rows, hasProductColumn);
         redisTemplate.opsForValue().set("FILE_" + reqId + "_ERROR", excel, 30, TimeUnit.MINUTES);
         updateState(reqId, s -> {
@@ -426,10 +491,17 @@ public class JournalBulkValidationService {
 
     private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv) throws IOException {
         saveRowsToRedis(reqId, rows);
+        if (!isCsv) {
+            byte[] csv = generateSuccessCsv(rows, pDate);
+            redisTemplate.opsForValue().set("FILE_" + reqId + "_SUCCESS", csv, 30, TimeUnit.MINUTES);
+        }
+        List<Map<String, Object>> preview = rows.stream().limit(2000).map(this::mapToPreview).collect(Collectors.toList());
         updateState(reqId, s -> {
             s.setCurrentStage(4);
             s.setStatus("SUCCESS");
             s.setMessage("Validation Successful");
+            s.setHasSuccessFile(!isCsv);
+            try { s.setPreviewDataJson(objectMapper.writeValueAsString(preview)); } catch (JsonProcessingException ignored) {}
         });
     }
 
@@ -448,19 +520,72 @@ public class JournalBulkValidationService {
             redisTemplate.opsForValue().set("DATA_" + requestId, baos.toByteArray(), 1, TimeUnit.HOURS);
             log.info("CACHE_DATA_SAVED | ReqID: {} | Rows: {}", requestId, rows.size());
         } catch (IOException | DataAccessException e) {
-            // Rule 2: Sanitized log
-            log.error("CACHE_SAVE_FAILURE | ReqID: {} | Status: Redis persistence failure", requestId);
+            // Rule 2: Sanitized log for cache failures
+            log.error("CACHE_SAVE_FAILURE | ReqID: {} | Status: Persistence error", requestId);
         }
+    }
+
+    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
+        StringBuilder csv = new StringBuilder(rows.size() * 100);
+        DateTimeFormatter ddMMyyyy = DateTimeFormatter.ofPattern("ddMMyyyy");
+        String col2 = postingDate.format(ddMMyyyy);
+        String year = (postingDate.getMonthValue() >= 4) ? String.valueOf(postingDate.getYear()) : String.valueOf(postingDate.getYear() - 1);
+        String month = String.format("%02d", (postingDate.getMonthValue() >= 4) ? (postingDate.getMonthValue() - 3) : (postingDate.getMonthValue() + 9));
+
+        for (ExcelRowData row : rows) {
+            String cDate = row.isSystemFormat ? row.sysDate : col2;
+            String cYear = row.isSystemFormat ? row.sysYear : year;
+            String cMonth = row.isSystemFormat ? row.sysPeriod : month;
+            String col5 = String.format("%5s", row.branch).replace(' ', '0');
+            String col6 = (row.currency == null || row.currency.isEmpty()) ? "INR" : row.currency;
+            String plainAmt = row.amount.abs().setScale(4, RoundingMode.HALF_UP).toPlainString();
+            int dotIndex = plainAmt.indexOf('.');
+            String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
+            String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
+            String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
+            String col9 = "Credit".equalsIgnoreCase(row.txnType) ? "Cr" : "Dr";
+            String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
+            String col11 = (row.productCode != null && !row.productCode.isEmpty()) ? row.productCode : "A";
+            csv.append("01,").append(cDate).append(",").append(cYear).append(",").append(cMonth).append(",")
+                    .append(col5).append(",").append(col6).append(",").append(row.cgl).append(",").append(col8).append(",")
+                    .append(col9).append(",").append(col10).append(",").append(col11).append(",B,C,D\n");
+        }
+        return csv.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     private byte[] generateErrorExcelFast(List<ExcelRowData> rows, boolean includeProduct) throws IOException {
         try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
             Sheet sheet = workbook.createSheet("Error Report");
+            CellStyle errStyle = workbook.createCellStyle();
+            Font f = workbook.createFont(); f.setColor(IndexedColors.RED.getIndex()); errStyle.setFont(f);
+
+            Row h = sheet.createRow(0);
+            List<String> headerList = new ArrayList<>(Arrays.asList("Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks"));
+            if (includeProduct) headerList.add("Product");
+            headerList.add("ERRORS");
+            if (rows.stream().anyMatch(r -> r.isSystemFormat)) headerList.addAll(0, Arrays.asList("Site", "Date", "Year", "Month"));
+            for (int i = 0; i < headerList.size(); i++) h.createCell(i).setCellValue(headerList.get(i));
+
             int idx = 1;
+            boolean isSystem = rows.stream().anyMatch(r -> r.isSystemFormat);
             for (ExcelRowData d : rows) {
                 Row r = sheet.createRow(idx++);
-                r.createCell(0).setCellValue(d.branch);
-                if (d.hasErrors()) r.createCell(8).setCellValue(d.getAllErrors());
+                int col = 0;
+                if (isSystem) {
+                    r.createCell(col++).setCellValue(sanitize(d.sysSite));
+                    r.createCell(col++).setCellValue(sanitize(d.sysDate));
+                    r.createCell(col++).setCellValue(sanitize(d.sysYear));
+                    r.createCell(col++).setCellValue(sanitize(d.sysPeriod));
+                }
+                r.createCell(col++).setCellValue(sanitize(d.branch));
+                r.createCell(col++).setCellValue(sanitize(d.currency));
+                r.createCell(col++).setCellValue(sanitize(d.cgl));
+                r.createCell(col++).setCellValue(d.amount != null ? d.amount.toString() : "");
+                r.createCell(col++).setCellValue(sanitize(d.txnType));
+                r.createCell(col++).setCellValue(sanitize(d.remarks));
+                if (includeProduct) r.createCell(col++).setCellValue(sanitize(d.productCode));
+                Cell c = r.createCell(col);
+                if (d.hasErrors()) { c.setCellValue(d.getAllErrors()); c.setCellStyle(errStyle); }
             }
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             workbook.write(out);
@@ -468,14 +593,45 @@ public class JournalBulkValidationService {
         }
     }
 
+    private String sanitize(String value) {
+        if (value == null) return "";
+        if (value.startsWith("=") || value.startsWith("+") || value.startsWith("-") || value.startsWith("@")) return "'" + value;
+        return value;
+    }
+
+    public byte[] generateTemplateBytes() throws IOException {
+        try (SXSSFWorkbook wb = new SXSSFWorkbook()) {
+            Sheet sheet = wb.createSheet("Journal Template");
+            Row row = sheet.createRow(0);
+            String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product"};
+            for (int i = 0; i < headers.length; i++) {
+                Cell cell = row.createCell(i); cell.setCellValue(headers[i]); sheet.setColumnWidth(i, 4000);
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            wb.write(out);
+            return out.toByteArray();
+        }
+    }
+
     private String parseCode(Cell c, DataFormatter f) {
         if (c == null) return "";
+        if (c.getCellType() == CellType.NUMERIC) return BigDecimal.valueOf(c.getNumericCellValue()).toPlainString().split("\\.")[0];
         return f.formatCellValue(c).trim();
     }
 
     private boolean isRowEmpty(Row r) {
         if (r == null) return true;
-        return r.getCell(0) == null;
+        for (int c = r.getFirstCellNum(); c < r.getLastCellNum(); c++)
+            if (r.getCell(c) != null && r.getCell(c).getCellType() != CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false;
+        return true;
+    }
+
+    private Map<String, Object> mapToPreview(ExcelRowData r) {
+        Map<String, Object> m = new HashMap<>();
+        m.put("id", r.rowIndex); m.put("branch", r.branch); m.put("currency", r.currency);
+        m.put("cgl", r.cgl); m.put("amount", r.amount != null ? r.amount.toString() : "");
+        m.put("txnType", r.txnType); m.put("remarks", r.remarks); m.put("productCode", r.productCode);
+        return m;
     }
 
     private static class ParsingResult {
@@ -485,6 +641,7 @@ public class JournalBulkValidationService {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     @JsonFormat(shape = JsonFormat.Shape.ARRAY)
+    @JsonPropertyOrder({"rowIndex", "branch", "currency", "cgl", "txnType", "remarks", "productCode", "amount", "isSystemFormat", "sysSite", "sysDate", "sysYear", "sysPeriod", "formatErrors", "dbErrors", "balErrors"})
     public static class ExcelRowData {
         public int rowIndex;
         public String branch = "", currency = "", cgl = "", txnType = "", remarks = "", productCode = "";
