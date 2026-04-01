@@ -1,126 +1,59 @@
-This error occurs because Spring is confused. You have two different methods trying to handle the same exception (IllegalStateException).
-Specifically, the handleConcurrency method was originally set to handle both ConcurrencyLockException and IllegalStateException. When we added the new handleStateErrors method for IllegalStateException in the previous step, it created a conflict.
-Here is the complete, clean version of GlobalExceptionHandler.java. I have removed the conflict by making sure each exception type is mapped to only one method.
-GlobalExceptionHandler.java
-package com.fincore.JournalService.Exception;
-
-import com.fincore.JournalService.Dto.ApiErrorResponseDto;
-import jakarta.servlet.http.HttpServletRequest;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataAccessException;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.multipart.MaxUploadSizeExceededException;
-
-import java.io.IOException;
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.stream.Collectors;
-
-/**
- * Centralized error management for consistent and secure API responses.
- * Rule 1: No generic Exception/RuntimeException catching.
- * Rule 2: Descriptive logging without PII leaks.
- */
-@RestControllerAdvice
-@Slf4j
-public class GlobalExceptionHandler {
-
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleValidation(MethodArgumentNotValidException ex, HttpServletRequest request) {
-        List<ApiErrorResponseDto.ValidationError> errors = ex.getBindingResult().getFieldErrors().stream()
-                .map(err -> ApiErrorResponseDto.ValidationError.builder()
-                        .field(err.getField())
-                        .message(err.getDefaultMessage())
-                        .build())
-                .collect(Collectors.toList());
-
-        log.warn("VALIDATION_FAILED | Path: {} | Errors: {}", request.getRequestURI(), errors.size());
-        return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed", "Input validation error", request.getRequestURI(), errors);
-    }
-
-    @ExceptionHandler(MaxUploadSizeExceededException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleMaxSize(MaxUploadSizeExceededException ex, HttpServletRequest request) {
-        log.error("FILE_TOO_LARGE | Path: {}", request.getRequestURI());
-        return buildResponse(HttpStatus.PAYLOAD_TOO_LARGE, "File Too Large", "Maximum upload size exceeded", request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(CustomExceptions.FileProcessingException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleFileProcessing(CustomExceptions.FileProcessingException ex, HttpServletRequest request) {
-        log.error("FILE_PROCESS_ERROR | Path: {} | Message: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.BAD_REQUEST, "File Error", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    /**
-     * FIXED: Removed IllegalStateException from here to resolve the Ambiguous mapping error.
-     */
-    @ExceptionHandler(CustomExceptions.ConcurrencyLockException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleConcurrency(CustomExceptions.ConcurrencyLockException ex, HttpServletRequest request) {
-        log.warn("CONCURRENCY_CONFLICT | Path: {} | Message: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.CONFLICT, "Operation Conflict", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(ResourceNotFoundException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleNotFound(ResourceNotFoundException ex, HttpServletRequest request) {
-        log.info("RESOURCE_NOT_FOUND | Path: {} | Resource: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.NOT_FOUND, "Not Found", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(CustomExceptions.CacheExpiredException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleCacheExpired(CustomExceptions.CacheExpiredException ex, HttpServletRequest request) {
-        log.warn("CACHE_EXPIRED | Path: {}", request.getRequestURI());
-        return buildResponse(HttpStatus.GONE, "Session Expired", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(DataIntegrityViolationException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleSqlIntegrity(DataIntegrityViolationException ex, HttpServletRequest request) {
-        log.error("DB_INTEGRITY_VIOLATION | Path: {} | Type: Constraint violation", request.getRequestURI());
-        return buildResponse(HttpStatus.CONFLICT, "Data Integrity Error", "Constraint violation or duplicate entry.", request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(DataAccessException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleDbError(DataAccessException ex, HttpServletRequest request) {
-        log.error("DATABASE_ACCESS_FAIL | Path: {} | Type: {}", request.getRequestURI(), ex.getClass().getSimpleName());
-        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Database Error", "A database error occurred.", request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(IOException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleIoException(IOException ex, HttpServletRequest request) {
-        log.error("IO_STREAM_FAILURE | Path: {} | Reason: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "IO Error", "Failed to process file stream.", request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler(IllegalStateException.class)
-    public ResponseEntity<ApiErrorResponseDto> handleStateErrors(IllegalStateException ex, HttpServletRequest request) {
-        log.warn("INVALID_STATE | Path: {} | Msg: {}", request.getRequestURI(), ex.getMessage());
-        return buildResponse(HttpStatus.CONFLICT, "Invalid State", ex.getMessage(), request.getRequestURI(), null);
-    }
-
-    @ExceptionHandler({NullPointerException.class, ArrayIndexOutOfBoundsException.class})
-    public ResponseEntity<ApiErrorResponseDto> handleInternalLogicErrors(Exception ex, HttpServletRequest request) {
-        log.error("INTERNAL_LOGIC_ERROR | Path: {} | Type: {}", request.getRequestURI(), ex.getClass().getSimpleName());
-        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Processing Error", "An internal error occurred.", request.getRequestURI(), null);
-    }
-
-    private ResponseEntity<ApiErrorResponseDto> buildResponse(HttpStatus status, String error, String message, String path, List<ApiErrorResponseDto.ValidationError> validationErrors) {
-        ApiErrorResponseDto response = ApiErrorResponseDto.builder()
-                .timestamp(LocalDateTime.now())
-                .status(status.value())
-                .error(error)
-                .message(message)
-                .path(path)
-                .validationErrors(validationErrors)
-                .build();
-        return new ResponseEntity<>(response, status);
-    }
+Based on a deep analysis of your updated code, you have successfully resolved the Ambiguous @ExceptionHandler crash, hardened the Async Batch Creation, and secured the Oracle Procedure logic.
+However, there are still remaining violations of Rule 2 (PII/Information Leakage) in your service layers and the Exception Handler that must be cleaned before production go-live.
+1. Audit of Fixed Items (Production Ready)
+ * Ambiguous Mapping Fix: You consolidated the database handlers into handleDatabaseOperation, which correctly masks raw Oracle messages and logs only the ORA- code.
+ * Async Safety & Deadlocks:
+   * The Redis lock TTL is now a safe 60 minutes.
+   * executeAsyncBatchCreation now includes a 30-minute hard timeout and robust finally block cleanup.
+   * processChunkRaw uses a specific JDBC timeout and handles connection pool exhaustion.
+ * JSON Injection: buildJsonPayloadFast now correctly uses objectMapper and LinkedHashMap instead of manual string concatenation.
+ * DTO Versioning: ExcelRowData has been hardened with explicit @JsonProperty indices to prevent data corruption during future deployments. [cite: 384-398]
+2. Remaining "Hard Fail" Violations (Rule 2)
+You still have several points where e.getMessage() is being logged. [cite_start]In a financial production environment, these messages can leak account numbers or internal file paths.
+Violation A: GlobalExceptionHandler.java
+Most of your non-database handlers are still leaking information via ex.getMessage().
+ * File Error: log.error("... Message: {}", ..., ex.getMessage())
+ * Concurrency: log.warn("... Message: {}", ..., ex.getMessage())
+ * IO Failures: log.error("... Reason: {}", ..., ex.getMessage())
+Violation B: Service Layers
+ * BranchService: log.error("... Database access error: {}", e.getMessage()) and log.error("... Error: {}", e.getMessage()).
+ * CglService: log.error("... Database access error: {}", e.getMessage()).
+ * HdfsRecoveryService: Multiple points logging e.getMessage() for query and persistence failures..
+ * SequenceService: Logging raw Oracle sequence errors..
+ * ValidationMasterService: Logging master data fetch failures..
+3. The Final Polish (Code Corrections)
+To be 100% compliant with your strict production rules, you must apply these final changes to remove the last pieces of information leakage.
+Final GlobalExceptionHandler.java Update
+Replace the chatty handlers with sanitized versions that log the exception type only.
+// REPLACED: handleFileProcessing (Sanitized)
+@ExceptionHandler(CustomExceptions.FileProcessingException.class)
+public ResponseEntity<ApiErrorResponseDto> handleFileProcessing(CustomExceptions.FileProcessingException ex, HttpServletRequest request) {
+    log.error("FILE_PROCESS_ERROR | Path: {} | Type: {}", request.getRequestURI(), ex.getClass().getSimpleName());
+    return buildResponse(HttpStatus.BAD_REQUEST, "File Error", "Failed to process the uploaded file.", request.getRequestURI(), null);
 }
 
-What was fixed:
- * Removed Overlap: The handleConcurrency method now only takes CustomExceptions.ConcurrencyLockException. It no longer competes with handleStateErrors for IllegalStateException.
- * Zero Spans: The code is clean and ready for copy-pasting.
- * [cite_start]Specific Exceptions: We kept the specific handlers for NullPointerException and ArrayIndexOutOfBoundsException to ensure we don't need a generic RuntimeException catch [cite: 232-233].
-You should be able to run the application now without the Ambiguous @ExceptionHandler error. Do you want to review the JournalRequestServiceImpl async logic next to ensure all RuntimeException blocks are removed?
+// REPLACED: handleIoException (Sanitized)
+@ExceptionHandler(IOException.class)
+public ResponseEntity<ApiErrorResponseDto> handleIoException(IOException ex, HttpServletRequest request) {
+    log.error("IO_STREAM_FAILURE | Path: {} | Type: {}", request.getRequestURI(), ex.getClass().getSimpleName());
+    return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "IO Error", "Internal storage access failure.", request.getRequestURI(), null);
+}
+
+Final Service Layer Logging Cleanup
+Update BranchService, CglService, and SequenceService to use safe logging.
+// Example: Corrected BranchService.java
+} catch (DataAccessException e) {
+    // Rule 2: Masked for PII Protection - Removed e.getMessage()
+    log.error("BRANCH_MAP_FETCH_FAIL | Type: {}", e.getClass().getSimpleName());
+    return Collections.emptyMap();
+}
+
+// Example: Corrected SequenceService.java
+} catch (PersistenceException e) {
+    log.error("SEQUENCE_FETCH_FAIL | Type: BATCH_ID | Status: Oracle sequence error");
+    throw new CustomExceptions.DatabaseOperationException("Critical failure: Batch sequence unavailable", e);
+}
+
+Final Verdict: Correct but needs "Rule 2" Cleanup
+The logic is perfect, the architecture is high-performance, and the core bugs are fixed. Once you remove the e.getMessage() calls from the remaining services and the Exception Handler, your code is 100% Ready for Production.
+Do you want me to provide a consolidated "Search and Replace" list to help you quickly find all remaining e.getMessage() violations across your files?
