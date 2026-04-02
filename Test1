@@ -1,16 +1,157 @@
-branch 	currency 	cgl         amount 	txntype 	remarks 
-32121	INR	      1111111111	3434	CR	         Remark
-32121	INR       1111111111    3434	DR	         Remark
+To fulfill your requirement of only showing the **Product** column when actual, valid data is provided (and not just the default "A" or an empty header), you need to update the parsing and completion methods in JournalBulkValidationService.java.
+I have removed all source/span markers and updated the logic to ensure that hasProductColumn only becomes true if a user provides a value that is **not empty** and **not the default "A"**.
+### **Updated Methods in JournalBulkValidationService.java**
+#### **1. Updated parseCsvStream**
+This method now checks if the product column contains real data before flagging it for the UI.
+```java
+private ParsingResult parseCsvStream(InputStream is, LocalDate postingDate) throws IOException {
+    List<ExcelRowData> list = new ArrayList<>();
+    boolean hasProductCol = false;
 
+    try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+        String line;
+        int i = 0;
+        while ((line = br.readLine()) != null) {
+            if (line.trim().isEmpty()) continue;
+            String[] c = line.split(",", -1);
 
-this excel i upload now in this case i am not giving a product code but when i load on the screen it show product
-under that all 'A' are showing that should not happen we are need to show A but in the case of the CSV Download Data
+            if (i == 0) {
+                String h = c.length > 0 ? c[0].trim().toLowerCase() : "";
+                if (h.contains("branch") || h.contains("batch")) {
+                    i++;
+                    continue;
+                }
+            }
 
-the condtion should be like if product is given and if it Valid then only show 
-other wise Dont show that column there 
+            ExcelRowData d = new ExcelRowData();
+            d.rowIndex = i++;
 
-if they just add the column name not data then also dont show the column 
+            String col0Clean = c.length > 0 ? c[0].replace("\uFEFF", "").trim() : "";
+            d.sysSite = col0Clean;
+            
+            if ("01".equals(col0Clean)) {
+                // System Format (14 Columns)
+                if (c.length > 10) { 
+                    String rawProd = c[10].trim();
+                    // LOGIC: Only flag true if it's NOT empty and NOT the default 'A'
+                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+                        d.productCode = rawProd;
+                        hasProductCol = true; 
+                    } else { 
+                        d.productCode = "A"; 
+                    }
+                } else { 
+                    d.productCode = "A"; 
+                }
+                // ... rest of indices remain same as original logic ...
+            } else {
+                // Manual Format
+                if (c.length > 6) { 
+                    String rawProd = c[6].trim();
+                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+                        d.productCode = rawProd;
+                        hasProductCol = true;
+                    } else { 
+                        d.productCode = "A"; 
+                    }
+                } else { 
+                    d.productCode = "A"; 
+                }
+            }
+            list.add(d);
+        }
+    }
+    return new ParsingResult(list, hasProductCol);
+}
 
+```
+#### **2. Updated parseSheet (Excel Parser)**
+This ensures that even if an Excel user has a "Product" column header but no data in the rows, the column stays hidden.
+```java
+private ParsingResult parseSheet(Sheet sheet, LocalDate postingDate) {
+    List<ExcelRowData> list = new ArrayList<>();
+    DataFormatter fmt = new DataFormatter();
+    boolean hasProductCol = false;
 
+    for (Row r : sheet) {
+        if (isRowEmpty(r)) continue;
+        if (r.getRowNum() == 0) {
+            String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
+            if (h.contains("branch") || h.contains("batch")) continue;
+        }
+        ExcelRowData d = new ExcelRowData();
+        d.rowIndex = r.getRowNum();
+        String col0 = parseCode(r.getCell(0), fmt);
 
+        if ("01".equals(col0) || "1".equals(col0)) {
+            // System Format Logic
+            Cell prodCell = r.getCell(10);
+            String rawProd = (prodCell != null) ? parseCode(prodCell, fmt) : "";
+            if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+                d.productCode = rawProd;
+                hasProductCol = true;
+            } else { 
+                d.productCode = "A"; 
+            }
+        } else {
+            // Manual Format Logic
+            Cell prodCell = r.getCell(6);
+            String rawProd = (prodCell != null) ? parseCode(prodCell, fmt) : "";
+            if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+                d.productCode = rawProd;
+                hasProductCol = true;
+            } else { 
+                d.productCode = "A"; 
+            }
+        }
+        list.add(d);
+    }
+    return new ParsingResult(list, hasProductCol);
+}
 
+```
+#### **3. Updated completeRequest**
+This method now explicitly saves the hasProductColumn flag into the BulkUploadStateDto so the frontend polling can see it.
+```java
+private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv, boolean hasProductColumn) throws IOException {
+    saveRowsToRedis(reqId, rows);
+    
+    if (!isCsv) {
+        byte[] csv = generateSuccessCsv(rows, pDate);
+        redisTemplate.opsForValue().set("FILE_" + reqId + "_SUCCESS", csv, 30, TimeUnit.MINUTES);
+    }
+    
+    List<Map<String, Object>> preview = rows.stream().limit(2000).map(this::mapToPreview).collect(Collectors.toList());
+    
+    updateState(reqId, s -> {
+        s.setCurrentStage(4);
+        s.setStatus("SUCCESS");
+        s.setMessage("Validation Successful");
+        s.setHasSuccessFile(!isCsv);
+        // PASSING THE FLAG TO FRONTEND STATE
+        s.setHasProductColumn(hasProductColumn); 
+        try { 
+            s.setPreviewDataJson(objectMapper.writeValueAsString(preview)); 
+        } catch (JsonProcessingException ignored) {}
+    });
+}
+
+```
+#### **4. Call-site Update in processAsync**
+Finally, ensure the main async loop passes the flag from the parsing result to the completion method.
+```java
+// Inside processAsync method
+ParsingResult parsingResult;
+// ... file parsing happens here ...
+
+// At the very end of the successful validation flow:
+completeRequest(requestId, parsedRows, postingDate, isCsv, parsingResult.hasProductColumn);
+
+```
+### **Important Step:**
+You must ensure that your **BulkUploadStateDto** class has the following field so that the value is correctly passed to your React frontend:
+```java
+private boolean hasProductColumn; // with standard getters and setters
+
+```
+This logic keeps your backend processing consistent (using "A" for the system) while giving the user a clean UI by hiding the column if they didn't explicitly provide custom product data.
