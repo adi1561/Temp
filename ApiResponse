@@ -1,7 +1,53 @@
-Branch	Currency	CGL	Amount	TxnType	Remarks	Product	ERRORS
-32121	INR	1111111111	3434	Credit	Remark	152	Product Code must be 8 digits or Blank
-32121	INR	1111111111	3434	Debit	Remark	A	
+This bug happens because the parser is overwriting your empty input with "A" immediately during the reading phase. To fix this, we must keep the productCode exactly as it is in the uploaded file (empty or otherwise) and only apply the "A" default at the very last moment when generating the final **Success CSV**.
+Here are the changes you need to make in JournalBulkValidationService.java:
+### **1. Update the Parsers (Keep raw data)**
+Modify both parseCsvStream and parseSheet to stop setting the default "A" during parsing. This ensures the **Error File** shows exactly what was uploaded.
+**Update in parseCsvStream:**
+```java
+// Inside the "01" (System) and Manual format blocks:
+String rawProd = c[10].trim(); // or c[6] for manual
+d.productCode = rawProd; // Keep the raw value (even if empty)
 
+// Logic for showing the column in UI remains:
+if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+    hasProductCol = true;
+}
 
-i got this one more bug see this in the error file u are adding the A why ??
-u just need to add that A in the CSV file which will be Downloaded on the Download CSV button 
+```
+**Update in parseSheet (Excel):**
+```java
+String rawProd = (prodCell != null) ? parseCode(prodCell, fmt) : "";
+d.productCode = rawProd; // Keep the raw value
+
+if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+    hasProductCol = true;
+}
+
+```
+### **2. Update generateSuccessCsv (Apply default here)**
+Find your generateSuccessCsv method (where you write the final rows for the Download button) and add the "A" default logic there. This ensures the system gets the "A" it needs, but the user's error report stays clean.
+```java
+private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate pDate) {
+    // ... your CSV writer setup ...
+    for (ExcelRowData row : rows) {
+        // Apply the "A" default ONLY for the final output
+        String finalProduct = (row.productCode == null || row.productCode.trim().isEmpty()) 
+                              ? "A" 
+                              : row.productCode;
+
+        writer.writeNext(new String[]{
+            // ... other columns ...
+            row.remarks,
+            finalProduct, // Use the defaulted value here
+            // ...
+        });
+    }
+    // ...
+}
+
+```
+### **3. Why this solves the Bug:**
+ 1. **Error Reports**: Since the parser no longer forces "A" into the ExcelRowData object, the error report generator will see an empty string (or whatever was actually uploaded) and print that in the error file.
+ 2. **Final CSV**: When the user clicks "Download CSV", the generateSuccessCsv logic checks if the field is empty and inserts "A" for the final system-ready file.
+ 3. **UI Preview**: The hasProductCol flag logic still works correctly; it will only be true if there is data other than an empty string or "A", keeping the screen clean for the user.
+**Does this resolve the issue in your error report, or do you need me to check the mapToPreview logic as well?**
