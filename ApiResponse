@@ -1,145 +1,189 @@
-I understand the issue clearly now. The "A" is appearing in your error report because your parsers are forcing that default value during the initial reading of the file, before the validation even runs.
-To ensure your error report shows exactly what the user uploaded (including blanks), you must remove the default "A" logic from your parsing methods and move it exclusively to the final CSV generation method.
-### **1. Updated: parseCsvStream (Complete Code)**
-This version preserves the raw input. If the product column is empty, productCode stays empty in the error report.
-```java
-private ParsingResult parseCsvStream(InputStream is, LocalDate postingDate) throws IOException {
-    List<ExcelRowData> list = new ArrayList<>();
-    boolean hasProductCol = false;
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2, 
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+BEGIN
 
-    try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-        String line;
-        int i = 0;
-        while ((line = br.readLine()) != null) {
-            if (line.trim().isEmpty()) continue;
-            String[] c = line.split(",", -1);
+    -- ==========================================================
+    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==========================================================
+    -- Rule 3: Validates that every non-INR currency in the batch has an active rate.
+    -- This prevents corrupted balances in the GL_BALANCE table.
+    SELECT COUNT(*)
+    INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY 
+        FROM JOURNAL_REQUEST 
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm 
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
-            if (i == 0) {
-                String h = c.length > 0 ? c[0].trim().toLowerCase() : "";
-                if (h.contains("branch") || h.contains("batch")) {
-                    i++; continue;
-                }
-            }
+    IF v_missing_rates > 0 THEN
+        -- Rule 1 & 2: Specific error code for Java to catch without leaking schema details.
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
 
-            ExcelRowData d = new ExcelRowData();
-            d.rowIndex = i++;
-            String col0Clean = c.length > 0 ? c[0].replace("\uFEFF", "").trim() : "";
-            d.sysSite = col0Clean;
+    -- START ATOMIC TRANSACTION
+    BEGIN
+        -- ==========================================================
+        -- 1. Insert into GL_TRANSACTIONS
+        -- ==========================================================
+        -- Safe for Parallelism: New row inserts do not lock existing data rows.
+        INSERT /*+ APPEND PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+            TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+            BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
+        )
+        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+            GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID, NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, 
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, 
+            'J'
+        FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-            if ("01".equals(col0Clean)) {
-                d.isSystemFormat = true;
-                if (c.length > 1) d.sysDate = c[1].trim();
-                if (c.length > 2) d.sysYear = c[2].trim();
-                if (c.length > 3) d.sysPeriod = c[3].trim();
-                if (c.length > 4) d.branch = c[4].trim();
-                if (c.length > 5) d.currency = c[5].trim().toUpperCase();
-                if (c.length > 6) d.cgl = c[6].trim();
-                parseAmount(d, (c.length > 7) ? c[7].trim() : "", (c.length > 8) ? c[8].trim() : "");
-                if (c.length > 9) d.remarks = c[9].trim();
-                
-                if (c.length > 10) {
-                    String rawProd = c[10].trim();
-                    d.productCode = rawProd; // KEEP RAW: Error file will show blank if input was blank
-                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                        hasProductCol = true;
-                    }
-                } else {
-                    d.productCode = "";
-                }
+        -- ==========================================================
+        -- 2. Insert into MASTER_JOURNAL 
+        -- ==========================================================
+        INSERT /*+ APPEND PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
+            JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH, 
+            JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF, 
+            JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
+        )
+        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+            MASTER_JOURNAL_SEQ.nextval, 
+            ABS(REQ_AMOUNT), 
+            'A', 
+            BATCH_ID, 
+            REQ_BRANCH_CODE, 
+            REQ_CGL, 
+            p_remarks, 
+            REQ_CURRENCY, 
+            JOURNAL_ID, 
+            NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), 
+            REQ_PRODUCT, 
+            REQ_NARRATION, 
+            CASE WHEN REQ_AMOUNT > 0 THEN 'Debit' ELSE 'Credit' END
+        FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-                if (c.length != 14) d.formatErrors.add("Invalid CSV columns (Expected 14)");
-                else validateSystemColumns(d, d.sysSite, d.sysDate, d.sysYear, d.sysPeriod, c[11].trim(), c[12].trim(), c[13].trim(), postingDate);
-            } else {
-                if (c.length > 0) d.branch = c[0].trim();
-                if (c.length > 1) d.currency = c[1].trim().toUpperCase();
-                if (c.length > 2) d.cgl = c[2].trim();
-                parseAmount(d, (c.length > 3) ? c[3].trim() : "", (c.length > 4) ? c[4].trim() : "");
-                if (c.length > 5) d.remarks = c[5].trim();
-                if (c.length > 6) {
-                    String rawProd = c[6].trim();
-                    d.productCode = rawProd; // KEEP RAW
-                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                        hasProductCol = true;
-                    }
-                } else {
-                    d.productCode = "";
-                }
-            }
-            list.add(d);
-        }
-    }
-    return new ParsingResult(list, hasProductCol);
-}
+        -- ==========================================================
+        -- 3. Merge Balances (CONCURRENCY FIX)
+        -- ==========================================================
+        /** * Rule 3 & Bug Fix #6: 
+         * REMOVED 'ALTER SESSION ENABLE PARALLEL DML' and 'PARALLEL' hint here.
+         * Parallel DML on existing rows requires an Exclusive Table Lock, which 
+         * prevents multiple admins from approving different batches simultaneously.
+         * Row-level locking (Standard Merge) is safer for high-concurrency production.
+         */
+        MERGE INTO GL_BALANCE target
+        USING (
+            SELECT 
+                j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+                CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE 
+            FROM JOURNAL_REQUEST j
+            LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1 
+            WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+            GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+        ) source
+        ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE 
+            AND target.CURRENCY = source.REQ_CURRENCY 
+            AND target.CGL = source.REQ_CGL 
+            AND target.BALANCE_DATE = source.BAL_DATE)
+        WHEN MATCHED THEN
+            UPDATE SET 
+                target.BALANCE = target.BALANCE + source.TXN_AMOUNT, 
+                target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+        WHEN NOT MATCHED THEN
+            INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+            VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE, 
+                    source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT, 
+                    (source.TXN_AMOUNT * source.EXCH_RATE));
 
-```
-### **2. Updated: parseSheet (Complete Code)**
-This version removes the else { d.productCode = "A"; } that was poisoning your Excel error reports.
-```java
-private ParsingResult parseSheet(Sheet sheet, LocalDate postingDate) {
-    List<ExcelRowData> list = new ArrayList<>();
-    DataFormatter fmt = new DataFormatter();
-    boolean hasProductCol = false;
+        -- ==========================================================
+        -- 4. Final Status Update
+        -- ==========================================================
+        UPDATE JOURNAL_REQUEST
+        SET REQ_STATUS = p_status, 
+            EXECUTOR_ID = p_executor_id, 
+            EXECUTION_DATE = SYSTIMESTAMP, 
+            EXECUTOR_REMARKS = p_remarks
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-    for (Row r : sheet) {
-        if (isRowEmpty(r)) continue;
-        if (r.getRowNum() == 0) {
-            String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
-            if (h.contains("branch") || h.contains("batch")) continue;
-        }
-        ExcelRowData d = new ExcelRowData();
-        d.rowIndex = r.getRowNum();
-        String col0 = parseCode(r.getCell(0), fmt);
+        COMMIT; 
 
-        if ("01".equals(col0) || "1".equals(col0)) {
-            d.isSystemFormat = true;
-            d.sysSite = col0;
-            d.sysDate = parseCode(r.getCell(1), fmt);
-            d.sysYear = parseCode(r.getCell(2), fmt);
-            d.sysPeriod = parseCode(r.getCell(3), fmt);
-            d.branch = parseCode(r.getCell(4), fmt);
-            d.currency = fmt.formatCellValue(r.getCell(5)).trim().toUpperCase();
-            d.cgl = parseCode(r.getCell(6), fmt);
-            parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
-            d.remarks = fmt.formatCellValue(r.getCell(9)).trim();
-            
-            Cell prodCell = r.getCell(10);
-            String rawProd = (prodCell != null) ? parseCode(prodCell, fmt).trim() : "";
-            d.productCode = rawProd; // KEEP RAW: No "A" default here
-            if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                hasProductCol = true;
-            }
-            
-            validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod,
-                    parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
-        } else {
-            d.branch = col0;
-            d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
-            d.cgl = parseCode(r.getCell(2), fmt);
-            parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
-            d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
-            
-            Cell prodCell = r.getCell(6);
-            String rawProd = (prodCell != null) ? parseCode(prodCell, fmt).trim() : "";
-            d.productCode = rawProd; // KEEP RAW
-            if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                hasProductCol = true;
-            }
-        }
-        list.add(d);
-    }
-    return new ParsingResult(list, hasProductCol);
-}
+        -- ==========================================================
+        -- 5. Return Sync Cursor to Java
+        -- ==========================================================
+        OPEN o_cursor FOR
+        SELECT 
+            j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL, 
+            j.REQ_CSV_DATE AS BAL_DATE, g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+        FROM (SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
+              FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id) j
+        JOIN GL_BALANCE g 
+            ON g.BRANCH_CODE = j.REQ_BRANCH_CODE 
+            AND g.CURRENCY = j.REQ_CURRENCY 
+            AND g.CGL = j.REQ_CGL 
+            AND g.BALANCE_DATE = j.REQ_CSV_DATE;
 
-```
-### **3. Logic in generateSuccessCsv**
-Your current logic for the Success CSV is correct because it serves as the final system gatekeeper. By keeping the parsers raw and using the logic below in generateSuccessCsv, the "A" only ever appears in the final processed batch, never in the error files.
-```java
-// Keep this logic inside generateSuccessCsv:
-String col11 = (row.productCode == null || row.productCode.trim().isEmpty()) ? "A" : row.productCode.trim();
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            -- Rule 2: Re-raising for Java, but Java must be configured to log only the Code, not the Message.
+            RAISE; 
+    END;
+END;
 
-```
-### **Summary of the Fix:**
- * **Parsers**: No longer force "A". They store "" if the user left it blank.
- * **Error Report**: Uses the raw data from the parsers, so it correctly shows a blank cell.
- * **UI**: The hasProductCol flag remains accurate because it only triggers for non-blank, non-A data.
- * **Success CSV**: Correctly adds "A" so the system can process the file successfully.
+
+
+
+
+
+2nd one 
+
+create or replace PROCEDURE PURGE_JOURNAL_BATCH(
+    p_batch_id IN VARCHAR2,
+    p_user_id IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+BEGIN
+    -- 1. Security Check
+    SELECT BATCH_STATUS INTO v_status
+    FROM JOURNAL_BATCH_MASTER
+    WHERE BATCH_ID = p_batch_id AND CREATOR_ID = p_user_id;
+
+    -- ALLOW 'PENDING' OR 'QUEUED' (Locked by Java)
+    IF v_status NOT IN ('PENDING', 'QUEUED', 'ERROR') THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+    END IF;
+
+    -- 2. Fast Chunked Delete
+    LOOP
+        DELETE FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id
+          AND REQ_STATUS IN ('P', 'R') -- Clean PENDING or REJECTED
+          AND ROWNUM <= 50000;
+
+        EXIT WHEN SQL%ROWCOUNT = 0;
+        COMMIT; 
+    END LOOP;
+
+    -- 3. Delete Master
+    DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
+    COMMIT;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+END;
+
+this is 2 procedures that we are using in the DB but tell in which file we are using this and how this flow for the Query what we are doing in the Gl balance and what we are doing in the  Insert into GL_TRANSACTIONS
