@@ -1,170 +1,30 @@
-The reason "A" is still appearing in your error file is because the code you provided still contains the else { d.productCode = "A"; } logic inside the parsers. This explicitly overwrites empty values with "A" before the error report is even generated.
-To fix this, the parsers must store the **raw data** (even if blank), and we move the "A" default logic exclusively to the generateSuccessCsv method.
-### **1. Updated: parseCsvStream (Complete & Clean)**
-```java
-private ParsingResult parseCsvStream(InputStream is, LocalDate postingDate) throws IOException {
-    List<ExcelRowData> list = new ArrayList<>();
-    boolean hasProductCol = false;
+ private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
+        StringBuilder csv = new StringBuilder(rows.size() * 100);
+        DateTimeFormatter ddMMyyyy = DateTimeFormatter.ofPattern("ddMMyyyy");
+        String col2 = postingDate.format(ddMMyyyy);
+        String year = (postingDate.getMonthValue() >= 4) ? String.valueOf(postingDate.getYear()) : String.valueOf(postingDate.getYear() - 1);
+        String month = String.format("%02d", (postingDate.getMonthValue() >= 4) ? (postingDate.getMonthValue() - 3) : (postingDate.getMonthValue() + 9));
 
-    try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-        String line;
-        int i = 0;
-        while ((line = br.readLine()) != null) {
-            if (line.trim().isEmpty()) continue;
-            String[] c = line.split(",", -1);
-
-            if (i == 0) {
-                String h = c.length > 0 ? c[0].trim().toLowerCase() : "";
-                if (h.contains("branch") || h.contains("batch")) {
-                    i++; continue;
-                }
-            }
-
-            ExcelRowData d = new ExcelRowData();
-            d.rowIndex = i++;
-
-            String col0Clean = c.length > 0 ? c[0].replace("\uFEFF", "").trim() : "";
-            d.sysSite = col0Clean;
-
-            if ("01".equals(col0Clean)) {
-                d.isSystemFormat = true;
-                if (c.length > 1) d.sysDate = c[1].trim();
-                if (c.length > 2) d.sysYear = c[2].trim();
-                if (c.length > 3) d.sysPeriod = c[3].trim();
-                if (c.length > 4) d.branch = c[4].trim();
-                if (c.length > 5) d.currency = c[5].trim().toUpperCase();
-                if (c.length > 6) d.cgl = c[6].trim();
-                parseAmount(d, (c.length > 7) ? c[7].trim() : "", (c.length > 8) ? c[8].trim() : "");
-                if (c.length > 9) d.remarks = c[9].trim();
-                
-                if (c.length > 10) {
-                    String rawProd = c[10].trim();
-                    d.productCode = rawProd; // FIX: Keep raw data for Error Report
-                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                        hasProductCol = true;
-                    }
-                } else {
-                    d.productCode = "";
-                }
-
-                if (c.length != 14) d.formatErrors.add("Invalid CSV columns (Expected 14)");
-                else validateSystemColumns(d, d.sysSite, d.sysDate, d.sysYear, d.sysPeriod, c[11].trim(), c[12].trim(), c[13].trim(), postingDate);
-            } else {
-                if (c.length > 0) d.branch = c[0].trim();
-                if (c.length > 1) d.currency = c[1].trim().toUpperCase();
-                if (c.length > 2) d.cgl = c[2].trim();
-                parseAmount(d, (c.length > 3) ? c[3].trim() : "", (c.length > 4) ? c[4].trim() : "");
-                if (c.length > 5) d.remarks = c[5].trim();
-                if (c.length > 6) {
-                    String rawProd = c[6].trim();
-                    d.productCode = rawProd; // FIX: Keep raw data
-                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                        hasProductCol = true;
-                    }
-                } else {
-                    d.productCode = "";
-                }
-            }
-            list.add(d);
-        }
-    }
-    return new ParsingResult(list, hasProductCol);
-}
-
-```
-### **2. Updated: parseSheet (Complete & Clean)**
-```java
-private ParsingResult parseSheet(Sheet sheet, LocalDate postingDate) {
-    List<ExcelRowData> list = new ArrayList<>();
-    DataFormatter fmt = new DataFormatter();
-    boolean hasProductCol = false;
-
-    for (Row r : sheet) {
-        if (isRowEmpty(r)) continue;
-        if (r.getRowNum() == 0) {
-            String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
-            if (h.contains("branch") || h.contains("batch")) continue;
-        }
-        ExcelRowData d = new ExcelRowData();
-        d.rowIndex = r.getRowNum();
-        String col0 = parseCode(r.getCell(0), fmt);
-
-        if ("01".equals(col0) || "1".equals(col0)) {
-            d.isSystemFormat = true;
-            d.sysSite = col0;
-            d.sysDate = parseCode(r.getCell(1), fmt);
-            d.sysYear = parseCode(r.getCell(2), fmt);
-            d.sysPeriod = parseCode(r.getCell(3), fmt);
-            d.branch = parseCode(r.getCell(4), fmt);
-            d.currency = fmt.formatCellValue(r.getCell(5)).trim().toUpperCase();
-            d.cgl = parseCode(r.getCell(6), fmt);
-            parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
-            d.remarks = fmt.formatCellValue(r.getCell(9)).trim();
-            
-            Cell prodCell = r.getCell(10);
-            String rawProd = (prodCell != null) ? parseCode(prodCell, fmt) : "";
-            d.productCode = rawProd; // FIX: Remove the 'else' that forces "A"
-            if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                hasProductCol = true;
-            }
-            
-            validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod,
-                    parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
-        } else {
-            d.branch = col0;
-            d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
-            d.cgl = parseCode(r.getCell(2), fmt);
-            parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
-            d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
-            
-            Cell prodCell = r.getCell(6);
-            String rawProd = (prodCell != null) ? parseCode(prodCell, fmt) : "";
-            d.productCode = rawProd; // FIX: Keep raw user data
-            if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                hasProductCol = true;
-            }
-        }
-        list.add(d);
-    }
-    return new ParsingResult(list, hasProductCol);
-}
-
-```
-### **3. Updated: generateSuccessCsv (Final Export Logic)**
-This is the **only** place where we force the "A" default. This ensures the backend file gets what it needs, but the user's error report (which uses the raw ExcelRowData) remains accurate to what they uploaded.
-```java
-private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate pDate) {
-    try (ByteArrayOutputStream out = new ByteArrayOutputStream();
-         CSVWriter writer = new CSVWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8))) {
-        
         for (ExcelRowData row : rows) {
-            // APPLY DEFAULT "A" ONLY FOR THE SUCCESS CSV DOWNLOAD
-            String finalProduct = (row.productCode == null || row.productCode.trim().isEmpty()) ? "A" : row.productCode;
-
-            writer.writeNext(new String[]{
-                row.sysSite,
-                row.sysDate,
-                row.sysYear,
-                row.sysPeriod,
-                row.branch,
-                row.currency,
-                row.cgl,
-                row.amountStr,
-                row.txnTypeShort,
-                row.remarks,
-                finalProduct // Logic: System gets "A", but Error Report stays raw
-            });
+            String cDate = row.isSystemFormat ? row.sysDate : col2;
+            String cYear = row.isSystemFormat ? row.sysYear : year;
+            String cMonth = row.isSystemFormat ? row.sysPeriod : month;
+            String col5 = String.format("%5s", row.branch).replace(' ', '0');
+            String col6 = (row.currency == null || row.currency.isEmpty()) ? "INR" : row.currency;
+            String plainAmt = row.amount.abs().setScale(4, RoundingMode.HALF_UP).toPlainString();
+            int dotIndex = plainAmt.indexOf('.');
+            String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
+            String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
+            String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
+            String col9 = "Credit".equalsIgnoreCase(row.txnType) ? "Cr" : "Dr";
+            String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
+            String col11 = (row.productCode != null && !row.productCode.isEmpty()) ? row.productCode : "A";
+            csv.append("01,").append(cDate).append(",").append(cYear).append(",").append(cMonth).append(",")
+                    .append(col5).append(",").append(col6).append(",").append(row.cgl).append(",").append(col8).append(",")
+                    .append(col9).append(",").append(col10).append(",").append(col11).append(",B,C,D\n");
         }
-        writer.flush();
-        return out.toByteArray();
-    } catch (IOException e) {
-        log.error("CSV Export Failure", e);
-        return new byte[0];
+        return csv.toString().getBytes(StandardCharsets.UTF_8);
     }
-}
 
-```
-### **Why this fixes the problem:**
- 1. **Truthful Reporting**: Because parseSheet and parseCsvStream no longer force "A" into the object, the **Error File** will correctly show an empty cell (or your 123456 error) exactly as uploaded.
- 2. **UI Consistency**: The hasProductCol flag logic still works. It only becomes true if the user provided something that wasn't blank or "A", keeping the screen clean.
- 3. **System Compliance**: The generateSuccessCsv method handles the requirement for an "A" in the final processed batch, so your backend logic remains unbroken.
+
+this is my current SuccessCSV function in which u are telling that 
