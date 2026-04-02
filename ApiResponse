@@ -1,53 +1,67 @@
-This bug happens because the parser is overwriting your empty input with "A" immediately during the reading phase. To fix this, we must keep the productCode exactly as it is in the uploaded file (empty or otherwise) and only apply the "A" default at the very last moment when generating the final **Success CSV**.
-Here are the changes you need to make in JournalBulkValidationService.java:
-### **1. Update the Parsers (Keep raw data)**
-Modify both parseCsvStream and parseSheet to stop setting the default "A" during parsing. This ensures the **Error File** shows exactly what was uploaded.
-**Update in parseCsvStream:**
-```java
-// Inside the "01" (System) and Manual format blocks:
-String rawProd = c[10].trim(); // or c[6] for manual
-d.productCode = rawProd; // Keep the raw value (even if empty)
+Branch	Currency	CGL	Amount	TxnType	Remarks	Product	ERRORS
+32121	INR	1111111111	3434	Credit	Remark	123456	Product Code must be 8 digits or Blank
+32121	INR	1111111111	3434	Debit	Remark	A	
 
-// Logic for showing the column in UI remains:
-if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-    hasProductCol = true;
-}
 
-```
-**Update in parseSheet (Excel):**
-```java
-String rawProd = (prodCell != null) ? parseCode(prodCell, fmt) : "";
-d.productCode = rawProd; // Keep the raw value
+still i am getting this 
 
-if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-    hasProductCol = true;
-}
+    private ParsingResult parseSheet(Sheet sheet, LocalDate postingDate) {
+        List<ExcelRowData> list = new ArrayList<>();
+        DataFormatter fmt = new DataFormatter();
+        boolean hasProductCol = false;
 
-```
-### **2. Update generateSuccessCsv (Apply default here)**
-Find your generateSuccessCsv method (where you write the final rows for the Download button) and add the "A" default logic there. This ensures the system gets the "A" it needs, but the user's error report stays clean.
-```java
-private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate pDate) {
-    // ... your CSV writer setup ...
-    for (ExcelRowData row : rows) {
-        // Apply the "A" default ONLY for the final output
-        String finalProduct = (row.productCode == null || row.productCode.trim().isEmpty()) 
-                              ? "A" 
-                              : row.productCode;
+        for (Row r : sheet) {
+            if (isRowEmpty(r)) continue;
+            if (r.getRowNum() == 0) {
+                String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
+                if (h.contains("branch") || h.contains("batch")) continue;
+            }
+            ExcelRowData d = new ExcelRowData();
+            d.rowIndex = r.getRowNum();
+            String col0 = parseCode(r.getCell(0), fmt);
 
-        writer.writeNext(new String[]{
-            // ... other columns ...
-            row.remarks,
-            finalProduct, // Use the defaulted value here
-            // ...
-        });
+            if ("01".equals(col0) || "1".equals(col0)) {
+
+
+                d.isSystemFormat = true;
+                d.sysSite = col0;
+                d.sysDate = parseCode(r.getCell(1), fmt);
+                d.sysYear = parseCode(r.getCell(2), fmt);
+                d.sysPeriod = parseCode(r.getCell(3), fmt);
+                d.branch = parseCode(r.getCell(4), fmt);
+                d.currency = fmt.formatCellValue(r.getCell(5)).trim().toUpperCase();
+                d.cgl = parseCode(r.getCell(6), fmt);
+                parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
+                d.remarks = fmt.formatCellValue(r.getCell(9)).trim();
+                Cell prodCell = r.getCell(10);
+                String rawProd = (prodCell != null) ? parseCode(prodCell, fmt) : "";
+                d.productCode = rawProd;
+                if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+                    hasProductCol = true;
+                } else {
+                    d.productCode = "A";
+                }
+                validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod,
+                        parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
+            } else {
+                d.branch = col0;
+                d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
+                d.cgl = parseCode(r.getCell(2), fmt);
+                parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
+                d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
+                Cell prodCell = r.getCell(6);
+                String rawProd = (prodCell != null) ? parseCode(prodCell, fmt) : "";
+                if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+                    d.productCode = rawProd;
+                    hasProductCol = true;
+                } else {
+                    d.productCode = "A";
+                }
+            }
+            list.add(d);
+        }
+        return new ParsingResult(list, hasProductCol);
     }
-    // ...
-}
 
-```
-### **3. Why this solves the Bug:**
- 1. **Error Reports**: Since the parser no longer forces "A" into the ExcelRowData object, the error report generator will see an empty string (or whatever was actually uploaded) and print that in the error file.
- 2. **Final CSV**: When the user clicks "Download CSV", the generateSuccessCsv logic checks if the field is empty and inserts "A" for the final system-ready file.
- 3. **UI Preview**: The hasProductCol flag logic still works correctly; it will only be true if there is data other than an empty string or "A", keeping the screen clean for the user.
-**Does this resolve the issue in your error report, or do you need me to check the mapToPreview logic as well?**
+
+still i am getting responce in the error file can u do one thing parseSheet give mi this and onther one methods complate updated so that i can just copy paste and run 
