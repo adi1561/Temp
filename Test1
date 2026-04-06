@@ -1,897 +1,734 @@
-Journal Request 
-
-REQ_ID	NUMBER	No		1	
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	3	
-CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
-EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
-EXECUTION_DATE	DATE	Yes		6	Timestamp when this specific row was processed.
-EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
-PAYLOAD	CLOB	Yes		8	
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		9	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		10	Unique identifier for the individual request.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		11	Remarks inherited from the batch creation process.
-CREATOR_ROLE	NUMBER(10,0)	Yes		12	
-REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		13	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		14	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 BYTE)	Yes		15	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		16	Raw requested amount 
-REQ_CSV_DATE	DATE	Yes		17	The transaction date provided in the uploaded file.
-REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		18	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		19	The product  code requested.
-CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		20	
-
-
-JOURNAL BATCH MASTER
-
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
-CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
-REQ_DATE	TIMESTAMP(6)	Yes		3	Timestamp when the batch was originally created.
-BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	Initial remarks provided by the creator upon create.
-TOTAL_ROWS	NUMBER	Yes	0	5	Total number of valid transaction rows contained in this batch.
-TOTAL_DEBIT	NUMBER(25,4)	Yes	0	6	Sum of all debit transaction amounts in the batch.
-TOTAL_CREDIT	NUMBER(25,4)	Yes	0	7	Sum of all credit transaction amounts in the batch.
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	Current workflow state (e.g., PENDING, ACCEPTED, REJECTED, ERROR).
-EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	User ID of the person who approved or rejected the batch.
-EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rejected.
-EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
-
-
-MASTER JOURNAL
-
-JOURNAL_ID	NUMBER(19,0)	No		1	Unique sequential identifier for the master journal entry.
-JOURNAL_AMT	NUMBER(38,2)	Yes		2	Absolute transaction amount. Always positive; Txn Type determines debit/credit.
-AR_FLAG	VARCHAR2(1 CHAR)	Yes		3	Status flag indicating the record state. Default is A for Approved/Active.
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		4	Reference to the parent batch from JOURNAL_BATCH_MASTER.
-JOURNAL_BRANCH	VARCHAR2(50 CHAR)	Yes		5	The branch code where the transaction is booked.
-JOURNAL_CGL	VARCHAR2(50 CHAR)	Yes		6	The 10-digit Common General Ledger (CGL) account code.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Batch-level remarks provided by the executor during approval.
-CURRENCY	VARCHAR2(3 CHAR)	Yes		8	The 3-character currency code (e.g., INR, USD) for the transaction.
-JOURNAL_ID_REF	VARCHAR2(50 CHAR)	Yes		9	Reference back to the original row ID from the JOURNAL_REQUEST staging table.
-JOURNAL_PDATE	DATE	Yes		10	CSV date of the journal entry.
-PRODUCT_TYPE	VARCHAR2(20 CHAR)	Yes		11	The 8-digit product code
-REMARKS	VARCHAR2(50 CHAR)	Yes		12	specific remarks for this individual entry.
-TXN_TYPE	VARCHAR2(20 CHAR)	Yes		13	Specifies if the entry is a Debit or Credit.
-AC_CLASSIFICATION	VARCHAR2(255 CHAR)	Yes		14	
-
-
-
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   Box,
   Typography,
-  Chip,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
+  Grid,
   TextField,
   Button,
-  CircularProgress,
-  Tooltip,
-  IconButton,
-  Stack,
-  Grid,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
   Paper,
+  IconButton,
+  MenuItem,
+  CircularProgress,
+  Autocomplete,
+  Tooltip,
   Checkbox,
-  TablePagination,
-  Alert,
+  FormControlLabel,
+  Chip // Added Chip for Memo UI
 } from "@mui/material";
-import { DataGrid } from "@mui/x-data-grid";
-import {
-  Check as CheckIcon,
-  Clear as ClearIcon,
-  Visibility as VisibilityIcon,
-  Close as CloseIcon,
-} from "@mui/icons-material";
-import AccountCircleIcon from "@mui/icons-material/AccountCircle";
-import InfoIcon from "@mui/icons-material/Info";
-import { alpha } from "@mui/material/styles";
+import AddIcon from "@mui/icons-material/Add";
+import DeleteIcon from "@mui/icons-material/Delete";
+import { debounce } from "lodash";
+
 import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-const styles = {
-  mainContainer: {
-    padding: 3,
-    height: "100%",
-    width: "100%",
-    backgroundColor: "background.default",
-  },
-  dataGridContainer: {
-    height: 600,
-    width: "100%",
-    backgroundColor: "background.paper",
-    boxShadow: 2,
-    borderRadius: 2,
-    border: 1,
-    borderColor: "divider",
-    "& .MuiDataGrid-columnHeaders": {
-      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
-      fontWeight: "bold",
-      fontSize: "0.95rem",
-    },
-    "& .MuiDataGrid-row:hover": {
-      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
-    },
-  },
-  tableContainer: { height: 450, border: 1, borderColor: "divider", mt: 1 },
-  fixedContentBox: {
-    height: 500,
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "space-between",
-  },
-  tableHeaderCell: {
-    fontWeight: "bold",
-    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
-    whiteSpace: "nowrap",
-    zIndex: 10,
-  },
-  stickyHeaderColumn: (leftOffset) => ({
-    position: "sticky",
-    left: leftOffset,
-    top: 0,
-    zIndex: 20,
-    backgroundColor: "background.paper",
-    borderBottom: 1,
-    borderRight: 1,
-    borderColor: "divider",
-    fontWeight: "bold",
-  }),
-  stickyBodyColumn: (leftOffset) => ({
-    position: "sticky",
-    left: leftOffset,
-    zIndex: 5,
-    backgroundColor: "background.paper",
-    borderRight: 1,
-    borderColor: "divider",
-  }),
-  dialogTitle: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    pb: 1,
-  },
-  dialogActions: { p: 2, borderTop: 1, borderColor: "divider" },
-  loadingContainer: {
-    height: "100%",
-    display: "flex",
-    justifyContent: "center",
-    alignItems: "center",
-  },
+const initialRowState = {
+  id: Date.now(),
+  branch: null,
+  currency: "",
+  cgl: null,
+  amount: "",
+  txnType: "",
+  remarks: "",
+  productCode: "",
 };
 
-const formatCurrency = (num) => Number(num).toFixed(4);
-const getTxnTypeColor = (txnType) =>
-  txnType === "Credit" ? "error" : "success";
+const formatBigIntForDisplay = (val) => {
+  if (typeof val !== "bigint") {
+    val = BigInt(val || 0);
+  }
+  const str = val.toString().padStart(5, "0");
+  const integer = str.slice(0, -4);
+  const fractional = str.slice(-4);
+  return `${integer || "0"}.${fractional}`;
+};
 
-function CustomNoRowsOverlay() {
-  return (
-    <Stack height="100%" alignItems="center" justifyContent="center">
-      {" "}
-      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />{" "}
-      <Typography variant="h6">No Pending Requests</Typography>{" "}
-    </Stack>
-  );
-}
-
-export default function JournalRequestApproval() {
+export default function JournalPosting() {
   const { callApi } = useApi();
   const showSnackBar = useCustomSnackbar();
-  const isMounted = useRef(true);
-  const [currentUserId, setCurrentUserId] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState([]);
 
-  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [rows, setRows] = useState([initialRowState]);
+  const [currencyOptions, setCurrencyOptions] = useState([]);
+
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [selectedBatch, setSelectedBatch] = useState(null);
-  const [modalMode, setModalMode] = useState("ACCEPTED");
-  const [executorRemarks, setExecutorRemarks] = useState("");
 
-  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
-  const [batchDetails, setBatchDetails] = useState([]);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
-  const [detailPage, setDetailPage] = useState(0);
-  const [detailRowsPerPage, setDetailRowsPerPage] = useState(10);
-  const [detailTotalCount, setDetailTotalCount] = useState(0);
-  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
-  const [partialExecutorRemarks, setPartialExecutorRemarks] = useState("");
-  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
+  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
+  const [postingDate, setPostingDate] = useState("");
+
+  // Checkbox
+  const [checked, setChecked] = useState(false);
+
+  // FIX: Track loading by row.id instead of a single boolean
+  const [branchSearch, setBranchSearch] = useState({
+    loadingId: null,
+    options: [],
+  });
+  const [cglSearch, setCglSearch] = useState({ 
+    loadingId: null, 
+    options: [] 
+  });
 
   useEffect(() => {
-    isMounted.current = true;
-    try {
-      const auth =
-        sessionStorage.getItem("persist:auth") ||
-        localStorage.getItem("persist:auth");
-      if (auth) {
-        const user = JSON.parse(JSON.parse(auth).user);
-        if (user?.userId) setCurrentUserId(String(user.userId));
+    const fetchInitialData = async () => {
+      try {
+        const dateResponse = await callApi(
+          "/JS/journals/current-posting-date",
+          null,
+          "GET"
+        );
+
+        if (dateResponse) {
+          try {
+            const [year, month, day] = dateResponse.split("-");
+            const formattedDate = `${day}-${month}-${year}`;
+            setPostingDate(formattedDate);
+          } catch (e) { 
+            console.error("Could not parse date:", dateResponse, e);
+            setPostingDate(dateResponse);
+          }
+        } else {
+          showSnackBar("Failed to load official posting date.", "error");
+          setPostingDate("Error");
+        }
+
+        const currencyResponse = await callApi("/CM/common-master/currency", null, "GET");
+        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
+          const uniqueCurrencies = [...new Set(currencyResponse.data)];
+          setCurrencyOptions(uniqueCurrencies);
+        } else {
+          showSnackBar("Failed to load currencies.", "error");
+        }
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+        showSnackBar("An error occurred while loading page data.", "error");
       }
-    } catch (e) {}
-    return () => {
-      isMounted.current = false;
     };
-  }, []);
 
-  // Check if current user is the creator (Self-Approval restriction)
-  const isViewingSelfCreated =
-    currentUserId &&
-    viewingBatchCreatorId &&
-    String(currentUserId).trim().toUpperCase() ===
-      String(viewingBatchCreatorId).trim().toUpperCase();
-
-  const isLargeBatch = detailTotalCount > 2000;
-
-  const fetchPendingBatches = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await callApi(
-        "/JS/journals/pending-requests-summary",
-        null,
-        "GET"
-      );
-      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
-    } catch (err) {
-      if (isMounted.current && err.name !== "CanceledError")
-        showSnackBar("Failed to load requests", "error");
-    } finally {
-      if (isMounted.current) setLoading(false);
-    }
+    fetchInitialData();
   }, [callApi, showSnackBar]);
 
-  useEffect(() => {
-    fetchPendingBatches();
-  }, [fetchPendingBatches]);
+  const handleAddRow = () => {
+    const lastRow = rows[rows.length - 1];
 
-  const fetchBatchDetailsPaginated = async (batchId, page, size) => {
-    setDetailLoading(true);
-    try {
-      const res = await callApi(
-        `/JS/journals/by-batch-paginated/${batchId}?page=${page}&size=${size}`,
-        null,
-        "GET"
+    if (
+      !lastRow.branch ||
+      !lastRow.currency ||
+      !lastRow.cgl ||
+      !lastRow.amount ||
+      !lastRow.txnType
+    ) {
+      showSnackBar(
+        "Please fill all required fields (*) in the current row before adding a new one.",
+        "warning"
       );
-      if (res && res.content && isMounted.current) {
-        setDetailTotalCount(res.totalElements); // This updates the count used for logic
-        const journalGroups = new Map();
-        res.content.forEach((req) => {
-          try {
-            const payload = JSON.parse(req.payload);
-            const prefix = req.journalId.split("-")[0];
-            const amount = parseFloat(payload.amount) || 0;
-            const row = {
-              ...req,
-              payload,
-              journalPrefix: prefix,
-              amount: Math.abs(amount),
-              transactionType: amount < 0 ? "Credit" : "Debit",
-            };
-            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
-            journalGroups.get(prefix).push(row);
-          } catch (e) {}
-        });
-        setBatchDetails(Array.from(journalGroups.values()));
-      }
-    } catch (e) {
-      if (isMounted.current) showSnackBar("Failed to load details", "error");
-    } finally {
-      if (isMounted.current) setDetailLoading(false);
-    }
-  };
-
-  const handleOpenViewModal = (batchId, creatorId) => {
-    setViewingBatchId(batchId);
-    setViewingBatchCreatorId(String(creatorId));
-    setDetailPage(0);
-    setDetailRowsPerPage(10);
-    setSelectedJournalPrefixes([]);
-    setIsViewModalOpen(true);
-    fetchBatchDetailsPaginated(batchId, 0, 10);
-  };
-  const handleDetailPageChange = (event, newPage) => {
-    setDetailPage(newPage);
-    fetchBatchDetailsPaginated(viewingBatchId, newPage, detailRowsPerPage);
-  };
-  const handleDetailRowsPerPageChange = (event) => {
-    const newSize = parseInt(event.target.value, 10);
-    setDetailRowsPerPage(newSize);
-    setDetailPage(0);
-    fetchBatchDetailsPaginated(viewingBatchId, 0, newSize);
-  };
-  const handleCloseViewModal = () => {
-    setIsViewModalOpen(false);
-    setBatchDetails([]);
-    setViewingBatchId(null);
-    setViewingBatchCreatorId(null);
-    setSelectedJournalPrefixes([]);
-    setIsPartialSubmitting(false);
-    fetchPendingBatches();
-  };
-
-  const handleOpenModal = (batch, mode) => {
-    setSelectedBatch(batch);
-    setModalMode(mode);
-    setExecutorRemarks("");
-    setIsModalOpen(true);
-  };
-  const handleCloseModal = () => {
-    if (isSubmitting) return;
-    setIsModalOpen(false);
-    setSelectedBatch(null);
-  };
-
-  const handleSubmitAction = async () => {
-    if (modalMode === "REJECTED" && !executorRemarks.trim()) {
-      showSnackBar("Remarks required.", "warning");
       return;
     }
+
+    const newRow = {
+      ...initialRowState,
+      id: Date.now(),
+      remarks: checked ? commonBatchRemarks : "",
+    };
+    setRows([...rows, newRow]);
+  };
+  
+  const handleChange = (event) => {
+    const isChecked = event.target.checked;
+    setChecked(isChecked);
+
+    if (isChecked) {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: commonBatchRemarks,
+      }));
+      setRows(newRows);
+    } else {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: "",
+      }));
+      setRows(newRows);
+    }
+  };
+
+  const handleDeleteRow = (id) => {
+    if (rows.length > 1) {
+      setRows(rows.filter((row) => row.id !== id));
+    } else {
+      showSnackBar("Cannot delete the first row.", "warning");
+    }
+  };
+
+  const handleRowChange = (id, field, value) => {
+    const newRows = rows.map((row) => {
+      if (row.id === id) {
+        return { ...row, [field]: value };
+      }
+      return row;
+    });
+    setRows(newRows);
+  };
+
+  // FIX: Pass rowId to explicitly map the loading spinner
+  const searchBranches = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query) {
+        setBranchSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
+      try {
+        const response = await callApi(
+          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setBranchSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("Branch search failed.", "error");
+        setBranchSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  // FIX: Pass rowId to explicitly map the loading spinner
+  const searchCgls = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query) {
+        setCglSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
+      try { 
+        const response = await callApi(
+          `/JS/cgl-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setCglSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("CGL search failed.", "error");
+        setCglSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const handleSubmit = async () => {
     setIsSubmitting(true);
+
+    if (!commonBatchRemarks.trim()) {
+      showSnackBar(
+        "Please enter Common Batch Remarks before submitting.",
+        "error"
+      );
+      setIsSubmitting(false);
+      return;
+    }
+
+    const cglCheck = new Map();
+    for (const row of rows) {
+      if (!row.branch || !row.currency || !row.cgl) {
+        continue;
+      }
+      const key = `${row.branch.code}-${row.currency}`;
+      const cgl = row.cgl.cglNumber;
+
+      if (!cglCheck.has(key)) {
+        cglCheck.set(key, new Set());
+      }
+
+      const cglSet = cglCheck.get(key);
+      if (cglSet.has(cgl)) {
+        showSnackBar(
+          `Duplicate CGL entry: "${cgl}" is used more than once for branch "${row.branch.name}" and currency "${row.currency}".`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+      cglSet.add(cgl);
+    }
+
+    // --- MEMO LOGIC UPDATE START ---
+    const branchCurrencyTotals = new Map();
+    const branchEntryCheck = new Map();
+    const rowPayloads = [];
+
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch ||
+        !row.currency ||
+        !row.cgl ||
+        !row.amount ||
+        !row.txnType
+      ) {
+        showSnackBar(
+          `Row ${index + 1} is incomplete. Please fill all required fields.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+
+      const branchCode = row.branch.code;
+      const branchName = row.branch.name;
+      const currency = row.currency;
+
+      // Identify Memo vs Normal
+      const cglNumber = String(row.cgl.cglNumber);
+      const isMemo = cglNumber.startsWith("5");
+      const type = isMemo ? "MEMO" : "NORMAL";
+
+      const [integerPart = "0", fractionalPart = "0"] = (
+        row.amount || "0"
+      ).split(".");
+      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
+      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
+
+      // Composite key now includes Type (Memo/Normal)
+      const compositeKey = `${branchCode}-${currency}-${type}`;
+
+      if (!branchCurrencyTotals.has(compositeKey)) {
+        branchCurrencyTotals.set(compositeKey, {
+          totalDebit: 0n,
+          totalCredit: 0n,
+          branchName: branchName,
+          branchCode: branchCode,
+          currency: currency,
+          type: type, // Store type for validation message
+        });
+      }
+      const currencyTotals = branchCurrencyTotals.get(compositeKey);
+
+      if (row.txnType === "Debit") {
+        currencyTotals.totalDebit += amountAsBigInt;
+      } else if (row.txnType === "Credit") {
+        currencyTotals.totalCredit += amountAsBigInt;
+      }
+
+      if (!branchEntryCheck.has(branchCode)) {
+        branchEntryCheck.set(branchCode, {
+          hasDebit: false,
+          hasCredit: false,
+          branchName: branchName,
+        });
+      }
+      const branchCheck = branchEntryCheck.get(branchCode);
+
+      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
+        branchCheck.hasDebit = true;
+      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
+        branchCheck.hasCredit = true;
+      }
+
+      const finalAmount =
+        row.txnType === "Credit" ? "-" + row.amount : row.amount;
+
+      // FIX: Removed changeType: "ADD"
+      rowPayloads.push({
+        branch: row.branch.code,
+        currency: row.currency,
+        cgl: row.cgl.cglNumber,
+        amount: finalAmount,
+        productType: row.productCode,
+        remarks: row.remarks,
+        arFlag: "A",
+      });
+    }
+
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit, branchName } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar(
+          `Submission failed. Branch "${branchName}" (${branchCode}) must have at least one Debit and one Credit entry.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    // Validate Totals (Bucket-wise: Branch + Currency + Type)
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit, branchName, branchCode, currency, type } =
+        totals;
+
+      if (totalDebit !== totalCredit) {
+        showSnackBar(
+          `Submission failed. Totals for ${type} entries in branch "${branchName}" (${branchCode}) and currency "${currency}" do not match. Debit: ${formatBigIntForDisplay(
+            totalDebit
+          )}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+    // --- MEMO LOGIC UPDATE END ---
+
+    const finalPayload = {
+      commonBatchRemarks: commonBatchRemarks.trim(),
+      rows: rowPayloads,
+    };
+
     try {
-      await callApi(
-        "/JS/journals/process-bulk",
-        {
-          batchId: selectedBatch.batchId,
-          status: modalMode,
-          remarks:
-            executorRemarks.trim() ||
-            (modalMode === "ACCEPTED" ? "Accepted" : "Rejected"),
-        },
+      const response = await callApi(
+        "/JS/journals/create-batch",
+        finalPayload,
         "POST"
       );
+
+      const newBatchId = response?.[0]?.batchId || "N/A";
+
       showSnackBar(
-        modalMode === "ACCEPTED"
-          ? "Request Accepted Successfully"
-          : "Request Rejected Successfully",
+        `All ${response.length} Journal entries submitted successfully! Batch ID: ${newBatchId}`,
         "success"
       );
-      handleCloseModal();
-      fetchPendingBatches();
-    } catch (e) {
-      showSnackBar("Failed to process", "error");
+      setRows([{ ...initialRowState, id: Date.now() }]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+    } catch (error) {
+      showSnackBar("Journal Batch submission failed", "error");
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const handleSubmitPartialAction = async (mode) => {
-    if (mode === "REJECTED" && !partialExecutorRemarks.trim()) {
-      showSnackBar("Remarks required.", "warning");
-      return;
-    }
-    if (selectedJournalPrefixes.length === 0) {
-      showSnackBar("Select at least one.", "warning");
-      return;
-    }
-    if (!viewingBatchId) {
-      showSnackBar("Batch ID is missing!", "error");
-      return;
-    }
-
-    setIsPartialSubmitting(true);
-    try {
-      await callApi(
-        "/JS/journals/process-bulk",
-        {
-          batchId: viewingBatchId,
-          journalIdPrefixes: selectedJournalPrefixes,
-          status: mode,
-          remarks:
-            partialExecutorRemarks.trim() ||
-            (mode === "ACCEPTED" ? "Accepted" : "Rejected"),
-        },
-        "POST"
-      );
-      showSnackBar(
-        mode === "ACCEPTED"
-          ? "Selected Entries Accepted Successfully"
-          : "Selected Entries Rejected Successfully",
-        "success"
-      );
-      handleCloseViewModal();
-    } catch (e) {
-      showSnackBar("Failed", "error");
-      setIsPartialSubmitting(false);
-    }
-  };
-
-  const handleSelectAllClick = (event) => {
-    if (event.target.checked)
-      setSelectedJournalPrefixes(batchDetails.map((g) => g[0].journalPrefix));
-    else setSelectedJournalPrefixes([]);
-  };
-  const handleRowCheckboxClick = (event, prefix) => {
-    if (event) event.stopPropagation();
-    const index = selectedJournalPrefixes.indexOf(prefix);
-    let newSelected = [];
-    if (index === -1) newSelected = [...selectedJournalPrefixes, prefix];
-    else newSelected = selectedJournalPrefixes.filter((p) => p !== prefix);
-    setSelectedJournalPrefixes(newSelected);
-  };
-
-  const columns = [
-    {
-      field: "batchId",
-      headerName: "Batch ID",
-      width: 125,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-    },
-    {
-      field: "requestStatus",
-      headerName: "Status",
-      width: 125,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => (
-        <Chip label={p.value} color="warning" size="small" variant="outlined" />
-      ),
-    },
-    {
-      field: "creatorId",
-      headerName: "Creator",
-      width: 150,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => (
-        <Chip icon={<AccountCircleIcon />} label={p.value} size="small" />
-      ),
-    },
-    {
-      field: "requestDate",
-      headerName: "Submitted On",
-      width: 200,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) =>
-        new Date(p.value).toLocaleString("en-IN", {
-          dateStyle: "medium",
-          timeStyle: "short",
-        }),
-    },
-    {
-      field: "commonBatchRemarks",
-      headerName: "Creator Remarks",
-      width: 200,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-    },
-    {
-      field: "requestCount",
-      headerName: "No. of Entries",
-      width: 100,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-    },
-    {
-      field: "totalDebit",
-      headerName: "Total Debit",
-      width: 150,
-      align: "right",
-      headerAlign: "right",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => (
-        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
-          {formatCurrency(p.value)}
-        </Typography>
-      ),
-    },
-    {
-      field: "totalCredit",
-      headerName: "Total Credit",
-      width: 150,
-      align: "right",
-      headerAlign: "right",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => (
-        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
-          {formatCurrency(p.value)}
-        </Typography>
-      ),
-    },
-    {
-      field: "actions",
-      headerName: "Actions",
-      flex: 0.8,
-      minWidth: 150,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (params) => {
-        const isSelf =
-          currentUserId &&
-          params.row.creatorId &&
-          String(currentUserId).trim().toUpperCase() ===
-            String(params.row.creatorId).trim().toUpperCase();
-        return (
-          <Stack direction="row" spacing={1} justifyContent="center">
-            {" "}
-            <Tooltip title="View">
-              {" "}
-              <IconButton
-                onClick={() =>
-                  handleOpenViewModal(params.row.batchId, params.row.creatorId)
-                }
-                color="primary"
-              >
-                <VisibilityIcon />
-              </IconButton>{" "}
-            </Tooltip>{" "}
-            <Tooltip title={isSelf ? "Self-approval disabled" : "Accept"}>
-              {" "}
-              <span>
-                {" "}
-                <IconButton
-                  onClick={() => handleOpenModal(params.row, "ACCEPTED")}
-                  color="success"
-                  disabled={isSelf}
-                >
-                  <CheckIcon />
-                </IconButton>{" "}
-              </span>{" "}
-            </Tooltip>{" "}
-            <Tooltip title={isSelf ? "Self-rejection disabled" : "Reject"}>
-              {" "}
-              <span>
-                {" "}
-                <IconButton
-                  onClick={() => handleOpenModal(params.row, "REJECTED")}
-                  color="error"
-                  disabled={isSelf}
-                >
-                  <ClearIcon />
-                </IconButton>{" "}
-              </span>{" "}
-            </Tooltip>{" "}
-          </Stack>
-        );
-      },
-    },
-  ];
-
   return (
-    <Box sx={styles.mainContainer}>
-      <DataGrid
-        rows={rows}
-        columns={columns}
-        loading={loading}
-        getRowId={(row) => row.batchId}
-        disableRowSelectionOnClick
-        pageSizeOptions={[5, 10, 25]}
-        disableColumnResize
-        rowHeight={52}
-        initialState={{
-          pagination: { paginationModel: { page: 0, pageSize: 10 } },
-        }}
-        slots={{ noRowsOverlay: CustomNoRowsOverlay }}
-        sx={styles.dataGridContainer}
-      />
-      
-      {/* --- Main Grid Approve/Reject Dialog --- */}
-      <Dialog
-        open={isModalOpen}
-        onClose={handleCloseModal}
-        fullWidth
-        maxWidth="sm"
-      >
-        {" "}
-        <DialogTitle>
-          {modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch
-        </DialogTitle>{" "}
-        <DialogContent>
-          {" "}
-          <DialogContentText>
-            Confirm {modalMode.toLowerCase()} for batch{" "}
-            <strong>{selectedBatch?.batchId}</strong>?
-          </DialogContentText>{" "}
-          <TextField
-            autoFocus={modalMode === "REJECTED"}
-            required={modalMode === "REJECTED"}
-            margin="dense"
-            label="Remarks"
-            fullWidth
-            variant="standard"
-            value={executorRemarks}
-            onChange={(e) => setExecutorRemarks(e.target.value)}
-            disabled={isSubmitting}
-          />{" "}
-        </DialogContent>{" "}
-        <DialogActions sx={styles.dialogActions}>
-          {" "}
-          <Button onClick={handleCloseModal} disabled={isSubmitting}>
-            Cancel
-          </Button>{" "}
-          <Button
-            onClick={handleSubmitAction}
-            variant="contained"
-            color={modalMode === "ACCEPTED" ? "success" : "error"}
-            disabled={isSubmitting}
-          >
-            {isSubmitting ? <CircularProgress size={24} /> : "Confirm"}
-          </Button>{" "}
-        </DialogActions>{" "}
-      </Dialog>
-      
-      {/* --- View Details Modal --- */}
-      <Dialog
-        open={isViewModalOpen}
-        onClose={handleCloseViewModal}
-        fullWidth
-        maxWidth="lg"
-      >
-        {" "}
-        <DialogTitle sx={styles.dialogTitle}>
-          {" "}
-          <Typography variant="h6">
-            Batch Details: {viewingBatchId}
-          </Typography>{" "}
-          <IconButton onClick={handleCloseViewModal}>
-            <CloseIcon />
-          </IconButton>{" "}
-        </DialogTitle>{" "}
-        <DialogContent dividers sx={{ p: 0 }}>
-          {" "}
-          <Box sx={styles.fixedContentBox}>
-            {/* --- ADDED WARNING ALERT FOR LARGE BATCHES  > 2000 --- */}
-            {isLargeBatch && (
-              <Alert severity="info" sx={{ m: 1 }}>
-                Batch contains {detailTotalCount} entries. Partial approval is disabled for large batches grater 2000. 
-                Please close this view and Accept/Reject the entire batch from the main list.
-              </Alert>
-            )}
+    <Box sx={{ p: 3, maxWidth: "98%" }}>
+      <Paper elevation={3} sx={{ p: 3 }}>
+        <Box>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+            <Typography variant="body1" fontWeight="bold" component="span">
+              Posting Date:
+            </Typography>
+            <Typography variant="body1" fontWeight="bold" component="span">
+              {postingDate}
+            </Typography>
+          </Box>
+          <Box sx={{ marginTop: 0.5 }}>
+            <Typography
+              variant="body2"
+              component="span"
+              sx={{ color: "#ec0101ff" }}
+            >
+              Note: All Journals will be Posted on this Date
+            </Typography>
+          </Box>
+        </Box>
 
-            {detailLoading ? (
-              <Box sx={styles.loadingContainer}>
-                <CircularProgress />
-              </Box>
-            ) : batchDetails.length > 0 ? (
-              <>
-                {" "}
-                <TableContainer component={Paper} sx={styles.tableContainer}>
-                  {" "}
-                  <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
-                    {" "}
-                    <TableHead>
-                      {" "}
-                      <TableRow>
-                        {" "}
-                        <TableCell
-                          padding="checkbox"
-                          sx={styles.stickyHeaderColumn(0)}
-                        >
-                          <Checkbox
-                            color="primary"
-                            indeterminate={
-                              selectedJournalPrefixes.length > 0 &&
-                              selectedJournalPrefixes.length <
-                                batchDetails.length
-                            }
-                            checked={
-                              batchDetails.length > 0 &&
-                              selectedJournalPrefixes.length ===
-                                batchDetails.length
-                            }
-                            onChange={handleSelectAllClick}
-                            // --- DISABLED IF SELF OR LARGE BATCH ---
-                            disabled={isViewingSelfCreated || isLargeBatch}
-                          />
-                        </TableCell>{" "}
-                        <TableCell
-                          align="center"
-                          sx={styles.stickyHeaderColumn(48)}
-                        >
-                          Journal ID
-                        </TableCell>{" "}
-                        <TableCell align="center" sx={styles.tableHeaderCell}>
-                          Branch
-                        </TableCell>{" "}
-                        <TableCell align="center" sx={styles.tableHeaderCell}>
-                          Currency
-                        </TableCell>{" "}
-                        <TableCell align="center" sx={styles.tableHeaderCell}>
-                          CGL
-                        </TableCell>{" "}
-                        <TableCell align="center" sx={styles.tableHeaderCell}>
-                          Amount
-                        </TableCell>{" "}
-                        <TableCell align="center" sx={styles.tableHeaderCell}>
-                          Type
-                        </TableCell>{" "}
-                      </TableRow>{" "}
-                    </TableHead>{" "}
-                    <TableBody>
-                      {" "}
-                      {batchDetails.map((group, groupIndex) => {
-                        const isSelected = selectedJournalPrefixes.includes(
-                          group[0].journalPrefix
-                        );
-                        return group.map((row, rowIndex) => (
-                          <TableRow
-                            key={row.id}
-                            hover={!isViewingSelfCreated && !isLargeBatch} // Disable hover effect
-                            // --- CLICK HANDLER DISABLED IF LARGE BATCH ---
-                            onClick={() =>
-                              !isViewingSelfCreated &&
-                              !isLargeBatch && 
-                              handleRowCheckboxClick(null, row.journalPrefix)
-                            }
-                            selected={isSelected}
-                            sx={{
-                              cursor: (isViewingSelfCreated || isLargeBatch)
-                                ? "not-allowed"
-                                : "pointer",
-                              ...(rowIndex === 0 &&
-                                groupIndex > 0 && {
-                                  borderTop: 1,
-                                  borderColor: "divider",
-                                }),
-                            }}
-                          >
-                            {" "}
-                            {rowIndex === 0 && (
-                              <>
-                                <TableCell
-                                  padding="checkbox"
-                                  rowSpan={group.length}
-                                  sx={styles.stickyBodyColumn(0)}
-                                >
-                                  <Checkbox
-                                    color="primary"
-                                    checked={isSelected}
-                                    // --- CHECKBOX DISABLED IF LARGE BATCH ---
-                                    disabled={isViewingSelfCreated || isLargeBatch}
-                                    onClick={(e) =>
-                                      handleRowCheckboxClick(
-                                        e,
-                                        row.journalPrefix
-                                      )
-                                    }
-                                  />{" "}
-                                </TableCell>{" "}
-                                <TableCell
-                                  align="center"
-                                  rowSpan={group.length}
-                                  sx={styles.stickyBodyColumn(48)}
-                                >
-                                  {row.journalPrefix}
-                                </TableCell>
-                              </>
-                            )}{" "}
-                            <TableCell align="center">
-                              {row.payload.branch}
-                            </TableCell>
-                            <TableCell align="center">
-                              {row.payload.currency}
-                            </TableCell>
-                            <TableCell align="center">
-                              {row.payload.cgl}
-                            </TableCell>
-                            <TableCell align="center">
-                              {formatCurrency(row.amount)}
-                            </TableCell>
-                            <TableCell align="center">
-                              <Chip
-                                label={row.transactionType}
-                                color={getTxnTypeColor(row.transactionType)}
-                                size="small"
-                              />
-                            </TableCell>{" "}
-                          </TableRow>
-                        ));
-                      })}{" "}
-                    </TableBody>{" "}
-                  </Table>{" "}
-                </TableContainer>{" "}
-                <TablePagination
-                  component="div"
-                  count={detailTotalCount}
-                  page={detailPage}
-                  onPageChange={handleDetailPageChange}
-                  rowsPerPage={detailRowsPerPage}
-                  onRowsPerPageChange={handleDetailRowsPerPageChange}
-                  rowsPerPageOptions={[10, 25, 50]}
-                />{" "}
-              </>
-            ) : (
-              <Typography sx={{ p: 3 }}>No details.</Typography>
-            )}{" "}
-          </Box>{" "}
-        </DialogContent>{" "}
-        <DialogActions sx={styles.dialogActions}>
-          {" "}
-          <Grid container spacing={2} alignItems="center">
-            {" "}
-            <Grid item xs={12} md={6}>
-              <TextField
-                margin="dense"
-                label="Remarks (Selected)"
-                fullWidth
-                size="small"
-                value={partialExecutorRemarks}
-                onChange={(e) => setPartialExecutorRemarks(e.target.value)}
-                disabled={
-                  isPartialSubmitting ||
-                  selectedJournalPrefixes.length === 0 ||
-                  isViewingSelfCreated
+        <Grid item xs={12} md={12} sx={{ margin: "1% 0%", width: "95%" }}>
+          <TextField
+            label="Common Batch Remarks"
+            value={commonBatchRemarks}
+            onChange={(e) => {
+              const newValue = e.target.value;
+              if (newValue.length <= 50) {
+                setCommonBatchRemarks(newValue);
+
+                if (checked && newValue.trim()) {
+                  setRows(
+                    rows.map((row) => ({
+                      ...row,
+                      remarks: newValue,
+                    }))
+                  );
                 }
-              />
-            </Grid>{" "}
-            <Grid item xs={12} md={6}>
-              <Stack direction="row" spacing={1} justifyContent="flex-end">
-                <Button
-                  variant="contained"
-                  color="success"
-                  onClick={() => handleSubmitPartialAction("ACCEPTED")}
-                  disabled={
-                    isPartialSubmitting ||
-                    selectedJournalPrefixes.length === 0 ||
-                    isViewingSelfCreated
-                  }
-                >
-                  Accept
-                </Button>
-                <Button
-                  variant="contained"
-                  color="error"
-                  onClick={() => handleSubmitPartialAction("REJECTED")}
-                  disabled={
-                    isPartialSubmitting ||
-                    selectedJournalPrefixes.length === 0 ||
-                    isViewingSelfCreated
-                  }
-                >
-                  Reject
-                </Button>
-              </Stack>
-            </Grid>{" "}
-          </Grid>{" "}
-        </DialogActions>{" "}
-      </Dialog>
+
+                if (!newValue.trim()) {
+                  setChecked(false);
+                  setRows(
+                    rows.map((row) => ({
+                      ...row,
+                      remarks: "",
+                    }))
+                  );
+                }
+              }
+            }}
+            fullWidth
+            required
+            multiline
+            rows={1}
+            InputProps={{
+              inputProps: {
+                maxLength: 50,
+              },
+            }}
+          />
+          <Box sx={{ display: "flex", alignItems: "center" }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={checked}
+                  onChange={handleChange}
+                  color="primary"
+                  disabled={!commonBatchRemarks.trim()}
+                />
+              }
+              label="Apply This Remark To All Below Transaction"
+            />
+          </Box>
+        </Grid>
+
+        <Box>
+          {rows.map((row, index) => (
+            <React.Fragment key={row.id}>
+              <Grid container spacing={2} alignItems="center">
+                {/* Branch */}
+                <Grid item xs={12} md={3} size={1.8}>
+                  <Autocomplete
+                    popupIcon={null}
+                    autoHighlight
+                    options={branchSearch.options}
+                    getOptionLabel={(option) =>
+                      `${option.code} - ${option.name}`
+                    }
+                    value={row.branch}
+                    onChange={(event, newValue) =>
+                      handleRowChange(row.id, "branch", newValue)
+                    }
+                    onInputChange={(event, newInputValue) =>
+                      searchBranches(newInputValue, row.id) // FIX: pass row.id
+                    }
+                    loading={branchSearch.loadingId === row.id} // FIX: check row.id
+                    filterOptions={(x) => x}
+                    isOptionEqualToValue={(option, value) =>
+                      option.code === value.code
+                    }
+                    noOptionsText=""
+                    renderInput={(params) => (
+                      <Tooltip
+                        title="Search by Branch name or Branch code"
+                        placement="top-start"
+                      >
+                        <TextField
+                          {...params}
+                          label="Branch *"
+                          placeholder="Search by name or code"
+                          InputLabelProps={{ shrink: true }}
+                          InputProps={{
+                            ...params.InputProps,
+                            endAdornment: (
+                              <Box>
+                                {branchSearch.loadingId === row.id ? ( // FIX: check row.id
+                                  <CircularProgress color="inherit" size={20} />
+                                ) : null}
+                                {params.InputProps.endAdornment}
+                              </Box>
+                            ),
+                          }}
+                        />
+                      </Tooltip>
+                    )}
+                  />
+                </Grid>
+
+                {/* Currency */}
+                <Grid item xs={12} md={1.5} size={1.5}>
+                  <TextField
+                    popupIcon={null}
+                    select
+                    label="Currency *"
+                    value={row.currency}
+                    onChange={(e) =>
+                      handleRowChange(row.id, "currency", e.target.value)
+                    }
+                    fullWidth
+                  >
+                    <MenuItem value="" disabled>
+                      <em>Select Currency</em>
+                    </MenuItem>
+                    {currencyOptions.map((c) => (
+                      <MenuItem key={c} value={c}>
+                        {c}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+
+                {/* CGL */}
+                <Grid item xs={12} md={2} size={1.8}>
+                  <Autocomplete
+                    popupIcon={null}
+                    autoHighlight
+                    options={cglSearch.options}
+                    getOptionLabel={(option) =>
+                      `${option.cglNumber} - ${option.description}`
+                    }
+                    value={row.cgl}
+                    onChange={(event, newValue) =>
+                      handleRowChange(row.id, "cgl", newValue)
+                    }
+                    onInputChange={(event, newInputValue) =>
+                      searchCgls(newInputValue, row.id) // FIX: pass row.id
+                    }
+                    loading={cglSearch.loadingId === row.id} // FIX: check row.id
+                    filterOptions={(x) => x}
+                    isOptionEqualToValue={(option, value) =>
+                      option.cglNumber === value.cglNumber
+                    }
+                    noOptionsText=""
+                    renderInput={(params) => (
+                      <TextField
+                        {...params}
+                        label="CGL *"
+                        placeholder="Search CGL by number or name"
+                        InputLabelProps={{ shrink: true }}
+                        InputProps={{
+                          ...params.InputProps,
+                          endAdornment: (
+                            <Box sx={{ marginLeft: "2%", display: "flex", alignItems: "center" }}>
+                              {row.cgl && String(row.cgl.cglNumber).startsWith("5") && (
+                                <Chip label="MEMO" size="small" color="warning" sx={{ height: 20, fontSize: "0.7rem", mr: 1 }} />
+                              )}
+                              {cglSearch.loadingId === row.id ? ( // FIX: check row.id
+                                <CircularProgress color="inherit" size={20} />
+                              ) : null}
+                              {params.InputProps.endAdornment}
+                            </Box>
+                          ),
+                        }}
+                      />
+                    )}
+                  />
+                </Grid>
+
+                {/* Amount */}
+                <Grid item xs={12} md={2} size={1.5}>
+                  <TextField
+                    label="Amount *"
+                    type="text"
+                    value={row.amount}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (/^\d{0,21}(\.\d{0,4})?$/.test(val)) {
+                        handleRowChange(row.id, "amount", val);
+                      }
+                    }}
+                    fullWidth
+                    placeholder="0.0000"
+                  />
+                </Grid>
+
+                {/* Txn Type */}
+                <Grid item xs={12} md={1} size={1.3}>
+                  <TextField
+                    select
+                    label="Txn Type *"
+                    value={row.txnType}
+                    onChange={(e) =>
+                      handleRowChange(row.id, "txnType", e.target.value)
+                    }
+                    fullWidth
+                  >
+                    <MenuItem value="" disabled>
+                      <em>Select Type</em>
+                    </MenuItem>
+                    <MenuItem value="Debit">Debit</MenuItem>
+                    <MenuItem value="Credit">Credit</MenuItem>
+                  </TextField>
+                </Grid>
+
+                {/* Product Code */}
+                <Grid item xs={12} md={2} size={1.5}>
+                  <TextField
+                    label="Product Code"
+                    value={row.productCode}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (/^\d{0,8}$/.test(val)) {
+                        handleRowChange(row.id, "productCode", val);
+                      }
+                    }}
+                    fullWidth
+                    InputProps={{
+                      inputProps: {
+                        maxLength: 8,
+                      },
+                    }}
+                  />
+                </Grid>
+
+                {/* Remarks (Individual) */}
+                <Grid item xs={12} md={2} size={2}>
+                  <TextField
+                    label="Remarks"
+                    value={row.remarks}
+                    onChange={(e) => {
+                      const val = e.target.value;
+
+                      if (val.length <= 50) {
+                        handleRowChange(row.id, "remarks", val);
+                      }
+                    }}
+                    fullWidth
+                    InputProps={{
+                      inputProps: {
+                        maxLength: 50,
+                      },
+                      readOnly: checked,
+                    }}
+                  />
+                </Grid>
+
+                {/* Actions */}
+                <Grid item xs={12} md={0.5} sx={{ textAlign: "center" }}>
+                  <IconButton
+                    onClick={() => handleDeleteRow(row.id)}
+                    aria-label="delete row"
+                  >
+                    <DeleteIcon />
+                  </IconButton>
+                </Grid>
+              </Grid>
+
+              {index < rows.length - 1 && (
+                <Box
+                  sx={{
+                    borderBottom: 1,
+                    borderColor: "divider",
+                    my: 2,
+                  }}
+                />
+              )}
+            </React.Fragment>
+          ))}
+
+          <Box sx={{ mt: 3, display: "flex", gap: 2, justifyContent: "right" }}>
+            <Button
+              variant="contained"
+              startIcon={<AddIcon />}
+              onClick={handleAddRow}
+            >
+              Add Row
+            </Button>
+
+            <Button
+              variant="contained"
+              color="success"
+              onClick={handleSubmit}
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
+            </Button>
+          </Box>
+        </Box>
+      </Paper>
     </Box>
   );
 }
 
 
 
-there same changes there as a profetional code stactures
-in case of Accept and Reject for both the make the remarks compasalary
-in the comments just Allow 
-a-z  , A-Z , and Numbers others Dont Allow
-add * showing this is compalsarey
-and minium 2 char and maximum 30 char for the comments 
+in this file add validation for that remarks where we are adding for other files 
+and there is one problem like 
+when i search in the branch , cgl at the start as i click in the input for search there is empty tray comming which should not be there 
+only when i start typing then only  i should get the data 
 
-
-and when ever we are taking input from the user at that time add line the that input box which things are allow like 
-Example -> Allowed 5-100 characters (alphabets, numbers, spaces,._"<>/&()=-) below that box in small letter i hope u understand what i am saying 
-No. of Entries is not visible create space for that in the table
-
-make this changes and give mi updated code full file and Dont remove the existing code or existing functionlity
-current code file is about 820 lines ur updated file should be 820+ only 
-and also remmber this things as we are applying this for other files also 
-
-
+when i clik on the curreny that drop down is above the that drop feilds Design wise it not looking good 
+that drop down should come with scroll and 
