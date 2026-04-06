@@ -1,65 +1,47 @@
-To implement the **"starts with"** search logic in your backend, you need to add two new methods to your JournalRequestServiceImpl.java and replace the placeholder logic at the bottom of the file.
-As a Senior Software Engineer, I recommend adding these methods specifically to handle the high-concurrency needs of your search bar, ensuring they use the paginated repository calls we added previously to keep the UI responsive.
-### **Methods to Add/Replace in JournalRequestServiceImpl.java**
-#### **1. Add these New Methods (Inside the Class Body)**
-Add these two methods before the // --- Overrides --- section. They directly call your new repository methods using the PENDING status to filter the results.
-```java
-    /**
-     * SEARCH BY BRANCH (STARTS WITH)
-     * Rule: Specifically filters by PENDING status for the Authorization screen.
-     * Logic: Passes the prefix to the repository which uses 'LIKE branch%'
-     */
-    public Page<JournalRequest> searchPendingByBranchPrefix(String branchPrefix, Pageable pageable) {
-        log.info("SEARCH_BRANCH_PREFIX | Prefix: {} | Page: {}", branchPrefix, pageable.getPageNumber());
-        return journalRequestRepository.findByReqBranchCodeStartingWithAndRequestStatus(
-                branchPrefix, 
-                RequestStatus.PENDING, 
-                pageable
-        );
-    }
+package com.fincore.JournalService.Controller;
+
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Service.JournalRequestService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/JS/journals")
+@RequiredArgsConstructor
+public class JournalRequestController {
+
+    private final JournalRequestService journalRequestService;
 
     /**
-     * SEARCH BY CGL (STARTS WITH)
-     * Rule: Strictly matches the beginning of the CGL string.
-     * Optimization: Allows Oracle to perform an Index Range Scan.
+     * DYNAMIC PREFIX SEARCH
+     * Endpoint: GET /JS/journals/search-pending
+     * Parameters: branch (optional), cgl (optional), page, size
+     * Logic: Implements "Starts With" matching for Authorization screen filtering.
      */
-    public Page<JournalRequest> searchPendingByCglPrefix(String cglPrefix, Pageable pageable) {
-        log.info("SEARCH_CGL_PREFIX | Prefix: {} | Page: {}", cglPrefix, pageable.getPageNumber());
-        return journalRequestRepository.findByReqCglStartingWithAndRequestStatus(
-                cglPrefix, 
-                RequestStatus.PENDING, 
-                pageable
-        );
+    @GetMapping("/search-pending")
+    public ResponseEntity<Page<JournalRequest>> searchPendingRequests(
+            @RequestParam(required = false) String branch,
+            @RequestParam(required = false) String cgl,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        
+        Pageable pageable = PageRequest.of(page, size);
+
+        // Prioritize Branch search if both are provided
+        if (branch != null && !branch.trim().isEmpty()) {
+            return ResponseEntity.ok(journalRequestService.searchPendingByBranchPrefix(branch.trim(), pageable));
+        } 
+        
+        // Fallback to CGL search
+        if (cgl != null && !cgl.trim().isEmpty()) {
+            return ResponseEntity.ok(journalRequestService.searchPendingByCglPrefix(cgl.trim(), pageable));
+        }
+
+        // Default: Return all pending requests if no search criteria provided
+        return ResponseEntity.ok(journalRequestService.getRequestsByStatus("PENDING", pageable));
     }
-
-```
-#### **2. Update the "Overrides" Section (At the Bottom)**
-You need to replace your current placeholder getPendingRequests method. Instead of returning an empty list, it should now return all requests in the PENDING state to provide a default view for your search bar when it's empty.
-**Existing Code:**
-```java
-@Override public List<JournalRequest> getPendingRequests(String u, Integer r) { return new ArrayList<>(); }
-
-```
-**Replacement Code:**
-```java
-    /**
-     * FETCH ALL PENDING REQUESTS
-     * Replaces the empty placeholder to provide a default view for the search screen.
-     */
-    @Override 
-    public List<JournalRequest> getPendingRequests(String userId, Integer roleId) { 
-        return journalRequestRepository.findByRequestStatus(RequestStatus.PENDING); 
-    }
-
-```
-### **Summary of the Changes**
-| Existing Status | Change Action | New Logic / Method |
-|---|---|---|
-| **New Requirement** | **ADD** | searchPendingByBranchPrefix: Uses the StartingWith repository call to filter branches by their leading characters. |
-| **New Requirement** | **ADD** | searchPendingByCglPrefix: Uses the StartingWith repository call to filter CGLs by their leading characters. |
-| **Placeholder** | **REPLACE** | getPendingRequests: Now calls findByRequestStatus(RequestStatus.PENDING) instead of returning new ArrayList<>(). |
-### **Why these changes work:**
- 1. **Starts With Enforcement**: By calling the StartingWith methods in the repository, you satisfy the requirement that "321" matches "32121" but not "44321".
- 2. **Oracle Optimization**: Using a prefix match (text%) allows the database to use the index on REQ_BRANCH_CODE or REQ_CGL. A "containing" search (%text%) would force a full table scan, which is much slower.
- 3. **UI Data Integrity**: Returning Page<JournalRequest> ensures your React **DataGrid** can handle large amounts of data with built-in pagination.
-**Next Step**: You should update your JournalRequestController.java to include a new endpoint that calls these searchPending... methods so your frontend can access them. Would you like the code for that endpoint?
+}
