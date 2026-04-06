@@ -1,146 +1,116 @@
-Awesome. Let's knock out **Bug 2: Broken Transaction Boundaries & Manual JDBC Connections**.
+Excellent. Let's knock out **Bug 3: The Distributed Scheduler Race Condition**.
 ### The Problem
-In JournalRequestServiceImpl, your processChunkRaw method bypasses Spring entirely to grab a raw connection and manually commit [cite: 764-775].
-```java
-// The dangerous part of your existing code:
-try (Connection conn = dataSource.getConnection();
-     PreparedStatement ps = conn.prepareStatement(sql)) {
-     conn.setAutoCommit(false);
-     // ...
-     ps.executeBatch();
-     conn.commit(); 
-}
-
-```
-Because this runs inside the new ChunkWorker threads, it completely ignores the @Transactional wrapper of the parent method. [cite_start]Worse, if an exception occurs during conn.commit(), it throws a raw SQLException, bypassing Spring's DataAccessException translation. This can lead to connection leaks in HikariCP under heavy load and partial data corruption if the cleanup fallback doesn't catch the raw SQL error properly.
+In your HdfsRecoveryService, you have the @Scheduled(fixedDelay = 300000) annotation. In a production environment with multiple instances (pods) of your JournalService running behind a load balancer, every single instance will trigger this method at the same time.
+They will all query the HDFS_SYNC_RETRY_QUEUE for PENDING records, pull the exact same batch IDs, and concurrently fire hdfsSyncService.syncToDataLake(). This race condition will blast the Data Lake with duplicate update commands.
 ### The Fix
-We will rewrite processChunkRaw to use Spring's jdbcTemplate.batchUpdate(). This allows Spring to manage the connection lifecycle, execute the batch efficiently, and translate any errors into standard DataAccessExceptions so your existing handleAsyncFailure rollback logic actually catches them.
-Here is the code replacement.
-**File:** com/fincore/JournalService/Service/JournalRequestServiceImpl.java
-**Find this existing method (around line 764):**
+Since your architecture already relies heavily on Redis, we will implement a distributed lock using StringRedisTemplate. We'll use the "Set If Absent" (SETNX) command.
+When the scheduler fires, the instance will try to place a lock in Redis. Only the *first* instance to reach Redis will acquire the lock and process the queue. The other instances will see the lock exists and quietly skip their execution for that cycle.
+Here is the exact code replacement.
+**File:** com/fincore/JournalService/Service/HdfsRecoveryService.java
+**1. Add the new dependencies at the top of the class:**
+Find your existing @Autowired block:
 ```java
-    private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
-        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-
-            if (conn == null) {
-                throw new SQLException("Connection Pool Exhausted: Could not acquire Oracle connection.");
-            }
-
-            conn.setAutoCommit(false);
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
-
-            for (int i = 0; i < chunk.size(); i++) {
-                JournalBulkValidationService.ExcelRowData r = chunk.get(i);
-                int globalIdx = globalOffset + i + 1;
-                String jId = batchId + "-" + globalIdx;
-                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
-
-                if (isCredit) credit.add(absAmt.longValue());
-                else debit.add(absAmt.longValue());
-
-                LocalDate rDate = LocalDate.now();
-                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                    try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
-                    }
-                    catch (DateTimeParseException ignored) {}
-                }
-
-
-                ps.setString(1, "P");
-                ps.setTimestamp(2, ts);
-                ps.setString(3, creatorId);
-                ps.setInt(4, creatorRole != null ? creatorRole : 0);
-                ps.setString(5, batchId);
-                ps.setString(6, jId);
-                ps.setString(7, commonRemarks);
-                ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
-
-                ps.setString(9, r.branch);
-                ps.setString(10, r.currency);
-                ps.setString(11, r.cgl);
-                ps.setBigDecimal(12, signedAmt);
-                ps.setDate(13, java.sql.Date.valueOf(rDate));
-                ps.setString(14, r.remarks);
-                ps.setString(15, r.productCode);
-
-                ps.addBatch();
-            }
-            ps.executeBatch();
-            conn.commit();
-        } catch (SQLException e) {
-            log.error("JDBC_SQL_FAIL | Batch: {} | SQLState: {} | ErrorCode: {}",
-                    batchId, e.getSQLState(), e.getErrorCode());
-            throw new CustomExceptions.DatabaseOperationException("Database integrity error during batch insert");
-        }
-    }
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate oracleJdbcTemplate;
 
 ```
-**Replace it entirely with this:**
+Replace it with this:
 ```java
-    /**
-     * High-performance JDBC Batch Insertion logic using Spring's JdbcTemplate.
-     * Prevents connection leaks and ensures proper exception translation.
-     */
-    private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
-        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate oracleJdbcTemplate;
 
+    // Injecting StringRedisTemplate for Distributed Locking
+    @Autowired
+    private org.springframework.data.redis.core.StringRedisTemplate stringRedisTemplate;
+
+```
+**2. Wrap the Scheduler in a Distributed Lock:**
+Find your existing retryFailedHdfsSyncs method:
+```java
+    @Scheduled(fixedDelay = 300000)
+    public void retryFailedHdfsSyncs() {
+        // 1. Fetch PENDING batches
+        String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
+        List<String> failedBatches;
         try {
-            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
-                    JournalBulkValidationService.ExcelRowData r = chunk.get(i);
-                    int globalIdx = globalOffset + i + 1;
-                    String jId = batchId + "-" + globalIdx;
-                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                    boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+            failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
+        } catch (DataAccessException e) {
+            log.error("HDFS_RECOVERY_QUERY_FAIL | Error fetching pending retries from Oracle: {}", e.getMessage());
+            return;
+        }
 
-                    if (isCredit) credit.add(absAmt.longValue());
-                    else debit.add(absAmt.longValue());
+        if (failedBatches.isEmpty()) {
+            return;
+        }
 
-                    LocalDate rDate = LocalDate.now();
-                    if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                        try { 
-                            rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); 
-                        } catch (DateTimeParseException ignored) {}
-                    }
-
-                    ps.setString(1, "P");
-                    ps.setTimestamp(2, ts);
-                    ps.setString(3, creatorId);
-                    ps.setInt(4, creatorRole != null ? creatorRole : 0);
-                    ps.setString(5, batchId);
-                    ps.setString(6, jId);
-                    ps.setString(7, commonRemarks);
-                    ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
-                    ps.setString(9, r.branch);
-                    ps.setString(10, r.currency);
-                    ps.setString(11, r.cgl);
-                    ps.setBigDecimal(12, signedAmt);
-                    ps.setDate(13, java.sql.Date.valueOf(rDate));
-                    ps.setString(14, r.remarks);
-                    ps.setString(15, r.productCode);
-                }
-
-                @Override
-                public int getBatchSize() {
-                    return chunk.size();
-                }
-            });
-        } catch (org.springframework.dao.DataAccessException e) {
-            log.error("JDBC_BATCH_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+        log.info("HDFS RECOVERY: Found {} failed batches. Starting self-healing...", failedBatches.size());
+        for (String batchId : failedBatches) {
+            try {
+                processRetry(batchId);
+            } catch (DataAccessException e) {
+                // Catch specific Spring DAO exceptions for DB issues
+                log.error("HDFS_RECOVERY_DB_ERROR | Batch: {} | Persistence error: {}", batchId, e.getMessage());
+                incrementRetryCount(batchId);
+            } catch (CustomExceptions.DatabaseOperationException e) {
+                // Catch internal service-wrapped exceptions
+                log.error("HDFS_RECOVERY_LOGIC_ERROR | Batch: {} | Logic failure: {}", batchId, e.getMessage());
+                incrementRetryCount(batchId);
+            }
         }
     }
 
 ```
-Now, if a chunk fails, JdbcTemplate will throw a DataAccessException, which will be correctly intercepted by your try-catch block inside executeAsyncBatchCreation to safely trigger the cleanupFailedBatch() purge logic.
-Shall we tackle **Bug 3: The Distributed Scheduler Race Condition** next, or would you like to review this one first?
+Replace it entirely with this:
+```java
+    @Scheduled(fixedDelay = 300000)
+    public void retryFailedHdfsSyncs() {
+        String lockKey = "SYSTEM_LOCK_HDFS_RECOVERY";
+        
+        try {
+            // Attempt to acquire lock for 4 minutes (expires safely before the next 5-min cycle)
+            Boolean acquired = stringRedisTemplate.opsForValue().setIfAbsent(lockKey, "LOCKED", 4, java.util.concurrent.TimeUnit.MINUTES);
+            
+            if (Boolean.FALSE.equals(acquired)) {
+                log.debug("HDFS_RECOVERY_SKIPPED | Status: Another node is currently processing the queue.");
+                return;
+            }
+
+            // 1. Fetch PENDING batches
+            String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
+            List<String> failedBatches;
+            try {
+                failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
+            } catch (DataAccessException e) {
+                log.error("HDFS_RECOVERY_QUERY_FAIL | Error fetching pending retries from Oracle: {}", e.getMessage());
+                return;
+            }
+
+            if (failedBatches.isEmpty()) {
+                return;
+            }
+
+            log.info("HDFS RECOVERY: Found {} failed batches. Starting self-healing...", failedBatches.size());
+            for (String batchId : failedBatches) {
+                try {
+                    processRetry(batchId);
+                } catch (DataAccessException e) {
+                    log.error("HDFS_RECOVERY_DB_ERROR | Batch: {} | Persistence error: {}", batchId, e.getMessage());
+                    incrementRetryCount(batchId);
+                } catch (CustomExceptions.DatabaseOperationException e) {
+                    log.error("HDFS_RECOVERY_LOGIC_ERROR | Batch: {} | Logic failure: {}", batchId, e.getMessage());
+                    incrementRetryCount(batchId);
+                }
+            }
+        } catch (org.springframework.data.redis.RedisConnectionFailureException e) {
+            log.error("HDFS_RECOVERY_REDIS_FAIL | Cannot acquire distributed lock. Skipping cycle to prevent race conditions.");
+        } finally {
+            // Guarantee the lock is released when the task finishes, allowing the next cycle to run smoothly
+            stringRedisTemplate.delete(lockKey);
+        }
+    }
+
+```
+This implementation guarantees that out of 5 running containers, 4 will hit the HDFS_RECOVERY_SKIPPED return block, and exactly 1 container will actually push the data to the Hive server.
+Shall we move on to fixing the final bug (Bug 4: The Dangling Redis Lock)?
