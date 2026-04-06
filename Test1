@@ -1,52 +1,102 @@
-To implement the **"starts with"** search logic for **Branch Code** and **CGL**, you need to modify your Spring Data JPA repository and the corresponding service implementation. This change ensures that Oracle performs an **Index Range Scan** (prefix match) instead of a full table scan (substring match), which is much faster for large datasets like JOURNAL_REQUEST.
-Here are the specific files and methods you need to update:
-### **1. File: JournalRequestRepository.java**
-This is the interface where your database queries are defined. You need to change the method naming convention or the @Query annotation to use the StartingWith keyword.
- * **If using Method Names**: Change any existing Containing methods to StartingWith.
-   ```java
-   // Change this:
-   List<JournalRequest> findByReqBranchCodeContaining(String branchCode);
-   
-   // To this:
-   List<JournalRequest> findByReqBranchCodeStartingWith(String branchCode);
-   
-   // Do the same for CGL:
-   List<JournalRequest> findByReqCglStartingWith(String cgl);
-   
-   ```
- * **If using @Query (JPQL)**: Update the LIKE clause so the % wildcard is only at the end.
-   ```java
-   // Correct "starts with" logic:
-   @Query("SELECT j FROM JournalRequest j WHERE j.reqBranchCode LIKE :branch% AND j.reqStatus = 'P'")
-   List<JournalRequest> searchByBranchPrefix(@Param("branch") String branch);
-   
-   ```
-### **2. File: JournalRequestServiceImpl.java**
-This is the implementation file where your business logic resides. You mentioned earlier that this file also handles calls to PROCESS_JOURNAL_BATCH.
- * **Method to change**: Look for the method that handles the search or filtering logic (e.g., getPendingRequests or searchRequests).
- * **The Change**: Ensure that the parameter you pass to the repository does **not** have a leading %.
-   ```java
-   // Inside the search method:
-   public List<JournalRequestDTO> searchByPrefix(String query) {
-       // The repository will now handle 'query%' automatically if using findBy...StartingWith
-       return repository.findByReqBranchCodeStartingWith(query)
-                        .stream()
-                        .map(this::convertToDto)
-                        .collect(Collectors.toList());
-   }
-   
-   ```
-### **3. File: JournalRequestSpecification.java (Optional)**
-If your search bar uses a dynamic filter (Criteria API), you need to change the like predicate logic.
- * **Method**: toPredicate
- * **The Change**:
-   ```java
-   // Change from:
-   cb.like(root.get("reqBranchCode"), "%" + filterValue + "%");
-   
-   // To:
-   cb.like(root.get("reqBranchCode"), filterValue + "%");
-   
-   ```
-### **Why this specific change?**
-In your JOURNAL_REQUEST table, columns like REQ_BRANCH_CODE and REQ_CGL are typically indexed. When you search for "Everything related" (%text%), the database cannot use the index effectively and must check every single row. By switching to "Starts with" (text%), Oracle can jump directly to the correct section of the index, making the search nearly instantaneous even if you have millions of rows.
+package com.fincore.JournalService.Repository;
+
+import java.util.List;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.stereotype.Repository;
+import org.springframework.data.repository.query.Param;
+
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+/**
+ * Handles data access for journal entries with optimized native queries for batch processing.
+ * Includes specialized queries for high-volume summaries and chunked deletions.
+ */
+@Repository
+public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> {
+
+    /**
+     * FETCH PENDING BATCH SUMMARIES
+     * Aggregates individual journal rows into a batch summary for the Authorization screen.
+     * Calculates total Debit/Credit by parsing JSON amounts:
+     * - Debit: Positive values in the 'amount' field.
+     * - Credit: Negative values in the 'amount' field (displayed as absolute).
+     */
+    @Query(value = """
+        SELECT 
+            BATCH_ID, 
+            MAX(CREATOR_ID) as CREATOR, 
+            MAX(REQ_DATE) as RDATE, 
+            MAX(COMMON_BATCH_REMARKS) as REM,
+            COUNT(*) as CNT,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR
+        FROM JOURNAL_REQUEST 
+        WHERE TRIM(REQ_STATUS) IN ('P', 'PENDING')
+        GROUP BY BATCH_ID
+        ORDER BY MAX(REQ_DATE) DESC
+    """, nativeQuery = true)
+    List<Object[]> findPendingBatchSummariesNative();
+
+    /**
+     * FETCH ALL BATCH HISTORY
+     * Provides a historical view of all batches (Accepted, Rejected, Pending, Error).
+     * Includes executor details and remarks for audit transparency.
+     */
+    @Query(value = """
+        SELECT 
+            BATCH_ID, 
+            MAX(CREATOR_ID) as CREATOR, 
+            MAX(REQ_DATE) as RDATE, 
+            MAX(COMMON_BATCH_REMARKS) as REM,
+            COUNT(*) as CNT,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR,
+            MAX(REQ_STATUS) as STATUS,
+            MAX(EXECUTOR_ID) as EXEC_ID,
+            MAX(EXECUTOR_REMARKS) as EXEC_REM
+        FROM JOURNAL_REQUEST 
+        GROUP BY BATCH_ID
+        ORDER BY MAX(REQ_DATE) DESC
+    """, nativeQuery = true)
+    List<Object[]> findAllBatchSummariesNative();
+
+    /**
+     * PAGINATED DETAIL FETCH
+     * Retrieves specific rows for a batch with stable ordering for UI consistency.
+     */
+    @Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
+            countQuery = "SELECT count(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
+            nativeQuery = true)
+    Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
+
+
+    /**
+     * FAST BATCH DELETE
+     * Directly removes all pending rows for a batch. Used for cancellation operations.
+     */
+    @Modifying
+    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(:userId)) AND TRIM(REQ_STATUS) IN ('P', 'PENDING')", nativeQuery = true)
+    void deleteBatchNative(@Param("batchId") String batchId, @Param("userId") String userId);
+
+    /**
+     * MULTI-ROW SPECIFIC DELETE
+     * Purges specific journal IDs from a batch.
+     */
+    @Modifying
+    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE JOURNAL_ID IN (:journalIds) AND CREATOR_ID = :userId", nativeQuery = true)
+    void deleteJournalsNative(@Param("journalIds") List<String> journalIds, @Param("userId") String userId);
+
+    // Standard Finder Methods
+    List<JournalRequest> findByBatchId(String batchId);
+    List<JournalRequest> findByCreatorId(String creatorId);
+    List<JournalRequest> findByRequestStatus(RequestStatus status);
+    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
+}
+
+this is my file which i am using now change accordingly and give mi the updated instractions and code accordinly 
