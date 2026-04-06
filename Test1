@@ -1,73 +1,95 @@
-package com.fincore.JournalService.config;
 
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.scheduling.annotation.AsyncConfigurer;
-import org.springframework.scheduling.annotation.EnableAsync;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-
-import java.util.concurrent.Executor;
-
-/**
- * Configures dedicated thread pools for high-volume row processing and chunking.
- * Implements global error handling for fire-and-forget async tasks.
- */
-@Configuration
-@EnableAsync
-@Slf4j
-public class AsyncConfig implements AsyncConfigurer {   
-
-    /**
-     * Dedicated executor for high-volume journal operations (Coordinator pool).
-     * Logic for pool sizing and queue capacity is preserved exactly as established.
-     */
-    @Bean(name = "bulkExecutor")
-    public Executor bulkExecutor() {
-        log.info("ASYNC_CONFIG_INIT | Initializing Bulk Thread Pool ");
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(10);
-        executor.setMaxPoolSize(20);
-        executor.setQueueCapacity(500);
-        executor.setThreadNamePrefix("BulkWorker-");
-        executor.initialize();
-        return executor;
-    }
-
-    /**
-     * Dedicated worker pool specifically for processing inner batch chunks.
-     * Prevents deadlock by separating chunk processing from the main coordinator threads.
-     */
-    @Bean(name = "chunkWorkerExecutor")
-    public Executor chunkWorkerExecutor() {
-        log.info("ASYNC_CONFIG_INIT | Initializing Chunk Worker Thread Pool ");
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(15);
-        executor.setMaxPoolSize(30);
-        executor.setQueueCapacity(1000);
-        executor.setThreadNamePrefix("ChunkWorker-");
-        executor.initialize();
-        return executor;
-    }
-
-    /**
-     * Global handler for uncaught exceptions in @Async methods that return void.
-     * Replaces generic catching with structured, descriptive logging.
-     */
     @Override
-    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
-        return (ex, method, params) -> {
-            log.error("ASYNC_TASK_EXCEPTION | Method: {} | Exception: {}",
-                    method.getName(), ex.getClass().getSimpleName());
+    @Async("bulkExecutor")
+    @Transactional
+    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        String lockKey = "LOCK_REQ_" + requestId;
+        MDC.put("batchId", batchId);
+        MDC.put("user", creatorId);
 
-            if (ex instanceof org.springframework.dao.DataAccessException) {
-                log.error("ASYNC_DATA_FAILURE | Status: Database connectivity lost in background thread");
-            } else if (ex instanceof NullPointerException) {
-                log.error("ASYNC_LOGIC_FAILURE | Status: Null pointer encountered in async task");
-            } else {
-                log.error("ASYNC_TECHNICAL_FAULT | Status: Unexpected background error");
+        log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
+        long start = System.currentTimeMillis();
+
+        try {
+            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+
+            List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+            if (cachedRows == null || cachedRows.isEmpty()) {
+                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
+                return;
             }
-        };
+
+            int totalRows = cachedRows.size();
+            int batchSize = 5000;
+
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+            LongAdder totalDebit = new LongAdder();
+            LongAdder totalCredit = new LongAdder();
+            AtomicInteger completedChunks = new AtomicInteger(0);
+            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+
+            for (int i = 0; i < totalRows; i += batchSize) {
+                final int startIdx = i;
+                final int endIdx = Math.min(i + batchSize, totalRows);
+                final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
+
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
+                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
+                        .thenRun(() -> {
+                            int done = completedChunks.incrementAndGet();
+                            int percent = 5 + (done * 90 / totalChunks);
+                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
+                                    String.format("Created %d/%d records...", Math.min(done * batchSize, totalRows), totalRows));
+                        });
+                futures.add(future);
+            }
+
+
+            try {
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                        .get(30, TimeUnit.MINUTES);
+            } catch (java.util.concurrent.TimeoutException te) {
+                log.error("BATCH_TIMEOUT | Batch: {} | Status: Processing exceeded 30 minutes", batchId);
+                throw new CustomExceptions.BatchProcessingException("Batch creation timed out. Check Oracle performance.");
+            } catch (InterruptedException | java.util.concurrent.ExecutionException e) {
+                log.error("ASYNC_EXECUTION_ERROR | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+                throw new CustomExceptions.BatchProcessingException("Parallel execution failed.", e.getCause());
+            } catch (CompletionException e) {
+                log.error("ASYNC_COMPLETION_ERROR | Batch: {} | Status: Thread join failure", batchId);
+                throw new CustomExceptions.BatchProcessingException("Background task interrupted.", e.getCause());
+            }
+
+
+
+            // Insert Master Record only after ALL chunks are confirmed successful
+            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
+                    BigDecimal.valueOf(totalDebit.sum()), BigDecimal.valueOf(totalCredit.sum()), "PENDING");
+
+            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Successfully created batch " + batchId);
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+            sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
+
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            if (config != null) {
+                String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
+                sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
+            }
+
+            log.info("BATCH_CREATION_FINISHED | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
+
+        } catch (CustomExceptions.BatchProcessingException | DataAccessException e) {
+            log.error("BATCH_FATAL_ERROR | Batch: {} | Status: Triggering Cleanup", batchId);
+            handleAsyncFailure(batchId, creatorId, requestId, "Database persistence failed. Partial data has been purged.");
+        } catch (Exception e) {
+            log.error("UNEXPECTED_SYSTEM_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred. Please retry.");
+        } finally {
+            redisTemplate.delete(lockKey);
+            redisTemplate.delete("DATA_" + requestId);
+            MDC.clear();
+        }
     }
-}
