@@ -1,28 +1,32 @@
-This is an excellent place to start. Fixing this Thread Starvation Deadlock will immediately stabilize your batch processing and prevent the entire application from freezing under load.
-To fix this, we are going to implement a **Coordinator-Worker pattern**.
- 1. bulkExecutor will remain the **Coordinator** (handling the top-level @Async tasks).
- 2. A new chunkWorkerExecutor will act as the **Worker** (processing the inner CompletableFuture chunks).
-Here are the exact file modifications you need to make.
-### 1. Update AsyncConfig.java
-We need to define the new thread pool dedicated strictly to processing the 5,000-row chunks.
-**File:** com/fincore/JournalService/config/AsyncConfig.java
-**Find this existing code block:**
-```java
-    @Bean(name = "bulkExecutor")
-    public Executor bulkExecutor() {
-        log.info("ASYNC_CONFIG_INIT | Initializing Bulk Thread Pool ");
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(10);
-        executor.setMaxPoolSize(20);
-        executor.setQueueCapacity(500);
-        executor.setThreadNamePrefix("BulkWorker-");
-        executor.initialize();
-        return executor;
-    [span_0](start_span)}
+package com.fincore.JournalService.config;
 
-```
-**Add the new Worker pool immediately below it:**
-```java
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.AsyncConfigurer;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import java.util.concurrent.Executor;
+
+
+
+/**
+ * Configures the dedicated 'bulkExecutor' thread pool for 600k+ row processing.
+ * Implements global error handling for fire-and-forget async tasks.
+ */
+@Configuration
+@EnableAsync
+@Slf4j
+public class AsyncConfig implements AsyncConfigurer {   
+
+
+    /**
+     * Dedicated executor for high-volume journal operations.
+     * Logic for pool sizing and queue capacity is preserved exactly as established.
+     */
+
     @Bean(name = "bulkExecutor")
     public Executor bulkExecutor() {
         log.info("ASYNC_CONFIG_INIT | Initializing Bulk Thread Pool ");
@@ -36,79 +40,26 @@ We need to define the new thread pool dedicated strictly to processing the 5,000
     }
 
     /**
-     * Dedicated worker pool specifically for processing inner batch chunks.
-     * Prevents deadlock by separating chunk processing from the main coordinator threads.
+     * Global handler for uncaught exceptions in @Async methods that return void.
+     * Replaces generic catching with structured, descriptive logging.
      */
-    @Bean(name = "chunkWorkerExecutor")
-    public Executor chunkWorkerExecutor() {
-        log.info("ASYNC_CONFIG_INIT | Initializing Chunk Worker Thread Pool ");
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(15);
-        executor.setMaxPoolSize(30);
-        executor.setQueueCapacity(1000);
-        executor.setThreadNamePrefix("ChunkWorker-");
-        executor.initialize();
-        return executor;
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -> {
+            log.error("ASYNC_TASK_EXCEPTION | Method: {} | Exception: {}",
+                    method.getName(), ex.getClass().getSimpleName());
+
+            if (ex instanceof org.springframework.dao.DataAccessException) {
+                log.error("ASYNC_DATA_FAILURE | Status: Database connectivity lost in background thread");
+            } else if (ex instanceof NullPointerException) {
+                log.error("ASYNC_LOGIC_FAILURE | Status: Null pointer encountered in async task");
+            } else {
+                log.error("ASYNC_TECHNICAL_FAULT | Status: Unexpected background error");
+            }
+        };
     }
+}
 
-```
-### 2. Update JournalRequestServiceImpl.java (Dependencies)
-Next, we inject this new pool into your service layer.
-**File:** com/fincore/JournalService/Service/JournalRequestServiceImpl.java
-**Find this existing code block (around the top where dependencies are declared):**
-```java
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
-
-    @Autowired
-    @Qualifier("bulkExecutor")
-    private Executor bulkExecutor;[span_0](end_span)
-
-```
-**Replace it with:**
-```java
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
-
-    @Autowired
-    @Qualifier("bulkExecutor")
-    private Executor bulkExecutor;
-
-    // Inject the new chunk worker pool
-    @Autowired
-    @Qualifier("chunkWorkerExecutor")
-    private Executor chunkWorkerExecutor;
-
-```
-### 3. Update JournalRequestServiceImpl.java (The Fix)
-Finally, we update the CompletableFuture to offload the raw chunk processing to the new worker pool instead of re-using the coordinator pool.
-**File:** com/fincore/JournalService/Service/JournalRequestServiceImpl.java
-**Find this existing code block inside executeAsyncBatchCreation:**
-```java
-            for (int i = 0; i < totalRows; i += batchSize) {
-                final int startIdx = i;
-                final int endIdx = Math.min(i + batchSize, totalRows);
-                final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
-                        .thenRun(() -> {
-                            [span_1](start_span)int done = completedChunks.incrementAndGet();[span_1](end_span)
-
-```
-**Replace it with:**
-```java
-            for (int i = 0; i < totalRows; i += batchSize) {
-                final int startIdx = i;
-                final int endIdx = Math.min(i + batchSize, totalRows);
-                final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
-                
-                // OFF-LOAD TO chunkWorkerExecutor INSTEAD OF bulkExecutor
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), chunkWorkerExecutor)
-                        .thenRun(() -> {
-                            int done = completedChunks.incrementAndGet();
-
-```
-By making these changes, the top-level request will grab a BulkWorker- thread, and it will dispatch all of the heavy database insertion work to the ChunkWorker- threads. The BulkWorker- thread can now safely block and wait for the chunks to finish without starving the system.
+give mi this comeplate file
+this is my existing code
