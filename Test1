@@ -1,95 +1,146 @@
-    @Override
-    @Async("bulkExecutor")
-    @Transactional
-    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-        String lockKey = "LOCK_REQ_" + requestId;
-        MDC.put("batchId", batchId);
-        MDC.put("user", creatorId);
+Awesome. Let's knock out **Bug 2: Broken Transaction Boundaries & Manual JDBC Connections**.
+### The Problem
+In JournalRequestServiceImpl, your processChunkRaw method bypasses Spring entirely to grab a raw connection and manually commit [cite: 764-775].
+```java
+// The dangerous part of your existing code:
+try (Connection conn = dataSource.getConnection();
+     PreparedStatement ps = conn.prepareStatement(sql)) {
+     conn.setAutoCommit(false);
+     // ...
+     ps.executeBatch();
+     conn.commit(); 
+}
 
-        log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
-        long start = System.currentTimeMillis();
+```
+Because this runs inside the new ChunkWorker threads, it completely ignores the @Transactional wrapper of the parent method. [cite_start]Worse, if an exception occurs during conn.commit(), it throws a raw SQLException, bypassing Spring's DataAccessException translation. This can lead to connection leaks in HikariCP under heavy load and partial data corruption if the cleanup fallback doesn't catch the raw SQL error properly.
+### The Fix
+We will rewrite processChunkRaw to use Spring's jdbcTemplate.batchUpdate(). This allows Spring to manage the connection lifecycle, execute the batch efficiently, and translate any errors into standard DataAccessExceptions so your existing handleAsyncFailure rollback logic actually catches them.
+Here is the code replacement.
+**File:** com/fincore/JournalService/Service/JournalRequestServiceImpl.java
+**Find this existing method (around line 764):**
+```java
+    private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
+        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
 
-        try {
-            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
-
-            List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-            if (cachedRows == null || cachedRows.isEmpty()) {
-                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
-                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
-                return;
+            if (conn == null) {
+                throw new SQLException("Connection Pool Exhausted: Could not acquire Oracle connection.");
             }
 
-            int totalRows = cachedRows.size();
-            int batchSize = 5000;
-
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-            LongAdder totalDebit = new LongAdder();
-            LongAdder totalCredit = new LongAdder();
-            AtomicInteger completedChunks = new AtomicInteger(0);
-            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
-
-            for (int i = 0; i < totalRows; i += batchSize) {
-                final int startIdx = i;
-                final int endIdx = Math.min(i + batchSize, totalRows);
-                final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
-
-                // FIX: Offloading the raw chunks to the new chunkWorkerExecutor to prevent thread starvation
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), chunkWorkerExecutor)
-                        .thenRun(() -> {
-                            int done = completedChunks.incrementAndGet();
-                            int percent = 5 + (done * 90 / totalChunks);
-                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                                    String.format("Created %d/%d records...", Math.min(done * batchSize, totalRows), totalRows));
-                        });
-                futures.add(future);
-            }
-
-
-            try {
-                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                        .get(30, TimeUnit.MINUTES);
-            } catch (java.util.concurrent.TimeoutException te) {
-                log.error("BATCH_TIMEOUT | Batch: {} | Status: Processing exceeded 30 minutes", batchId);
-                throw new CustomExceptions.BatchProcessingException("Batch creation timed out. Check Oracle performance.");
-            } catch (InterruptedException | java.util.concurrent.ExecutionException e) {
-                log.error("ASYNC_EXECUTION_ERROR | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-                throw new CustomExceptions.BatchProcessingException("Parallel execution failed.", e.getCause());
-            } catch (CompletionException e) {
-                log.error("ASYNC_COMPLETION_ERROR | Batch: {} | Status: Thread join failure", batchId);
-                throw new CustomExceptions.BatchProcessingException("Background task interrupted.", e.getCause());
-            }
-
-
-
-            // Insert Master Record only after ALL chunks are confirmed successful
+            conn.setAutoCommit(false);
             Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
-                    BigDecimal.valueOf(totalDebit.sum()), BigDecimal.valueOf(totalCredit.sum()), "PENDING");
+            final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
 
-            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Successfully created batch " + batchId);
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-            sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
+            for (int i = 0; i < chunk.size(); i++) {
+                JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+                int globalIdx = globalOffset + i + 1;
+                String jId = batchId + "-" + globalIdx;
+                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
+                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
 
-            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-            if (config != null) {
-                String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
-                sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
+                if (isCredit) credit.add(absAmt.longValue());
+                else debit.add(absAmt.longValue());
+
+                LocalDate rDate = LocalDate.now();
+                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                    try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
+                    }
+                    catch (DateTimeParseException ignored) {}
+                }
+
+
+                ps.setString(1, "P");
+                ps.setTimestamp(2, ts);
+                ps.setString(3, creatorId);
+                ps.setInt(4, creatorRole != null ? creatorRole : 0);
+                ps.setString(5, batchId);
+                ps.setString(6, jId);
+                ps.setString(7, commonRemarks);
+                ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
+
+                ps.setString(9, r.branch);
+                ps.setString(10, r.currency);
+                ps.setString(11, r.cgl);
+                ps.setBigDecimal(12, signedAmt);
+                ps.setDate(13, java.sql.Date.valueOf(rDate));
+                ps.setString(14, r.remarks);
+                ps.setString(15, r.productCode);
+
+                ps.addBatch();
             }
-
-            log.info("BATCH_CREATION_FINISHED | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
-
-        } catch (CustomExceptions.BatchProcessingException | DataAccessException e) {
-            log.error("BATCH_FATAL_ERROR | Batch: {} | Status: Triggering Cleanup", batchId);
-            handleAsyncFailure(batchId, creatorId, requestId, "Database persistence failed. Partial data has been purged.");
-        } catch (Exception e) {
-            log.error("UNEXPECTED_SYSTEM_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred. Please retry.");
-        } finally {
-            redisTemplate.delete(lockKey);
-            redisTemplate.delete("DATA_" + requestId);
-            MDC.clear();
+            ps.executeBatch();
+            conn.commit();
+        } catch (SQLException e) {
+            log.error("JDBC_SQL_FAIL | Batch: {} | SQLState: {} | ErrorCode: {}",
+                    batchId, e.getSQLState(), e.getErrorCode());
+            throw new CustomExceptions.DatabaseOperationException("Database integrity error during batch insert");
         }
     }
+
+```
+**Replace it entirely with this:**
+```java
+    /**
+     * High-performance JDBC Batch Insertion logic using Spring's JdbcTemplate.
+     * Prevents connection leaks and ensures proper exception translation.
+     */
+    private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
+        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+
+        try {
+            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                    JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+                    int globalIdx = globalOffset + i + 1;
+                    String jId = batchId + "-" + globalIdx;
+                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                    boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
+                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+
+                    if (isCredit) credit.add(absAmt.longValue());
+                    else debit.add(absAmt.longValue());
+
+                    LocalDate rDate = LocalDate.now();
+                    if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                        try { 
+                            rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); 
+                        } catch (DateTimeParseException ignored) {}
+                    }
+
+                    ps.setString(1, "P");
+                    ps.setTimestamp(2, ts);
+                    ps.setString(3, creatorId);
+                    ps.setInt(4, creatorRole != null ? creatorRole : 0);
+                    ps.setString(5, batchId);
+                    ps.setString(6, jId);
+                    ps.setString(7, commonRemarks);
+                    ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
+                    ps.setString(9, r.branch);
+                    ps.setString(10, r.currency);
+                    ps.setString(11, r.cgl);
+                    ps.setBigDecimal(12, signedAmt);
+                    ps.setDate(13, java.sql.Date.valueOf(rDate));
+                    ps.setString(14, r.remarks);
+                    ps.setString(15, r.productCode);
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return chunk.size();
+                }
+            });
+        } catch (org.springframework.dao.DataAccessException e) {
+            log.error("JDBC_BATCH_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+        }
+    }
+
+```
+Now, if a chunk fails, JdbcTemplate will throw a DataAccessException, which will be correctly intercepted by your try-catch block inside executeAsyncBatchCreation to safely trigger the cleanupFailedBatch() purge logic.
+Shall we tackle **Bug 3: The Distributed Scheduler Race Condition** next, or would you like to review this one first?
