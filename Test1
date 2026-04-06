@@ -1,86 +1,55 @@
-Journal Batch Master 
+Here is the exact API request you need to trigger the batch acceptance, which will in turn fire the HDFS sync logic.
+Based on the sample data you provided, batch **0002248** is currently PENDING, so we will use that for the test payload.
+### The API Request (Postman / cURL)
+**Endpoint:**
+```http
+POST http://localhost:8080/api/journals/process-bulk
 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
-CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
-REQ_DATE	TIMESTAMP(6)	Yes		3	Timestamp when the batch was originally created.
-BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	Initial remarks provided by the creator upon create.
-TOTAL_ROWS	NUMBER	Yes	0	5	Total number of valid transaction rows contained in this batch.
-TOTAL_DEBIT	NUMBER(25,4)	Yes	0	6	Sum of all debit transaction amounts in the batch.
-TOTAL_CREDIT	NUMBER(25,4)	Yes	0	7	Sum of all credit transaction amounts in the batch.
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	Current workflow state (e.g., PENDING, ACCEPTED, REJECTED, ERROR).
-EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	User ID of the person who approved or rejected the batch.
-EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rejected.
-EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
+```
+*(Make sure to change 8080 to whatever port your Spring Boot app is running on locally).*
+**Headers:**
+```http
+Content-Type: application/json
+Authorization: Bearer <INSERT_YOUR_JWT_TOKEN_HERE>
 
-sample data for Journal Batch master
+```
+**JSON Body:**
+```json
+{
+  "batchId": "0002248",
+  "journalIdPrefixes": [],
+  "status": "ACCEPTED",
+  "remarks": "Testing backend HDFS trigger"
+}
 
-0002250	1015698	02-04-26 05:19:32.777172000 PM	Bulk Upload - 2026-04-02	2	12345	12345	ACCEPTED	1021256	06-04-26 11:52:44.718791000 AM	sada
-0002248	1015698	02-04-26 05:18:51.444243000 PM	Bulk Upload - 2026-04-02	2	12345	12345	PENDING			
-0002247	1015698	02-04-26 05:17:58.894826000 PM	Bulk Upload - 2026-04-02	2	12345	12345	PENDING			
+```
+### What to Expect When You Hit "Send"
+ 1. **Immediate API Response:** Because this endpoint is asynchronous, you will immediately get a **202 Accepted** response back from the controller with this exact JSON:
+   ```json
+   {
+       "status": "PROCESSING",
+       "message": "Approval process started. Notifications will be sent upon completion."
+   }
+   
+   ```
+ 2. **Backend Processing (The Thrift Failure):**
+   * The bulkExecutor thread pool will pick up the task and execute the Oracle Stored Procedure (PROCESS_JOURNAL_BATCH).
+   * The database status for batch 0002248 will change to ACCEPTED.
+   * The HdfsSyncService will try to push the data to the Thrift Server.
+   * **Because Thrift is down**, it will throw a DataAccessException.
+   * Your catch block will intercept this and insert batch 0002248 into the HDFS_SYNC_RETRY_QUEUE.
+### How to Verify the Test Worked
+Once you get the 202 Accepted response from Postman, go straight to your Oracle database and run these two queries to confirm the fallback logic worked perfectly:
+**1. Check if the batch was approved successfully:**
+```sql
+SELECT BATCH_STATUS FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = '0002248';
+-- Expected result: ACCEPTED
 
+```
+**2. Check if the HDFS failure was caught and queued:**
+```sql
+SELECT STATUS FROM HDFS_SYNC_RETRY_QUEUE WHERE BATCH_ID = '0002248';
+-- Expected result: PENDING
 
-
-Journal Request 
-
-REQ_ID	NUMBER	No		1	
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	3	
-CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
-EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
-EXECUTION_DATE	DATE	Yes		6	Timestamp when this specific row was processed.
-EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
-PAYLOAD	CLOB	Yes		8	
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		9	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		10	Unique identifier for the individual request.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		11	Remarks inherited from the batch creation process.
-CREATOR_ROLE	NUMBER(10,0)	Yes		12	
-REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		13	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		14	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 BYTE)	Yes		15	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		16	Raw requested amount 
-REQ_CSV_DATE	DATE	Yes		17	The transaction date provided in the uploaded file.
-REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		18	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		19	The product  code requested.
-CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		20	
-
-
-3773501	P	08-01-26	2488766				{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1208505003","amount":1000,"productType":"12345678","remarks":"ewreew","arFlag":"A","acClassification":"A","batchId":"0001272","journalId":"0001272-54205","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":54205}	0001272	0001272-54205	Bulk Upload - 2025-12-02	51	32121	USD	1208505003	1000	02-12-25	ewreew	12345678	
-3773502	P	08-01-26	2488766				{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1122505001","amount":-1000,"productType":"12345679","remarks":"Normal","arFlag":"A","acClassification":"A","batchId":"0001272","journalId":"0001272-54206","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":54206}	0001272	0001272-54206	Bulk Upload - 2025-12-02	51	32121	USD	1122505001	-1000	02-12-25	Normal	12345679	
-3773503	P	08-01-26	2488766				{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1208505003","amount":1000,"productType":"12345678","remarks":"ewreew","arFlag":"A","acClassification":"A","batchId":"0001272","journalId":"0001272-54207","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":54207}	0001272	0001272-54207	Bulk Upload - 2025-12-02	51	32121	USD	1208505003	1000	02-12-25	ewreew	12345678	
-3773504	P	08-01-26	2488766				{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1122505001","amount":-1000,"productType":"12345679","remarks":"Normal","arFlag":"A","acClassification":"A","batchId":"0001272","journalId":"0001272-54208","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":54208}	0001272	0001272-54208	Bulk Upload - 2025-12-02	51	32121	USD	1122505001	-1000	02-12-25	Normal	12345679	
-3773505	P	08-01-26	2488766				{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1208505003","amount":1000,"productType":"12345678","remarks":"ewreew","arFlag":"A","acClassification":"A","batchId":"0001272","journalId":"0001272-54209","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":54209}	0001272	0001272-54209	Bulk Upload - 2025-12-02	51	32121	USD	1208505003	1000	02-12-25	ewreew	12345678	
-3773506	P	08-01-26	2488766				{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1122505001","amount":-1000,"productType":"12345679","remarks":"Normal","arFlag":"A","acClassification":"A","batchId":"0001272","journalId":"0001272-54210","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":54210}	0001272	0001272-54210	Bulk Upload - 2025-12-02	51	32121	USD	1122505001	-1000	02-12-25	Normal	12345679	
-
-
-
-HDFS_SYNC_QUEUE
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-CREATED_AT	TIMESTAMP(6)	Yes	SYSTIMESTAMP	2	
-RETRY_COUNT	NUMBER	Yes	0	3	
-STATUS	VARCHAR2(20 BYTE)	Yes	"'PENDING' -- PENDING, FAILED, COMPLETED
-"	4	
-
-JOURNAL_ID	NUMBER(19,0)	No		1	Unique sequential identifier for the master journal entry.
-JOURNAL_AMT	NUMBER(38,2)	Yes		2	Absolute transaction amount. Always positive; Txn Type determines debit/credit.
-AR_FLAG	VARCHAR2(1 CHAR)	Yes		3	Status flag indicating the record state. Default is A for Approved/Active.
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		4	Reference to the parent batch from JOURNAL_BATCH_MASTER.
-JOURNAL_BRANCH	VARCHAR2(50 CHAR)	Yes		5	The branch code where the transaction is booked.
-JOURNAL_CGL	VARCHAR2(50 CHAR)	Yes		6	The 10-digit Common General Ledger (CGL) account code.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Batch-level remarks provided by the executor during approval.
-CURRENCY	VARCHAR2(3 CHAR)	Yes		8	The 3-character currency code (e.g., INR, USD) for the transaction.
-JOURNAL_ID_REF	VARCHAR2(50 CHAR)	Yes		9	Reference back to the original row ID from the JOURNAL_REQUEST staging table.
-JOURNAL_PDATE	DATE	Yes		10	CSV date of the journal entry.
-PRODUCT_TYPE	VARCHAR2(20 CHAR)	Yes		11	The 8-digit product code
-REMARKS	VARCHAR2(50 CHAR)	Yes		12	specific remarks for this individual entry.
-TXN_TYPE	VARCHAR2(20 CHAR)	Yes		13	Specifies if the entry is a Debit or Credit.
-AC_CLASSIFICATION	VARCHAR2(255 CHAR)	Yes		14	
-
-sample data 
-1		12345.67	A	0001849	32121	1208505003	asd	USD	0001849-1	23-02-26	12345678	jflsadkd	Debit
-28		12345.67	A	0002250	32121	1122505001	sada	USD	0002250-2	02-04-26	12345679	Normal_Txn_B	Credit
-3		12345.67	A	0001850	32121	1208505003	new testing	USD	0001850-1	23-02-26	12345678	jflsadkd	Debit
-4		12345.67	A	0001850	32121	8812505008	new testing	USD	0001850-2	23-02-26	12345679	sales_B	Credit
-5		12345.67	A	0001855	32121	1208505003	new testing 2	USD	0001855-1	23-02-26	12345678	jflsadkd	Debit
-6		12345.67	A	0001855	32121	8812505008	new testing 2	USD	0001855-2	23-02-26	12345679	sales_B	Credit
-
-
+```
+Give that a run in Postman. If that HDFS_SYNC_RETRY_QUEUE table shows PENDING for this batch, your Spring Boot logic is rock solid and handling the infrastructure failure exactly as designed.
