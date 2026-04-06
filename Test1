@@ -1,41 +1,114 @@
-Here is the full mapping of the field names with their **Start** and **End** positions, based on the COBOL PIC definitions in your image.
-### **Positional Data Mapping**
-| Field Name | Start | End | Length |
-|---|---|---|---|
-| **B-SOC-NO** | 1 | 3 | 3 |
-| **B-ACCT-NO** | 4 | 19 | 16 |
-| **B-BR-NO** | 20 | 24 | 5 |
-| **B-STAT** | 25 | 26 | 2 |
-| **B-LOAN-BAL** | 27 | 44 | 18 |
-| **B-LOAN-TRM** | 45 | 50 | 6 |
-| **B-TERM-BASIS** | 51 | 51 | 1 |
-| **B-MARKET-SEG-CODE** | 52 | 55 | 4 |
-| **B-ACT-TYPE** | 56 | 59 | 4 |
-| **B-CAT** | 60 | 63 | 4 |
-| **B-APP-AMT** | 64 | 81 | 18 |
-| **B-ADV-VAL** | 82 | 99 | 18 |
-| **B-CURRENCY-IND** | 100 | 102 | 3 |
-| **B-OLD-BAD-DEBT-IND** | 103 | 104 | 2 |
-| **B-GL-CLASSIFICATION-CODE** | 105 | 129 | 25 |
-| **B-COLLECTION-AMT** | 130 | 147 | 18 |
-| **B-INT-ACCR** | 148 | 165 | 18 |
-| **B-BPI-ACCR** | 166 | 183 | 18 |
-| **B-CI-ACCR** | 184 | 201 | 18 |
-| **B-INT-ADJUSTMENT** | 202 | 219 | 18 |
-| **B-SPONSOR-ID** | 220 | 223 | 4 |
-| **B-PRTY-SECT-IND** | 224 | 224 | 1 |
-| **B-DIR-LEND-FLAG** | 225 | 225 | 1 |
-| **B-ACCT-SECT-IND** | 226 | 226 | 1 |
-| **B-CGL-COMPONENT-1-DR** | 227 | 243 | 17 |
-| **B-CGL-COMPONENT-2-DR** | 244 | 253 | 10 |
-| **B-CGL-COMPONENT-1-CR** | 254 | 270 | 17 |
-| **B-CGL-COMPONENT-2-CR** | 271 | 280 | 10 |
-| **B-INCA** | 281 | 298 | 18 |
-| **B-ARR-INT-ACCR** | 299 | 318 | 20 |
-| **B-ARR-INT-ADJUSTMENT** | 319 | 338 | 20 |
-| **B-BPI-INCR** | 339 | 358 | 20 |
-| **B-INT-INCR** | 359 | 378 | 20 |
-| **B-CI-INCR** | 379 | 398 | 20 |
-> **Note on Calculation:**
-> For fields labeled TRAILING SEPARATE (like S9(14)V999), the length includes the digits plus **1 extra byte** for the sign character (+ or -) at the end.
-> 
+This is an excellent place to start. Fixing this Thread Starvation Deadlock will immediately stabilize your batch processing and prevent the entire application from freezing under load.
+To fix this, we are going to implement a **Coordinator-Worker pattern**.
+ 1. bulkExecutor will remain the **Coordinator** (handling the top-level @Async tasks).
+ 2. A new chunkWorkerExecutor will act as the **Worker** (processing the inner CompletableFuture chunks).
+Here are the exact file modifications you need to make.
+### 1. Update AsyncConfig.java
+We need to define the new thread pool dedicated strictly to processing the 5,000-row chunks.
+**File:** com/fincore/JournalService/config/AsyncConfig.java
+**Find this existing code block:**
+```java
+    @Bean(name = "bulkExecutor")
+    public Executor bulkExecutor() {
+        log.info("ASYNC_CONFIG_INIT | Initializing Bulk Thread Pool ");
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(500);
+        executor.setThreadNamePrefix("BulkWorker-");
+        executor.initialize();
+        return executor;
+    [span_0](start_span)}
+
+```
+**Add the new Worker pool immediately below it:**
+```java
+    @Bean(name = "bulkExecutor")
+    public Executor bulkExecutor() {
+        log.info("ASYNC_CONFIG_INIT | Initializing Bulk Thread Pool ");
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(500);
+        executor.setThreadNamePrefix("BulkWorker-");
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Dedicated worker pool specifically for processing inner batch chunks.
+     * Prevents deadlock by separating chunk processing from the main coordinator threads.
+     */
+    @Bean(name = "chunkWorkerExecutor")
+    public Executor chunkWorkerExecutor() {
+        log.info("ASYNC_CONFIG_INIT | Initializing Chunk Worker Thread Pool ");
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(15);
+        executor.setMaxPoolSize(30);
+        executor.setQueueCapacity(1000);
+        executor.setThreadNamePrefix("ChunkWorker-");
+        executor.initialize();
+        return executor;
+    }
+
+```
+### 2. Update JournalRequestServiceImpl.java (Dependencies)
+Next, we inject this new pool into your service layer.
+**File:** com/fincore/JournalService/Service/JournalRequestServiceImpl.java
+**Find this existing code block (around the top where dependencies are declared):**
+```java
+    @Autowired
+    @Qualifier("byteArrayRedisTemplate")
+    private RedisTemplate<String, byte[]> redisTemplate;
+
+    @Autowired
+    @Qualifier("bulkExecutor")
+    private Executor bulkExecutor;[span_0](end_span)
+
+```
+**Replace it with:**
+```java
+    @Autowired
+    @Qualifier("byteArrayRedisTemplate")
+    private RedisTemplate<String, byte[]> redisTemplate;
+
+    @Autowired
+    @Qualifier("bulkExecutor")
+    private Executor bulkExecutor;
+
+    // Inject the new chunk worker pool
+    @Autowired
+    @Qualifier("chunkWorkerExecutor")
+    private Executor chunkWorkerExecutor;
+
+```
+### 3. Update JournalRequestServiceImpl.java (The Fix)
+Finally, we update the CompletableFuture to offload the raw chunk processing to the new worker pool instead of re-using the coordinator pool.
+**File:** com/fincore/JournalService/Service/JournalRequestServiceImpl.java
+**Find this existing code block inside executeAsyncBatchCreation:**
+```java
+            for (int i = 0; i < totalRows; i += batchSize) {
+                final int startIdx = i;
+                final int endIdx = Math.min(i + batchSize, totalRows);
+                final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
+                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
+                        .thenRun(() -> {
+                            [span_1](start_span)int done = completedChunks.incrementAndGet();[span_1](end_span)
+
+```
+**Replace it with:**
+```java
+            for (int i = 0; i < totalRows; i += batchSize) {
+                final int startIdx = i;
+                final int endIdx = Math.min(i + batchSize, totalRows);
+                final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
+                
+                // OFF-LOAD TO chunkWorkerExecutor INSTEAD OF bulkExecutor
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
+                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), chunkWorkerExecutor)
+                        .thenRun(() -> {
+                            int done = completedChunks.incrementAndGet();
+
+```
+By making these changes, the top-level request will grab a BulkWorker- thread, and it will dispatch all of the heavy database insertion work to the ChunkWorker- threads. The BulkWorker- thread can now safely block and wait for the chunks to finish without starving the system.
