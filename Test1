@@ -1,41 +1,52 @@
-To implement "starts with" matching for **Branch Code** and **CGL** search functionality, you need to modify the query logic in your Repository or Service layer. Using a prefix match (text%) instead of a substring match (%text%) ensures that the results are strictly filtered by how the values begin.
-As a Technical Lead, I recommend the following implementations based on your current Spring Boot and Oracle architecture:
-### 1. Spring Data JPA Repository
-If you are using Spring Data JPA method names, change the keyword from Containing to StartingWith.
-```java
-public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long> {
-
-    // Changes search from %query% to query%
-    List<JournalRequest> findByReqBranchCodeStartingWith(String branchCode);
-
-    List<JournalRequest> findByReqCglStartingWith(String cgl);
-}
-
-```
-### 2. Custom JPQL/SQL Query
-If you are using the @Query annotation, update the LIKE clause to place the wildcard only at the end of the parameter.
-```java
-@Query("SELECT j FROM JournalRequest j WHERE j.reqBranchCode LIKE :branchCode%")
-List<JournalRequest> searchByBranchPrefix(@Param("branchCode") String branchCode);
-
-@Query("SELECT j FROM JournalRequest j WHERE j.reqCgl LIKE :cgl%")
-List<JournalRequest> searchByCglPrefix(@Param("cgl") String cgl);
-
-```
-### 3. Dynamic Filtering (Criteria API / Specification)
-If your search bar supports multiple dynamic filters, update your Specification to use the startsWith helper or a trailing wildcard.
-```java
-public static Specification<JournalRequest> branchStartsWith(String branchCode) {
-    return (root, query, cb) -> 
-        cb.like(root.get("reqBranchCode"), branchCode + "%");
-}
-
-public static Specification<JournalRequest> cglStartsWith(String cgl) {
-    return (root, query, cb) -> 
-        cb.like(root.get("reqCgl"), cgl + "%");
-}
-
-```
-### 4. Database Indexing Tip
-By switching to "starts with" (LIKE 'text%'), you allow the Oracle database to utilize standard B-tree indexes effectively. A leading wildcard (LIKE '%text') forces a full table scan, whereas a trailing wildcard allows for an **Index Range Scan**, significantly improving search performance on large tables like JOURNAL_REQUEST.
-Ensure your composite indexes on REQ_BRANCH_CODE and REQ_CGL are optimized for these leading-edge searches.
+To implement the **"starts with"** search logic for **Branch Code** and **CGL**, you need to modify your Spring Data JPA repository and the corresponding service implementation. This change ensures that Oracle performs an **Index Range Scan** (prefix match) instead of a full table scan (substring match), which is much faster for large datasets like JOURNAL_REQUEST.
+Here are the specific files and methods you need to update:
+### **1. File: JournalRequestRepository.java**
+This is the interface where your database queries are defined. You need to change the method naming convention or the @Query annotation to use the StartingWith keyword.
+ * **If using Method Names**: Change any existing Containing methods to StartingWith.
+   ```java
+   // Change this:
+   List<JournalRequest> findByReqBranchCodeContaining(String branchCode);
+   
+   // To this:
+   List<JournalRequest> findByReqBranchCodeStartingWith(String branchCode);
+   
+   // Do the same for CGL:
+   List<JournalRequest> findByReqCglStartingWith(String cgl);
+   
+   ```
+ * **If using @Query (JPQL)**: Update the LIKE clause so the % wildcard is only at the end.
+   ```java
+   // Correct "starts with" logic:
+   @Query("SELECT j FROM JournalRequest j WHERE j.reqBranchCode LIKE :branch% AND j.reqStatus = 'P'")
+   List<JournalRequest> searchByBranchPrefix(@Param("branch") String branch);
+   
+   ```
+### **2. File: JournalRequestServiceImpl.java**
+This is the implementation file where your business logic resides. You mentioned earlier that this file also handles calls to PROCESS_JOURNAL_BATCH.
+ * **Method to change**: Look for the method that handles the search or filtering logic (e.g., getPendingRequests or searchRequests).
+ * **The Change**: Ensure that the parameter you pass to the repository does **not** have a leading %.
+   ```java
+   // Inside the search method:
+   public List<JournalRequestDTO> searchByPrefix(String query) {
+       // The repository will now handle 'query%' automatically if using findBy...StartingWith
+       return repository.findByReqBranchCodeStartingWith(query)
+                        .stream()
+                        .map(this::convertToDto)
+                        .collect(Collectors.toList());
+   }
+   
+   ```
+### **3. File: JournalRequestSpecification.java (Optional)**
+If your search bar uses a dynamic filter (Criteria API), you need to change the like predicate logic.
+ * **Method**: toPredicate
+ * **The Change**:
+   ```java
+   // Change from:
+   cb.like(root.get("reqBranchCode"), "%" + filterValue + "%");
+   
+   // To:
+   cb.like(root.get("reqBranchCode"), filterValue + "%");
+   
+   ```
+### **Why this specific change?**
+In your JOURNAL_REQUEST table, columns like REQ_BRANCH_CODE and REQ_CGL are typically indexed. When you search for "Everything related" (%text%), the database cannot use the index effectively and must check every single row. By switching to "Starts with" (text%), Oracle can jump directly to the correct section of the index, making the search nearly instantaneous even if you have millions of rows.
