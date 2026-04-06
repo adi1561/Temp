@@ -1,189 +1,757 @@
-create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
-    p_batch_id      IN VARCHAR2,
-    p_executor_id   IN VARCHAR2,
-    p_remarks       IN VARCHAR2,
-    p_status        IN VARCHAR2, 
-    o_cursor        OUT SYS_REFCURSOR
-) AS
-    v_missing_rates NUMBER;
-BEGIN
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+  TablePagination,
+  Alert,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Check as CheckIcon,
+  Clear as ClearIcon,
+  Visibility as VisibilityIcon,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import { alpha } from "@mui/material/styles";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-    -- ==========================================================
-    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
-    -- ==========================================================
-    -- Rule 3: Validates that every non-INR currency in the batch has an active rate.
-    -- This prevents corrupted balances in the GL_BALANCE table.
-    SELECT COUNT(*)
-    INTO v_missing_rates
-    FROM (
-        SELECT DISTINCT REQ_CURRENCY 
-        FROM JOURNAL_REQUEST 
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
-    ) req
-    LEFT JOIN CURRENCY_MASTER cm 
-        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
-    WHERE req.REQ_CURRENCY <> 'INR'
-      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
+/**
+ * PROFESSIONAL STYLES AND THEME CONFIGURATION
+ */
+const styles = {
+  mainContainer: {
+    padding: 3,
+    height: "100%",
+    width: "100%",
+    backgroundColor: "background.default",
+  },
+  dataGridContainer: {
+    height: 600,
+    width: "100%",
+    backgroundColor: "background.paper",
+    boxShadow: 2,
+    borderRadius: 2,
+    border: 1,
+    borderColor: "divider",
+    "& .MuiDataGrid-columnHeaders": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+      fontWeight: "bold",
+      fontSize: "0.95rem",
+    },
+    "& .MuiDataGrid-row:hover": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
+    },
+  },
+  tableContainer: { height: 450, border: 1, borderColor: "divider", mt: 1 },
+  fixedContentBox: {
+    height: 500,
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+  },
+  tableHeaderCell: {
+    fontWeight: "bold",
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+    whiteSpace: "nowrap",
+    zIndex: 10,
+  },
+  stickyHeaderColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    top: 0,
+    zIndex: 20,
+    backgroundColor: "background.paper",
+    borderBottom: 1,
+    borderRight: 1,
+    borderColor: "divider",
+    fontWeight: "bold",
+  }),
+  stickyBodyColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    zIndex: 5,
+    backgroundColor: "background.paper",
+    borderRight: 1,
+    borderColor: "divider",
+  }),
+  dialogTitle: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    pb: 1,
+  },
+  dialogActions: { p: 2, borderTop: 1, borderColor: "divider" },
+  loadingContainer: {
+    height: "100%",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  helperText: {
+    fontSize: "0.75rem",
+    color: "text.secondary",
+    marginTop: "4px",
+  }
+};
 
-    IF v_missing_rates > 0 THEN
-        -- Rule 1 & 2: Specific error code for Java to catch without leaking schema details.
-        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
-    END IF;
+const formatCurrency = (num) => Number(num).toFixed(4);
+const getTxnTypeColor = (txnType) =>
+  txnType === "Credit" ? "error" : "success";
 
-    -- START ATOMIC TRANSACTION
-    BEGIN
-        -- ==========================================================
-        -- 1. Insert into GL_TRANSACTIONS
-        -- ==========================================================
-        -- Safe for Parallelism: New row inserts do not lock existing data rows.
-        INSERT /*+ APPEND PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
-            TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
-            BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
-        )
-        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-            GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID, NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
-            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
-            CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, 
-            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, 
-            'J'
-        FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Pending Requests</Typography>
+    </Stack>
+  );
+}
 
-        -- ==========================================================
-        -- 2. Insert into MASTER_JOURNAL 
-        -- ==========================================================
-        INSERT /*+ APPEND PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
-            JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH, 
-            JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF, 
-            JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
-        )
-        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-            MASTER_JOURNAL_SEQ.nextval, 
-            ABS(REQ_AMOUNT), 
-            'A', 
-            BATCH_ID, 
-            REQ_BRANCH_CODE, 
-            REQ_CGL, 
-            p_remarks, 
-            REQ_CURRENCY, 
-            JOURNAL_ID, 
-            NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), 
-            REQ_PRODUCT, 
-            REQ_NARRATION, 
-            CASE WHEN REQ_AMOUNT > 0 THEN 'Debit' ELSE 'Credit' END
-        FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+export default function JournalRequestApproval() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
 
-        -- ==========================================================
-        -- 3. Merge Balances (CONCURRENCY FIX)
-        -- ==========================================================
-        /** * Rule 3 & Bug Fix #6: 
-         * REMOVED 'ALTER SESSION ENABLE PARALLEL DML' and 'PARALLEL' hint here.
-         * Parallel DML on existing rows requires an Exclusive Table Lock, which 
-         * prevents multiple admins from approving different batches simultaneously.
-         * Row-level locking (Standard Merge) is safer for high-concurrency production.
-         */
-        MERGE INTO GL_BALANCE target
-        USING (
-            SELECT 
-                j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
-                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
-                CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE 
-            FROM JOURNAL_REQUEST j
-            LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1 
-            WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
-            GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
-        ) source
-        ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE 
-            AND target.CURRENCY = source.REQ_CURRENCY 
-            AND target.CGL = source.REQ_CGL 
-            AND target.BALANCE_DATE = source.BAL_DATE)
-        WHEN MATCHED THEN
-            UPDATE SET 
-                target.BALANCE = target.BALANCE + source.TXN_AMOUNT, 
-                target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
-        WHEN NOT MATCHED THEN
-            INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
-            VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE, 
-                    source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT, 
-                    (source.TXN_AMOUNT * source.EXCH_RATE));
+  // AUTH AND INITIAL STATE
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
 
-        -- ==========================================================
-        -- 4. Final Status Update
-        -- ==========================================================
-        UPDATE JOURNAL_REQUEST
-        SET REQ_STATUS = p_status, 
-            EXECUTOR_ID = p_executor_id, 
-            EXECUTION_DATE = SYSTIMESTAMP, 
-            EXECUTOR_REMARKS = p_remarks
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+  // MODAL STATE FOR FULL BATCH ACTION
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED");
+  const [executorRemarks, setExecutorRemarks] = useState("");
 
-        COMMIT; 
+  // MODAL STATE FOR VIEWING DETAILS AND PARTIAL ACTION
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
+  const [detailPage, setDetailPage] = useState(0);
+  const [detailRowsPerPage, setDetailRowsPerPage] = useState(10);
+  const [detailTotalCount, setDetailTotalCount] = useState(0);
+  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
+  const [partialExecutorRemarks, setPartialExecutorRemarks] = useState("");
+  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
 
-        -- ==========================================================
-        -- 5. Return Sync Cursor to Java
-        -- ==========================================================
-        OPEN o_cursor FOR
-        SELECT 
-            j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL, 
-            j.REQ_CSV_DATE AS BAL_DATE, g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
-        FROM (SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
-              FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id) j
-        JOIN GL_BALANCE g 
-            ON g.BRANCH_CODE = j.REQ_BRANCH_CODE 
-            AND g.CURRENCY = j.REQ_CURRENCY 
-            AND g.CGL = j.REQ_CGL 
-            AND g.BALANCE_DATE = j.REQ_CSV_DATE;
+  // VALIDATION REGEX: Only a-z, A-Z, 0-9 allowed (Alphanumeric)
+  const remarksRegex = /^[a-zA-Z0-9]+$/;
 
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-            -- Rule 2: Re-raising for Java, but Java must be configured to log only the Code, not the Message.
-            RAISE; 
-    END;
-END;
+  useEffect(() => {
+    isMounted.current = true;
+    try {
+      const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+      }
+    } catch (e) {}
+    return () => { isMounted.current = false; };
+  }, []);
 
+  const isViewingSelfCreated =
+    currentUserId &&
+    viewingBatchCreatorId &&
+    String(currentUserId).trim().toUpperCase() === String(viewingBatchCreatorId).trim().toUpperCase();
 
+  const isLargeBatch = detailTotalCount > 2000;
 
+  // REMARK VALIDATION HELPER
+  const isValidRemark = (remark) => {
+    return remark.length >= 2 && remark.length <= 30 && remarksRegex.test(remark);
+  };
 
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await callApi("/JS/journals/pending-requests-summary", null, "GET");
+      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
+    } catch (err) {
+      if (isMounted.current && err.name !== "CanceledError")
+        showSnackBar("Failed to load requests", "error");
+    } finally {
+      if (isMounted.current) setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
 
+  useEffect(() => {
+    fetchPendingBatches();
+  }, [fetchPendingBatches]);
 
-2nd one 
+  const fetchBatchDetailsPaginated = async (batchId, page, size) => {
+    setDetailLoading(true);
+    try {
+      const res = await callApi(`/JS/journals/by-batch-paginated/${batchId}?page=${page}&size=${size}`, null, "GET");
+      if (res && res.content && isMounted.current) {
+        setDetailTotalCount(res.totalElements);
+        const journalGroups = new Map();
+        res.content.forEach((req) => {
+          try {
+            const payload = JSON.parse(req.payload);
+            const prefix = req.journalId.split("-")[0];
+            const amount = parseFloat(payload.amount) || 0;
+            const row = {
+              ...req,
+              payload,
+              journalPrefix: prefix,
+              amount: Math.abs(amount),
+              transactionType: amount < 0 ? "Credit" : "Debit",
+            };
+            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
+            journalGroups.get(prefix).push(row);
+          } catch (e) {}
+        });
+        setBatchDetails(Array.from(journalGroups.values()));
+      }
+    } catch (e) {
+      if (isMounted.current) showSnackBar("Failed to load details", "error");
+    } finally {
+      if (isMounted.current) setDetailLoading(false);
+    }
+  };
 
-create or replace PROCEDURE PURGE_JOURNAL_BATCH(
-    p_batch_id IN VARCHAR2,
-    p_user_id IN VARCHAR2
-) AS
-    v_status VARCHAR2(20);
-BEGIN
-    -- 1. Security Check
-    SELECT BATCH_STATUS INTO v_status
-    FROM JOURNAL_BATCH_MASTER
-    WHERE BATCH_ID = p_batch_id AND CREATOR_ID = p_user_id;
+  // MODAL HANDLERS
+  const handleOpenViewModal = (batchId, creatorId) => {
+    setViewingBatchId(batchId);
+    setViewingBatchCreatorId(String(creatorId));
+    setDetailPage(0);
+    setDetailRowsPerPage(10);
+    setSelectedJournalPrefixes([]);
+    setPartialExecutorRemarks("");
+    setIsViewModalOpen(true);
+    fetchBatchDetailsPaginated(batchId, 0, 10);
+  };
 
-    -- ALLOW 'PENDING' OR 'QUEUED' (Locked by Java)
-    IF v_status NOT IN ('PENDING', 'QUEUED', 'ERROR') THEN
-        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
-    END IF;
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setViewingBatchCreatorId(null);
+    setSelectedJournalPrefixes([]);
+    setPartialExecutorRemarks("");
+    setIsPartialSubmitting(false);
+    fetchPendingBatches();
+  };
 
-    -- 2. Fast Chunked Delete
-    LOOP
-        DELETE FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id
-          AND REQ_STATUS IN ('P', 'R') -- Clean PENDING or REJECTED
-          AND ROWNUM <= 50000;
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
+  };
 
-        EXIT WHEN SQL%ROWCOUNT = 0;
-        COMMIT; 
-    END LOOP;
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+    setExecutorRemarks("");
+  };
 
-    -- 3. Delete Master
-    DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
-    COMMIT;
+  // SUBMISSION LOGIC - FULL BATCH
+  const handleSubmitAction = async () => {
+    if (!isValidRemark(executorRemarks)) {
+      showSnackBar("A valid remark (Alphanumeric, 2-30 chars) is required.", "warning");
+      return;
+    }
 
-EXCEPTION
-    WHEN NO_DATA_FOUND THEN
-        RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
-END;
+    setIsSubmitting(true);
+    try {
+      await callApi(
+        "/JS/journals/process-bulk",
+        {
+          batchId: selectedBatch.batchId,
+          status: modalMode,
+          remarks: executorRemarks.trim(),
+        },
+        "POST"
+      );
+      showSnackBar(
+        modalMode === "ACCEPTED" ? "Batch Accepted Successfully" : "Batch Rejected Successfully",
+        "success"
+      );
+      handleCloseModal();
+      fetchPendingBatches();
+    } catch (e) {
+      showSnackBar("Failed to process request", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
 
-this is 2 procedures that we are using in the DB but tell in which file we are using this and how this flow for the Query what we are doing in the Gl balance and what we are doing in the  Insert into GL_TRANSACTIONS
+  // SUBMISSION LOGIC - PARTIAL SELECTION
+  const handleSubmitPartialAction = async (mode) => {
+    if (!isValidRemark(partialExecutorRemarks)) {
+      showSnackBar("A valid remark (Alphanumeric, 2-30 chars) is required for selection.", "warning");
+      return;
+    }
+    if (selectedJournalPrefixes.length === 0) {
+      showSnackBar("Please select at least one entry.", "warning");
+      return;
+    }
+    if (!viewingBatchId) {
+      showSnackBar("Critical Error: Batch ID missing.", "error");
+      return;
+    }
+
+    setIsPartialSubmitting(true);
+    try {
+      await callApi(
+        "/JS/journals/process-bulk",
+        {
+          batchId: viewingBatchId,
+          journalIdPrefixes: selectedJournalPrefixes,
+          status: mode,
+          remarks: partialExecutorRemarks.trim(),
+        },
+        "POST"
+      );
+      showSnackBar(
+        mode === "ACCEPTED" ? "Selected Entries Accepted" : "Selected Entries Rejected",
+        "success"
+      );
+      handleCloseViewModal();
+    } catch (e) {
+      showSnackBar("Failed to process partial request", "error");
+      setIsPartialSubmitting(false);
+    }
+  };
+
+  // TABLE EVENT HANDLERS
+  const handleDetailPageChange = (event, newPage) => {
+    setDetailPage(newPage);
+    fetchBatchDetailsPaginated(viewingBatchId, newPage, detailRowsPerPage);
+  };
+
+  const handleDetailRowsPerPageChange = (event) => {
+    const newSize = parseInt(event.target.value, 10);
+    setDetailRowsPerPage(newSize);
+    setDetailPage(0);
+    fetchBatchDetailsPaginated(viewingBatchId, 0, newSize);
+  };
+
+  const handleSelectAllClick = (event) => {
+    if (event.target.checked)
+      setSelectedJournalPrefixes(batchDetails.map((g) => g[0].journalPrefix));
+    else setSelectedJournalPrefixes([]);
+  };
+
+  const handleRowCheckboxClick = (event, prefix) => {
+    if (event) event.stopPropagation();
+    const index = selectedJournalPrefixes.indexOf(prefix);
+    let newSelected = [];
+    if (index === -1) newSelected = [...selectedJournalPrefixes, prefix];
+    else newSelected = selectedJournalPrefixes.filter((p) => p !== prefix);
+    setSelectedJournalPrefixes(newSelected);
+  };
+
+  /**
+   * MAIN DATAGRID COLUMN CONFIGURATION
+   */
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Chip label={p.value} color="warning" size="small" variant="outlined" />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Chip icon={<AccountCircleIcon />} label={p.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) =>
+        new Date(p.value).toLocaleString("en-IN", {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "requestCount",
+      headerName: "No. of Entries",
+      width: 150, // INCREASED WIDTH TO ENSURE VISIBILITY
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      width: 150,
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 150,
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 1, // ENSURED ACTIONS HAVE ADEQUATE SPACE
+      minWidth: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const isSelf =
+          currentUserId &&
+          params.row.creatorId &&
+          String(currentUserId).trim().toUpperCase() ===
+            String(params.row.creatorId).trim().toUpperCase();
+        return (
+          <Stack direction="row" spacing={1} justifyContent="center">
+            <Tooltip title="View Details">
+              <IconButton
+                onClick={() => handleOpenViewModal(params.row.batchId, params.row.creatorId)}
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={isSelf ? "Self-approval disabled" : "Approve Entire Batch"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "ACCEPTED")}
+                  color="success"
+                  disabled={isSelf}
+                >
+                  <CheckIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title={isSelf ? "Self-rejection disabled" : "Reject Entire Batch"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "REJECTED")}
+                  color="error"
+                  disabled={isSelf}
+                >
+                  <ClearIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Box sx={styles.mainContainer}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize
+        rowHeight={52}
+        initialState={{
+          pagination: { paginationModel: { page: 0, pageSize: 10 } },
+        }}
+        slots={{ noRowsOverlay: CustomNoRowsOverlay }}
+        sx={styles.dataGridContainer}
+      />
+      
+      {/* --- MAIN GRID APPROVE/REJECT DIALOG --- */}
+      <Dialog open={isModalOpen} onClose={handleCloseModal} fullWidth maxWidth="sm">
+        <DialogTitle>
+          {modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Confirming action for batch <strong>{selectedBatch?.batchId}</strong>.
+          </DialogContentText>
+          <TextField
+            autoFocus
+            required
+            label="Remarks *"
+            fullWidth
+            variant="outlined"
+            size="small"
+            value={executorRemarks}
+            onChange={(e) => setExecutorRemarks(e.target.value)}
+            disabled={isSubmitting}
+            error={executorRemarks.length > 0 && !isValidRemark(executorRemarks)}
+            helperText={
+              <Typography sx={styles.helperText}>
+                Example -> Allowed 2-30 characters (alphabets, numbers only)
+              </Typography>
+            }
+          />
+        </DialogContent>
+        <DialogActions sx={styles.dialogActions}>
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSubmitAction}
+            variant="contained"
+            color={modalMode === "ACCEPTED" ? "success" : "error"}
+            disabled={isSubmitting || !isValidRemark(executorRemarks)}
+          >
+            {isSubmitting ? <CircularProgress size={24} /> : "Confirm Action"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      
+      {/* --- VIEW DETAILS MODAL --- */}
+      <Dialog open={isViewModalOpen} onClose={handleCloseViewModal} fullWidth maxWidth="lg">
+        <DialogTitle sx={styles.dialogTitle}>
+          <Typography variant="h6">Batch Details: {viewingBatchId}</Typography>
+          <IconButton onClick={handleCloseViewModal}>
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers sx={{ p: 0 }}>
+          <Box sx={styles.fixedContentBox}>
+            {isLargeBatch && (
+              <Alert severity="info" sx={{ m: 1 }}>
+                Batch contains {detailTotalCount} entries. Partial approval is disabled for large batches (> 2000). 
+                Please approve/reject the entire batch from the main list.
+              </Alert>
+            )}
+
+            {detailLoading ? (
+              <Box sx={styles.loadingContainer}>
+                <CircularProgress />
+              </Box>
+            ) : batchDetails.length > 0 ? (
+              <>
+                <TableContainer component={Paper} sx={styles.tableContainer}>
+                  <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell padding="checkbox" sx={styles.stickyHeaderColumn(0)}>
+                          <Checkbox
+                            color="primary"
+                            indeterminate={
+                              selectedJournalPrefixes.length > 0 &&
+                              selectedJournalPrefixes.length < batchDetails.length
+                            }
+                            checked={
+                              batchDetails.length > 0 &&
+                              selectedJournalPrefixes.length === batchDetails.length
+                            }
+                            onChange={handleSelectAllClick}
+                            disabled={isViewingSelfCreated || isLargeBatch}
+                          />
+                        </TableCell>
+                        <TableCell align="center" sx={styles.stickyHeaderColumn(48)}>
+                          Journal ID
+                        </TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Branch</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => {
+                        const isSelected = selectedJournalPrefixes.includes(group[0].journalPrefix);
+                        return group.map((row, rowIndex) => (
+                          <TableRow
+                            key={row.id}
+                            hover={!isViewingSelfCreated && !isLargeBatch}
+                            onClick={() =>
+                              !isViewingSelfCreated &&
+                              !isLargeBatch && 
+                              handleRowCheckboxClick(null, row.journalPrefix)
+                            }
+                            selected={isSelected}
+                            sx={{
+                              cursor: (isViewingSelfCreated || isLargeBatch) ? "not-allowed" : "pointer",
+                              ...(rowIndex === 0 && groupIndex > 0 && { borderTop: 1, borderColor: "divider" }),
+                            }}
+                          >
+                            {rowIndex === 0 && (
+                              <>
+                                <TableCell padding="checkbox" rowSpan={group.length} sx={styles.stickyBodyColumn(0)}>
+                                  <Checkbox
+                                    color="primary"
+                                    checked={isSelected}
+                                    disabled={isViewingSelfCreated || isLargeBatch}
+                                    onClick={(e) => handleRowCheckboxClick(e, row.journalPrefix)}
+                                  />
+                                </TableCell>
+                                <TableCell align="center" rowSpan={group.length} sx={styles.stickyBodyColumn(48)}>
+                                  {row.journalPrefix}
+                                </TableCell>
+                              </>
+                            )}
+                            <TableCell align="center">{row.payload.branch}</TableCell>
+                            <TableCell align="center">{row.payload.currency}</TableCell>
+                            <TableCell align="center">{row.payload.cgl}</TableCell>
+                            <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
+                            <TableCell align="center">
+                              <Chip
+                                label={row.transactionType}
+                                color={getTxnTypeColor(row.transactionType)}
+                                size="small"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ));
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                <TablePagination
+                  component="div"
+                  count={detailTotalCount}
+                  page={detailPage}
+                  onPageChange={handleDetailPageChange}
+                  rowsPerPage={detailRowsPerPage}
+                  onRowsPerPageChange={handleDetailRowsPerPageChange}
+                  rowsPerPageOptions={[10, 25, 50]}
+                />
+              </>
+            ) : (
+              <Typography sx={{ p: 3 }}>No details available for this batch.</Typography>
+            )}
+          </Box>
+        </DialogContent>
+        <DialogActions sx={styles.dialogActions}>
+          <Grid container spacing={2} alignItems="center">
+            <Grid item xs={12} md={6}>
+              <TextField
+                required
+                margin="dense"
+                label="Remarks (Selected Entries) *"
+                fullWidth
+                size="small"
+                variant="outlined"
+                value={partialExecutorRemarks}
+                onChange={(e) => setPartialExecutorRemarks(e.target.value)}
+                disabled={isPartialSubmitting || selectedJournalPrefixes.length === 0 || isViewingSelfCreated}
+                error={partialExecutorRemarks.length > 0 && !isValidRemark(partialExecutorRemarks)}
+                helperText={
+                  <Typography sx={styles.helperText}>
+                    Example -> Allowed 2-30 characters (alphabets, numbers only)
+                  </Typography>
+                }
+              />
+            </Grid>
+            <Grid item xs={12} md={6}>
+              <Stack direction="row" spacing={1} justifyContent="flex-end">
+                <Button
+                  variant="contained"
+                  color="success"
+                  onClick={() => handleSubmitPartialAction("ACCEPTED")}
+                  disabled={
+                    isPartialSubmitting ||
+                    selectedJournalPrefixes.length === 0 ||
+                    isViewingSelfCreated ||
+                    !isValidRemark(partialExecutorRemarks)
+                  }
+                >
+                  Accept Selection
+                </Button>
+                <Button
+                  variant="contained"
+                  color="error"
+                  onClick={() => handleSubmitPartialAction("REJECTED")}
+                  disabled={
+                    isPartialSubmitting ||
+                    selectedJournalPrefixes.length === 0 ||
+                    isViewingSelfCreated ||
+                    !isValidRemark(partialExecutorRemarks)
+                  }
+                >
+                  Reject Selection
+                </Button>
+              </Stack>
+            </Grid>
+          </Grid>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
