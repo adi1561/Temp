@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Box,
   Typography,
@@ -13,7 +13,8 @@ import {
   Tooltip,
   Checkbox,
   FormControlLabel,
-  Chip // Added Chip for Memo UI
+  Chip,
+  FormHelperText
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
@@ -49,16 +50,15 @@ export default function JournalPosting() {
 
   const [rows, setRows] = useState([initialRowState]);
   const [currencyOptions, setCurrencyOptions] = useState([]);
-
   const [isSubmitting, setIsSubmitting] = useState(false);
-
   const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
   const [postingDate, setPostingDate] = useState("");
-
-  // Checkbox
   const [checked, setChecked] = useState(false);
 
-  // FIX: Track loading by row.id instead of a single boolean
+  // States to control search dropdown visibility
+  const [activeBranchSearchId, setActiveBranchSearchId] = useState(null);
+  const [activeCglSearchId, setActiveCglSearchId] = useState(null);
+
   const [branchSearch, setBranchSearch] = useState({
     loadingId: null,
     options: [],
@@ -83,7 +83,6 @@ export default function JournalPosting() {
             const formattedDate = `${day}-${month}-${year}`;
             setPostingDate(formattedDate);
           } catch (e) { 
-            console.error("Could not parse date:", dateResponse, e);
             setPostingDate(dateResponse);
           }
         } else {
@@ -93,301 +92,163 @@ export default function JournalPosting() {
 
         const currencyResponse = await callApi("/CM/common-master/currency", null, "GET");
         if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
-          const uniqueCurrencies = [...new Set(currencyResponse.data)];
-          setCurrencyOptions(uniqueCurrencies);
+          setCurrencyOptions([...new Set(currencyResponse.data)]);
         } else {
           showSnackBar("Failed to load currencies.", "error");
         }
       } catch (error) {
-        console.error("Error fetching initial data:", error);
         showSnackBar("An error occurred while loading page data.", "error");
       }
     };
-
     fetchInitialData();
   }, [callApi, showSnackBar]);
 
+  // Filtering function: allows only a-z, A-Z, 0-9 and space
+  const filterRemarks = (val) => val.replace(/[^a-zA-Z0-9 ]/g, "");
+  const isRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+
   const handleAddRow = () => {
     const lastRow = rows[rows.length - 1];
-
-    if (
-      !lastRow.branch ||
-      !lastRow.currency ||
-      !lastRow.cgl ||
-      !lastRow.amount ||
-      !lastRow.txnType
-    ) {
-      showSnackBar(
-        "Please fill all required fields (*) in the current row before adding a new one.",
-        "warning"
-      );
+    if (!lastRow.branch || !lastRow.currency || !lastRow.cgl || !lastRow.amount || !lastRow.txnType) {
+      showSnackBar("Please fill all required fields (*) in the current row before adding a new one.", "warning");
       return;
     }
-
-    const newRow = {
-      ...initialRowState,
-      id: Date.now(),
-      remarks: checked ? commonBatchRemarks : "",
-    };
+    const newRow = { ...initialRowState, id: Date.now(), remarks: checked ? commonBatchRemarks : "" };
     setRows([...rows, newRow]);
   };
   
-  const handleChange = (event) => {
+  const handleCheckboxChange = (event) => {
     const isChecked = event.target.checked;
     setChecked(isChecked);
-
-    if (isChecked) {
-      const newRows = rows.map((row) => ({
-        ...row,
-        remarks: commonBatchRemarks,
-      }));
-      setRows(newRows);
-    } else {
-      const newRows = rows.map((row) => ({
-        ...row,
-        remarks: "",
-      }));
-      setRows(newRows);
-    }
+    setRows(rows.map((row) => ({ ...row, remarks: isChecked ? commonBatchRemarks : "" })));
   };
 
   const handleDeleteRow = (id) => {
-    if (rows.length > 1) {
-      setRows(rows.filter((row) => row.id !== id));
-    } else {
-      showSnackBar("Cannot delete the first row.", "warning");
-    }
+    if (rows.length > 1) setRows(rows.filter((row) => row.id !== id));
+    else showSnackBar("Cannot delete the first row.", "warning");
   };
 
   const handleRowChange = (id, field, value) => {
-    const newRows = rows.map((row) => {
-      if (row.id === id) {
-        return { ...row, [field]: value };
-      }
-      return row;
-    });
-    setRows(newRows);
+    setRows(rows.map((row) => (row.id === id ? { ...row, [field]: value } : row)));
   };
 
-  // FIX: Pass rowId to explicitly map the loading spinner
   const searchBranches = useCallback(
     debounce(async (query, rowId) => {
-      if (!query) {
+      if (!query || query.trim().length === 0) {
         setBranchSearch({ loadingId: null, options: [] });
+        setActiveBranchSearchId(null);
         return;
       }
       setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
+      setActiveBranchSearchId(rowId);
       try {
-        const response = await callApi(
-          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
-          null,
-          "GET"
-        );
-
+        const response = await callApi(`/JS/branches-journal/search?query=${encodeURIComponent(query)}`, null, "GET");
         setBranchSearch({ loadingId: null, options: response || [] });
       } catch (error) {
-        showSnackBar("Branch search failed.", "error");
         setBranchSearch({ loadingId: null, options: [] });
       }
     }, 300),
-    [callApi, showSnackBar]
+    [callApi]
   );
 
-  // FIX: Pass rowId to explicitly map the loading spinner
   const searchCgls = useCallback(
     debounce(async (query, rowId) => {
-      if (!query) {
+      if (!query || query.trim().length === 0) {
         setCglSearch({ loadingId: null, options: [] });
+        setActiveCglSearchId(null);
         return;
       }
       setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
+      setActiveCglSearchId(rowId);
       try { 
-        const response = await callApi(
-          `/JS/cgl-journal/search?query=${encodeURIComponent(query)}`,
-          null,
-          "GET"
-        );
-
+        const response = await callApi(`/JS/cgl-journal/search?query=${encodeURIComponent(query)}`, null, "GET");
         setCglSearch({ loadingId: null, options: response || [] });
       } catch (error) {
-        showSnackBar("CGL search failed.", "error");
         setCglSearch({ loadingId: null, options: [] });
       }
     }, 300),
-    [callApi, showSnackBar]
+    [callApi]
   );
 
   const handleSubmit = async () => {
-    setIsSubmitting(true);
-
-    if (!commonBatchRemarks.trim()) {
-      showSnackBar(
-        "Please enter Common Batch Remarks before submitting.",
-        "error"
-      );
-      setIsSubmitting(false);
+    if (!isRemarksValid(commonBatchRemarks)) {
+      showSnackBar("Common Batch Remarks are compulsory (2-30 characters).", "error");
       return;
     }
-
+    
+    setIsSubmitting(true);
     const cglCheck = new Map();
-    for (const row of rows) {
-      if (!row.branch || !row.currency || !row.cgl) {
-        continue;
-      }
-      const key = `${row.branch.code}-${row.currency}`;
-      const cgl = row.cgl.cglNumber;
-
-      if (!cglCheck.has(key)) {
-        cglCheck.set(key, new Set());
-      }
-
-      const cglSet = cglCheck.get(key);
-      if (cglSet.has(cgl)) {
-        showSnackBar(
-          `Duplicate CGL entry: "${cgl}" is used more than once for branch "${row.branch.name}" and currency "${row.currency}".`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
-      }
-      cglSet.add(cgl);
-    }
-
-    // --- MEMO LOGIC UPDATE START ---
     const branchCurrencyTotals = new Map();
     const branchEntryCheck = new Map();
     const rowPayloads = [];
 
     for (const [index, row] of rows.entries()) {
-      if (
-        !row.branch ||
-        !row.currency ||
-        !row.cgl ||
-        !row.amount ||
-        !row.txnType
-      ) {
-        showSnackBar(
-          `Row ${index + 1} is incomplete. Please fill all required fields.`,
-          "error"
-        );
+      if (!row.branch || !row.currency || !row.cgl || !row.amount || !row.txnType) {
+        showSnackBar(`Row ${index + 1} is incomplete. Please fill all required fields.`, "error");
         setIsSubmitting(false);
         return;
       }
 
-      const branchCode = row.branch.code;
-      const branchName = row.branch.name;
-      const currency = row.currency;
+      // Duplicate Check
+      const key = `${row.branch.code}-${row.currency}`;
+      const cglNum = row.cgl.cglNumber;
+      if (!cglCheck.has(key)) cglCheck.set(key, new Set());
+      if (cglCheck.get(key).has(cglNum)) {
+        showSnackBar(`Duplicate CGL entry: "${cglNum}" is used more than once for branch "${row.branch.name}" and currency "${row.currency}".`, "error");
+        setIsSubmitting(false); return;
+      }
+      cglCheck.get(key).add(cglNum);
 
-      // Identify Memo vs Normal
-      const cglNumber = String(row.cgl.cglNumber);
-      const isMemo = cglNumber.startsWith("5");
+      // Totals & Memo Logic
+      const isMemo = String(cglNum).startsWith("5");
       const type = isMemo ? "MEMO" : "NORMAL";
-
-      const [integerPart = "0", fractionalPart = "0"] = (
-        row.amount || "0"
-      ).split(".");
-      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
-      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
-
-      // Composite key now includes Type (Memo/Normal)
-      const compositeKey = `${branchCode}-${currency}-${type}`;
+      const [intPart = "0", fracPart = "0"] = (row.amount || "0").split(".");
+      const amountAsBigInt = BigInt(intPart + fracPart.substring(0, 4).padEnd(4, "0"));
+      const compositeKey = `${row.branch.code}-${row.currency}-${type}`;
 
       if (!branchCurrencyTotals.has(compositeKey)) {
-        branchCurrencyTotals.set(compositeKey, {
-          totalDebit: 0n,
-          totalCredit: 0n,
-          branchName: branchName,
-          branchCode: branchCode,
-          currency: currency,
-          type: type, // Store type for validation message
-        });
+        branchCurrencyTotals.set(compositeKey, { totalDebit: 0n, totalCredit: 0n, branchName: row.branch.name, branchCode: row.branch.code, currency: row.currency, type });
       }
       const currencyTotals = branchCurrencyTotals.get(compositeKey);
+      if (row.txnType === "Debit") currencyTotals.totalDebit += amountAsBigInt;
+      else currencyTotals.totalCredit += amountAsBigInt;
 
-      if (row.txnType === "Debit") {
-        currencyTotals.totalDebit += amountAsBigInt;
-      } else if (row.txnType === "Credit") {
-        currencyTotals.totalCredit += amountAsBigInt;
+      if (!branchEntryCheck.has(row.branch.code)) {
+        branchEntryCheck.set(row.branch.code, { hasDebit: false, hasCredit: false, branchName: row.branch.name });
       }
+      const bCheck = branchEntryCheck.get(row.branch.code);
+      if (row.txnType === "Debit") bCheck.hasDebit = true;
+      else bCheck.hasCredit = true;
 
-      if (!branchEntryCheck.has(branchCode)) {
-        branchEntryCheck.set(branchCode, {
-          hasDebit: false,
-          hasCredit: false,
-          branchName: branchName,
-        });
-      }
-      const branchCheck = branchEntryCheck.get(branchCode);
-
-      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
-        branchCheck.hasDebit = true;
-      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
-        branchCheck.hasCredit = true;
-      }
-
-      const finalAmount =
-        row.txnType === "Credit" ? "-" + row.amount : row.amount;
-
-      // FIX: Removed changeType: "ADD"
       rowPayloads.push({
         branch: row.branch.code,
         currency: row.currency,
         cgl: row.cgl.cglNumber,
-        amount: finalAmount,
+        amount: row.txnType === "Credit" ? "-" + row.amount : row.amount,
         productType: row.productCode,
         remarks: row.remarks,
         arFlag: "A",
       });
     }
 
-    for (const [branchCode, totals] of branchEntryCheck.entries()) {
-      const { hasDebit, hasCredit, branchName } = totals;
-      if (!hasDebit || !hasCredit) {
-        showSnackBar(
-          `Submission failed. Branch "${branchName}" (${branchCode}) must have at least one Debit and one Credit entry.`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
+    // Validation Loops
+    for (const [code, totals] of branchEntryCheck.entries()) {
+      if (!totals.hasDebit || !totals.hasCredit) {
+        showSnackBar(`Branch "${totals.branchName}" (${code}) must have at least one Debit and one Credit entry.`, "error");
+        setIsSubmitting(false); return;
       }
     }
 
-    // Validate Totals (Bucket-wise: Branch + Currency + Type)
-    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
-      const { totalDebit, totalCredit, branchName, branchCode, currency, type } =
-        totals;
-
-      if (totalDebit !== totalCredit) {
-        showSnackBar(
-          `Submission failed. Totals for ${type} entries in branch "${branchName}" (${branchCode}) and currency "${currency}" do not match. Debit: ${formatBigIntForDisplay(
-            totalDebit
-          )}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
+    for (const totals of branchCurrencyTotals.values()) {
+      if (totals.totalDebit !== totals.totalCredit) {
+        showSnackBar(`Totals for ${totals.type} in branch "${totals.branchName}" and currency "${totals.currency}" do not match.`, "error");
+        setIsSubmitting(false); return;
       }
     }
-    // --- MEMO LOGIC UPDATE END ---
-
-    const finalPayload = {
-      commonBatchRemarks: commonBatchRemarks.trim(),
-      rows: rowPayloads,
-    };
 
     try {
-      const response = await callApi(
-        "/JS/journals/create-batch",
-        finalPayload,
-        "POST"
-      );
-
-      const newBatchId = response?.[0]?.batchId || "N/A";
-
-      showSnackBar(
-        `All ${response.length} Journal entries submitted successfully! Batch ID: ${newBatchId}`,
-        "success"
-      );
+      const response = await callApi("/JS/journals/create-batch", { commonBatchRemarks: commonBatchRemarks.trim(), rows: rowPayloads }, "POST");
+      showSnackBar(`Journal entries submitted successfully! Batch ID: ${response?.[0]?.batchId || "N/A"}`, "success");
       setRows([{ ...initialRowState, id: Date.now() }]);
       setCommonBatchRemarks("");
       setChecked(false);
@@ -400,195 +261,131 @@ export default function JournalPosting() {
 
   return (
     <Box sx={{ p: 3, maxWidth: "98%" }}>
-      <Paper elevation={3} sx={{ p: 3 }}>
-        <Box>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-            <Typography variant="body1" fontWeight="bold" component="span">
-              Posting Date:
-            </Typography>
-            <Typography variant="body1" fontWeight="bold" component="span">
-              {postingDate}
-            </Typography>
-          </Box>
-          <Box sx={{ marginTop: 0.5 }}>
-            <Typography
-              variant="body2"
-              component="span"
-              sx={{ color: "#ec0101ff" }}
-            >
-              Note: All Journals will be Posted on this Date
-            </Typography>
-          </Box>
+      <Paper elevation={3} sx={{ p: 3, borderRadius: '12px' }}>
+        <Box sx={{ mb: 3 }}>
+          <Stack direction="row" spacing={1} alignItems="center">
+            <Typography variant="body1" fontWeight="bold">Posting Date:</Typography>
+            <Typography variant="body1" color="primary" fontWeight="bold">{postingDate}</Typography>
+          </Stack>
+          <Typography variant="caption" color="error" sx={{ fontWeight: 500 }}>
+            Note: All journals will be posted on this date.
+          </Typography>
         </Box>
 
-        <Grid item xs={12} md={12} sx={{ margin: "1% 0%", width: "95%" }}>
-          <TextField
-            label="Common Batch Remarks"
-            value={commonBatchRemarks}
-            onChange={(e) => {
-              const newValue = e.target.value;
-              if (newValue.length <= 50) {
-                setCommonBatchRemarks(newValue);
-
-                if (checked && newValue.trim()) {
-                  setRows(
-                    rows.map((row) => ({
-                      ...row,
-                      remarks: newValue,
-                    }))
-                  );
+        <Grid container sx={{ mb: 2 }}>
+          <Grid item xs={12} md={8}>
+            <TextField
+              label="Common Batch Remarks *"
+              value={commonBatchRemarks}
+              onChange={(e) => {
+                const filtered = filterRemarks(e.target.value);
+                if (filtered.length <= 30) {
+                  setCommonBatchRemarks(filtered);
+                  if (checked) setRows(rows.map(r => ({ ...r, remarks: filtered })));
                 }
-
-                if (!newValue.trim()) {
-                  setChecked(false);
-                  setRows(
-                    rows.map((row) => ({
-                      ...row,
-                      remarks: "",
-                    }))
-                  );
-                }
-              }
-            }}
-            fullWidth
-            required
-            multiline
-            rows={1}
-            InputProps={{
-              inputProps: {
-                maxLength: 50,
-              },
-            }}
-          />
-          <Box sx={{ display: "flex", alignItems: "center" }}>
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={checked}
-                  onChange={handleChange}
-                  color="primary"
-                  disabled={!commonBatchRemarks.trim()}
-                />
-              }
-              label="Apply This Remark To All Below Transaction"
+              }}
+              fullWidth
+              required
+              multiline
+              rows={1}
+              inputProps={{ maxLength: 30 }}
+              error={commonBatchRemarks.length > 0 && !isRemarksValid(commonBatchRemarks)}
             />
-          </Box>
+            <FormHelperText sx={{ color: 'text.secondary' }}>
+              Allowed: 2-30 characters (alphabets, numbers, and spaces only)
+            </FormHelperText>
+            <FormControlLabel
+              control={<Checkbox checked={checked} onChange={handleCheckboxChange} disabled={!isRemarksValid(commonBatchRemarks)} />}
+              label="Apply this remark to all transactions below"
+            />
+          </Grid>
         </Grid>
 
         <Box>
           {rows.map((row, index) => (
             <React.Fragment key={row.id}>
-              <Grid container spacing={2} alignItems="center">
+              <Grid container spacing={2} alignItems="flex-start" sx={{ mb: 1 }}>
                 {/* Branch */}
-                <Grid item xs={12} md={3} size={1.8}>
+                <Grid item xs={12} md={2.5}>
                   <Autocomplete
-                    popupIcon={null}
+                    open={activeBranchSearchId === row.id && branchSearch.options.length > 0}
+                    onOpen={() => {}}
+                    onClose={() => setActiveBranchSearchId(null)}
                     autoHighlight
                     options={branchSearch.options}
-                    getOptionLabel={(option) =>
-                      `${option.code} - ${option.name}`
-                    }
+                    getOptionLabel={(option) => `${option.code} - ${option.name}`}
                     value={row.branch}
-                    onChange={(event, newValue) =>
-                      handleRowChange(row.id, "branch", newValue)
-                    }
-                    onInputChange={(event, newInputValue) =>
-                      searchBranches(newInputValue, row.id) // FIX: pass row.id
-                    }
-                    loading={branchSearch.loadingId === row.id} // FIX: check row.id
+                    onChange={(event, newValue) => handleRowChange(row.id, "branch", newValue)}
+                    onInputChange={(event, newInputValue) => searchBranches(newInputValue, row.id)}
+                    loading={branchSearch.loadingId === row.id}
                     filterOptions={(x) => x}
-                    isOptionEqualToValue={(option, value) =>
-                      option.code === value.code
-                    }
-                    noOptionsText=""
                     renderInput={(params) => (
-                      <Tooltip
-                        title="Search by Branch name or Branch code"
-                        placement="top-start"
-                      >
-                        <TextField
-                          {...params}
-                          label="Branch *"
-                          placeholder="Search by name or code"
-                          InputLabelProps={{ shrink: true }}
-                          InputProps={{
-                            ...params.InputProps,
-                            endAdornment: (
-                              <Box>
-                                {branchSearch.loadingId === row.id ? ( // FIX: check row.id
-                                  <CircularProgress color="inherit" size={20} />
-                                ) : null}
-                                {params.InputProps.endAdornment}
-                              </Box>
-                            ),
-                          }}
-                        />
-                      </Tooltip>
+                      <TextField
+                        {...params}
+                        label="Branch *"
+                        InputLabelProps={{ shrink: true }}
+                        placeholder="Type to search..."
+                        InputProps={{
+                          ...params.InputProps,
+                          endAdornment: (
+                            <React.Fragment>
+                              {branchSearch.loadingId === row.id ? <CircularProgress color="inherit" size={20} /> : null}
+                              {params.InputProps.endAdornment}
+                            </React.Fragment>
+                          ),
+                        }}
+                      />
                     )}
                   />
                 </Grid>
 
                 {/* Currency */}
-                <Grid item xs={12} md={1.5} size={1.5}>
+                <Grid item xs={12} md={1.3}>
                   <TextField
-                    popupIcon={null}
                     select
                     label="Currency *"
                     value={row.currency}
-                    onChange={(e) =>
-                      handleRowChange(row.id, "currency", e.target.value)
-                    }
+                    onChange={(e) => handleRowChange(row.id, "currency", e.target.value)}
                     fullWidth
+                    SelectProps={{
+                      MenuProps: {
+                        PaperProps: { style: { maxHeight: 250 } },
+                        anchorOrigin: { vertical: "bottom", horizontal: "left" },
+                        transformOrigin: { vertical: "top", horizontal: "left" },
+                      }
+                    }}
                   >
-                    <MenuItem value="" disabled>
-                      <em>Select Currency</em>
-                    </MenuItem>
-                    {currencyOptions.map((c) => (
-                      <MenuItem key={c} value={c}>
-                        {c}
-                      </MenuItem>
-                    ))}
+                    {currencyOptions.map((c) => <MenuItem key={c} value={c}>{c}</MenuItem>)}
                   </TextField>
                 </Grid>
 
                 {/* CGL */}
-                <Grid item xs={12} md={2} size={1.8}>
+                <Grid item xs={12} md={2.2}>
                   <Autocomplete
-                    popupIcon={null}
+                    open={activeCglSearchId === row.id && cglSearch.options.length > 0}
+                    onClose={() => setActiveCglSearchId(null)}
                     autoHighlight
                     options={cglSearch.options}
-                    getOptionLabel={(option) =>
-                      `${option.cglNumber} - ${option.description}`
-                    }
+                    getOptionLabel={(option) => `${option.cglNumber} - ${option.description}`}
                     value={row.cgl}
-                    onChange={(event, newValue) =>
-                      handleRowChange(row.id, "cgl", newValue)
-                    }
-                    onInputChange={(event, newInputValue) =>
-                      searchCgls(newInputValue, row.id) // FIX: pass row.id
-                    }
-                    loading={cglSearch.loadingId === row.id} // FIX: check row.id
+                    onChange={(event, newValue) => handleRowChange(row.id, "cgl", newValue)}
+                    onInputChange={(event, newInputValue) => searchCgls(newInputValue, row.id)}
+                    loading={cglSearch.loadingId === row.id}
                     filterOptions={(x) => x}
-                    isOptionEqualToValue={(option, value) =>
-                      option.cglNumber === value.cglNumber
-                    }
-                    noOptionsText=""
                     renderInput={(params) => (
                       <TextField
                         {...params}
                         label="CGL *"
-                        placeholder="Search CGL by number or name"
                         InputLabelProps={{ shrink: true }}
+                        placeholder="Type to search..."
                         InputProps={{
                           ...params.InputProps,
                           endAdornment: (
-                            <Box sx={{ marginLeft: "2%", display: "flex", alignItems: "center" }}>
+                            <Box sx={{ display: "flex", alignItems: "center" }}>
                               {row.cgl && String(row.cgl.cglNumber).startsWith("5") && (
-                                <Chip label="MEMO" size="small" color="warning" sx={{ height: 20, fontSize: "0.7rem", mr: 1 }} />
+                                <Chip label="MEMO" size="small" color="warning" sx={{ height: 20, fontSize: "0.65rem", mr: 0.5 }} />
                               )}
-                              {cglSearch.loadingId === row.id ? ( // FIX: check row.id
-                                <CircularProgress color="inherit" size={20} />
-                              ) : null}
+                              {cglSearch.loadingId === row.id ? <CircularProgress color="inherit" size={20} /> : null}
                               {params.InputProps.endAdornment}
                             </Box>
                           ),
@@ -599,122 +396,55 @@ export default function JournalPosting() {
                 </Grid>
 
                 {/* Amount */}
-                <Grid item xs={12} md={2} size={1.5}>
+                <Grid item xs={12} md={1.5}>
                   <TextField
                     label="Amount *"
-                    type="text"
                     value={row.amount}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (/^\d{0,21}(\.\d{0,4})?$/.test(val)) {
-                        handleRowChange(row.id, "amount", val);
-                      }
-                    }}
+                    onChange={(e) => { if (/^\d{0,21}(\.\d{0,4})?$/.test(e.target.value)) handleRowChange(row.id, "amount", e.target.value); }}
                     fullWidth
                     placeholder="0.0000"
                   />
                 </Grid>
 
                 {/* Txn Type */}
-                <Grid item xs={12} md={1} size={1.3}>
-                  <TextField
-                    select
-                    label="Txn Type *"
-                    value={row.txnType}
-                    onChange={(e) =>
-                      handleRowChange(row.id, "txnType", e.target.value)
-                    }
-                    fullWidth
-                  >
-                    <MenuItem value="" disabled>
-                      <em>Select Type</em>
-                    </MenuItem>
+                <Grid item xs={12} md={1.2}>
+                  <TextField select label="Type *" value={row.txnType} onChange={(e) => handleRowChange(row.id, "txnType", e.target.value)} fullWidth>
                     <MenuItem value="Debit">Debit</MenuItem>
                     <MenuItem value="Credit">Credit</MenuItem>
                   </TextField>
                 </Grid>
 
-                {/* Product Code */}
-                <Grid item xs={12} md={2} size={1.5}>
-                  <TextField
-                    label="Product Code"
-                    value={row.productCode}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (/^\d{0,8}$/.test(val)) {
-                        handleRowChange(row.id, "productCode", val);
-                      }
-                    }}
-                    fullWidth
-                    InputProps={{
-                      inputProps: {
-                        maxLength: 8,
-                      },
-                    }}
-                  />
-                </Grid>
-
                 {/* Remarks (Individual) */}
-                <Grid item xs={12} md={2} size={2}>
+                <Grid item xs={12} md={2.3}>
                   <TextField
-                    label="Remarks"
+                    label="Remarks *"
                     value={row.remarks}
                     onChange={(e) => {
-                      const val = e.target.value;
-
-                      if (val.length <= 50) {
-                        handleRowChange(row.id, "remarks", val);
-                      }
+                      const filtered = filterRemarks(e.target.value);
+                      if (filtered.length <= 30) handleRowChange(row.id, "remarks", filtered);
                     }}
                     fullWidth
-                    InputProps={{
-                      inputProps: {
-                        maxLength: 50,
-                      },
-                      readOnly: checked,
-                    }}
+                    disabled={checked}
+                    inputProps={{ maxLength: 30 }}
+                    error={row.remarks.length > 0 && !isRemarksValid(row.remarks)}
                   />
+                  <Typography variant="caption" sx={{ fontSize: '0.65rem', color: 'text.secondary' }}>
+                    Allowed: 2-30 chars (A-Z, 0-9)
+                  </Typography>
                 </Grid>
 
-                {/* Actions */}
-                <Grid item xs={12} md={0.5} sx={{ textAlign: "center" }}>
-                  <IconButton
-                    onClick={() => handleDeleteRow(row.id)}
-                    aria-label="delete row"
-                  >
-                    <DeleteIcon />
-                  </IconButton>
+                <Grid item xs={12} md={1} sx={{ textAlign: "center", pt: 1 }}>
+                  <IconButton onClick={() => handleDeleteRow(row.id)} color="error" size="small"><DeleteIcon /></IconButton>
                 </Grid>
               </Grid>
-
-              {index < rows.length - 1 && (
-                <Box
-                  sx={{
-                    borderBottom: 1,
-                    borderColor: "divider",
-                    my: 2,
-                  }}
-                />
-              )}
+              {index < rows.length - 1 && <Box sx={{ borderBottom: 1, borderColor: "divider", my: 2 }} />}
             </React.Fragment>
           ))}
 
-          <Box sx={{ mt: 3, display: "flex", gap: 2, justifyContent: "right" }}>
-            <Button
-              variant="contained"
-              startIcon={<AddIcon />}
-              onClick={handleAddRow}
-            >
-              Add Row
-            </Button>
-
-            <Button
-              variant="contained"
-              color="success"
-              onClick={handleSubmit}
-              disabled={isSubmitting}
-            >
-              {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
+          <Box sx={{ mt: 4, display: "flex", gap: 2, justifyContent: "flex-end" }}>
+            <Button variant="outlined" startIcon={<AddIcon />} onClick={handleAddRow}>Add Row</Button>
+            <Button variant="contained" color="success" onClick={handleSubmit} disabled={isSubmitting || !isRemarksValid(commonBatchRemarks)}>
+              {isSubmitting ? <CircularProgress size={24} /> : "Submit Journal"}
             </Button>
           </Box>
         </Box>
@@ -722,14 +452,3 @@ export default function JournalPosting() {
     </Box>
   );
 }
-
-
-
-in this file add validation for that remarks where we are adding for other files 
-and there is one problem like 
-when i search in the branch , cgl at the start as i click in the input for search there is empty tray comming which should not be there 
-only when i start typing then only  i should get the data 
-
-when i clik on the curreny that drop down is above the that drop feilds Design wise it not looking good 
-that drop down should come with scroll and 
-
