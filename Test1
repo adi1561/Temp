@@ -1,15 +1,38 @@
-Here are simple, professional one-liners for your screens, following the style of your other descriptions:
-### **Journal Management Menu Descriptions**
- * **Journal Posting**
-   To create and submit manual journal entries for financial processing.
- * **Journal Authorization**
-   To review and process the pending approval requests for journal entries.
- * **Journal Posting Status**
-   To check the current status and history of all submitted journal entries.
- * **Journal Bulk Upload**
-   To upload and process many journal entries at once using a single file.
-### **Why these work:**
- * **Simple**: They avoid complex words like "authorization requests" or "systematic processing" where possible.
- * **Consistent**: They use the same "To [action]..." format as your existing menu.
- * **Clear**: They explain exactly what the user does on that screen.
-Do these work for your menu, or would you like them even shorter?
+Testing the backend directly via API endpoints is exactly what you should be doing. In fact, bypassing the frontend using a tool like Postman, Insomnia, or cURL is the best way to isolate backend bugs without UI interference.
+To test the HDFS sync logic, we need to look at how your system is designed. The HDFS sync isn't an isolated endpoint; it gets triggered automatically when a user **approves** a pending journal batch.
+Here is the exact blueprint to trigger this flow using Postman or cURL.
+### Step 1: Prepare Your Authentication
+Your SecurityConfig relies on a stateless JWT architecture and a ContextRbacFilter. You will need a valid JWT token. If your auth service is running, log in to get a token, or grab a fresh one if you have a local workaround.
+### Step 2: Trigger the Bulk Process Endpoint
+You need to simulate a user approving a batch. This will trigger JournalRequestController.processBulkRequests.
+ * **HTTP Method:** POST
+ * **URL:** http://localhost:<YOUR_PORT>/api/journals/process-bulk
+ * **Headers:**
+   * Content-Type: application/json
+   * Authorization: Bearer <YOUR_JWT_TOKEN>
+ * **JSON Body:** Based on your BulkProcessJournalRequestDto, the payload should look like this:
+```json
+{
+  "batchId": "YOUR_PENDING_BATCH_ID",
+  "status": "ACCEPTED",
+  "remarks": "Testing HDFS sync via Postman",
+  "journalIdPrefixes": []
+}
+
+```
+*(Make sure to replace "YOUR_PENDING_BATCH_ID" with an actual batch ID currently sitting in PENDING status in your database).*
+### Step 3: Observe the Fallback Logic
+Because your Thrift server is currently failing, here is what will happen in the background when you hit that endpoint:
+ 1. The API will immediately return a 202 ACCEPTED status with a message saying "Approval process started...".
+ 2. In the background, the @Async("bulkExecutor") thread will run the Oracle procedure to approve the batch.
+ 3. It will then attempt to call hdfsSyncService.syncToDataLake(syncData).
+ 4. **The Catch:** Because the Thrift server is down, this will throw a DataAccessException.
+ 5. Your error handling will catch it and insert the batch into the HDFS_SYNC_RETRY_QUEUE.
+### Step 4: Verify the Database
+Since the Thrift connection is failing, your true test of the backend logic right now is checking if that fallback worked. Run this query in your Oracle DB:
+```sql
+SELECT * FROM HDFS_SYNC_RETRY_QUEUE WHERE BATCH_ID = 'YOUR_PENDING_BATCH_ID';
+
+```
+If the record is there with a status of PENDING, your backend logic is working perfectly and successfully caught the Thrift server failure. Once your Thrift server is back online, your scheduled HdfsRecoveryService will automatically wake up every 5 minutes and process that queue.
+Do you have Postman set up, and do you know the ID of a pending batch you can use to run this test?
