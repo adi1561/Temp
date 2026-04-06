@@ -1,110 +1,80 @@
-package com.fincore.JournalService.Repository;
-
-import java.util.List;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Modifying;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
-import org.springframework.stereotype.Repository;
-import org.springframework.data.repository.query.Param;
+After updating your repository with the "starts with" methods, the next file to modify is your **Service Implementation** file, typically named **JournalRequestServiceImpl.java**.
+This file acts as the bridge between your REST Controller and the Database. You need to add or update the methods that handle the search logic to call the new repository functions.
+### **File to modify: JournalRequestServiceImpl.java**
+Add these methods to handle the prefix-based search for Branch and CGL. This implementation ensures that the search is restricted to "PENDING" status as required for your Authorization screen.
+```java
+package com.fincore.JournalService.Service.impl;
 
 import com.fincore.JournalService.Models.JournalRequest;
 import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
+import com.fincore.JournalService.Service.JournalRequestService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import java.util.List;
 
-/**
- * Handles data access for journal entries with optimized native queries for batch processing.
- * Includes specialized queries for high-volume summaries and chunked deletions.
- */
-@Repository
-public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> {
+@Service
+public class JournalRequestServiceImpl implements JournalRequestService {
 
-    /**
-     * FETCH PENDING BATCH SUMMARIES
-     * Aggregates individual journal rows into a batch summary for the Authorization screen.
-     * Calculates total Debit/Credit by parsing JSON amounts.
-     */
-    @Query(value = """
-        SELECT 
-            BATCH_ID, 
-            MAX(CREATOR_ID) as CREATOR, 
-            MAX(REQ_DATE) as RDATE, 
-            MAX(COMMON_BATCH_REMARKS) as REM,
-            COUNT(*) as CNT,
-            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
-            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR
-        FROM JOURNAL_REQUEST 
-        WHERE TRIM(REQ_STATUS) IN ('P', 'PENDING')
-        GROUP BY BATCH_ID
-        ORDER BY MAX(REQ_DATE) DESC
-    """, nativeQuery = true)
-    List<Object[]> findPendingBatchSummariesNative();
+    @Autowired
+    private JournalRequestRepository repository;
 
     /**
-     * FETCH ALL BATCH HISTORY
-     * Provides a historical view of all batches (Accepted, Rejected, Pending, Error).
+     * SEARCH BY BRANCH (STARTS WITH)
+     * Calls the repository to find pending requests starting with the specific branch code.
      */
-    @Query(value = """
-        SELECT 
-            BATCH_ID, 
-            MAX(CREATOR_ID) as CREATOR, 
-            MAX(REQ_DATE) as RDATE, 
-            MAX(COMMON_BATCH_REMARKS) as REM,
-            COUNT(*) as CNT,
-            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
-            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR,
-            MAX(REQ_STATUS) as STATUS,
-            MAX(EXECUTOR_ID) as EXEC_ID,
-            MAX(EXECUTOR_REMARKS) as EXEC_REM
-        FROM JOURNAL_REQUEST 
-        GROUP BY BATCH_ID
-        ORDER BY MAX(REQ_DATE) DESC
-    """, nativeQuery = true)
-    List<Object[]> findAllBatchSummariesNative();
+    public Page<JournalRequest> searchPendingByBranchPrefix(String branchPrefix, int page, int size) {
+        Pageable pageable = PageRequest.of(page, size);
+        // Note: We pass the raw prefix; Spring Data JPA handles the 'prefix%' logic.
+        return repository.findByReqBranchCodeStartingWithAndRequestStatus(
+                branchPrefix, 
+                RequestStatus.PENDING, 
+                pageable
+        );
+    }
 
     /**
-     * PAGINATED DETAIL FETCH
-     * Retrieves specific rows for a batch with stable ordering for UI consistency.
+     * SEARCH BY CGL (STARTS WITH)
+     * Calls the repository to find pending requests starting with the specific CGL code.
      */
-    @Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
-            countQuery = "SELECT count(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
-            nativeQuery = true)
-    Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
+    public Page<JournalRequest> searchPendingByCglPrefix(String cglPrefix, int page, int size) {
+        Pageable pageable = PageRequest.of(page, size);
+        return repository.findByReqCglStartingWithAndRequestStatus(
+                cglPrefix, 
+                RequestStatus.PENDING, 
+                pageable
+        );
+    }
 
-
-    /**
-     * FAST BATCH DELETE
-     * Directly removes all pending rows for a batch.
-     */
-    @Modifying
-    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(:userId)) AND TRIM(REQ_STATUS) IN ('P', 'PENDING')", nativeQuery = true)
-    void deleteBatchNative(@Param("batchId") String batchId, @Param("userId") String userId);
-
-    /**
-     * MULTI-ROW SPECIFIC DELETE
-     * Purges specific journal IDs from a batch.
-     */
-    @Modifying
-    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE JOURNAL_ID IN (:journalIds) AND CREATOR_ID = :userId", nativeQuery = true)
-    void deleteJournalsNative(@Param("journalIds") List<String> journalIds, @Param("userId") String userId);
-
-    // Standard Finder Methods
-    List<JournalRequest> findByBatchId(String batchId);
-    List<JournalRequest> findByCreatorId(String creatorId);
-    List<JournalRequest> findByRequestStatus(RequestStatus status);
-    
-    /**
-     * NEW: SEARCH BY BRANCH CODE (STARTS WITH)
-     * Filters rows where the Branch Code starts with the provided prefix.
-     */
-    Page<JournalRequest> findByReqBranchCodeStartingWithAndRequestStatus(String branchCode, RequestStatus status, Pageable pageable);
-
-    /**
-     * NEW: SEARCH BY CGL (STARTS WITH)
-     * Filters rows where the CGL starts with the provided prefix.
-     */
-    Page<JournalRequest> findByReqCglStartingWithAndRequestStatus(String cgl, RequestStatus status, Pageable pageable);
-
-    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
+    // ... [Preserve all other existing methods like findPendingBatchSummaries, processBulk, etc.] ...
 }
+
+```
+### **Changes needed in your Controller (JournalRequestController.java)**
+You also need to expose these search methods via API endpoints so the React frontend can call them when the user types in the search bar.
+```java
+@GetMapping("/search-pending")
+public ResponseEntity<Page<JournalRequest>> searchPendingRequests(
+        @RequestParam(required = false) String branch,
+        @RequestParam(required = false) String cgl,
+        @RequestParam(defaultValue = "0") int page,
+        @RequestParam(defaultValue = "10") int size) {
+    
+    if (branch != null && !branch.isEmpty()) {
+        return ResponseEntity.ok(service.searchPendingByBranchPrefix(branch, page, size));
+    } else if (cgl != null && !cgl.isEmpty()) {
+        return ResponseEntity.ok(service.searchPendingByCglPrefix(cgl, page, size));
+    }
+    
+    return ResponseEntity.badRequest().build();
+}
+
+```
+### **Why this is the correct next step:**
+ 1. **Encapsulation**: Your Repository handles the SQL logic, but the Service Implementation handles the **Business Rules** (like ensuring only PENDING items are searched).
+ 2. **Performance**: By calling the StartingWith methods, you ensure that the Oracle database uses an **Index Range Scan**, which is critical for maintaining high performance with large datasets.
+ 3. **UI Integration**: This provides the exact paginated data structure that your React **DataGrid** or **Table** needs to display results as the user types.
+**Would you like me to also provide the updated React search bar logic to call this new API?**
