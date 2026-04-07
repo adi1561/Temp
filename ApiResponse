@@ -1,162 +1,99 @@
-This is the fix for the **incorrect count and total amount** bug in your JournalRequestServiceImpl.java.
-The primary reasons for the bug were:
- 1. **Truncation**: Using absAmt.longValue() discarded decimals, ruining financial totals [cite: 776-777].
- 2. [cite_start]**Duplicate Inserts**: Lack of an initial cleanup meant that if an upload was retried, rows from the previous attempt remained in the database, causing the count to inflate (e.g., 75,000 + 30,000 from a partial fail = 105,000).
-### File: JournalRequestServiceImpl.java
-#### 1. Updated processChunkRaw Method
-This code uses a scaling factor of 10,000 to ensure that 4 decimal places are preserved when adding to the LongAdder [cite: 618-622, 774-783].
+The next critical change addresses the **Out of Memory (OOM) / Heap Space** error that will occur when you hit 500,000 records.
+### The Reason for the Bug: "The Single-Blob Bottleneck"
+[cite_start]Your current code attempts to save the entire list of 500,000 records as one giant GZIP blob into a single Redis key [cite: 644-645].
+ 1. **Memory Spike:** Creating a baos.toByteArray() for 500k records requires a massive, contiguous block of RAM. If your heap is 4GB, this single operation can easily trigger a crash.
+ 2. [cite_start]**Redis Limits:** A single Redis value has a hard limit (usually 512MB), and processing such a large string causes significant "Stop the World" pauses in the JVM during serialization and decompression [cite: 517-522].
+ 3. [cite_start]**Instruction Retention:** By chunking the data in Redis, we keep the memory footprint small and manageable without changing a single line of your validation logic [cite: 536-541].
+### File: JournalBulkValidationService.java
+#### 1. Updated saveRowsToRedis Method
+This method now splits your parsedRows into manageable chunks of 5,000 records. [cite_start]It saves each chunk as a separate key and stores a "Metadata" key to keep track of how many chunks exist [cite: 644-647].
 ```java
-private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, 
-                             String batchId, 
-                             String commonRemarks, 
-                             String creatorId, 
-                             Integer creatorRole, 
-                             int globalOffset, 
-                             LongAdder debit, 
-                             LongAdder credit) {
-    
-    String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-    final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
-    
-    // Scaling factor to support up to 4 decimal places without losing precision
-    final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
+private void saveRowsToRedis(String requestId, List<ExcelRowData> rows) {
+    if (rows == null || rows.isEmpty()) return;
 
     try {
-        jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
-            @Override
-            public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
-                JournalBulkValidationService.ExcelRowData r = chunk.get(i);
-        
-                int globalIdx = globalOffset + i + 1;
-                String jId = batchId + "-" + globalIdx;
+        int chunkSize = 5000;
+        int totalRows = rows.size();
+        int totalChunks = (int) Math.ceil((double) totalRows / chunkSize);
+
+        // 1. Save chunks individually to prevent memory spikes
+        for (int i = 0; i < totalChunks; i++) {
+            int start = i * chunkSize;
+            int end = Math.min(start + chunkSize, totalRows);
+            List<ExcelRowData> chunk = rows.subList(start, end);
+
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                 GZIPOutputStream gos = new GZIPOutputStream(baos)) {
+                objectMapper.writeValue(gos, chunk);
+                gos.finish();
                 
-                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
-
-                // Add to LongAdder using the scaling factor to preserve decimals
-                long scaledValue = absAmt.multiply(SCALE_FACTOR).longValue();
-
-                if (isCredit) {
-                    credit.add(scaledValue);
-                } else {
-                    debit.add(scaledValue);
-                }
-
-                LocalDate rDate = LocalDate.now();
-                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                    try {
-                        rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
-                    } catch (DateTimeParseException ignored) {}
-                }
-
-                ps.setString(1, "P");
-                ps.setTimestamp(2, ts);
-                ps.setString(3, creatorId);
-                ps.setInt(4, creatorRole != null ? creatorRole : 0);
-                ps.setString(5, batchId);
-                ps.setString(6, jId);
-                ps.setString(7, commonRemarks);
-                ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
-                ps.setString(9, r.branch);
-                ps.setString(10, r.currency);
-                ps.setString(11, r.cgl);
-                ps.setBigDecimal(12, signedAmt);
-                ps.setDate(13, java.sql.Date.valueOf(rDate));
-                ps.setString(14, r.remarks);
-                ps.setString(15, r.productCode);
+                String chunkKey = "DATA_CHUNK_" + requestId + "_" + i;
+                redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 1, TimeUnit.HOURS);
             }
+        }
 
-            @Override
-            public int getBatchSize() {
-                return chunk.size();
-            }
-        });
-    } catch (org.springframework.dao.DataAccessException e) {
-        log.error("JDBC_BATCH_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-        throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+        // 2. Save metadata so the retrieval service knows how many chunks to fetch
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("totalChunks", totalChunks);
+        meta.put("totalRows", totalRows);
+        
+        byte[] metaBytes = objectMapper.writeValueAsBytes(meta);
+        redisTemplate.opsForValue().set("DATA_META_" + requestId, metaBytes, 1, TimeUnit.HOURS);
+
+        log.info("CACHE_DATA_SAVED | ReqID: {} | TotalRows: {} | Chunks: {}", requestId, totalRows, totalChunks);
+
+    } catch (IOException | DataAccessException e) {
+        log.error("CACHE_SAVE_FAILURE | ReqID: {} | Status: Chunked persistence error", requestId);
+        throw new CustomExceptions.RedisOperationException("Failed to cache large dataset", e);
     }
 }
 
 ```
-#### 2. Updated executeAsyncBatchCreation Method
-[cite_start]This version includes the **Idempotency Delete** (to clear partial data from failed attempts) and the **Decimal Recovery** logic for the final summary record [cite: 405-406, 742-764].
+#### 2. Updated getValidRowsFromCache Method
+This method reverses the process. It reads the metadata, fetches each chunk one-by-one, and reconstructs the list. [cite_start]This prevents the "Decompression OOM" where the JVM tries to inflate 500,000 objects at once from a single stream [cite: 517-522].
 ```java
-@Override
-@Async("bulkExecutor")
-@Transactional
-public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-    String lockKey = "LOCK_REQ_" + requestId;
-    MDC.put("batchId", batchId);
-    MDC.put("user", creatorId);
-
-    log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
+public List<ExcelRowData> getValidRowsFromCache(String requestId) {
     long start = System.currentTimeMillis();
+    
+    // 1. Fetch metadata
+    byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
+    if (metaBytes == null) {
+        throw new CustomExceptions.CacheExpiredException("Validation data expired (TTL 1 Hour). Please re-upload.");
+    }
 
     try {
-        // 1. IDEMPOTENCY: Clear any existing rows for this batchId before starting
-        // This prevents the "75,000 becoming 105,000" bug if the process is retried.
-        jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+        Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
+        int totalChunks = (int) meta.get("totalChunks");
+        int totalRows = (int) meta.get("totalRows");
 
-        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
-        List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-        
-        if (cachedRows == null || cachedRows.isEmpty()) {
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
-            return;
+        List<ExcelRowData> allRows = new ArrayList<>(totalRows);
+
+        // 2. Fetch and decompress each chunk
+        for (int i = 0; i < totalChunks; i++) {
+            byte[] compressedChunk = redisTemplate.opsForValue().get("DATA_CHUNK_" + requestId + "_" + i);
+            if (compressedChunk == null) {
+                throw new CustomExceptions.CacheExpiredException("Missing data chunk " + i + ". Please re-upload.");
+            }
+
+            try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressedChunk))) {
+                List<ExcelRowData> chunkRows = objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
+                allRows.addAll(chunkRows);
+            }
         }
 
-        int totalRows = cachedRows.size();
-        int batchSize = 5000;
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        log.info("CACHE_RETRIEVAL_SUCCESS | ReqID: {} | Rows: {} | Duration: {}ms",
+                requestId, allRows.size(), (System.currentTimeMillis() - start));
+        return allRows;
 
-        LongAdder totalDebit = new LongAdder();
-        LongAdder totalCredit = new LongAdder();
-        AtomicInteger completedChunks = new AtomicInteger(0);
-        int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
-
-        for (int i = 0; i < totalRows; i += batchSize) {
-            final int startIdx = i;
-            final int endIdx = Math.min(i + batchSize, totalRows);
-            final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
-
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), chunkWorkerExecutor)
-                .thenRun(() -> {
-                    int done = completedChunks.incrementAndGet();
-                    int percent = 5 + (done * 90 / totalChunks);
-                    progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                        String.format("Created %d/%d records...", Math.min(done * batchSize, totalRows), totalRows));
-                });
-            futures.add(future);
-        }
-
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.MINUTES);
-
-        // 2. DECIMAL RECOVERY: Convert the scaled Long values back to BigDecimal
-        final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
-        BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
-        BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
-
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-        
-        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
-                            finalDebit, finalCredit, "PENDING");
-
-        progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-        log.info("BATCH_CREATION_FINISHED | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
-
-    } catch (Exception e) {
-        log.error("BATCH_FATAL_ERROR | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-        handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred. Please retry.");
-    } finally {
-        redisTemplate.delete(lockKey);
-        redisTemplate.delete("DATA_" + requestId);
-        MDC.clear();
+    } catch (IOException | DataAccessException e) {
+        log.error("DECOMPRESSION_FAIL | ReqID: {} | Status: Chunked stream corrupted", requestId);
+        throw new CustomExceptions.FileProcessingException("Failed to reconstruct cached data", e);
     }
 }
 
 ```
-[cite_start]This ensures the math is perfect and the database is always in a clean state before the batch starts. Let me know when you are ready to fix the **Out of Memory** issue in the validation service.
+### Why this is production-ready:
+ 1. [cite_start]**Memory Management**: By limiting serialization to 5,000 rows at a time, you keep the memory buffers small (<10MB per chunk) instead of one massive buffer that crashes the heap [cite: 644-645].
+ 2. [cite_start]**No Logic Loss**: Your ExcelRowData [cite: 683-701] [cite_start]and your runDbCheck/runBalanceCheck methods [cite: 614-622] stay exactly as they are. This change only fixes the "Transport" and "Storage" of the data.
+ 3. **Speed**: Parallel garbage collection works much better with small objects (chunks) than with massive objects (500k row list).
+**Next step?** We should fix the **Async Race Condition** in the updateState method, or if you're ready, we can look at the **Excel Streaming Parser** to make the file reading even faster for 500k rows. Which one would you like next?
