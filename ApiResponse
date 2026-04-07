@@ -1,76 +1,90 @@
-Methods annotated with '@Transactional' must be overridable 
+The error happens because Spring’s **@Transactional** logic uses "proxies." Since Spring needs to wrap your method to start and stop the transaction, the method **cannot be private**. It must be **public** so Spring can override it.
+Additionally, to ensure the new transaction (REQUIRES_NEW) actually starts, the method needs to be called in a way that goes through the Spring proxy.
+Here is the fixed, full code for the method. I have changed the visibility to **public** to solve your error and kept the success-only counting logic to fix your "105,000 instead of 75,000" bug.
+### Updated processChunkRaw Method
+```java
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, 
+                            String batchId, 
+                            String commonRemarks, 
+                            String creatorId, 
+                            Integer creatorRole, 
+                            int globalOffset, 
+                            LongAdder globalDebit, 
+                            LongAdder globalCredit) {
+    
+    String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+    final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+    final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
 
-this is error getting after replacing the function
-old function 
-private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
-                                 String batchId,
-                                 String commonRemarks,
-                                 String creatorId,
-                                 Integer creatorRole,
-                                 int globalOffset,
-                                 LongAdder debit,
-                                 LongAdder credit) {
+    try {
+        // 1. Execute the batch insert
+        jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                JournalBulkValidationService.ExcelRowData r = chunk.get(i);
 
-        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+                int globalIdx = globalOffset + i + 1;
+                String jId = batchId + "-" + globalIdx;
 
-        // Scaling factor to support up to 4 decimal places without losing precision
-        final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
+                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
+                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
 
-        try {
-            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
-                    JournalBulkValidationService.ExcelRowData r = chunk.get(i);
-
-                    int globalIdx = globalOffset + i + 1;
-                    String jId = batchId + "-" + globalIdx;
-
-                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                    boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
-
-                    // Add to LongAdder using the scaling factor to preserve decimals
-                    long scaledValue = absAmt.multiply(SCALE_FACTOR).longValue();
-
-                    if (isCredit) {
-                        credit.add(scaledValue);
-                    } else {
-                        debit.add(scaledValue);
-                    }
-
-                    LocalDate rDate = LocalDate.now();
-                    if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                        try {
-                            rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
-                        } catch (DateTimeParseException ignored) {}
-                    }
-
-                    ps.setString(1, "P");
-                    ps.setTimestamp(2, ts);
-                    ps.setString(3, creatorId);
-                    ps.setInt(4, creatorRole != null ? creatorRole : 0);
-                    ps.setString(5, batchId);
-                    ps.setString(6, jId);
-                    ps.setString(7, commonRemarks);
-                    ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
-                    ps.setString(9, r.branch);
-                    ps.setString(10, r.currency);
-                    ps.setString(11, r.cgl);
-                    ps.setBigDecimal(12, signedAmt);
-                    ps.setDate(13, java.sql.Date.valueOf(rDate));
-                    ps.setString(14, r.remarks);
-                    ps.setString(15, r.productCode);
+                LocalDate rDate = LocalDate.now();
+                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                    try {
+                        rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
+                    } catch (DateTimeParseException ignored) {}
                 }
 
-                @Override
-                public int getBatchSize() {
-                    return chunk.size();
-                }
-            });
-        } catch (org.springframework.dao.DataAccessException e) {
-            log.error("JDBC_BATCH_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+                ps.setString(1, "P");
+                ps.setTimestamp(2, ts);
+                ps.setString(3, creatorId);
+                ps.setInt(4, creatorRole != null ? creatorRole : 0);
+                ps.setString(5, batchId);
+                ps.setString(6, jId);
+                ps.setString(7, commonRemarks);
+                ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
+                ps.setString(9, r.branch);
+                ps.setString(10, r.currency);
+                ps.setString(11, r.cgl);
+                ps.setBigDecimal(12, signedAmt);
+                ps.setDate(13, java.sql.Date.valueOf(rDate));
+                ps.setString(14, r.remarks);
+                ps.setString(15, r.productCode);
+            }
+
+            @Override
+            public int getBatchSize() {
+                return chunk.size();
+            }
+        });
+
+        // 2. ONLY update global totals if the database insert above was successful.
+        // This stops the "Wrong Count" bug because failed/retried chunks won't be counted twice.
+        for (JournalBulkValidationService.ExcelRowData r : chunk) {
+            BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+            long scaledValue = absAmt.multiply(SCALE_FACTOR).longValue();
+
+            if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
+                globalCredit.add(scaledValue);
+            } else {
+                globalDebit.add(scaledValue);
+            }
         }
+
+    } catch (org.springframework.dao.DataAccessException e) {
+        log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
+        throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
     }
+}
+
+```
+### Important Note for 500,000 rows:
+Since you are calling processChunkRaw from within the same service class (JournalRequestServiceImpl), Spring's transaction proxy will be bypassed if you call it as this.processChunkRaw(...).
+To make @Transactional work correctly and handle 500,000 records without locking the whole database, you should either:
+ 1. **Self-Inject the Service**: Add @Autowired private JournalRequestServiceImpl self; and call it as self.processChunkRaw(...).
+ 2. **Move the method**: Put this method in a separate @Service (e.g., JournalRowWriterService) and call it from there.
+This ensures each 5,000-row chunk has its own separate transaction, which is required for high-volume uploads.
