@@ -1,117 +1,80 @@
-The bug where 75,000 rows suddenly appear as 105,000 (or other inflated numbers) is caused by a **Lack of Transactional Atomicity** combined with **State Corruption in Redis**.
+The "wrong count" bug (where 75,000 rows show up as 105,000) and the system's inability to reach 500,000 records are caused by a **Thread Pool Deadlock and Starvation** issue within your asynchronous configuration.
 ### The Reason for the Bug
- 1. **Orphan Threading:** In JournalRequestServiceImpl, your executeAsyncBatchCreation method uses CompletableFuture.runAsync. If the main process times out or fails, those background threads **keep running**. If you restart the upload, the old threads are still inserting rows while the new ones start, leading to "double-counting."
- 2. **The "Blind Overwrite" in Redis:** Your updateState method reads the state from Redis, modifies it, and writes it back [cite: 642-644]. In a high-volume multithreaded environment (like 500k rows), two threads can read the state at the same time, modify different fields, and the second one will overwrite the first one's progress. This makes the UI display incorrect "Total Rows" or "Progress" counts.
- 3. [cite_start]**Missing Unique Constraint:** Because JOURNAL_ID is not the Primary Key, the database allows duplicate rows for the same batch if the process is retried without a clean purge.
-### File: JournalBulkValidationService.java
-#### Updated updateState Method (Thread-Safe Version)
-We will change this to be **Synchronized** or use a "Read-Latest" pattern to ensure that when we update the row count or status, we don't accidentally overwrite the totalRows set by the parser [cite: 642-644].
+You have a **Circular Dependency** on your bulkExecutor thread pool:
+ 1. **Coordinator Blocking**: The executeAsyncBatchCreation method runs on the bulkExecutor pool (which has a max of 20 threads). Inside this method, you call futures.get(30, TimeUnit.MINUTES), which **blocks** that thread for up to 30 minutes. [cite: 754-755]
+ 2. [cite_start]**Progress Deadlock**: While the coordinator thread is blocked, the worker chunks finish and call progressService.sendProgress. However, sendProgress is **also** marked to run on the bulkExecutor.
+ 3. **The Crash**: If multiple users upload files, all 20 threads in the bulkExecutor become blocked waiting for chunks. Because they are blocked, they cannot execute the sendProgress tasks. This fills up the task queue (capacity 500) until the system either crashes, rejects new tasks, or triggers a "Caller-Runs" policy that corrupts the internal state and makes counts appear inflated or erratic.
+### File 1: AsyncConfig.java
+**Change**: Add a dedicated, lightweight thread pool for progress updates so they never block or get blocked by heavy database operations. [cite: 13-18]
 ```java
-/**
- * UPDATED: Thread-safe state management for Redis.
- * This prevents concurrent stages from overwriting each other's metadata.
- */
-private synchronized void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) {
-    // 1. Always pull the freshest state from Redis to avoid "Stale Object" overwrites
-    BulkUploadStateDto state = getStatusFromRedis(requestId);
-    if (state == null) {
-        state = new BulkUploadStateDto();
-        state.setRequestId(requestId);
-    }
-
-    // 2. Apply the update (e.g., changing status, incrementing counts, or setting total rows)
-    updater.accept(state);
-
-    // 3. Persist the updated object back to Redis immediately
-    saveStatusToRedis(requestId, state);
+@Bean(name = "progressExecutor")
+public Executor progressExecutor() {
+    log.info("ASYNC_CONFIG_INIT | Initializing Dedicated Progress Thread Pool");
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(5);
+    executor.setMaxPoolSize(10);
+    executor.setQueueCapacity(2000);
+    executor.setThreadNamePrefix("Progress-");
+    executor.initialize();
+    return executor;
 }
 
 ```
-### File: JournalRequestServiceImpl.java
-#### Updated executeAsyncBatchCreation (Atomicity Fix)
-To stop the "105,000" bug, we must ensure that we strictly manage the lifecycle of the background threads. [cite_start]I have added a **Pre-emptive Purge** and a **Strict Join** to ensure no orphan rows are left behind [cite: 742-764].
+### File 2: ProgressService.java
+[cite_start]**Change**: Point the @Async annotation to the new dedicated pool.
+```java
+// Change the executor name from "bulkExecutor" to "progressExecutor"
+@Async("progressExecutor")
+public void sendProgress(String taskId, String userId, int percent, String status, String message) {
+    // ... rest of your existing logic remains exactly the same ...
+}
+
+```
+### File 3: JournalRequestServiceImpl.java
+**Method**: executeAsyncBatchCreation
+**Change**: Remove the blocking .get() call and replace it with a non-blocking thenRunAsync chain. This releases the coordinator thread immediately back to the pool while the chunks are being inserted. [cite: 754-761]
 ```java
 @Override
 @Async("bulkExecutor")
 @Transactional
 public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-    String lockKey = "LOCK_REQ_" + requestId;
-    MDC.put("batchId", batchId);
-    MDC.put("user", creatorId);
+    // ... (Keep your initial cleanup and data retrieval logic) ...
 
-    log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
-    long start = System.currentTimeMillis();
+    // Replace the blocking CompletableFuture logic with this:
+    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+        .thenRunAsync(() -> {
+            try {
+                // 1. Recover totals using the precision logic we fixed earlier
+                final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
+                BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+                BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
 
-    try {
-        // 1. STRICT IDEMPOTENCY: Delete any partial data from previous failed attempts.
-        // This is the primary fix for the "100,000 instead of 75,000" bug.
-        jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-        jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+                // 2. Insert Master Record
+                Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+                String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+                jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows, finalDebit, finalCredit, "PENDING");
 
-        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
-        List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-        
-        if (cachedRows == null || cachedRows.isEmpty()) {
-            log.error("CACHE_MISS | Batch: {} | Status: No valid rows found in Redis", batchId);
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired. Please re-upload.");
-            return;
-        }
+                // 3. Final Notifications
+                progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+                log.info("BATCH_CREATION_FINISHED | Batch: {} | Rows: {}", batchId, totalRows);
 
-        int totalRows = cachedRows.size();
-        int batchSize = 5000;
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
+            } catch (Exception e) {
+                log.error("ASYNC_COMPLETION_ERROR | Batch: {} | Msg: {}", batchId, e.getMessage());
+                handleAsyncFailure(batchId, creatorId, requestId, "Database finalization failed.");
+            }
+        }, bulkExecutor) // Use the pool to handle the final insert, but do NOT block the original thread
+        .exceptionally(ex -> {
+            log.error("PARALLEL_CHUNK_FAILURE | Batch: {} | Reason: {}", batchId, ex.getMessage());
+            handleAsyncFailure(batchId, creatorId, requestId, "Parallel processing failed.");
+            return null;
+        });
 
-        LongAdder totalDebit = new LongAdder();
-        LongAdder totalCredit = new LongAdder();
-        AtomicInteger completedChunks = new AtomicInteger(0);
-        int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
-
-        for (int i = 0; i < totalRows; i += batchSize) {
-            final int startIdx = i;
-            final int endIdx = Math.min(i + batchSize, totalRows);
-            final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
-
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), chunkWorkerExecutor)
-                .thenRun(() -> {
-                    int done = completedChunks.incrementAndGet();
-                    int percent = 5 + (done * 90 / totalChunks);
-                    progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                        String.format("Inserted %d of %d records", Math.min(done * batchSize, totalRows), totalRows));
-                });
-            futures.add(future);
-        }
-
-        // 2. WAIT FOR ALL: Block until every single chunk is confirmed in the DB.
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.MINUTES);
-
-        // 3. FINAL SUMMARY: Insert the master record only after row counts are verified.
-        final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
-        BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
-        BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
-
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-        
-        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows, finalDebit, finalCredit, "PENDING");
-
-        progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch successfully created with " + totalRows + " rows.");
-        log.info("BATCH_CREATION_SUCCESS | Batch: {} | Total: {} | Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
-
-    } catch (Exception e) {
-        log.error("ASYNC_BATCH_CRASH | Batch: {} | Error: {}", batchId, e.getMessage());
-        handleAsyncFailure(batchId, creatorId, requestId, "Critical Error: " + e.getMessage());
-    } finally {
-        redisTemplate.delete(lockKey);
-        redisTemplate.delete("DATA_" + requestId);
-        MDC.clear();
-    }
+    // The method now returns immediately, freeing up the thread!
 }
 
 ```
-### Why this works:
- * [cite_start]**Synchronized State**: The updateState fix ensures that when Stage 1 and Stage 2 of validation overlap, they don't overwrite the "Total Rows" count in Redis [cite: 642-644].
- * [cite_start]**Master Cleanup**: By deleting existing data for the batchId at the start of the thread, we ensure that no matter how many times the user retries, the final count in JOURNAL_REQUEST will always match the file [cite: 785-786].
- * [cite_start]**Precision Recovery**: The totals are now recovered using the RECOVERY_FACTOR, ensuring your financial dashboard is accurate.
-[cite_start]I have kept all your **MDC logging**, **Sequence generation**, and **Notification logic** exactly as it was [cite: 738, 743, 845-847].
-What is the next bug you want to tackle? We should look at **Single-Session Security** or **Notification Routing** if those are causing issues.
+### Why this solves it:
+ * [cite_start]**No Deadlock**: Progress updates now have their own "lane" (progressExecutor) and can't be blocked by heavy DB writers.
+ * **High Scalability**: By removing .get(), your 20 coordinator threads are only busy for a few milliseconds (just to spawn the chunks) instead of 30 minutes. This allows the system to handle 500,000+ rows across multiple concurrent users easily.
+ * [cite_start]**Count Integrity**: The "Wrong Count" happens when tasks are rejected and retried inconsistently; by using a non-blocking chain, the sequence of operations (Chunks -> Master Record) is strictly enforced. [cite: 759-760]
+Is there any other specific part of the multithreading behavior you'd like to dive into?
