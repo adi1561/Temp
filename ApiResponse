@@ -1,30 +1,32 @@
 @Override
 @Async("bulkExecutor")
+// Note: @Transactional is intentionally removed here to allow processChunkRaw 
+// to manage its own independent transactions for each 5,000-row chunk.
 public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
     String lockKey = "LOCK_REQ_" + requestId;
     MDC.put("batchId", batchId);
     MDC.put("user", creatorId);
-    
-    // Tracks rows successfully committed to the DB to prevent "Ghost Counts"
-    AtomicInteger successfulRowsCount = new AtomicInteger(0);
 
-    // Capture the MDC context for worker thread traceability
+    // 1. Capture MDC context to ensure worker threads have traceable logs
     Map<String, String> contextMap = MDC.getCopyOfContextMap();
+    AtomicInteger successfulRowsCount = new AtomicInteger(0);
 
     log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
     long start = System.currentTimeMillis();
 
     try {
-        [span_0](start_span)// Idempotency: Clear existing data for this batchId[span_0](end_span)
+        // 2. IDEMPOTENCY: Purge any existing data for this batchId to prevent count inflation
         jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
         jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
 
-        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Fetching cached data...");
+        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+        
+        // Retrieve valid rows from the GZIP-compressed Redis cache
         List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-
+        
         if (cachedRows == null || cachedRows.isEmpty()) {
             log.error("CACHE_MISS | Batch: {} | Status: No valid rows found in Redis", batchId);
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired. Please re-upload.");
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
             return;
         }
 
@@ -32,73 +34,96 @@ public void executeAsyncBatchCreation(String batchId, String requestId, String c
         int batchSize = 5000;
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
+        // High-precision thread-safe counters for financial totals
         LongAdder totalDebit = new LongAdder();
         LongAdder totalCredit = new LongAdder();
         AtomicInteger completedChunks = new AtomicInteger(0);
         int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
 
+        // 3. PARALLEL CHUNKING: Process 5,000 rows at a time
         for (int i = 0; i < totalRows; i += batchSize) {
             final int startIdx = i;
             final int endIdx = Math.min(i + batchSize, totalRows);
             final List<JournalBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
 
+            // Use 'self' to ensure call goes through Spring proxy for @Transactional(Propagation.REQUIRES_NEW)
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                        if (contextMap != null) MDC.setContextMap(contextMap);
-                        try {
-                            // Using 'self' ensures the @Transactional(Propagation.REQUIRES_NEW) is honored
-                            self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
-                            
-                            // Only count rows if the DB transaction succeeded
-                            successfulRowsCount.addAndGet(chunk.size());
-                        } finally {
-                            MDC.clear();
-                        }
-                    }, chunkWorkerExecutor)
-                    .thenRun(() -> {
-                        int done = completedChunks.incrementAndGet();
-                        int percent = 5 + (done * 90 / totalChunks);
-                        progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                                String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
-                    });
-
+                if (contextMap != null) MDC.setContextMap(contextMap);
+                try {
+                    self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+                    // Increment successfully committed row count
+                    successfulRowsCount.addAndGet(chunk.size());
+                } finally {
+                    MDC.clear();
+                }
+            }, chunkWorkerExecutor)
+            .thenRun(() -> {
+                int done = completedChunks.incrementAndGet();
+                int percent = 5 + (done * 90 / totalChunks);
+                progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
+                        String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
+            });
             futures.add(future);
         }
 
-        // Wait for parallel processing to complete (increased timeout for 500k rows)
+        // 4. WAIT FOR COMPLETION: Block until all parallel workers finish (45 min timeout for 500k rows)
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
 
-        // Convert scaled totals back to BigDecimal
+        // 5. PRECISION RECOVERY: Scale back LongAdder totals to 4-decimal BigDecimal
         final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
         BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
         BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
 
-        // FINAL MASTER RECORD: Use successfulRowsCount to ensure count integrity
+        // 6. INTEGRITY CHECK: Verify that actual saved rows match expected rows
+        int actualCommittedRows = successfulRowsCount.get();
+        String batchStatus = "PENDING";
+        String finalRemarks = commonRemarks;
+
+        if (actualCommittedRows != totalRows) {
+            batchStatus = "ERROR";
+            finalRemarks = String.format("INTEGRITY_FAILURE: Expected %d rows but only %d were saved.", totalRows, actualCommittedRows);
+            log.error("BATCH_INTEGRITY_FAILED | Batch: {} | Expected: {} | Actual: {}", batchId, totalRows, actualCommittedRows);
+        }
+
+        // 7. FINAL MASTER RECORD: Insert the summary record
         Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        
+        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, actualCommittedRows,
+                finalDebit, finalCredit, batchStatus, (actualCommittedRows != totalRows ? finalRemarks : ""));
 
-        int finalCommittedRows = successfulRowsCount.get();
-        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, finalCommittedRows,
-                finalDebit, finalCredit, "PENDING");
+        // Audit and Notification Logic (Preserved Business Logic)
+        if ("ERROR".equals(batchStatus)) {
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", finalRemarks);
+        } else {
+            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Successfully created batch " + batchId);
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+            sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
 
-        progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-        log.info("BATCH_SUCCESS | Batch: {} | CommittedRows: {} | Duration: {}ms", batchId, finalCommittedRows, System.currentTimeMillis() - start);
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            if (config != null) {
+                String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
+                sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
+            }
+        }
+
+        log.info("BATCH_CREATION_FINISHED | Batch: {} | Status: {} | Rows: {} | Duration: {}ms", 
+                batchId, batchStatus, actualCommittedRows, System.currentTimeMillis() - start);
 
     } catch (Exception e) {
-        log.error("BATCH_FATAL_ERROR | Batch: {} | Msg: {}", batchId, e.getMessage());
-        handleAsyncFailure(batchId, creatorId, requestId, "Critical system error during batch creation.");
+        log.error("BATCH_FATAL_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+        handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred during batch creation.");
     } finally {
-        // Optimized Batch Cleanup to prevent network bottlenecks
+        // 8. OPTIMIZED CLEANUP: Batch delete all Redis keys in one network call
         List<String> keysToDelete = new ArrayList<>();
         keysToDelete.add(lockKey);
+        keysToDelete.add("DATA_" + requestId);
         keysToDelete.add("DATA_META_" + requestId);
         
-        // Calculate max possible chunks (e.g., 500k rows / 5000 per chunk = 100 chunks)
-        int maxChunks = 105; 
-        for (int k = 0; k < maxChunks; k++) {
+        // Clean up chunked keys if they exist (assuming max 500k rows / 5k chunk = 100 keys)
+        for (int k = 0; k < 110; k++) {
             keysToDelete.add("DATA_CHUNK_" + requestId + "_" + k);
         }
-        
-        // Deleting the list in one operation is significantly faster than a loop
         redisTemplate.delete(keysToDelete);
         
         MDC.clear();
