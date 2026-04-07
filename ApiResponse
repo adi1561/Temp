@@ -1,100 +1,29 @@
-@Override
-@Async("bulkExecutor")
-// NOTE: @Transactional is REMOVED from this method level to allow 
-// processChunkRaw to commit in independent mini-transactions.
-public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-    String lockKey = "LOCK_REQ_" + requestId;
-    MDC.put("batchId", batchId);
-    MDC.put("user", creatorId);
+spring.datasource.hikari.maximum-pool-size=30
+spring.datasource.hikari.minimum-idle=10
+spring.datasource.hikari.connection-timeout=30000
+spring.datasource.hikari.idle-timeout=600000
+spring.datasource.hikari.max-lifetime=1800000
 
-    // Capture the MDC context to pass it into background worker threads
-    Map<String, String> contextMap = MDC.getCopyOfContextMap();
 
-    log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
-    long start = System.currentTimeMillis();
+# --- Redis Configuration ---
+# Ensure timeouts are set so a Redis glitch doesn't hang the app
+spring.data.redis.host=10.0.17.242
+spring.data.redis.port=6379
+spring.data.redis.timeout=2000
+spring.data.redis.jedis.pool.max-active=50
+spring.data.redis.jedis.pool.max-idle=10
+spring.data.redis.jedis.pool.min-idle=5
 
-    try {
-        // 1. IDEMPOTENCY: Clear partial data from any previous failed attempts.
-        // This is the primary fix for the "75,000 becoming 105,000" row count bug.
-        jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-        jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+# --- 3. FILE UPLOAD LIMITS ---
+# 600k rows in Excel can be 50MB+. Ensure Spring accepts it.
+spring.servlet.multipart.max-file-size=100MB
+spring.servlet.multipart.max-request-size=100MB
 
-        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Fetching cached data...");
-        List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-        
-        if (cachedRows == null || cachedRows.isEmpty()) {
-            log.error("CACHE_MISS | Batch: {} | Status: No valid rows found in Redis", batchId);
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired. Please re-upload.");
-            return;
-        }
+# --- 4. ASYNC EXECUTOR TUNING (Matches our Java Config) ---
+# Verify these match the AsyncConfig.java values
+app.async.core-pool-size=5
+app.async.max-pool-size=20
+app.async.queue-capacity=500
 
-        int totalRows = cachedRows.size();
-        int batchSize = 5000;
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-        // High-precision thread-safe counters
-        LongAdder totalDebit = new LongAdder();
-        LongAdder totalCredit = new LongAdder();
-        AtomicInteger completedChunks = new AtomicInteger(0);
-        int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
-
-        // 2. PARALLEL CHUNKING
-        for (int i = 0; i < totalRows; i += batchSize) {
-            final int startIdx = i;
-            final int endIdx = Math.min(i + batchSize, totalRows);
-            final List<JournalBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
-
-            // USE 'self' to ensure the @Transactional(Propagation.REQUIRES_NEW) on processChunkRaw is honored
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                // Restore MDC context in the worker thread so logs are traceable
-                if (contextMap != null) MDC.setContextMap(contextMap);
-                try {
-                    self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
-                } finally {
-                    MDC.clear();
-                }
-            }, chunkWorkerExecutor)
-            .thenRun(() -> {
-                int done = completedChunks.incrementAndGet();
-                int percent = 5 + (done * 90 / totalChunks);
-                progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                    String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
-            });
-            
-            futures.add(future);
-        }
-
-        // 3. SYNCHRONIZE: Wait for all chunks to be committed to the database.
-        // 45-minute timeout specifically for 500,000+ row volume.
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
-
-        // 4. PRECISION RECOVERY: Scale back the LongAdder totals to BigDecimal
-        final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
-        BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
-        BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
-
-        // 5. FINAL MASTER RECORD: Inserted only after all chunks are confirmed
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-        
-        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
-                            finalDebit, finalCredit, "PENDING");
-
-        progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-        log.info("BATCH_SUCCESS | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
-
-    } catch (Exception e) {
-        log.error("BATCH_FATAL_ERROR | Batch: {} | Msg: {}", batchId, e.getMessage());
-        handleAsyncFailure(batchId, creatorId, requestId, "Critical system error during batch creation.");
-    } finally {
-        // Cleanup Redis resources
-        redisTemplate.delete(lockKey);
-        redisTemplate.delete("DATA_META_" + requestId);
-        // Delete chunked keys if your implementation uses them
-        for(int k=0; k<1000; k++) {
-            Boolean deleted = redisTemplate.delete("DATA_CHUNK_" + requestId + "_" + k);
-            if (Boolean.FALSE.equals(deleted)) break; 
-        }
-        MDC.clear();
-    }
-}
+this is propery which is alredy there in my application.proprety
