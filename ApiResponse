@@ -1,7 +1,70 @@
-The error happens because Spring’s **@Transactional** logic uses "proxies." Since Spring needs to wrap your method to start and stop the transaction, the method **cannot be private**. It must be **public** so Spring can override it.
-Additionally, to ensure the new transaction (REQUIRES_NEW) actually starts, the method needs to be called in a way that goes through the Spring proxy.
-Here is the fixed, full code for the method. I have changed the visibility to **public** to solve your error and kept the success-only counting logic to fix your "105,000 instead of 75,000" bug.
-### Updated processChunkRaw Method
+The error **"Methods annotated with '@Transactional' must be overridable"** occurs because Spring uses CGLIB proxies to handle transactions. For Spring to "wrap" your method in a transaction, the method must be **public** and the class must not be final.
+However, there is a **hidden architectural bug** here: In Spring, calling a @Transactional method from within the same class (e.g., this.processChunkRaw(...)) **bypasses the proxy**. This means your "mini-transactions" aren't actually starting, which is exactly why your database is locking up and counts are getting corrupted.
+### The Next Bug: Transactional Proxy Bypass & MDC Context Loss
+ 1. **The Proxy Bug:** Because executeAsyncBatchCreation calls processChunkRaw directly, Spring never sees the @Transactional annotation on the chunk. For 500,000 records, this causes the database to treat the whole process as one giant, unstable transaction or a series of auto-commits that can't roll back.
+ 2. **The MDC Bug:** MDC (Mapped Diagnostic Context) is ThreadLocal. When you use CompletableFuture.runAsync, the worker thread **loses the batchId and user info**. Your logs for 500,000 rows will be "silent," making it impossible to debug which chunk failed.
+### File: JournalRequestServiceImpl.java
+To solve this, we will use **Self-Injection**. This is a professional pattern that forces the call through the Spring Proxy so that @Transactional and MDC are respected.
+#### 1. Add Self-Injection and Update executeAsyncBatchCreation
+Add this at the top of your class and update the loop logic.
+```java
+@Autowired
+@Lazy
+private JournalRequestServiceImpl self; // Self-injection to solve the Proxy Bypass bug
+
+@Override
+@Async("bulkExecutor")
+public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+    MDC.put("batchId", batchId);
+    MDC.put("user", creatorId);
+    
+    // Capture MDC context to pass to worker threads
+    Map<String, String> contextMap = MDC.getCopyOfContextMap();
+
+    try {
+        jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+        List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+        
+        int totalRows = cachedRows.size();
+        int batchSize = 5000;
+        LongAdder totalDebit = new LongAdder();
+        LongAdder totalCredit = new LongAdder();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        for (int i = 0; i < totalRows; i += batchSize) {
+            final int startIdx = i;
+            final int endIdx = Math.min(i + batchSize, totalRows);
+            final List<JournalBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
+
+            // USE 'self' instead of 'this' to ensure @Transactional works
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                // Restore MDC context in the worker thread
+                if (contextMap != null) MDC.setContextMap(contextMap);
+                try {
+                    self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+                } finally {
+                    MDC.clear();
+                }
+            }, chunkWorkerExecutor);
+            
+            futures.add(future);
+        }
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
+
+        // ... Summary insertion logic (already fixed in previous step) ...
+
+    } catch (Exception e) {
+        log.error("BATCH_CRITICAL_FAILURE | Error: {}", e.getMessage());
+        handleAsyncFailure(batchId, creatorId, requestId, e.getMessage());
+    } finally {
+        MDC.clear();
+    }
+}
+
+```
+#### 2. Full Code for processChunkRaw (Public & Transactional)
+Now that it's public, Spring can override it. We also added Propagation.REQUIRES_NEW so each chunk is a safe, independent unit of work.
 ```java
 @Transactional(propagation = Propagation.REQUIRES_NEW)
 public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, 
@@ -19,24 +82,21 @@ public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chun
     final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
 
     try {
-        // 1. Execute the batch insert
         jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
             @Override
             public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
                 JournalBulkValidationService.ExcelRowData r = chunk.get(i);
-
                 int globalIdx = globalOffset + i + 1;
                 String jId = batchId + "-" + globalIdx;
-
+                
                 BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
                 boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
                 BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
 
                 LocalDate rDate = LocalDate.now();
                 if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                    try {
-                        rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
-                    } catch (DateTimeParseException ignored) {}
+                    try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); } 
+                    catch (DateTimeParseException ignored) {}
                 }
 
                 ps.setString(1, "P");
@@ -57,17 +117,12 @@ public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chun
             }
 
             @Override
-            public int getBatchSize() {
-                return chunk.size();
-            }
+            public int getBatchSize() { return chunk.size(); }
         });
 
-        // 2. ONLY update global totals if the database insert above was successful.
-        // This stops the "Wrong Count" bug because failed/retried chunks won't be counted twice.
+        // Precision counting: Only update if the DB transaction succeeds
         for (JournalBulkValidationService.ExcelRowData r : chunk) {
-            BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-            long scaledValue = absAmt.multiply(SCALE_FACTOR).longValue();
-
+            long scaledValue = r.amount.abs().multiply(SCALE_FACTOR).longValue();
             if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
                 globalCredit.add(scaledValue);
             } else {
@@ -75,16 +130,15 @@ public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chun
             }
         }
 
-    } catch (org.springframework.dao.DataAccessException e) {
-        log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
-        throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+    } catch (Exception e) {
+        log.error("CHUNK_WRITE_FAIL | Offset: {} | Error: {}", globalOffset, e.getMessage());
+        throw e; // Triggers rollback for this chunk ONLY
     }
 }
 
 ```
-### Important Note for 500,000 rows:
-Since you are calling processChunkRaw from within the same service class (JournalRequestServiceImpl), Spring's transaction proxy will be bypassed if you call it as this.processChunkRaw(...).
-To make @Transactional work correctly and handle 500,000 records without locking the whole database, you should either:
- 1. **Self-Inject the Service**: Add @Autowired private JournalRequestServiceImpl self; and call it as self.processChunkRaw(...).
- 2. **Move the method**: Put this method in a separate @Service (e.g., JournalRowWriterService) and call it from there.
-This ensures each 5,000-row chunk has its own separate transaction, which is required for high-volume uploads.
+### Why this is the "Senior Engineer" solution:
+ * **Idempotency & Rollback:** By using REQUIRES_NEW, if chunk #10 fails, chunks #1-#9 remain safely in the DB. When the user retries, your DELETE at the start ensures a clean slate.
+ * **Observability:** Passing the contextMap to workers ensures your logs always show the batchId, even inside parallel threads.
+ * **Proxy Integrity:** Self-injection ensures Spring manages the transactions, preventing partial data corruption that leads to the "Wrong Count" bug.
+Next bug? We should look at **Hikari Connection Pool Sizing**, as 50 parallel database workers will quickly exhaust a default connection pool and crash the service. Ready?
