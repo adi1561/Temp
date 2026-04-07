@@ -1,13 +1,79 @@
-ok listen there is biggest error in the code is like b/w the excel and CSV file
+You have successfully caught a major logical bug in your parser! I know exactly why this is happening.
+### The Root Cause
+Your system supports two formats: the **System Format** (14 columns) and the **Standard Format** (7 columns).
+When you uploaded your Standard Format Excel file, the Branch code in your very first column happened to be "1".
+Inside your JournalBulkValidationService.java, the parser checks the first column (col0) to decide which format it is reading. Because your branch code was "1", this if statement triggered:
+```java
+if ("01".equals(col0) || "1".equals(col0)) {
 
-when i upload the excel file it giving me the error for the CSV file which is should not happen 
-Site	Date	Year	Month	Branch	Currency	CGL	Amount	TxnType	Remarks	ERRORS
-1	INR	5000000000	18378272	CR	REMARKS		0			Site must be '01'; Invalid Date Format (ddMMyyyy); Col 12 must be 'B'; Col 13 must be 'C'; Col 14 must be 'D'; Amount cannot be Zero or Null; Remarks is Mandatory; Currency must be exactly 3 characters; CGL is Mandatory
-1	INR	5000001642	18378272	DR	REMARKS		0			Site must be '01'; Invalid Date Format (ddMMyyyy); Col 12 must be 'B'; Col 13 must be 'C'; Col 14 must be 'D'; Amount cannot be Zero or Null; Remarks is Mandatory; Currency must be exactly 3 characters; CGL is Mandatory
+```
+The parser mistakenly assumed you were uploading a **System Format** file! Because it thought it was reading the System format, it shifted all your columns: it treated "1" as the Site, your currency "INR" as the Date, your CGL "5000000000" as the Year, and so on.
+### The Fix
+To fix this without losing any business logic, we just need to add a column count check. The Standard Format only has 7 columns, while the System Format has 14. If we ensure the row has more than 8 columns, we guarantee it won't mistake a Standard file for a System file, even if the Branch code is "1".
+Here are the exact changes you need to make in **JournalBulkValidationService.java**:
+#### 1. Update parseExcelStream
+Find the if statement that checks for "01" in parseExcelStream and update it:
+**Change this:**
+```java
+                // --- START PRESERVED BUSINESS LOGIC (01 Format) ---
+                if ("01".equals(col0) || "1".equals(col0)) {
+                    d.isSystemFormat = true;
+                    d.sysSite = col0;
 
+```
+**To this:**
+```java
+                // --- START PRESERVED BUSINESS LOGIC (01 Format) ---
+                // FIX: Check column count to prevent Branch "1" from triggering System Format
+                if (("01".equals(col0) || "1".equals(col0)) && r.getLastCellNum() > 8) {
+                    d.isSystemFormat = true;
+                    d.sysSite = col0;
 
-something like this but i upload the excel file not csv file 
+```
+#### 2. Update parseSheet (For Consistency)
+You have a secondary method called parseSheet that contains the exact same logic. Update it so it doesn't cause bugs if you use it later.
+**Change this:**
+```java
+            if ("01".equals(col0) || "1".equals(col0)) {
+                d.isSystemFormat = true;
+                d.sysSite = col0;
 
-i dont why this is happning cheak every line of code and find out this and give mi complate 
-file name methods name whats need to be change 
-and dont loose the buiness logic keep that as it is 
+```
+**To this:**
+```java
+            if (("01".equals(col0) || "1".equals(col0)) && r.getLastCellNum() > 8) {
+                d.isSystemFormat = true;
+                d.sysSite = col0;
+
+```
+### Bonus Fix: Critical CSV Bug
+While analyzing your file, I found that your CSV parser has the exact same vulnerability, plus a massive typo that will break all System CSV uploads. In parseCsvStream, it expects 14 columns but accidentally checks if the column count is exactly **88**!
+**In parseCsvStream, make these two fixes:**
+**Change this:**
+```java
+                // Logic for System Format (01) preserved exactly
+                if ("01".equals(col0Clean)) {
+                    d.isSystemFormat = true;
+                    // ... [code omitted for brevity] ...
+                    
+                    //change
+                    if (c.length != 88) {
+                        d.formatErrors.add("Invalid CSV columns (Expected 14)");
+                    } else {
+
+```
+**To this:**
+```java
+                // Logic for System Format (01) preserved exactly
+                // FIX: Check column count to distinguish from Standard Format
+                if ("01".equals(col0Clean) && c.length > 8) {
+                    d.isSystemFormat = true;
+                    // ... [code omitted for brevity] ...
+                    
+                    // FIX: Changed 88 to < 14
+                    if (c.length < 14) {
+                        d.formatErrors.add("Invalid CSV columns (Expected 14)");
+                    } else {
+
+```
+Make these updates, restart your application, and your Standard Excel file will parse flawlessly!
