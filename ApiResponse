@@ -1,2 +1,115 @@
+In a production environment, using TRUNCATE for a shared staging table like JOURNAL_REQUEST is extremely dangerous and is not recommended for this service.
+### Why you should NOT use TRUNCATE
+ 1. **Data Loss for Other Users**: TRUNCATE is a "Table-Level" operation. It deletes **every row** in the table, not just your batch. If two developers or users are uploading files at the same time, User A's TRUNCATE will wipe out User B's 500,000 rows instantly.
+ 2. **No Rollback**: TRUNCATE is a DDL command in Oracle. It performs an implicit commit. If your batch creation fails later, you cannot roll back the cleanup.
+ 3. **Locks**: TRUNCATE requires an exclusive lock on the entire table, which will block all other users from uploading until the command finishes.
+### The Professional Solution: Optimized DELETE
+The reason DELETE was slow before is that the database had to search through millions of rows without a map. By creating the index I recommended, the DELETE becomes nearly as fast as a TRUNCATE but stays safe for other users.
+**Run this once in the database to make DELETE fast:**
+```sql
+CREATE INDEX IDX_JR_BATCH_ID ON JOURNAL_REQUEST (BATCH_ID);
 
-   CREATE SEQUENCE  "FINCORE"."BATCH_SEQ"  MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 2288 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL ;
+```
+### Updated executeAsyncBatchCreation
+This code keeps the safe DELETE logic but is fully optimized for 500,000 rows. It uses the successfulRowsCount to ensure integrity and a batch Redis delete for speed.
+**File:** JournalRequestServiceImpl.java
+```java
+@Override
+@Async("bulkExecutor")
+public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+    String lockKey = "LOCK_REQ_" + requestId;
+    MDC.put("batchId", batchId);
+    MDC.put("user", creatorId);
+    
+    AtomicInteger successfulRowsCount = new AtomicInteger(0);
+    Map<String, String> contextMap = MDC.getCopyOfContextMap();
+
+    log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
+    long start = System.currentTimeMillis();
+
+    try {
+        // SAFE CLEANUP: With the IDX_JR_BATCH_ID index, this is now instant.
+        [span_0](start_span)// It only removes rows for THIS batchId, so other users are safe. [cite: 785-786]
+        jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+        jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+
+        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Fetching cached data...");
+        List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+
+        if (cachedRows == null || cachedRows.isEmpty()) {
+            log.error("CACHE_MISS | Batch: {} | Status: No data found", batchId);
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired.");
+            return;
+        }
+
+        int totalRows = cachedRows.size();
+        int batchSize = 5000;
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        LongAdder totalDebit = new LongAdder();
+        LongAdder totalCredit = new LongAdder();
+        AtomicInteger completedChunks = new AtomicInteger(0);
+        int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+
+        for (int i = 0; i < totalRows; i += batchSize) {
+            final int startIdx = i;
+            final int endIdx = Math.min(i + batchSize, totalRows);
+            final List<JournalBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
+
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                if (contextMap != null) MDC.setContextMap(contextMap);
+                try {
+                    self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+                    successfulRowsCount.addAndGet(chunk.size());
+                } finally {
+                    MDC.clear();
+                }
+            }, chunkWorkerExecutor)
+            .thenRun(() -> {
+                int done = completedChunks.incrementAndGet();
+                int percent = 5 + (done * 90 / totalChunks);
+                progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
+                        String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
+            });
+            futures.add(future);
+        }
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
+
+        final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
+        BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+        BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+
+        int actualRows = successfulRowsCount.get();
+        String batchStatus = (actualRows == totalRows) ? "PENDING" : "ERROR";
+        String finalRemarks = (actualRows == totalRows) ? commonRemarks : "INTEGRITY_FAILURE: Row count mismatch.";
+
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        
+        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, actualRows,
+                finalDebit, finalCredit, batchStatus, (actualRows != totalRows ? finalRemarks : ""));
+
+        if ("ERROR".equals(batchStatus)) {
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", finalRemarks);
+        } else {
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+        }
+
+    } catch (Exception e) {
+        log.error("BATCH_FATAL_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+        handleAsyncFailure(batchId, creatorId, requestId, "Internal error during batch creation.");
+    } finally {
+        [cite_start]// Optimized Batch Cleanup[span_0](end_span)
+        List<String> keysToDelete = new ArrayList<>();
+        keysToDelete.add(lockKey);
+        keysToDelete.add("DATA_" + requestId);
+        keysToDelete.add("DATA_META_" + requestId);
+        for (int k = 0; k < 110; k++) {
+            keysToDelete.add("DATA_CHUNK_" + requestId + "_" + k);
+        }
+        redisTemplate.delete(keysToDelete);
+        MDC.clear();
+    }
+}
+
+```
