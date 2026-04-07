@@ -1,13 +1,41 @@
-2026-04-07T19:05:56.087+05:30  INFO 14000 --- [JournalService] [    BulkCoord-1] c.f.J.Service.ValidationMasterService    : MASTER_DATA_LOADED | Type: CURRENCIES | Count: 44 | Duration: 18ms
-2026-04-07T19:05:56.169+05:30  INFO 14000 --- [JournalService] [    BulkCoord-1] c.f.J.Service.ValidationMasterService    : MASTER_DATA_LOADED | Type: CGLS | Count: 6890 | Duration: 82ms
-2026-04-07T19:05:56.176+05:30  INFO 14000 --- [JournalService] [    BulkCoord-1] c.f.J.S.JournalBulkValidationService     : VALIDATION_SUCCESS | ReqID: 9a599042-1d2a-4aad-8688-87a2e332e28e | Duration: 361ms
-2026-04-07T19:05:56.207+05:30  INFO 14000 --- [JournalService] [    BulkCoord-1] c.f.J.S.JournalBulkValidationService     : CACHE_DATA_SAVED | ReqID: 9a599042-1d2a-4aad-8688-87a2e332e28e | TotalRows: 2 | Chunks: 1
-2026-04-07T19:05:59.283+05:30  INFO 14000 --- [JournalService] [nio-9999-exec-3] c.f.J.C.JournalRequestController         : CACHE_BATCH_INIT | User: 1021256 | ReqID: 9a599042-1d2a-4aad-8688-87a2e332e28e
-2026-04-07T19:05:59.372+05:30  INFO 14000 --- [JournalService] [nio-9999-exec-3] c.f.J.Service.SequenceService            : SEQUENCE_GENERATED | Type: BATCH_ID | Value: 0002280
-2026-04-07T19:05:59.376+05:30  INFO 14000 --- [JournalService] [    BulkCoord-2] c.f.J.Service.JournalRequestServiceImpl  : ASYNC_BATCH_START | Batch: 0002280 | Source: 9a599042-1d2a-4aad-8688-87a2e332e28e
-2026-04-07T19:05:59.440+05:30  INFO 14000 --- [JournalService] [    BulkCoord-2] c.f.J.S.JournalBulkValidationService     : CACHE_RETRIEVAL_SUCCESS | ReqID: 9a599042-1d2a-4aad-8688-87a2e332e28e | Rows: 2 | Duration: 9ms
-2026-04-07T19:05:59.614+05:30  INFO 14000 --- [JournalService] [    BulkCoord-2] c.f.J.Service.NotificationWriterService  : NOTIFICATION_SAVED | Type: DIRECT | UserID: 1021256 | Ref: 0002280
-2026-04-07T19:05:59.699+05:30  INFO 14000 --- [JournalService] [    BulkCoord-2] c.f.J.Service.PermissionConfigService    : PERMISSION_CACHE_MISS | Fetching routing metadata for: JOURNAL_AUTH
-2026-04-07T19:05:59.796+05:30  WARN 14000 --- [JournalService] [    BulkCoord-2] c.f.J.Service.PermissionConfigService    : PERMISSION_CONFIG_NOT_FOUND | No mapping exists for: JOURNAL_AUTH. Applying defaults.
-2026-04-07T19:05:59.796+05:30  WARN 14000 --- [JournalService] [    BulkCoord-2] c.f.J.Service.NotificationWriterService  : NOTIFICATION_SKIPPED | Reason: Recipient missing | AggregateID: 0002280
-2026-04-07T19:05:59.812+05:30  INFO 14000 --- [JournalService] [    BulkCoord-2] c.f.J.Service.JournalRequestServiceImpl  : BATCH_CREATION_FINISHED | Batch: 0002280 | Status: PENDING | Rows: 2 | Duration: 436ms
+I see exactly what is happening in your logs. Your system successfully created the batch and even sent the direct notification to the creator (NOTIFICATION_SAVED | Type: DIRECT).
+However, when it tried to broadcast the approval request, it hit this:
+PERMISSION_CONFIG_NOT_FOUND | No mapping exists for: JOURNAL_AUTH
+Because your PermissionConfigService returned zero roles, your NotificationWriterService correctly blocked the notification to prevent sending a blank alert (NOTIFICATION_SKIPPED | Reason: Recipient missing).
+### The Root Cause
+The native SQL query in your PermissionRepository executed perfectly without any syntax errors, but it returned **zero rows**.
+Why? Because in Oracle SQL, the LIKE operator is **strictly case-sensitive**. Your query is looking for exactly %approve% or %reject% in lowercase. If your database stores the menu action as "Approve", "APPROVE", or "Approve Journal", the query will fail to match it and return nothing.
+### The Fix
+We need to make the MENU_ACTION check case-insensitive by wrapping it in Oracle's LOWER() function so it successfully matches your database rows regardless of how they are capitalized.
+**File:** PermissionRepository.java
+**Method:** findUrlAndRolesByRequestType
+**Change your existing query:**
+```java
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM MENU_ITEMS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+
+```
+**To this:**
+```java
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM MENU_ITEMS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         -- FIX: Wrapped MENU_ACTION in LOWER() for case-insensitive matching
+         AND (LOWER(p.MENU_ACTION) LIKE '%approve%' OR LOWER(p.MENU_ACTION) LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+
+```
+Restart your application, and this query will now properly fetch the authorized roles and trigger your approval notifications!
