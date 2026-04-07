@@ -1,131 +1,68 @@
-@Override
-@Async("bulkExecutor")
-// Note: @Transactional is intentionally removed here to allow processChunkRaw 
-// to manage its own independent transactions for each 5,000-row chunk.
-public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-    String lockKey = "LOCK_REQ_" + requestId;
-    MDC.put("batchId", batchId);
-    MDC.put("user", creatorId);
+Yes, to handle **500,000 records** without the database becoming a bottleneck, changing the sequence allocation is only half the battle. As a Tech Lead, I recommend a specific indexing strategy and a few Oracle-side "housekeeping" steps to ensure those inserts don't crawl to a halt.
+Here is your step-by-step performance optimization plan:
+### Phase 1: Database Sequence Sync
+When you set allocationSize = 1000 in Java, the database sequence **must** have a matching cache. If the DB cache is 20 and Java wants 1000, you will see a massive performance hit because the DB will still be writing to disk to update the sequence metadata.
+**Run this SQL:**
+```sql
+-- Sync the DB cache with your Java allocation size
+ALTER SEQUENCE JOURNAL_REQUEST_SEQ CACHE 1000;
 
-    // 1. Capture MDC context to ensure worker threads have traceable logs
-    Map<String, String> contextMap = MDC.getCopyOfContextMap();
-    AtomicInteger successfulRowsCount = new AtomicInteger(0);
+```
+### Phase 2: Indexing Strategy
+For a staging table like JOURNAL_REQUEST that grows and shrinks rapidly, too many indexes will slow down your **inserts**. However, you absolutely need these for the **Search** and **Delete** operations your code performs.
+**1. The "Idempotency" Index (High Priority)**
+Your code runs DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ? at the start of every upload. Without an index on BATCH_ID, Oracle will perform a **Full Table Scan** of millions of rows just to delete one batch.
+```sql
+CREATE INDEX IDX_JR_BATCH_ID ON JOURNAL_REQUEST (BATCH_ID);
 
-    log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
-    long start = System.currentTimeMillis();
+```
+**2. The "Authorization Screen" Composite Index**
+Your search queries filter by BRANCH_CODE or CGL while also checking if the status is PENDING. A composite index allows for an **Index Range Scan**, which is significantly faster for 500k rows.
+```sql
+-- For Branch searches
+CREATE INDEX IDX_JR_BRANCH_STATUS ON JOURNAL_REQUEST (REQ_BRANCH_CODE, REQ_STATUS);
 
-    try {
-        // 2. IDEMPOTENCY: Purge any existing data for this batchId to prevent count inflation
-        jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-        jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+-- For CGL searches
+CREATE INDEX IDX_JR_CGL_STATUS ON JOURNAL_REQUEST (REQ_CGL, REQ_STATUS);
 
-        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
-        
-        // Retrieve valid rows from the GZIP-compressed Redis cache
-        List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-        
-        if (cachedRows == null || cachedRows.isEmpty()) {
-            log.error("CACHE_MISS | Batch: {} | Status: No valid rows found in Redis", batchId);
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
-            return;
-        }
-
-        int totalRows = cachedRows.size();
-        int batchSize = 5000;
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-        // High-precision thread-safe counters for financial totals
-        LongAdder totalDebit = new LongAdder();
-        LongAdder totalCredit = new LongAdder();
-        AtomicInteger completedChunks = new AtomicInteger(0);
-        int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
-
-        // 3. PARALLEL CHUNKING: Process 5,000 rows at a time
-        for (int i = 0; i < totalRows; i += batchSize) {
-            final int startIdx = i;
-            final int endIdx = Math.min(i + batchSize, totalRows);
-            final List<JournalBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
-
-            // Use 'self' to ensure call goes through Spring proxy for @Transactional(Propagation.REQUIRES_NEW)
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                if (contextMap != null) MDC.setContextMap(contextMap);
-                try {
-                    self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
-                    // Increment successfully committed row count
-                    successfulRowsCount.addAndGet(chunk.size());
-                } finally {
-                    MDC.clear();
-                }
-            }, chunkWorkerExecutor)
-            .thenRun(() -> {
-                int done = completedChunks.incrementAndGet();
-                int percent = 5 + (done * 90 / totalChunks);
-                progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                        String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
-            });
-            futures.add(future);
-        }
-
-        // 4. WAIT FOR COMPLETION: Block until all parallel workers finish (45 min timeout for 500k rows)
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
-
-        // 5. PRECISION RECOVERY: Scale back LongAdder totals to 4-decimal BigDecimal
-        final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
-        BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
-        BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
-
-        // 6. INTEGRITY CHECK: Verify that actual saved rows match expected rows
-        int actualCommittedRows = successfulRowsCount.get();
-        String batchStatus = "PENDING";
-        String finalRemarks = commonRemarks;
-
-        if (actualCommittedRows != totalRows) {
-            batchStatus = "ERROR";
-            finalRemarks = String.format("INTEGRITY_FAILURE: Expected %d rows but only %d were saved.", totalRows, actualCommittedRows);
-            log.error("BATCH_INTEGRITY_FAILED | Batch: {} | Expected: {} | Actual: {}", batchId, totalRows, actualCommittedRows);
-        }
-
-        // 7. FINAL MASTER RECORD: Insert the summary record
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        
-        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, actualCommittedRows,
-                finalDebit, finalCredit, batchStatus, (actualCommittedRows != totalRows ? finalRemarks : ""));
-
-        // Audit and Notification Logic (Preserved Business Logic)
-        if ("ERROR".equals(batchStatus)) {
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", finalRemarks);
-        } else {
-            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Successfully created batch " + batchId);
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-            sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
-
-            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-            if (config != null) {
-                String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
-                sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
-            }
-        }
-
-        log.info("BATCH_CREATION_FINISHED | Batch: {} | Status: {} | Rows: {} | Duration: {}ms", 
-                batchId, batchStatus, actualCommittedRows, System.currentTimeMillis() - start);
-
-    } catch (Exception e) {
-        log.error("BATCH_FATAL_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
-        handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred during batch creation.");
-    } finally {
-        // 8. OPTIMIZED CLEANUP: Batch delete all Redis keys in one network call
-        List<String> keysToDelete = new ArrayList<>();
-        keysToDelete.add(lockKey);
-        keysToDelete.add("DATA_" + requestId);
-        keysToDelete.add("DATA_META_" + requestId);
-        
-        // Clean up chunked keys if they exist (assuming max 500k rows / 5k chunk = 100 keys)
-        for (int k = 0; k < 110; k++) {
-            keysToDelete.add("DATA_CHUNK_" + requestId + "_" + k);
-        }
-        redisTemplate.delete(keysToDelete);
-        
-        MDC.clear();
-    }
+```
+### Phase 3: Entity Update
+Update your JournalRequest.java model to match the new cache size. Ensure the allocationSize matches the DB CACHE exactly to avoid "jumping" sequence numbers.
+```java
+@Entity
+@Table(name = "JOURNAL_REQUEST")
+@Data
+public class JournalRequest {
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "JOURNAL_REQUEST_SEQ")
+    @SequenceGenerator(
+        name = "JOURNAL_REQUEST_SEQ", 
+        sequenceName = "JOURNAL_REQUEST_SEQ", 
+        [span_8](start_span)allocationSize = 1000 // Match the DB CACHE 1000[span_8](end_span)
+    )
+    @Column(name = "REQ_ID")
+    private Long id;
+    
+    // ... rest of the file
 }
+
+```
+### Phase 4: Production Housekeeping
+Since you are sending this to production with a high volume of data, you must account for **Oracle Statistics**. When you suddenly drop 500,000 rows into a table, the Oracle Optimizer might still think the table is empty and choose the wrong "Execution Plan."
+**Step 1: Re-gather Stats after the first big upload**
+After you successfully upload your first 500k batch in the UAT or Prod environment, run this to "teach" the database how big the table really is:
+```sql
+EXEC DBMS_STATS.GATHER_TABLE_STATS(OWNNAME => 'FINCORE', TABNAME => 'JOURNAL_REQUEST');
+
+```
+**Step 2: Table Fragmentation**
+Because you are frequently inserting and then deleting 500k rows, the table might become "fragmented" over time (holding onto empty space).
+ * **Tech Lead Tip:** Ask your DBA if they recommend using TRUNCATE instead of DELETE for specific maintenance windows, or if the tablespace has AUTOALLOCATE enabled.
+### Summary Checklist
+| Target | Action | Reason |
+|---|---|---|
+| **Oracle Sequence** | ALTER ... CACHE 1000 | Reduces disk I/O for ID generation. |
+| **Indexing** | Create IDX on BATCH_ID | Makes the initial DELETE instant instead of minutes. |
+| **Composite Index** | (BRANCH, STATUS) | Speeds up the Authorization UI search. |
+| **Java Code** | allocationSize = 1000 | Allows Spring to "batch" ID requests. |
+Do you have access to run these ALTER commands on the database, or do I need to help you write a Migration script (like Flyway or Liquibase) to do it automatically?
