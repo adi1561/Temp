@@ -1,78 +1,101 @@
-The next critical bug is **Database Connection Pool Starvation**. While we fixed the thread pools to handle 500,000 records, your database configuration will likely crash the service under this load.
-### The Reason for the Bug
-Your chunkWorkerExecutor is configured with **50 maximum threads**. Each thread calls processChunkRaw, which is annotated with @Transactional(propagation = Propagation.REQUIRES_NEW).
- 1. **The Conflict:** REQUIRES_NEW forces every one of those 50 threads to grab its own dedicated database connection from the pool.
- 2. **The Bottleneck:** The default Spring Boot/HikariCP connection pool size is only **10**.
- 3. **The Crash:** When you upload 500,000 rows, 50 threads will try to work simultaneously. 10 will get a connection, and the other 40 will sit and wait. After 30 seconds (default timeout), those 40 threads will throw SQLTransientConnectionException: Connection is not available. This will cause chunks of your data to fail randomly, leading to the **incorrect counts** you are seeing in the master record.
-### Part 1: Update application.properties
-You must increase the connection pool size to match or exceed your thread pool size plus a small buffer for the rest of the application.
-```properties
-# Hikari Connection Pool Settings for High-Volume Uploads
-spring.datasource.hikari.maximum-pool-size=65
-spring.datasource.hikari.minimum-idle=10
-spring.datasource.hikari.idle-timeout=300000
-spring.datasource.hikari.connection-timeout=60000
-spring.datasource.hikari.max-lifetime=1800000
+ @Override
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        String lockKey = "LOCK_REQ_" + requestId;
+        MDC.put("batchId", batchId);
+        MDC.put("user", creatorId);
+        AtomicInteger successfulRowsCount = new AtomicInteger(0);
 
-```
-### Part 2: Update AsyncConfig.java
-We need to ensure the bulkExecutor (the coordinator) and the chunkWorkerExecutor (the writers) are perfectly tuned. If the writers are too fast and the pool is too small, the system will starve.
-```java
-@Bean(name = "bulkExecutor")
-public Executor bulkExecutor() {
-    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-    executor.setCorePoolSize(10);
-    executor.setMaxPoolSize(20);
-    executor.setQueueCapacity(100);
-    executor.setThreadNamePrefix("BulkCoord-");
-    executor.initialize();
-    return executor;
-}
+        // Capture the MDC context to pass it into background worker threads
+        Map<String, String> contextMap = MDC.getCopyOfContextMap();
 
-@Bean(name = "chunkWorkerExecutor")
-public Executor chunkWorkerExecutor() {
-    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-    // Keep core lower to save resources, but allow jumping to 50 for large files
-    executor.setCorePoolSize(25);
-    executor.setMaxPoolSize(50);
-    executor.setQueueCapacity(500);
-    executor.setThreadNamePrefix("BulkWriter-");
-    // CRITICAL: Ensure we don't use CallerRunsPolicy here as it blocks the coordinator
-    executor.setRejectedExecutionHandler(new java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy());
-    executor.initialize();
-    return executor;
-}
+        log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
+        long start = System.currentTimeMillis();
 
-```
-### Part 3: Update JournalRequestServiceImpl.java (Logic Fix)
-To prevent the "Wrong Count" bug when some chunks fail due to connection issues, we must change how we report the TOTAL_ROWS. Instead of using the file size, we should use an AtomicInteger that only counts rows that were **actually, successfully committed** to the database.
-```java
-// Inside executeAsyncBatchCreation method:
+        try {
+            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+            jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
 
-// 1. Define a counter for successfully inserted rows
-AtomicInteger successfulRowsCount = new AtomicInteger(0);
+            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Fetching cached data...");
+            List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
 
-// 2. In the loop, update the counter after processChunkRaw succeeds
-CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-    if (contextMap != null) MDC.setContextMap(contextMap);
-    try {
-        self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
-        // ONLY increment if the method above didn't throw an exception
-        successfulRowsCount.addAndGet(chunk.size());
-    } finally {
-        MDC.clear();
-    }
-}, chunkWorkerExecutor);
+            if (cachedRows == null || cachedRows.isEmpty()) {
+                log.error("CACHE_MISS | Batch: {} | Status: No valid rows found in Redis", batchId);
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired. Please re-upload.");
+                return;
+            }
 
-// 3. When inserting into JOURNAL_BATCH_MASTER, use the successfulRowsCount
-int finalTotalRows = successfulRowsCount.get();
+            int totalRows = cachedRows.size();
+            int batchSize = 5000;
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, finalTotalRows,
+            // High-precision thread-safe counters
+            LongAdder totalDebit = new LongAdder();
+            LongAdder totalCredit = new LongAdder();
+            AtomicInteger completedChunks = new AtomicInteger(0);
+            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+
+            // 2. PARALLEL CHUNKING
+            for (int i = 0; i < totalRows; i += batchSize) {
+                final int startIdx = i;
+                final int endIdx = Math.min(i + batchSize, totalRows);
+                final List<JournalBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
+
+                // USE 'self' to ensure the @Transactional(Propagation.REQUIRES_NEW) on processChunkRaw is honored
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                            // Restore MDC context in the worker thread so logs are traceable
+                            if (contextMap != null) MDC.setContextMap(contextMap);
+                            try {
+                                self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+
+                                successfulRowsCount.addAndGet(chunk.size());
+                            } finally {
+                                MDC.clear();
+                            }
+                        }, chunkWorkerExecutor)
+                        .thenRun(() -> {
+                            int done = completedChunks.incrementAndGet();
+                            int percent = 5 + (done * 90 / totalChunks);
+                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
+                                    String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
+                        });
+
+                futures.add(future);
+            }
+
+            // 3. SYNCHRONIZE: Wait for all chunks to be committed to the database.
+            // 45-minute timeout specifically for 500,000+ row volume.
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
+
+            // 4. PRECISION RECOVERY: Scale back the LongAdder totals to BigDecimal
+            final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
+            BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+            BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+
+            // 5. FINAL MASTER RECORD: Inserted only after all chunks are confirmed
+            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+
+            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
                     finalDebit, finalCredit, "PENDING");
 
-```
-### Why this solves it:
- * **Availability**: By increasing the maximum-pool-size to 65, your 50 worker threads will never have to wait or time out for a database connection.
- * **Precision**: By using successfulRowsCount.addAndGet(chunk.size()) *after* the self.processChunkRaw call, you ensure that if a database connection failure *does* happen, the Master record will show the actual number of rows inserted (e.g., 70,000) instead of the "ghost count" (75,000).
-Next bug? We should look at **Index Contention on the Oracle/SQL Sequence**, which will slow down the 500,000-row insert as you scale. Ready?
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+            log.info("BATCH_SUCCESS | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
+
+        } catch (Exception e) {
+            log.error("BATCH_FATAL_ERROR | Batch: {} | Msg: {}", batchId, e.getMessage());
+            handleAsyncFailure(batchId, creatorId, requestId, "Critical system error during batch creation.");
+        } finally {
+            // Cleanup Redis resources
+            redisTemplate.delete(lockKey);
+            redisTemplate.delete("DATA_META_" + requestId);
+            // Delete chunked keys if your implementation uses them
+            for(int k=0; k<1000; k++) {
+                Boolean deleted = redisTemplate.delete("DATA_CHUNK_" + requestId + "_" + k);
+                if (Boolean.FALSE.equals(deleted)) break;
+            }
+            MDC.clear();
+        }
+    }
+
+can u add the required things and give mi updated fileas
