@@ -1,5 +1,33 @@
-        <dependency>
-            <groupId>com.github.pjfanning</groupId>
-            <artifactId>excel-streaming-reader</artifactId>
-            <version>4.0.5</version> 
-        </dependency>
+Awesome, you have successfully fixed the root cause of the crash! By swapping to pjfanning, your application can now stream Excel files using Apache POI 5.2.5 without hitting that NoSuchMethodError.
+Now for the final, critical change to ensure your application is truly production-ready.
+We need to add a safety net to your async thread. Right now, if the Java Virtual Machine throws an Error (like OutOfMemoryError or another LinkageError), your thread dies instantly, bypassing your Exception catch blocks. When this happens, the database status never updates to ERROR, leaving the user's batch stuck in PROCESSING forever.
+### The Final Change: Add the Throwable Catch Block
+Open **JournalBulkValidationService.java** and locate the **processAsync** method.
+Scroll down to the bottom of that method where all the catch blocks are located. Add the new catch (Throwable t) block right before the finally block.
+**Make your code look exactly like this:**
+```java
+        } catch (DataAccessException e) {
+            log.error("REDIS_OR_DB_UNAVAILABLE | ReqID: {} | Status: Backend connection failure", requestId);
+            handleAsyncCrash(requestId, "System temporarily unavailable. Please try again later.");
+        } catch (NullPointerException | ArrayIndexOutOfBoundsException e) {
+            log.error("INTERNAL_LOGIC_ERROR | ReqID: {} | Type: {}", requestId, e.getClass().getSimpleName());
+            handleAsyncCrash(requestId, "Internal system failure during processing.");
+        } 
+        // ---> ADD THIS NEW BLOCK BELOW <---
+        catch (Throwable t) {
+            log.error("FATAL_SYSTEM_ERROR | ReqID: {} | Type: {}", requestId, t.getClass().getSimpleName(), t);
+            handleAsyncCrash(requestId, "A critical system error occurred during processing.");
+        }
+        // ---> ADD THIS NEW BLOCK ABOVE <---
+        finally {
+            if (tempFile.exists() && !tempFile.delete()) {
+                log.warn("CLEANUP_WARN | Path: {} | Status: Temp file purge failed", tempFilePath);
+            }
+            MDC.clear();
+        }
+    }
+
+```
+### Why this is important:
+Throwable is the absolute top-level parent class in Java. By catching Throwable, you guarantee that **no matter what happens**—even if the server runs out of memory or a library is completely missing—your handleAsyncCrash method will run. This ensures the batch status safely updates to ERROR and the user gets a message, rather than waiting forever.
+Once you add this block, you are fully good to compile, test, and push to production! Let me know how the test run goes.
