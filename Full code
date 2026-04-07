@@ -1,6 +1,7 @@
 -----------------------------------------------------------------------------
 Config files
 -----------------------------------------------------------------------------
+
 package com.fincore.JournalService.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -43,7 +44,6 @@ public class AppConfig {
 }
 
 
-
 package com.fincore.JournalService.config;
 
 import lombok.extern.slf4j.Slf4j;
@@ -56,10 +56,8 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
 
-
-
 /**
- * Configures the dedicated 'bulkExecutor' thread pool for 600k+ row processing.
+ * Configures dedicated thread pools for high-volume row processing and chunking.
  * Implements global error handling for fire-and-forget async tasks.
  */
 @Configuration
@@ -67,12 +65,10 @@ import java.util.concurrent.Executor;
 @Slf4j
 public class AsyncConfig implements AsyncConfigurer {
 
-
     /**
-     * Dedicated executor for high-volume journal operations.
+     * Dedicated executor for high-volume journal operations (Coordinator pool).
      * Logic for pool sizing and queue capacity is preserved exactly as established.
      */
-
     @Bean(name = "bulkExecutor")
     public Executor bulkExecutor() {
         log.info("ASYNC_CONFIG_INIT | Initializing Bulk Thread Pool ");
@@ -86,10 +82,25 @@ public class AsyncConfig implements AsyncConfigurer {
     }
 
     /**
+     * Dedicated worker pool specifically for processing inner batch chunks.
+     * Prevents deadlock by separating chunk processing from the main coordinator threads.
+     */
+    @Bean(name = "chunkWorkerExecutor")
+    public Executor chunkWorkerExecutor() {
+        log.info("ASYNC_CONFIG_INIT | Initializing Chunk Worker Thread Pool ");
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(15);
+        executor.setMaxPoolSize(30);
+        executor.setQueueCapacity(1000);
+        executor.setThreadNamePrefix("ChunkWorker-");
+        executor.initialize();
+        return executor;
+    }
+
+    /**
      * Global handler for uncaught exceptions in @Async methods that return void.
      * Replaces generic catching with structured, descriptive logging.
      */
-
     @Override
     public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
         return (ex, method, params) -> {
@@ -106,8 +117,6 @@ public class AsyncConfig implements AsyncConfigurer {
         };
     }
 }
-
-
 
 package com.fincore.JournalService.config;
 
@@ -142,6 +151,7 @@ public class CacheConfig {
         return cacheManager;
     }
 }
+
 
 
 package com.fincore.JournalService.config;
@@ -185,7 +195,6 @@ public class HiveDbConfig {
         return new JdbcTemplate(dataSource);
     }
 }
-
 
 package com.fincore.JournalService.config;
 
@@ -440,11 +449,6 @@ public class SecurityConfig {
         return http.build();
     }
 }
-
-
-
-
-
 
 -----------------------------------------------------------------------------
 Controllers files
@@ -2441,6 +2445,20 @@ public interface PermissionRepository extends JpaRepository<Permissions, Integer
 -----------------------------------------------------------------------------
 Services files
 -----------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Dto.BranchDto;
@@ -2615,10 +2633,13 @@ import java.util.List;
 public class HdfsRecoveryService {
 
     private final HdfsSyncService hdfsSyncService;
-
     @Autowired
     @Qualifier("oracleJdbcTemplate")
     private JdbcTemplate oracleJdbcTemplate;
+
+    // Injecting StringRedisTemplate for Distributed Locking
+    @Autowired
+    private org.springframework.data.redis.core.StringRedisTemplate stringRedisTemplate;
 
     /**
      * Scheduled task to retry PENDING syncs from the retry queue.
@@ -2627,34 +2648,48 @@ public class HdfsRecoveryService {
 
     @Scheduled(fixedDelay = 300000)
     public void retryFailedHdfsSyncs() {
-        // 1. Fetch PENDING batches
-        String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
-        List<String> failedBatches;
+        String lockKey = "SYSTEM_LOCK_HDFS_RECOVERY";
+
         try {
-            failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
-        } catch (DataAccessException e) {
-            log.error("HDFS_RECOVERY_QUERY_FAIL | Error fetching pending retries from Oracle: {}", e.getMessage());
-            return;
-        }
+            // Attempt to acquire lock for 4 minutes (expires safely before the next 5-min cycle)
+            Boolean acquired = stringRedisTemplate.opsForValue().setIfAbsent(lockKey, "LOCKED", 4, java.util.concurrent.TimeUnit.MINUTES);
 
-        if (failedBatches.isEmpty()) {
-            return;
-        }
-
-        log.info("HDFS RECOVERY: Found {} failed batches. Starting self-healing...", failedBatches.size());
-
-        for (String batchId : failedBatches) {
-            try {
-                processRetry(batchId);
-            } catch (DataAccessException e) {
-                // Catch specific Spring DAO exceptions for DB issues
-                log.error("HDFS_RECOVERY_DB_ERROR | Batch: {} | Persistence error: {}", batchId, e.getMessage());
-                incrementRetryCount(batchId);
-            } catch (CustomExceptions.DatabaseOperationException e) {
-                // Catch internal service-wrapped exceptions
-                log.error("HDFS_RECOVERY_LOGIC_ERROR | Batch: {} | Logic failure: {}", batchId, e.getMessage());
-                incrementRetryCount(batchId);
+            if (Boolean.FALSE.equals(acquired)) {
+                log.debug("HDFS_RECOVERY_SKIPPED | Status: Another node is currently processing the queue.");
+                return;
             }
+
+            // 1. Fetch PENDING batches
+            String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
+            List<String> failedBatches;
+            try {
+                failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
+            } catch (DataAccessException e) {
+                log.error("HDFS_RECOVERY_QUERY_FAIL | Error fetching pending retries from Oracle: {}", e.getMessage());
+                return;
+            }
+
+            if (failedBatches.isEmpty()) {
+                return;
+            }
+
+            log.info("HDFS RECOVERY: Found {} failed batches. Starting self-healing...", failedBatches.size());
+            for (String batchId : failedBatches) {
+                try {
+                    processRetry(batchId);
+                } catch (DataAccessException e) {
+                    log.error("HDFS_RECOVERY_DB_ERROR | Batch: {} | Persistence error: {}", batchId, e.getMessage());
+                    incrementRetryCount(batchId);
+                } catch (CustomExceptions.DatabaseOperationException e) {
+                    log.error("HDFS_RECOVERY_LOGIC_ERROR | Batch: {} | Logic failure: {}", batchId, e.getMessage());
+                    incrementRetryCount(batchId);
+                }
+            }
+        } catch (org.springframework.data.redis.RedisConnectionFailureException e) {
+            log.error("HDFS_RECOVERY_REDIS_FAIL | Cannot acquire distributed lock. Skipping cycle to prevent race conditions.");
+        } finally {
+            // Guarantee the lock is released when the task finishes, allowing the next cycle to run smoothly
+            stringRedisTemplate.delete(lockKey);
         }
     }
     /**
@@ -2709,9 +2744,6 @@ public class HdfsRecoveryService {
         }
     }
 }
-
-
-
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Dto.HdfsSyncDto;
@@ -2788,7 +2820,6 @@ public class    HdfsSyncService {
         }
     }
 }
-
 
 package com.fincore.JournalService.Service;
 
@@ -3535,8 +3566,6 @@ public class JournalBulkValidationService {
         }
     }
 }
-
-
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -3695,6 +3724,11 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Qualifier("bulkExecutor")
     private Executor bulkExecutor;
 
+    // Inject the new chunk worker pool
+    @Autowired
+    @Qualifier("chunkWorkerExecutor")
+    private Executor chunkWorkerExecutor;
+
     @Autowired
     @Qualifier("oracleDataSource")
     private DataSource dataSource;
@@ -3770,8 +3804,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 final int endIdx = Math.min(i + batchSize, totalRows);
                 final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
 
+                // FIX: Offloading the raw chunks to the new chunkWorkerExecutor to prevent thread starvation
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
+                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), chunkWorkerExecutor)
                         .thenRun(() -> {
                             int done = completedChunks.incrementAndGet();
                             int percent = 5 + (done * 90 / totalChunks);
@@ -3829,8 +3864,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
     }
 
-
-
     private void handleAsyncFailure(String batchId, String creatorId, String requestId, String message) {
         cleanupFailedBatch(batchId);
 
@@ -3848,61 +3881,55 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     private void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
         String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
 
-            if (conn == null) {
-                throw new SQLException("Connection Pool Exhausted: Could not acquire Oracle connection.");
-            }
+        try {
+            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                    JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+                    int globalIdx = globalOffset + i + 1;
+                    String jId = batchId + "-" + globalIdx;
+                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                    boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
+                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
 
-            conn.setAutoCommit(false);
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+                    if (isCredit) credit.add(absAmt.longValue());
+                    else debit.add(absAmt.longValue());
 
-            for (int i = 0; i < chunk.size(); i++) {
-                JournalBulkValidationService.ExcelRowData r = chunk.get(i);
-                int globalIdx = globalOffset + i + 1;
-                String jId = batchId + "-" + globalIdx;
+                    LocalDate rDate = LocalDate.now();
+                    if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                        try {
+                            rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
+                        } catch (DateTimeParseException ignored) {}
+                    }
 
-                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
-
-                if (isCredit) credit.add(absAmt.longValue());
-                else debit.add(absAmt.longValue());
-
-                LocalDate rDate = LocalDate.now();
-                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                    try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); }
-                    catch (DateTimeParseException ignored) {}
+                    ps.setString(1, "P");
+                    ps.setTimestamp(2, ts);
+                    ps.setString(3, creatorId);
+                    ps.setInt(4, creatorRole != null ? creatorRole : 0);
+                    ps.setString(5, batchId);
+                    ps.setString(6, jId);
+                    ps.setString(7, commonRemarks);
+                    ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
+                    ps.setString(9, r.branch);
+                    ps.setString(10, r.currency);
+                    ps.setString(11, r.cgl);
+                    ps.setBigDecimal(12, signedAmt);
+                    ps.setDate(13, java.sql.Date.valueOf(rDate));
+                    ps.setString(14, r.remarks);
+                    ps.setString(15, r.productCode);
                 }
 
-
-                ps.setString(1, "P");
-                ps.setTimestamp(2, ts);
-                ps.setString(3, creatorId);
-                ps.setInt(4, creatorRole != null ? creatorRole : 0);
-                ps.setString(5, batchId);
-                ps.setString(6, jId);
-                ps.setString(7, commonRemarks);
-                ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
-
-                ps.setString(9, r.branch);
-                ps.setString(10, r.currency);
-                ps.setString(11, r.cgl);
-                ps.setBigDecimal(12, signedAmt);
-                ps.setDate(13, java.sql.Date.valueOf(rDate));
-                ps.setString(14, r.remarks);
-                ps.setString(15, r.productCode);
-
-                ps.addBatch();
-            }
-            ps.executeBatch();
-            conn.commit();
-        } catch (SQLException e) {
-            log.error("JDBC_SQL_FAIL | Batch: {} | SQLState: {} | ErrorCode: {}",
-                    batchId, e.getSQLState(), e.getErrorCode());
-            throw new CustomExceptions.DatabaseOperationException("Database integrity error during batch insert");
+                @Override
+                public int getBatchSize() {
+                    return chunk.size();
+                }
+            });
+        } catch (org.springframework.dao.DataAccessException e) {
+            log.error("JDBC_BATCH_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
         }
     }
 
@@ -4323,7 +4350,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
 }
 
-
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Models.Notifications;
@@ -4399,7 +4425,6 @@ public class NotificationWriterService {
         }
     }
 }
-
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Dto.NotificationConfigDto;
@@ -4725,5 +4750,68 @@ public class ValidationMasterService {
         }
     }
 }
+
+
+DB tables
+
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
+CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
+REQ_DATE	TIMESTAMP(6)	Yes		3	Timestamp when the batch was originally created.
+BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	Initial remarks provided by the creator upon create.
+TOTAL_ROWS	NUMBER	Yes	0	5	Total number of valid transaction rows contained in this batch.
+TOTAL_DEBIT	NUMBER(25,4)	Yes	0	6	Sum of all debit transaction amounts in the batch.
+TOTAL_CREDIT	NUMBER(25,4)	Yes	0	7	Sum of all credit transaction amounts in the batch.
+BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	Current workflow state (e.g., PENDING, ACCEPTED, REJECTED, ERROR).
+EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	User ID of the person who approved or rejected the batch.
+EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rejected.
+EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
+
+
+Journal Request
+REQ_ID	NUMBER	No		1	
+REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
+REQ_DATE	DATE	No	SYSDATE 	3	
+CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
+EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
+EXECUTION_DATE	DATE	Yes		6	Timestamp when this specific row was processed.
+EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
+PAYLOAD	CLOB	Yes		8	
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		9	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		10	Unique identifier for the individual request.
+COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		11	Remarks inherited from the batch creation process.
+CREATOR_ROLE	NUMBER(10,0)	Yes		12	
+REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		13	The branch code requested for the transaction.
+REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		14	The 3-character currency code requested.
+REQ_CGL	VARCHAR2(50 BYTE)	Yes		15	The 10-digit CGL account code requested.
+REQ_AMOUNT	NUMBER(25,4)	Yes		16	Raw requested amount 
+REQ_CSV_DATE	DATE	Yes		17	The transaction date provided in the uploaded file.
+REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		18	remarks from the uploaded file.
+REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		19	The product  code requested.
+CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		20	
+
+
+master Journal 
+JOURNAL_ID	NUMBER(19,0)	No		1	Unique sequential identifier for the master journal entry.
+JOURNAL_AMT	NUMBER(38,2)	Yes		2	Absolute transaction amount. Always positive; Txn Type determines debit/credit.
+AR_FLAG	VARCHAR2(1 CHAR)	Yes		3	Status flag indicating the record state. Default is A for Approved/Active.
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		4	Reference to the parent batch from JOURNAL_BATCH_MASTER.
+JOURNAL_BRANCH	VARCHAR2(50 CHAR)	Yes		5	The branch code where the transaction is booked.
+JOURNAL_CGL	VARCHAR2(50 CHAR)	Yes		6	The 10-digit Common General Ledger (CGL) account code.
+COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Batch-level remarks provided by the executor during approval.
+CURRENCY	VARCHAR2(3 CHAR)	Yes		8	The 3-character currency code (e.g., INR, USD) for the transaction.
+JOURNAL_ID_REF	VARCHAR2(50 CHAR)	Yes		9	Reference back to the original row ID from the JOURNAL_REQUEST staging table.
+JOURNAL_PDATE	DATE	Yes		10	CSV date of the journal entry.
+PRODUCT_TYPE	VARCHAR2(20 CHAR)	Yes		11	The 8-digit product code
+REMARKS	VARCHAR2(50 CHAR)	Yes		12	specific remarks for this individual entry.
+TXN_TYPE	VARCHAR2(20 CHAR)	Yes		13	Specifies if the entry is a Debit or Credit.
+AC_CLASSIFICATION	VARCHAR2(255 CHAR)	Yes		14	
+
+
+HDFS RETRY QUEUE
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	
+CREATED_AT	TIMESTAMP(6)	Yes	SYSTIMESTAMP	2	
+RETRY_COUNT	NUMBER	Yes	0	3	
+STATUS	VARCHAR2(20 BYTE)	Yes	"'PENDING' -- PENDING, FAILED, COMPLETED
+"	4	
 
 
