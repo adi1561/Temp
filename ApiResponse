@@ -1,144 +1,100 @@
-The error **"Methods annotated with '@Transactional' must be overridable"** occurs because Spring uses CGLIB proxies to handle transactions. For Spring to "wrap" your method in a transaction, the method must be **public** and the class must not be final.
-However, there is a **hidden architectural bug** here: In Spring, calling a @Transactional method from within the same class (e.g., this.processChunkRaw(...)) **bypasses the proxy**. This means your "mini-transactions" aren't actually starting, which is exactly why your database is locking up and counts are getting corrupted.
-### The Next Bug: Transactional Proxy Bypass & MDC Context Loss
- 1. **The Proxy Bug:** Because executeAsyncBatchCreation calls processChunkRaw directly, Spring never sees the @Transactional annotation on the chunk. For 500,000 records, this causes the database to treat the whole process as one giant, unstable transaction or a series of auto-commits that can't roll back.
- 2. **The MDC Bug:** MDC (Mapped Diagnostic Context) is ThreadLocal. When you use CompletableFuture.runAsync, the worker thread **loses the batchId and user info**. Your logs for 500,000 rows will be "silent," making it impossible to debug which chunk failed.
-### File: JournalRequestServiceImpl.java
-To solve this, we will use **Self-Injection**. This is a professional pattern that forces the call through the Spring Proxy so that @Transactional and MDC are respected.
-#### 1. Add Self-Injection and Update executeAsyncBatchCreation
-Add this at the top of your class and update the loop logic.
-```java
-@Autowired
-@Lazy
-private JournalRequestServiceImpl self; // Self-injection to solve the Proxy Bypass bug
-
 @Override
 @Async("bulkExecutor")
+// NOTE: @Transactional is REMOVED from this method level to allow 
+// processChunkRaw to commit in independent mini-transactions.
 public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+    String lockKey = "LOCK_REQ_" + requestId;
     MDC.put("batchId", batchId);
     MDC.put("user", creatorId);
-    
-    // Capture MDC context to pass to worker threads
+
+    // Capture the MDC context to pass it into background worker threads
     Map<String, String> contextMap = MDC.getCopyOfContextMap();
 
+    log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
+    long start = System.currentTimeMillis();
+
     try {
+        // 1. IDEMPOTENCY: Clear partial data from any previous failed attempts.
+        // This is the primary fix for the "75,000 becoming 105,000" row count bug.
         jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+        jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+
+        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Fetching cached data...");
         List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
         
+        if (cachedRows == null || cachedRows.isEmpty()) {
+            log.error("CACHE_MISS | Batch: {} | Status: No valid rows found in Redis", batchId);
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired. Please re-upload.");
+            return;
+        }
+
         int totalRows = cachedRows.size();
         int batchSize = 5000;
-        LongAdder totalDebit = new LongAdder();
-        LongAdder totalCredit = new LongAdder();
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
+        // High-precision thread-safe counters
+        LongAdder totalDebit = new LongAdder();
+        LongAdder totalCredit = new LongAdder();
+        AtomicInteger completedChunks = new AtomicInteger(0);
+        int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+
+        // 2. PARALLEL CHUNKING
         for (int i = 0; i < totalRows; i += batchSize) {
             final int startIdx = i;
             final int endIdx = Math.min(i + batchSize, totalRows);
             final List<JournalBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
 
-            // USE 'self' instead of 'this' to ensure @Transactional works
+            // USE 'self' to ensure the @Transactional(Propagation.REQUIRES_NEW) on processChunkRaw is honored
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                // Restore MDC context in the worker thread
+                // Restore MDC context in the worker thread so logs are traceable
                 if (contextMap != null) MDC.setContextMap(contextMap);
                 try {
                     self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
                 } finally {
                     MDC.clear();
                 }
-            }, chunkWorkerExecutor);
+            }, chunkWorkerExecutor)
+            .thenRun(() -> {
+                int done = completedChunks.incrementAndGet();
+                int percent = 5 + (done * 90 / totalChunks);
+                progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
+                    String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
+            });
             
             futures.add(future);
         }
 
+        // 3. SYNCHRONIZE: Wait for all chunks to be committed to the database.
+        // 45-minute timeout specifically for 500,000+ row volume.
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
 
-        // ... Summary insertion logic (already fixed in previous step) ...
+        // 4. PRECISION RECOVERY: Scale back the LongAdder totals to BigDecimal
+        final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
+        BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+        BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+
+        // 5. FINAL MASTER RECORD: Inserted only after all chunks are confirmed
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        
+        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
+                            finalDebit, finalCredit, "PENDING");
+
+        progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+        log.info("BATCH_SUCCESS | Batch: {} | TotalRows: {} | Duration: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
 
     } catch (Exception e) {
-        log.error("BATCH_CRITICAL_FAILURE | Error: {}", e.getMessage());
-        handleAsyncFailure(batchId, creatorId, requestId, e.getMessage());
+        log.error("BATCH_FATAL_ERROR | Batch: {} | Msg: {}", batchId, e.getMessage());
+        handleAsyncFailure(batchId, creatorId, requestId, "Critical system error during batch creation.");
     } finally {
+        // Cleanup Redis resources
+        redisTemplate.delete(lockKey);
+        redisTemplate.delete("DATA_META_" + requestId);
+        // Delete chunked keys if your implementation uses them
+        for(int k=0; k<1000; k++) {
+            Boolean deleted = redisTemplate.delete("DATA_CHUNK_" + requestId + "_" + k);
+            if (Boolean.FALSE.equals(deleted)) break; 
+        }
         MDC.clear();
     }
 }
-
-```
-#### 2. Full Code for processChunkRaw (Public & Transactional)
-Now that it's public, Spring can override it. We also added Propagation.REQUIRES_NEW so each chunk is a safe, independent unit of work.
-```java
-@Transactional(propagation = Propagation.REQUIRES_NEW)
-public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk, 
-                            String batchId, 
-                            String commonRemarks, 
-                            String creatorId, 
-                            Integer creatorRole, 
-                            int globalOffset, 
-                            LongAdder globalDebit, 
-                            LongAdder globalCredit) {
-    
-    String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-    final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
-    final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
-
-    try {
-        jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
-            @Override
-            public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
-                JournalBulkValidationService.ExcelRowData r = chunk.get(i);
-                int globalIdx = globalOffset + i + 1;
-                String jId = batchId + "-" + globalIdx;
-                
-                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
-
-                LocalDate rDate = LocalDate.now();
-                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                    try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); } 
-                    catch (DateTimeParseException ignored) {}
-                }
-
-                ps.setString(1, "P");
-                ps.setTimestamp(2, ts);
-                ps.setString(3, creatorId);
-                ps.setInt(4, creatorRole != null ? creatorRole : 0);
-                ps.setString(5, batchId);
-                ps.setString(6, jId);
-                ps.setString(7, commonRemarks);
-                ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
-                ps.setString(9, r.branch);
-                ps.setString(10, r.currency);
-                ps.setString(11, r.cgl);
-                ps.setBigDecimal(12, signedAmt);
-                ps.setDate(13, java.sql.Date.valueOf(rDate));
-                ps.setString(14, r.remarks);
-                ps.setString(15, r.productCode);
-            }
-
-            @Override
-            public int getBatchSize() { return chunk.size(); }
-        });
-
-        // Precision counting: Only update if the DB transaction succeeds
-        for (JournalBulkValidationService.ExcelRowData r : chunk) {
-            long scaledValue = r.amount.abs().multiply(SCALE_FACTOR).longValue();
-            if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
-                globalCredit.add(scaledValue);
-            } else {
-                globalDebit.add(scaledValue);
-            }
-        }
-
-    } catch (Exception e) {
-        log.error("CHUNK_WRITE_FAIL | Offset: {} | Error: {}", globalOffset, e.getMessage());
-        throw e; // Triggers rollback for this chunk ONLY
-    }
-}
-
-```
-### Why this is the "Senior Engineer" solution:
- * **Idempotency & Rollback:** By using REQUIRES_NEW, if chunk #10 fails, chunks #1-#9 remain safely in the DB. When the user retries, your DELETE at the start ensures a clean slate.
- * **Observability:** Passing the contextMap to workers ensures your logs always show the batchId, even inside parallel threads.
- * **Proxy Integrity:** Self-injection ensures Spring manages the transactions, preventing partial data corruption that leads to the "Wrong Count" bug.
-Next bug? We should look at **Hikari Connection Pool Sizing**, as 50 parallel database workers will quickly exhaust a default connection pool and crash the service. Ready?
