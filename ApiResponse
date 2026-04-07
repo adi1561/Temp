@@ -8,13 +8,14 @@ public void executeAsyncBatchCreation(String batchId, String requestId, String c
     // Tracks rows successfully committed to the DB to prevent "Ghost Counts"
     AtomicInteger successfulRowsCount = new AtomicInteger(0);
 
+    [span_3](start_span)// Capture the MDC context for worker thread traceability[span_3](end_span)
     Map<String, String> contextMap = MDC.getCopyOfContextMap();
 
     log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
     long start = System.currentTimeMillis();
 
     try {
-        // Idempotency: Clear existing data for this batchId
+        [span_4](start_span)// Idempotency: Clear existing data for this batchId [cite: 785-786]
         jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
         jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
 
@@ -44,7 +45,7 @@ public void executeAsyncBatchCreation(String batchId, String requestId, String c
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                         if (contextMap != null) MDC.setContextMap(contextMap);
                         try {
-                            // Using 'self' ensures the @Transactional(Propagation.REQUIRES_NEW) is honored
+                            [cite_start]// Using 'self' ensures the @Transactional(Propagation.REQUIRES_NEW) is honored[span_4](end_span)
                             self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
                             
                             // Only count rows if the DB transaction succeeded
@@ -63,15 +64,15 @@ public void executeAsyncBatchCreation(String batchId, String requestId, String c
             futures.add(future);
         }
 
-        // Wait for parallel processing to complete
+        [span_5](start_span)// Wait for parallel processing to complete (increased timeout for 500k rows)[span_5](end_span)
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
 
-        // Convert scaled totals back to BigDecimal
+        [span_6](start_span)// Convert scaled totals back to BigDecimal[span_6](end_span)
         final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
         BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
         BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
 
-        // FINAL MASTER RECORD: Use successfulRowsCount to ensure count integrity
+        [span_7](start_span)// FINAL MASTER RECORD: Use successfulRowsCount to ensure count integrity[span_7](end_span)
         Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
         String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
@@ -86,16 +87,20 @@ public void executeAsyncBatchCreation(String batchId, String requestId, String c
         log.error("BATCH_FATAL_ERROR | Batch: {} | Msg: {}", batchId, e.getMessage());
         handleAsyncFailure(batchId, creatorId, requestId, "Critical system error during batch creation.");
     } finally {
-        // Cleanup Redis resources
-        redisTemplate.delete(lockKey);
-        redisTemplate.delete("DATA_META_" + requestId);
+        [span_8](start_span)// FIX: Optimized Batch Cleanup to prevent network bottlenecks[span_8](end_span)
+        List<String> keysToDelete = new ArrayList<>();
+        keysToDelete.add(lockKey);
+        keysToDelete.add("DATA_META_" + requestId);
         
-        // Dynamic cleanup based on actual chunks created
-        int totalChunksToClean = (int) Math.ceil((double) 500000 / 5000); // Coverage for max expected rows
-        for(int k = 0; k < totalChunksToClean; k++) {
-            Boolean deleted = redisTemplate.delete("DATA_CHUNK_" + requestId + "_" + k);
-            if (Boolean.FALSE.equals(deleted) && k > 10) break; // Optimization: stop if key doesn't exist
+        // Calculate max possible chunks (e.g., 500k rows / 5000 per chunk = 100 chunks)
+        int maxChunks = 105; 
+        for (int k = 0; k < maxChunks; k++) {
+            keysToDelete.add("DATA_CHUNK_" + requestId + "_" + k);
         }
+        
+        // Deleting the list in one operation is significantly faster than a loop
+        redisTemplate.delete(keysToDelete);
+        
         MDC.clear();
     }
 }
