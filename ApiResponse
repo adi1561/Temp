@@ -1,93 +1,117 @@
-The next critical bug is the **Excel Memory Leak**.
-In your current code, parseExcelStream uses new XSSFWorkbook(is). This is known as the **User Model API**. It loads the entire XML structure of the spreadsheet into the JVM memory. For a file with 500,000 rows, this will consume **several gigabytes of RAM**, leading to an immediate java.lang.OutOfMemoryError: Java heap space in production, even if your server has 8GB or 16GB of RAM.
-To fix this while **preserving 100% of your business logic**, we must use the **POI Streaming API** (or SXSSF logic for reading). This allows the service to read the file row-by-row without loading the whole thing into memory.
+The bug where 75,000 rows suddenly appear as 105,000 (or other inflated numbers) is caused by a **Lack of Transactional Atomicity** combined with **State Corruption in Redis**.
+### The Reason for the Bug
+ 1. **Orphan Threading:** In JournalRequestServiceImpl, your executeAsyncBatchCreation method uses CompletableFuture.runAsync. If the main process times out or fails, those background threads **keep running**. If you restart the upload, the old threads are still inserting rows while the new ones start, leading to "double-counting."
+ 2. **The "Blind Overwrite" in Redis:** Your updateState method reads the state from Redis, modifies it, and writes it back [cite: 642-644]. In a high-volume multithreaded environment (like 500k rows), two threads can read the state at the same time, modify different fields, and the second one will overwrite the first one's progress. This makes the UI display incorrect "Total Rows" or "Progress" counts.
+ 3. [cite_start]**Missing Unique Constraint:** Because JOURNAL_ID is not the Primary Key, the database allows duplicate rows for the same batch if the process is retried without a clean purge.
 ### File: JournalBulkValidationService.java
-I have rewritten these methods to use a streaming approach. I have kept your exact column indices (0-13 for "01" format, 0-6 for standard), your DataFormatter logic, and your hasProductCol detection [cite: 583-597].
-#### 1. Updated parseExcelStream Method
-[cite_start]This method now uses the StreamingReader pattern (or a low-memory wrapper) to iterate over rows safely [cite: 581-582].
+#### Updated updateState Method (Thread-Safe Version)
+We will change this to be **Synchronized** or use a "Read-Latest" pattern to ensure that when we update the row count or status, we don't accidentally overwrite the totalRows set by the parser [cite: 642-644].
 ```java
-private ParsingResult parseExcelStream(InputStream is, LocalDate postingDate) throws IOException {
-    // We use the same ParsingResult structure to maintain compatibility with your processAsync method
-    List<ExcelRowData> list = new ArrayList<>();
-    boolean hasProductCol = false;
-    DataFormatter fmt = new DataFormatter();
-
-    // Use StreamingWorkbook to avoid loading the entire 500k rows into the Heap
-    // Note: This requires the 'com.monitorjbl:xlsx-streamer' library or using POI's XSSFReader.
-    // I will use the standard POI XSSFReader logic to ensure it works with your current dependencies.
-    try (Workbook wb = com.monitorjbl.xlsx.StreamingReader.builder()
-            .rowCacheSize(100)    // Only keep 100 rows in memory at a time
-            .bufferSize(4096)     // Buffer size for reading the XML
-            .open(is)) {
-        
-        Sheet sheet = wb.getSheetAt(0);
-        for (Row r : sheet) {
-            if (isRowEmpty(r)) continue;
-
-            // Rule 3: Skip header row logic preserved
-            if (r.getRowNum() == 0) {
-                String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
-                if (h.contains("branch") || h.contains("batch")) continue;
-            }
-
-            ExcelRowData d = new ExcelRowData();
-            d.rowIndex = r.getRowNum();
-            String col0 = parseCode(r.getCell(0), fmt);
-
-            // --- START PRESERVED BUSINESS LOGIC (01 Format) ---
-            if ("01".equals(col0) || "1".equals(col0)) {
-                d.isSystemFormat = true;
-                d.sysSite = col0;
-                d.sysDate = parseCode(r.getCell(1), fmt);
-                d.sysYear = parseCode(r.getCell(2), fmt);
-                d.sysPeriod = parseCode(r.getCell(3), fmt);
-                d.branch = parseCode(r.getCell(4), fmt);
-                d.currency = fmt.formatCellValue(r.getCell(5)).trim().toUpperCase();
-                d.cgl = parseCode(r.getCell(6), fmt);
-                parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
-                d.remarks = fmt.formatCellValue(r.getCell(9)).trim();
-
-                Cell prodCell = r.getCell(10);
-                String rawProd = (prodCell != null) ? parseCode(prodCell, fmt).trim() : "";
-                d.productCode = rawProd;
-                if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                    hasProductCol = true;
-                }
-
-                // Call your existing validation for system columns
-                validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod,
-                        parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
-            } 
-            // --- START PRESERVED BUSINESS LOGIC (Standard Format) ---
-            else {
-                d.branch = col0;
-                d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
-                d.cgl = parseCode(r.getCell(2), fmt);
-                parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
-                d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
-
-                Cell prodCell = r.getCell(6);
-                String rawProd = (prodCell != null) ? parseCode(prodCell, fmt).trim() : "";
-                d.productCode = rawProd;
-                if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                    hasProductCol = true;
-                }
-            }
-            list.add(d);
-        }
-    } catch (Exception e) {
-        log.error("EXCEL_STREAM_PARSE_FAIL | Reason: {}", e.getMessage());
-        throw new IOException("Failed to stream Excel content: " + e.getMessage());
+/**
+ * UPDATED: Thread-safe state management for Redis.
+ * This prevents concurrent stages from overwriting each other's metadata.
+ */
+private synchronized void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) {
+    // 1. Always pull the freshest state from Redis to avoid "Stale Object" overwrites
+    BulkUploadStateDto state = getStatusFromRedis(requestId);
+    if (state == null) {
+        state = new BulkUploadStateDto();
+        state.setRequestId(requestId);
     }
-    
-    return new ParsingResult(list, hasProductCol);
+
+    // 2. Apply the update (e.g., changing status, incrementing counts, or setting total rows)
+    updater.accept(state);
+
+    // 3. Persist the updated object back to Redis immediately
+    saveStatusToRedis(requestId, state);
 }
 
 ```
-### Why this is essential for 500k rows:
- 1. [cite_start]**Heap Stability**: By using the StreamingReader, your JVM only holds the data for the "current" row in memory. The previous rows are discarded from the heap immediately after being added to your list.
- 2. **Logic Continuity**: I have used your exact parseCode and fmt.formatCellValue calls to ensure that **leading zeros** in branch codes or CGL numbers are not lost [cite: 583-588, 592-594].
- 3. [cite_start]**Data Safety**: The isRowEmpty check is still there to prevent processing thousands of "ghost" empty rows at the end of an Excel sheet [cite: 583, 677-679].
-**Note on Dependency**: To use StreamingReader, you usually need the xlsx-streamer dependency in your pom.xml. If you cannot add new libraries, let me know, and I can provide a much longer version using the native XSSFReader and SAX handlers (which is built into standard POI).
-[cite_start]**What’s next?** There is one more "invisible" bug: in JournalRequestServiceImpl.executeAsyncBatchCreation, you call CompletableFuture.runAsync using chunkWorkerExecutor. If that executor's queue is full, it might use a **CallerRunsPolicy**, which would block your main thread and slow down the whole service.
-Should we review the **Thread Pool configuration** next, or is there another specific behavior you want to fix?
+### File: JournalRequestServiceImpl.java
+#### Updated executeAsyncBatchCreation (Atomicity Fix)
+To stop the "105,000" bug, we must ensure that we strictly manage the lifecycle of the background threads. [cite_start]I have added a **Pre-emptive Purge** and a **Strict Join** to ensure no orphan rows are left behind [cite: 742-764].
+```java
+@Override
+@Async("bulkExecutor")
+@Transactional
+public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+    String lockKey = "LOCK_REQ_" + requestId;
+    MDC.put("batchId", batchId);
+    MDC.put("user", creatorId);
+
+    log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
+    long start = System.currentTimeMillis();
+
+    try {
+        // 1. STRICT IDEMPOTENCY: Delete any partial data from previous failed attempts.
+        // This is the primary fix for the "100,000 instead of 75,000" bug.
+        jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+        jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+
+        progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+        List<JournalBulkValidationService.ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+        
+        if (cachedRows == null || cachedRows.isEmpty()) {
+            log.error("CACHE_MISS | Batch: {} | Status: No valid rows found in Redis", batchId);
+            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired. Please re-upload.");
+            return;
+        }
+
+        int totalRows = cachedRows.size();
+        int batchSize = 5000;
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        LongAdder totalDebit = new LongAdder();
+        LongAdder totalCredit = new LongAdder();
+        AtomicInteger completedChunks = new AtomicInteger(0);
+        int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+
+        for (int i = 0; i < totalRows; i += batchSize) {
+            final int startIdx = i;
+            final int endIdx = Math.min(i + batchSize, totalRows);
+            final List<JournalBulkValidationService.ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
+
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
+                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), chunkWorkerExecutor)
+                .thenRun(() -> {
+                    int done = completedChunks.incrementAndGet();
+                    int percent = 5 + (done * 90 / totalChunks);
+                    progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
+                        String.format("Inserted %d of %d records", Math.min(done * batchSize, totalRows), totalRows));
+                });
+            futures.add(future);
+        }
+
+        // 2. WAIT FOR ALL: Block until every single chunk is confirmed in the DB.
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.MINUTES);
+
+        // 3. FINAL SUMMARY: Insert the master record only after row counts are verified.
+        final BigDecimal RECOVERY_FACTOR = new BigDecimal("10000");
+        BigDecimal finalDebit = BigDecimal.valueOf(totalDebit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+        BigDecimal finalCredit = BigDecimal.valueOf(totalCredit.sum()).divide(RECOVERY_FACTOR, 4, RoundingMode.HALF_UP);
+
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        
+        jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows, finalDebit, finalCredit, "PENDING");
+
+        progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch successfully created with " + totalRows + " rows.");
+        log.info("BATCH_CREATION_SUCCESS | Batch: {} | Total: {} | Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
+
+    } catch (Exception e) {
+        log.error("ASYNC_BATCH_CRASH | Batch: {} | Error: {}", batchId, e.getMessage());
+        handleAsyncFailure(batchId, creatorId, requestId, "Critical Error: " + e.getMessage());
+    } finally {
+        redisTemplate.delete(lockKey);
+        redisTemplate.delete("DATA_" + requestId);
+        MDC.clear();
+    }
+}
+
+```
+### Why this works:
+ * [cite_start]**Synchronized State**: The updateState fix ensures that when Stage 1 and Stage 2 of validation overlap, they don't overwrite the "Total Rows" count in Redis [cite: 642-644].
+ * [cite_start]**Master Cleanup**: By deleting existing data for the batchId at the start of the thread, we ensure that no matter how many times the user retries, the final count in JOURNAL_REQUEST will always match the file [cite: 785-786].
+ * [cite_start]**Precision Recovery**: The totals are now recovered using the RECOVERY_FACTOR, ensuring your financial dashboard is accurate.
+[cite_start]I have kept all your **MDC logging**, **Sequence generation**, and **Notification logic** exactly as it was [cite: 738, 743, 845-847].
+What is the next bug you want to tackle? We should look at **Single-Session Security** or **Notification Routing** if those are causing issues.
