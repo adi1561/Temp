@@ -1,45 +1,90 @@
-    private byte[] generateErrorExcelFast(List<ExcelRowData> rows, boolean includeProduct) throws IOException {
-        // FIX: Declare the workbook OUTSIDE the try block so the finally block can see it
-        SXSSFWorkbook workbook = new SXSSFWorkbook(100); 
-        
+Perfect. You are now on the final stretch! We are moving to **Group 5: General Java Bugs & Security**.
+These fixes prevent silent data crashes and close a major security loophole where users could potentially delete each other's data.
+Here are the exact code replacements:
+### 1. Fix the BranchService Crash (C-5)
+If your database ever gets a duplicate branch code, the Collectors.toMap function will throw an IllegalStateException and crash the endpoint.
+**File:** BranchService.java
+**Method:** getBranchCodeAndNameMap()
+**Change this:**
+```java
+return branches.stream()
+    .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName));
+
+```
+**To this:**
+```java
+return branches.stream()
+    .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName, (existing, replacement) -> existing));
+
+```
+### 2. Fix the NullPointerException in Batch Counting (C-7)
+If a batch doesn't exist, queryForObject returns null, which crashes when Java tries to convert it to a primitive long.
+**File:** JournalRequestServiceImpl.java
+**Method:** getRequestCountByBatchId()
+**Replace the entire method with this:**
+```java
+    @Override
+    public long getRequestCountByBatchId(String batchId) {
         try {
-            Sheet sheet = workbook.createSheet("Error Report");
-            CellStyle errStyle = workbook.createCellStyle();
-            Font f = workbook.createFont(); f.setColor(IndexedColors.RED.getIndex()); errStyle.setFont(f);
-
-            Row h = sheet.createRow(0);
-            List<String> headerList = new ArrayList<>(Arrays.asList("Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks"));
-            if (includeProduct) headerList.add("Product");
-            headerList.add("ERRORS");
-            if (rows.stream().anyMatch(r -> r.isSystemFormat)) headerList.addAll(0, Arrays.asList("Site", "Date", "Year", "Month"));
-            for (int i = 0; i < headerList.size(); i++) h.createCell(i).setCellValue(headerList.get(i));
-
-            int idx = 1;
-            boolean isSystem = rows.stream().anyMatch(r -> r.isSystemFormat);
-            for (ExcelRowData d : rows) {
-                Row r = sheet.createRow(idx++);
-                int col = 0;
-                if (isSystem) {
-                    r.createCell(col++).setCellValue(sanitize(d.sysSite));
-                    r.createCell(col++).setCellValue(sanitize(d.sysDate));
-                    r.createCell(col++).setCellValue(sanitize(d.sysYear));
-                    r.createCell(col++).setCellValue(sanitize(d.sysPeriod));
-                }
-                r.createCell(col++).setCellValue(sanitize(d.branch));
-                r.createCell(col++).setCellValue(sanitize(d.currency));
-                r.createCell(col++).setCellValue(sanitize(d.cgl));
-                r.createCell(col++).setCellValue(d.amount != null ? d.amount.toString() : "");
-                r.createCell(col++).setCellValue(sanitize(d.txnType));
-                r.createCell(col++).setCellValue(sanitize(d.remarks));
-                if (includeProduct) r.createCell(col++).setCellValue(sanitize(d.productCode));
-                Cell c = r.createCell(col);
-                if (d.hasErrors()) { c.setCellValue(d.getAllErrors()); c.setCellStyle(errStyle); }
-            }
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            workbook.write(out);
-            return out.toByteArray();
-        } finally {
-            workbook.dispose();  // CRITICAL FIX: Cleans up temp files on K8s disk
-            workbook.close();
+            Long result = jdbcTemplate.queryForObject(
+                "SELECT NVL(TOTAL_ROWS, 0) FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", Long.class, batchId);
+            return result != null ? result : 0L;
+        } catch (EmptyResultDataAccessException e) {
+            log.warn("COUNT_NOT_FOUND | Batch: {} | Status: Batch not in master table", batchId);
+            return 0L;
+        } catch (DataAccessException e) {
+            log.error("COUNT_QUERY_FAIL | Batch: {} | Status: Query failure", batchId);
+            return 0L;
         }
     }
+
+```
+### 3. Secure the cancelMyRequest Endpoint (H-6)
+Right now, any logged-in user can delete any other user's journal requests if they know the ID. We must enforce an ownership check.
+**File:** JournalRequestServiceImpl.java
+**Method:** cancelMyRequest()
+**Replace the entire method with this:**
+```java
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        JournalRequest request = journalRequestRepository.findById(requestId)
+            .orElseThrow(() -> new RuntimeException("Request not found: " + requestId)); // Replace RuntimeException with your custom ResourceNotFoundException if you have one
+
+        // CRITICAL FIX: Security Ownership Check
+        if (!request.getCreatorId().equalsIgnoreCase(userId)) {
+            log.warn("UNAUTHORIZED_DELETE | User: {} | RequestOwner: {} | ReqID: {}", userId, request.getCreatorId(), requestId);
+            throw new IllegalStateException("You can only cancel your own requests.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Only PENDING requests can be cancelled. Current: " + request.getRequestStatus());
+        }
+
+        journalRequestRepository.delete(request);
+        log.info("REQUEST_CANCELLED | User: {} | ReqID: {}", userId, requestId);
+    }
+
+```
+### 4. Fix Inconsistent Pagination (NH-2)
+When paginating data, if you don't use ORDER BY, Oracle can return rows in a random order, causing rows to appear on multiple pages or disappear entirely.
+**File:** JournalRequestRepository.java
+**Method:** findByBatchIdPaginated
+**Change this:**
+```java
+@Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
+        countQuery = "SELECT count(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
+        nativeQuery = true)
+Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
+
+```
+**To this:**
+```java
+// CRITICAL FIX: Added ORDER BY REQ_ID ASC to ensure stable pagination pages
+@Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId ORDER BY REQ_ID ASC",
+        countQuery = "SELECT count(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
+        nativeQuery = true)
+Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
+
+```
+Apply these final changes, run your build, and your backend will be fully secured and stabilized! Let me know if everything compiles cleanly.
