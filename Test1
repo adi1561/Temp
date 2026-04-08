@@ -1,173 +1,44 @@
-Excellent progress! You are now entering **Group 4: K8s & HDFS Stability**.
-These fixes are critical for running your microservice in a Kubernetes cluster without running out of memory, and they ensure that if your Big Data cluster (Hive/HDFS) goes down, you don't permanently lose financial data.
-Here are the exact replacements for Group 4:
-### 1. Stop Swallowing HDFS Exceptions (NC-7)
-Because syncToDataLake is currently marked as @Async, when it throws a database error, the main thread never hears about it, so it never queues the data for retry.
-**File:** HdfsSyncService.java
-Locate your syncToDataLake method. Remove @Async and remove the try-catch block that swallows the error:
-**Replace with:**
-```java
-    // CRITICAL FIX: Removed @Async. The caller is already on a background thread.
-    // Letting this run synchronously allows the caller to catch exceptions and queue for retry.
-    public void syncToDataLake(List<HdfsSyncDto> data) {
-        if (data == null || data.isEmpty()) return;
-        
-        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
-        long startTime = System.currentTimeMillis();
+ private byte[] generateErrorExcelFast(List<ExcelRowData> rows, boolean includeProduct) throws IOException {
+        try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
+            Sheet sheet = workbook.createSheet("Error Report");
+            CellStyle errStyle = workbook.createCellStyle();
+            Font f = workbook.createFont(); f.setColor(IndexedColors.RED.getIndex()); errStyle.setFont(f);
 
-        try {
-            String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
-                    "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
+            Row h = sheet.createRow(0);
+            List<String> headerList = new ArrayList<>(Arrays.asList("Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks"));
+            if (includeProduct) headerList.add("Product");
+            headerList.add("ERRORS");
+            if (rows.stream().anyMatch(r -> r.isSystemFormat)) headerList.addAll(0, Arrays.asList("Site", "Date", "Year", "Month"));
+            for (int i = 0; i < headerList.size(); i++) h.createCell(i).setCellValue(headerList.get(i));
 
-            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(PreparedStatement ps, int i) throws SQLException {
-                    HdfsSyncDto dto = data.get(i);
-                    ps.setBigDecimal(1, dto.getNewBalance());
-                    ps.setBigDecimal(2, dto.getNewInrBalance());
-                    ps.setString(3, dto.getBranch());
-                    ps.setString(4, dto.getCurrency());
-                    ps.setString(5, dto.getCgl());
-                    ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate()));
+            int idx = 1;
+            boolean isSystem = rows.stream().anyMatch(r -> r.isSystemFormat);
+            for (ExcelRowData d : rows) {
+                Row r = sheet.createRow(idx++);
+                int col = 0;
+                if (isSystem) {
+                    r.createCell(col++).setCellValue(sanitize(d.sysSite));
+                    r.createCell(col++).setCellValue(sanitize(d.sysDate));
+                    r.createCell(col++).setCellValue(sanitize(d.sysYear));
+                    r.createCell(col++).setCellValue(sanitize(d.sysPeriod));
                 }
-
-                @Override
-                public int getBatchSize() {
-                    return data.size();
-                }
-            });
-
-            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
-                    (System.currentTimeMillis() - startTime), data.size());
-
-        } catch (DataAccessException e) {
-            log.error("HDFS_SYNC_DB_FAIL | Status: Connectivity or Syntax error | Type: {}", e.getClass().getSimpleName());
-            // CRITICAL FIX: DO NOT SWALLOW IT. Throw it so JournalRequestServiceImpl queues it!
-            throw e; 
+                r.createCell(col++).setCellValue(sanitize(d.branch));
+                r.createCell(col++).setCellValue(sanitize(d.currency));
+                r.createCell(col++).setCellValue(sanitize(d.cgl));
+                r.createCell(col++).setCellValue(d.amount != null ? d.amount.toString() : "");
+                r.createCell(col++).setCellValue(sanitize(d.txnType));
+                r.createCell(col++).setCellValue(sanitize(d.remarks));
+                if (includeProduct) r.createCell(col++).setCellValue(sanitize(d.productCode));
+                Cell c = r.createCell(col);
+                if (d.hasErrors()) { c.setCellValue(d.getAllErrors()); c.setCellStyle(errStyle); }
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            workbook.write(out);
+            return out.toByteArray();
+        }finally {
+            workbook.dispose();  // CRITICAL FIX: Cleans up temp files on K8s disk
+            workbook.close();
         }
     }
 
-```
-### 2. Fix the Dead Retry Service & Redis Lock (H-2 & NM-8)
-We need to fix the bug where the Redis lock deletes someone else's lock, and extend the lock TTL from 4 minutes to 10 minutes so pods don't overlap.
-**File:** HdfsRecoveryService.java
-Replace your entire retryFailedHdfsSyncs method:
-```java
-    @Scheduled(fixedDelay = 300000)
-    public void retryFailedHdfsSyncs() {
-        String lockKey = "SYSTEM_LOCK_HDFS_RECOVERY";
-        boolean lockAcquired = false;
-
-        try {
-            // CRITICAL FIX: Lock TTL extended to 10 mins to prevent race conditions under load
-            Boolean acquired = stringRedisTemplate.opsForValue()
-                .setIfAbsent(lockKey, "LOCKED", 10, java.util.concurrent.TimeUnit.MINUTES);
-            lockAcquired = Boolean.TRUE.equals(acquired);
-
-            if (!lockAcquired) {
-                log.debug("HDFS_RECOVERY_SKIPPED | Status: Another node is currently processing.");
-                return;
-            }
-
-            String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
-            List<String> failedBatches;
-            try {
-                failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
-            } catch (DataAccessException e) {
-                log.error("HDFS_RECOVERY_QUERY_FAIL | Error: {}", e.getMessage());
-                return;
-            }
-
-            if (failedBatches.isEmpty()) return;
-
-            log.info("HDFS RECOVERY: Found {} failed batches.", failedBatches.size());
-            for (String batchId : failedBatches) {
-                try {
-                    processRetry(batchId);
-                } catch (DataAccessException | CustomExceptions.DatabaseOperationException e) {
-                    log.error("HDFS_RECOVERY_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
-                    incrementRetryCount(batchId);
-                }
-            }
-        } catch (org.springframework.data.redis.RedisConnectionFailureException e) {
-            log.error("HDFS_RECOVERY_REDIS_FAIL | Cannot acquire distributed lock.");
-        } finally {
-            // CRITICAL FIX: Only release if THIS thread actually acquired it!
-            if (lockAcquired) {
-                try { stringRedisTemplate.delete(lockKey); }
-                catch (Exception e) { log.warn("HDFS_LOCK_RELEASE_FAIL"); }
-            }
-        }
-    }
-
-```
-### 3. Prevent K8s Pod Out-Of-Sync Errors (NH-6)
-Your application is currently using an in-memory cache for permissions. In Kubernetes, this means Pod A won't know about permissions updated on Pod B. We must switch this to Redis.
-**File:** CacheConfig.java
-Replace the entire class to use the Redis-backed CacheManager:
-```java
-package com.fincore.JournalService.Config; // Update with your actual package
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.annotation.EnableCaching;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-@Configuration
-@EnableCaching
-@Slf4j
-public class CacheConfig {
-
-    @Bean
-    public org.springframework.cache.CacheManager cacheManager(
-            org.springframework.data.redis.connection.RedisConnectionFactory connectionFactory) {
-
-        log.info("CACHE_CONFIG_INIT | Using Redis-backed CacheManager for K8s compatibility");
-
-        org.springframework.data.redis.cache.RedisCacheConfiguration config =
-            org.springframework.data.redis.cache.RedisCacheConfiguration.defaultCacheConfig()
-                .entryTtl(java.time.Duration.ofMinutes(30))
-                .disableCachingNullValues()
-                .serializeValuesWith(
-                    org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair
-                        .fromSerializer(new org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer()));
-
-        return org.springframework.data.redis.cache.RedisCacheManager.builder(connectionFactory)
-                .cacheDefaults(config)
-                .withCacheConfiguration("notification_configs",
-                    config.entryTtl(java.time.Duration.ofHours(1)))
-                .build();
-    }
-}
-
-```
-### 4. Prevent K8s Out-Of-Memory Crashes (NM-7)
-If you generate a large Excel error file, Apache POI creates temporary files on the container's disk. If you don't call .dispose(), the pod's disk fills up and Kubernetes will kill the pod.
-**File:** JournalBulkValidationService.java
-Find the generateErrorExcelFast method and modify the try block:
-**Change this:**
-```java
-    try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
-        // ... build workbook ...
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        workbook.write(out);
-        return out.toByteArray();
-    }
-
-```
-**To this:**
-```java
-    SXSSFWorkbook workbook = new SXSSFWorkbook(100);
-    try {
-        // ... build workbook (keep your existing sheet building logic here) ...
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        workbook.write(out);
-        return out.toByteArray();
-    } finally {
-        workbook.dispose();  // CRITICAL FIX: Cleans up temp files on K8s disk
-        workbook.close();
-    }
-
-```
-*(Make the exact same fix for generateTemplateBytes() if you are using SXSSFWorkbook there too!)*
-Save your changes and compile! Let me know when you are ready to tackle the final bits of **Group 5 (General Java Bugs & Security)**.
+workbook -> error other methods that u told i implimented correctly
