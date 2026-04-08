@@ -1,42 +1,9 @@
-Based on the exact table schemas you just shared and the way we just rebuilt your PROCESS_JOURNAL_BATCH procedure, we can definitively identify which columns are dead weight.
-Here is the deep-dive analysis of what is safe to drop, what is risky, and the exact SQL commands to clean up your database.
-### 🟢 1. 100% Safe to Drop (Dead Columns)
-These columns are completely ignored by your new PROCESS_JOURNAL_BATCH procedure and your Java bulk ingestion logic. They are just taking up space.
- * **MASTER_JOURNAL.AC_CLASSIFICATION**: Your procedure maps 13 columns into MASTER_JOURNAL, but AC_CLASSIFICATION is entirely skipped. Every single bulk upload will leave this NULL.
- * **JOURNAL_REQUEST.CHANGE_TYPE**: This looks like a copy-paste from a generic request table. Journal bulk uploads do not use "Change Types" (like ADD/UPDATE/DELETE); they are strictly financial entries.
- * **JOURNAL_REQUEST.CREATOR_ROLE**: Role-based access is validated at the application/API level and recorded at the batch level, not per individual row of a 100,000-row file.
-**The Cleanup Script (Safe to run):**
-```sql
-ALTER TABLE MASTER_JOURNAL DROP COLUMN AC_CLASSIFICATION;
-ALTER TABLE JOURNAL_REQUEST DROP COLUMN CHANGE_TYPE;
-ALTER TABLE JOURNAL_REQUEST DROP COLUMN CREATOR_ROLE;
-
-```
-### 🟡 2. The Heavyweight: JOURNAL_REQUEST.PAYLOAD (CLOB)
-This is the biggest performance and storage bottleneck in your database.
-You are currently storing the exact same data twice:
- 1. Neatly organized in relational columns (REQ_BRANCH_CODE, REQ_AMOUNT, REQ_CURRENCY, etc.)
- 2. Mashed together as a massive JSON string in the PAYLOAD CLOB column.
-**Why you shouldn't drop it *yet*:**
-If you remember the React code we fixed earlier, the frontend "View Details" modal is currently doing this: const payload = JSON.parse(req.payload); to display the table.
-**The Action Plan for PAYLOAD:**
- 1. **Update Java First:** Update your fetchBatchDetailsPaginated API in Java to return the relational columns directly (e.g., map reqBranchCode to branch) instead of sending the raw PAYLOAD string.
- 2. **Update React:** Change the frontend to read row.branch instead of row.payload.branch.
- 3. **Drop the Column:** Once the UI no longer needs the JSON string, run this command to free up gigabytes of tablespace:
-   ```sql
-   ALTER TABLE JOURNAL_REQUEST DROP COLUMN PAYLOAD;
-   
-   ```
-### 🟠 3. Schema Precision Mismatch (Needs Fixing, Not Dropping)
-While looking at your tables, I caught a structural mismatch that could cause data rounding errors:
- * In JOURNAL_REQUEST, the REQ_AMOUNT is NUMBER(25,4).
- * But in MASTER_JOURNAL, the JOURNAL_AMT is NUMBER(38,2).
-If a user uploads a transaction for 100.1234, it will save perfectly in the staging table, but when the procedure copies it to MASTER_JOURNAL, Oracle will silently chop off the last two decimal places and store 100.12.
-**The Fix Script:**
-You should align the audit table to match the precision of the staging table:
-```sql
 ALTER TABLE MASTER_JOURNAL MODIFY JOURNAL_AMT NUMBER(38,4);
 
-```
-### What you should KEEP:
-Everything in **JOURNAL_BATCH_MASTER** is perfectly lean and necessary for auditing and pagination. Do not drop anything there. Similarly, the AR_FLAG in MASTER_JOURNAL and COMMON_BATCH_REMARKS in JOURNAL_REQUEST might seem redundant, but they are lightweight and often required by downstream reporting tools, so they are safe to leave alone.
+Error starting at line : 1 in command -
+ALTER TABLE MASTER_JOURNAL MODIFY JOURNAL_AMT NUMBER(38,4)
+Error report -
+ORA-01440: column to be modified must be empty to decrease precision or scale
+01440. 00000 -  "column to be modified must be empty to decrease precision or scale"
+*Cause:    
+*Action:
