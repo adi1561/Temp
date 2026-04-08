@@ -1,102 +1,179 @@
-Excellent choice. Group 1 is the most critical foundation to fix first, because if Hibernate runs with the current configuration, it could corrupt your database schema.
-Here are the exact code replacements you need to make for the **Entities & Configs (Group 1)**.
-### 1. Fix Missing Entity Fields (Critical to prevent schema deletion)
-If Hibernate updates your database right now, it will delete the INR_BALANCE and CURRENCY_RATE columns. We need to add them to your Java models.
-**File:** GlBalance.java
-Find the balance field and add the inrBalance field right after it:
-```java
-    @Column(name = "BALANCE", precision = 25, scale = 4)
-    private BigDecimal balance;
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2, 
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+BEGIN
 
-    // ✅ ADD THIS:
-    @Column(name = "INR_BALANCE", precision = 25, scale = 4)
-    private BigDecimal inrBalance;
+    -- ==========================================================
+    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==========================================================
+    -- Rule 3: Validates that every non-INR currency in the batch has an active rate.
+    -- This prevents corrupted balances in the GL_BALANCE table.
+    SELECT COUNT(*)
+    INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY 
+        FROM JOURNAL_REQUEST 
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm 
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
-```
-**File:** CurrencyMaster.java
-Find the flag field and add the currencyRate field right after it:
-```java
-    @Column(name = "FLAG")
-    private Integer flag;
+    IF v_missing_rates > 0 THEN
+        -- Rule 1 & 2: Specific error code for Java to catch without leaking schema details.
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
 
-    // ✅ ADD THIS:
-    @Column(name = "CURRENCY_RATE", precision = 18, scale = 6)
-    private BigDecimal currencyRate;
+    -- START ATOMIC TRANSACTION
+    BEGIN
+        -- ==========================================================
+        -- 1. Insert into GL_TRANSACTIONS
+        -- ==========================================================
+        -- Safe for Parallelism: New row inserts do not lock existing data rows.
+        INSERT /*+ APPEND PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+            TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+            BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
+        )
+        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+            GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID, NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, 
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, 
+            'J'
+        FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-```
-### 2. Lock Down Hibernate Schema Generation
-Never let Hibernate alter your production tables automatically. We must change it to only "validate" what is there.
-**File:** OracleDbConfig.java
-Locate your oracleEntityManagerFactory() method and change the hbm2ddl.auto property.
-**Change this:**
-```java
-properties.put("hibernate.hbm2ddl.auto", "update");
+        -- ==========================================================
+        -- 2. Insert into MASTER_JOURNAL 
+        -- ==========================================================
+        INSERT /*+ APPEND PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
+            JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH, 
+            JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF, 
+            JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
+        )
+        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+            MASTER_JOURNAL_SEQ.nextval, 
+            ABS(REQ_AMOUNT), 
+            'A', 
+            BATCH_ID, 
+            REQ_BRANCH_CODE, 
+            REQ_CGL, 
+            p_remarks, 
+            REQ_CURRENCY, 
+            JOURNAL_ID, 
+            NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), 
+            REQ_PRODUCT, 
+            REQ_NARRATION, 
+            CASE WHEN REQ_AMOUNT > 0 THEN 'Debit' ELSE 'Credit' END
+        FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-```
-**To this:**
-```java
-properties.put("hibernate.hbm2ddl.auto", "validate"); // ✅ FIX: Validates schema instead of altering it
+        -- ==========================================================
+        -- 3. Merge Balances (CONCURRENCY FIX)
+        -- ==========================================================
 
-```
-**
-### 3. Remove Illegal @Temporal Annotations
-@Temporal is an outdated annotation for old Java Date objects and will cause Hibernate errors when used with modern java.time classes.
-**File:** GlTransaction.java (and check JournalRequest.java if it has the same)
-**Change this:**
-```java
-    @Column(name = "TRANSACTION_DATE")
-    @Temporal(TemporalType.DATE)
-    private LocalDate transactionDate;
+        MERGE INTO GL_BALANCE target
+        USING (
+            SELECT 
+                j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+                CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE 
+            FROM JOURNAL_REQUEST j
+            LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1 
+            WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+            GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+        ) source
+        ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE 
+            AND target.CURRENCY = source.REQ_CURRENCY 
+            AND target.CGL = source.REQ_CGL 
+            AND target.BALANCE_DATE = source.BAL_DATE)
+        WHEN MATCHED THEN
+            UPDATE SET 
+                target.BALANCE = target.BALANCE + source.TXN_AMOUNT, 
+                target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+        WHEN NOT MATCHED THEN
+            INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+            VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE, 
+                    source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT, 
+                    (source.TXN_AMOUNT * source.EXCH_RATE));
 
-    @Column(name = "POST_DATE")
-    @Temporal(TemporalType.TIMESTAMP)
-    private LocalDateTime postDate;
+        -- ==========================================================
+        -- 4. Final Status Update
+        -- ==========================================================
+        UPDATE JOURNAL_REQUEST
+        SET REQ_STATUS = p_status, 
+            EXECUTOR_ID = p_executor_id, 
+            EXECUTION_DATE = SYSTIMESTAMP, 
+            EXECUTOR_REMARKS = p_remarks
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-```
-**To this:**
-```java
-    // ✅ FIX: Removed @Temporal annotations
-    @Column(name = "TRANSACTION_DATE")
-    private LocalDate transactionDate;
+        COMMIT; 
 
-    @Column(name = "POST_DATE")
-    private LocalDateTime postDate;
+        -- ==========================================================
+        -- 5. Return Sync Cursor to Java
+        -- ==========================================================
+        OPEN o_cursor FOR
+        SELECT 
+            j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL, 
+            j.REQ_CSV_DATE AS BAL_DATE, g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+        FROM (SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
+              FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id) j
+        JOIN GL_BALANCE g 
+            ON g.BRANCH_CODE = j.REQ_BRANCH_CODE 
+            AND g.CURRENCY = j.REQ_CURRENCY 
+            AND g.CGL = j.REQ_CGL 
+            AND g.BALANCE_DATE = j.REQ_CSV_DATE;
 
-```
-**
-### 4. Fix Validation in DTOs
-Using @Column in a DTO class does absolutely nothing. We need to use jakarta.validation.constraints to actually enforce the rules.
-**File:** ProcessJournalRequestDto.java
-**Change this:**
-```java
-@Data
-@Getter
-@Setter
-public class ProcessJournalRequestDto {
-    @Column(nullable = false)
-    private Long requestId;
-    @Column(nullable = false)
-    private RequestStatus status;
-    @Size(max = 50)
-    private String remarks;
-}
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            -- Rule 2: Re-raising for Java, but Java must be configured to log only the Code, not the Message.
+            RAISE; 
+    END;
+END;
 
-```
-**To this:**
-```java
-@Data
-public class ProcessJournalRequestDto {
-    // ✅ FIX: Replaced @Column with @NotNull for proper validation, and removed redundant @Getter/@Setter
-    @NotNull(message = "Request ID is required")
-    private Long requestId;
-    
-    @NotNull(message = "Status is required")
-    private RequestStatus status;
-    
-    @Size(max = 50)
-    private String remarks;
-}
 
-```
-**
-Make these changes, run a quick Maven build (mvn clean install) to ensure no compilation errors, and let me know when you're ready to tackle **Group 3 (The Stored Procedure Fixes)**!
+2nd 
+create or replace PROCEDURE PURGE_JOURNAL_BATCH(
+    p_batch_id IN VARCHAR2,
+    p_user_id IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+BEGIN
+    -- 1. Security Check
+    SELECT BATCH_STATUS INTO v_status
+    FROM JOURNAL_BATCH_MASTER
+    WHERE BATCH_ID = p_batch_id AND CREATOR_ID = p_user_id;
+
+    -- ALLOW 'PENDING' OR 'QUEUED' (Locked by Java)
+    IF v_status NOT IN ('PENDING', 'QUEUED', 'ERROR') THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+    END IF;
+
+    -- 2. Fast Chunked Delete
+    LOOP
+        DELETE FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id
+          AND REQ_STATUS IN ('P', 'R') -- Clean PENDING or REJECTED
+          AND ROWNUM <= 50000;
+
+        EXIT WHEN SQL%ROWCOUNT = 0;
+        COMMIT; 
+    END LOOP;
+
+    -- 3. Delete Master
+    DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
+    COMMIT;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+END;
+
+
