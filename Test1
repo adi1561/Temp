@@ -1,40 +1,57 @@
-This is a very common accounting requirement! In many core banking and ERP systems, **Credits are stored as positive values** and **Debits are stored as negative values** at the balance level.
-Since your system currently treats Debits as positive (REQ_AMOUNT > 0) when inserting into the transaction tables, we just need to invert the sign mathematically before we merge it into the GL_BALANCE table.
-You only need to change **one line** in your PROCESS_JOURNAL_BATCH procedure.
-### The Fix
-Open your PROCESS_JOURNAL_BATCH procedure and locate **Step 3. Merge GL Balances**.
-You are going to change SUM(j.REQ_AMOUNT) as TXN_AMOUNT to SUM(j.REQ_AMOUNT * -1) as TXN_AMOUNT.
-Here is the exact updated MERGE block to copy and paste over your old Step 3:
-```sql
-    -- 3. Merge GL Balances
-    MERGE INTO GL_BALANCE target
-    USING (
-        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
-               NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
-               -- FIX: Multiply by -1 so Debits (Positive REQ_AMOUNT) subtract from balance, 
-               -- and Credits (Negative REQ_AMOUNT) add to balance.
-               SUM(j.REQ_AMOUNT * -1) as TXN_AMOUNT,
-               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
-        FROM JOURNAL_REQUEST j
-        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
-        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
-        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
-    ) source
-    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
-        AND target.CURRENCY = source.REQ_CURRENCY
-        AND target.CGL = source.REQ_CGL
-        AND target.BALANCE_DATE = source.BAL_DATE)
-    WHEN MATCHED THEN
-        UPDATE SET
-            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
-            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
-    WHEN NOT MATCHED THEN
-        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
-        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
-                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
-                (source.TXN_AMOUNT * source.EXCH_RATE));
+JOURNAL_BATCH_MASTER
 
-```
-### Why this works so safely:
-By making the change inside the USING (SELECT ...) clause, the inverted TXN_AMOUNT automatically cascades down to both the UPDATE logic (for existing balances) and the INSERT logic (for brand new balances), as well as the INR_BALANCE calculations.
-Because we only inverted it in Step 3, your GL_TRANSACTIONS and MASTER_JOURNAL audit tables will still correctly log Debits and Credits exactly as the user submitted them!
+
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
+CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
+REQ_DATE	TIMESTAMP(6)	Yes		3	Timestamp when the batch was originally created.
+BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	Initial remarks provided by the creator upon create.
+TOTAL_ROWS	NUMBER	Yes	0	5	Total number of valid transaction rows contained in this batch.
+TOTAL_DEBIT	NUMBER(25,4)	Yes	0	6	Sum of all debit transaction amounts in the batch.
+TOTAL_CREDIT	NUMBER(25,4)	Yes	0	7	Sum of all credit transaction amounts in the batch.
+BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	Current workflow state (e.g., PENDING, ACCEPTED, REJECTED, ERROR).
+EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	User ID of the person who approved or rejected the batch.
+EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rejected.
+EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
+
+
+JOURNAL_REQUEST
+REQ_ID	NUMBER	No		1	
+REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
+REQ_DATE	DATE	No	SYSDATE 	3	
+CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
+EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
+EXECUTION_DATE	DATE	Yes		6	Timestamp when this specific row was processed.
+EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
+PAYLOAD	CLOB	Yes		8	
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		9	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		10	Unique identifier for the individual request.
+COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		11	Remarks inherited from the batch creation process.
+CREATOR_ROLE	NUMBER(10,0)	Yes		12	
+REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		13	The branch code requested for the transaction.
+REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		14	The 3-character currency code requested.
+REQ_CGL	VARCHAR2(50 BYTE)	Yes		15	The 10-digit CGL account code requested.
+REQ_AMOUNT	NUMBER(25,4)	Yes		16	Raw requested amount 
+REQ_CSV_DATE	DATE	Yes		17	The transaction date provided in the uploaded file.
+REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		18	remarks from the uploaded file.
+REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		19	The product  code requested.
+CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		20	
+
+
+MASTER_JOURNAL
+JOURNAL_ID	NUMBER(19,0)	No		1	Unique sequential identifier for the master journal entry.
+JOURNAL_AMT	NUMBER(38,2)	Yes		2	Absolute transaction amount. Always positive; Txn Type determines debit/credit.
+AR_FLAG	VARCHAR2(1 CHAR)	Yes		3	Status flag indicating the record state. Default is A for Approved/Active.
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		4	Reference to the parent batch from JOURNAL_BATCH_MASTER.
+JOURNAL_BRANCH	VARCHAR2(50 CHAR)	Yes		5	The branch code where the transaction is booked.
+JOURNAL_CGL	VARCHAR2(50 CHAR)	Yes		6	The 10-digit Common General Ledger (CGL) account code.
+COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Batch-level remarks provided by the executor during approval.
+CURRENCY	VARCHAR2(3 CHAR)	Yes		8	The 3-character currency code (e.g., INR, USD) for the transaction.
+JOURNAL_ID_REF	VARCHAR2(50 CHAR)	Yes		9	Reference back to the original row ID from the JOURNAL_REQUEST staging table.
+JOURNAL_PDATE	DATE	Yes		10	CSV date of the journal entry.
+PRODUCT_TYPE	VARCHAR2(20 CHAR)	Yes		11	The 8-digit product code
+REMARKS	VARCHAR2(50 CHAR)	Yes		12	specific remarks for this individual entry.
+TXN_TYPE	VARCHAR2(20 CHAR)	Yes		13	Specifies if the entry is a Debit or Credit.
+AC_CLASSIFICATION	VARCHAR2(255 CHAR)	Yes		14	
+
+
+
