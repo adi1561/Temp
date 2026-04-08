@@ -1,23 +1,10 @@
-Hello Adesh, you are exactly right to question the backend here!
-I have reviewed your backend code, and I can tell you precisely why the notifications are not showing up on the frontend screen, even though the logs show NOTIFICATION_SAVED.
-### The Missing Link: Database vs. Real-time Broadcast
-If you look at your ProgressService.java, it does two things: it updates the status, **and** it broadcasts a message to Redis using stringRedisTemplate.convertAndSend(...). This live broadcast is what triggers real-time UI updates on the frontend.
-However, your NotificationWriterService.java currently **only saves the notification to the Oracle Database** (notificationRepository.save(notification)). It never broadcasts the alert to your Redis/WebSocket live stream! Because it only sits quietly in the database, the frontend never receives the "ping" to show the notification bell or popup.
-### The Fix: Broadcast Notifications to Redis
-To fix this, we need to update your NotificationWriterService.java to inject your Redis template and broadcast the notification immediately after saving it to the database.
-Here is the fully updated **NotificationWriterService.java**:
-```java
 package com.fincore.JournalService.Service;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.JournalService.Models.Notifications;
 import com.fincore.JournalService.Repository.NotificationRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -33,15 +20,18 @@ import org.springframework.transaction.annotation.Transactional;
 public class NotificationWriterService {
 
     private final NotificationRepository notificationRepository;
-    
-    // NEW: Inject Redis and Jackson for live broadcasting
-    private final StringRedisTemplate stringRedisTemplate;
-    private final ObjectMapper objectMapper;
 
-    // NEW: Define the live notification topic
-    @Value("${notification.alert.topic:notifications:alerts}")
-    private String alertTopic;
-
+    /**
+     * Persists a notification event.
+     * Propagation set to REQUIRES_NEW to support @Async callers and ensure
+     * visibility regardless of the parent transaction status.
+     * * @param userId Targeted user ID (null for broadcast)
+     * @param targetRole Targeted role (null for direct user)
+     * @param message The alert content
+     * @param linkUrl Redirect URL for the frontend
+     * @param aggregateId Reference ID (e.g., Batch ID)
+     * @param eventSource Service identifier
+     */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
 
@@ -66,23 +56,14 @@ public class NotificationWriterService {
                     .aggregateId(aggregateId)
                     .eventSource(eventSource)
                     .build();
-            
-            // 1. Save to Database
-            Notifications savedNotification = notificationRepository.save(notification);
 
-            // 2. NEW: Broadcast to Redis so the Frontend receives it in real-time
-            try {
-                String jsonPayload = objectMapper.writeValueAsString(savedNotification);
-                stringRedisTemplate.convertAndSend(alertTopic, jsonPayload);
-            } catch (JsonProcessingException e) {
-                log.error("NOTIFICATION_BROADCAST_FAIL | AggregateID: {} | Reason: JSON Serialization failed", aggregateId);
-            }
+            notificationRepository.save(notification);
 
             // Logging metadata only to satisfy PII requirements
             if (userId != null) {
-                log.info("NOTIFICATION_SAVED_AND_BROADCAST | Type: DIRECT | UserID: {} | Ref: {}", userId, aggregateId);
+                log.info("NOTIFICATION_SAVED | Type: DIRECT | UserID: {} | Ref: {}", userId, aggregateId);
             } else {
-                log.info("NOTIFICATION_SAVED_AND_BROADCAST | Type: BROADCAST | Role: {} | Ref: {}", targetRole, aggregateId);
+                log.info("NOTIFICATION_SAVED | Type: BROADCAST | Role: {} | Ref: {}", targetRole, aggregateId);
             }
 
         } catch (DataAccessException e) {
@@ -92,7 +73,3 @@ public class NotificationWriterService {
         }
     }
 }
-
-```
-### Why this solves it:
-By adding the stringRedisTemplate.convertAndSend, the moment the backend creates the "Batch Approved Successfully" or "Batch Requires Approval" notification, it pushes the alert directly to the live notifications:alerts topic. Assuming your frontend websocket is listening to this Redis topic (similar to the progress topic), the notification bell will update instantly without needing a page refresh!
