@@ -1,90 +1,40 @@
-Perfect. You are now on the final stretch! We are moving to **Group 5: General Java Bugs & Security**.
-These fixes prevent silent data crashes and close a major security loophole where users could potentially delete each other's data.
-Here are the exact code replacements:
-### 1. Fix the BranchService Crash (C-5)
-If your database ever gets a duplicate branch code, the Collectors.toMap function will throw an IllegalStateException and crash the endpoint.
-**File:** BranchService.java
-**Method:** getBranchCodeAndNameMap()
-**Change this:**
-```java
-return branches.stream()
-    .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName));
+This is a very common accounting requirement! In many core banking and ERP systems, **Credits are stored as positive values** and **Debits are stored as negative values** at the balance level.
+Since your system currently treats Debits as positive (REQ_AMOUNT > 0) when inserting into the transaction tables, we just need to invert the sign mathematically before we merge it into the GL_BALANCE table.
+You only need to change **one line** in your PROCESS_JOURNAL_BATCH procedure.
+### The Fix
+Open your PROCESS_JOURNAL_BATCH procedure and locate **Step 3. Merge GL Balances**.
+You are going to change SUM(j.REQ_AMOUNT) as TXN_AMOUNT to SUM(j.REQ_AMOUNT * -1) as TXN_AMOUNT.
+Here is the exact updated MERGE block to copy and paste over your old Step 3:
+```sql
+    -- 3. Merge GL Balances
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+               -- FIX: Multiply by -1 so Debits (Positive REQ_AMOUNT) subtract from balance, 
+               -- and Credits (Negative REQ_AMOUNT) add to balance.
+               SUM(j.REQ_AMOUNT * -1) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM JOURNAL_REQUEST j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
 
 ```
-**To this:**
-```java
-return branches.stream()
-    .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName, (existing, replacement) -> existing));
-
-```
-### 2. Fix the NullPointerException in Batch Counting (C-7)
-If a batch doesn't exist, queryForObject returns null, which crashes when Java tries to convert it to a primitive long.
-**File:** JournalRequestServiceImpl.java
-**Method:** getRequestCountByBatchId()
-**Replace the entire method with this:**
-```java
-    @Override
-    public long getRequestCountByBatchId(String batchId) {
-        try {
-            Long result = jdbcTemplate.queryForObject(
-                "SELECT NVL(TOTAL_ROWS, 0) FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", Long.class, batchId);
-            return result != null ? result : 0L;
-        } catch (EmptyResultDataAccessException e) {
-            log.warn("COUNT_NOT_FOUND | Batch: {} | Status: Batch not in master table", batchId);
-            return 0L;
-        } catch (DataAccessException e) {
-            log.error("COUNT_QUERY_FAIL | Batch: {} | Status: Query failure", batchId);
-            return 0L;
-        }
-    }
-
-```
-### 3. Secure the cancelMyRequest Endpoint (H-6)
-Right now, any logged-in user can delete any other user's journal requests if they know the ID. We must enforce an ownership check.
-**File:** JournalRequestServiceImpl.java
-**Method:** cancelMyRequest()
-**Replace the entire method with this:**
-```java
-    @Override
-    @Transactional
-    public void cancelMyRequest(Long requestId, String userId) {
-        JournalRequest request = journalRequestRepository.findById(requestId)
-            .orElseThrow(() -> new RuntimeException("Request not found: " + requestId)); // Replace RuntimeException with your custom ResourceNotFoundException if you have one
-
-        // CRITICAL FIX: Security Ownership Check
-        if (!request.getCreatorId().equalsIgnoreCase(userId)) {
-            log.warn("UNAUTHORIZED_DELETE | User: {} | RequestOwner: {} | ReqID: {}", userId, request.getCreatorId(), requestId);
-            throw new IllegalStateException("You can only cancel your own requests.");
-        }
-
-        if (request.getRequestStatus() != RequestStatus.PENDING) {
-            throw new IllegalStateException("Only PENDING requests can be cancelled. Current: " + request.getRequestStatus());
-        }
-
-        journalRequestRepository.delete(request);
-        log.info("REQUEST_CANCELLED | User: {} | ReqID: {}", userId, requestId);
-    }
-
-```
-### 4. Fix Inconsistent Pagination (NH-2)
-When paginating data, if you don't use ORDER BY, Oracle can return rows in a random order, causing rows to appear on multiple pages or disappear entirely.
-**File:** JournalRequestRepository.java
-**Method:** findByBatchIdPaginated
-**Change this:**
-```java
-@Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
-        countQuery = "SELECT count(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
-        nativeQuery = true)
-Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
-
-```
-**To this:**
-```java
-// CRITICAL FIX: Added ORDER BY REQ_ID ASC to ensure stable pagination pages
-@Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId ORDER BY REQ_ID ASC",
-        countQuery = "SELECT count(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
-        nativeQuery = true)
-Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
-
-```
-Apply these final changes, run your build, and your backend will be fully secured and stabilized! Let me know if everything compiles cleanly.
+### Why this works so safely:
+By making the change inside the USING (SELECT ...) clause, the inverted TXN_AMOUNT automatically cascades down to both the UPDATE logic (for existing balances) and the INSERT logic (for brand new balances), as well as the INR_BALANCE calculations.
+Because we only inverted it in Step 3, your GL_TRANSACTIONS and MASTER_JOURNAL audit tables will still correctly log Debits and Credits exactly as the user submitted them!
