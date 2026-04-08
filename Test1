@@ -1,57 +1,42 @@
-JOURNAL_BATCH_MASTER
+Based on the exact table schemas you just shared and the way we just rebuilt your PROCESS_JOURNAL_BATCH procedure, we can definitively identify which columns are dead weight.
+Here is the deep-dive analysis of what is safe to drop, what is risky, and the exact SQL commands to clean up your database.
+### 🟢 1. 100% Safe to Drop (Dead Columns)
+These columns are completely ignored by your new PROCESS_JOURNAL_BATCH procedure and your Java bulk ingestion logic. They are just taking up space.
+ * **MASTER_JOURNAL.AC_CLASSIFICATION**: Your procedure maps 13 columns into MASTER_JOURNAL, but AC_CLASSIFICATION is entirely skipped. Every single bulk upload will leave this NULL.
+ * **JOURNAL_REQUEST.CHANGE_TYPE**: This looks like a copy-paste from a generic request table. Journal bulk uploads do not use "Change Types" (like ADD/UPDATE/DELETE); they are strictly financial entries.
+ * **JOURNAL_REQUEST.CREATOR_ROLE**: Role-based access is validated at the application/API level and recorded at the batch level, not per individual row of a 100,000-row file.
+**The Cleanup Script (Safe to run):**
+```sql
+ALTER TABLE MASTER_JOURNAL DROP COLUMN AC_CLASSIFICATION;
+ALTER TABLE JOURNAL_REQUEST DROP COLUMN CHANGE_TYPE;
+ALTER TABLE JOURNAL_REQUEST DROP COLUMN CREATOR_ROLE;
 
+```
+### 🟡 2. The Heavyweight: JOURNAL_REQUEST.PAYLOAD (CLOB)
+This is the biggest performance and storage bottleneck in your database.
+You are currently storing the exact same data twice:
+ 1. Neatly organized in relational columns (REQ_BRANCH_CODE, REQ_AMOUNT, REQ_CURRENCY, etc.)
+ 2. Mashed together as a massive JSON string in the PAYLOAD CLOB column.
+**Why you shouldn't drop it *yet*:**
+If you remember the React code we fixed earlier, the frontend "View Details" modal is currently doing this: const payload = JSON.parse(req.payload); to display the table.
+**The Action Plan for PAYLOAD:**
+ 1. **Update Java First:** Update your fetchBatchDetailsPaginated API in Java to return the relational columns directly (e.g., map reqBranchCode to branch) instead of sending the raw PAYLOAD string.
+ 2. **Update React:** Change the frontend to read row.branch instead of row.payload.branch.
+ 3. **Drop the Column:** Once the UI no longer needs the JSON string, run this command to free up gigabytes of tablespace:
+   ```sql
+   ALTER TABLE JOURNAL_REQUEST DROP COLUMN PAYLOAD;
+   
+   ```
+### 🟠 3. Schema Precision Mismatch (Needs Fixing, Not Dropping)
+While looking at your tables, I caught a structural mismatch that could cause data rounding errors:
+ * In JOURNAL_REQUEST, the REQ_AMOUNT is NUMBER(25,4).
+ * But in MASTER_JOURNAL, the JOURNAL_AMT is NUMBER(38,2).
+If a user uploads a transaction for 100.1234, it will save perfectly in the staging table, but when the procedure copies it to MASTER_JOURNAL, Oracle will silently chop off the last two decimal places and store 100.12.
+**The Fix Script:**
+You should align the audit table to match the precision of the staging table:
+```sql
+ALTER TABLE MASTER_JOURNAL MODIFY JOURNAL_AMT NUMBER(38,4);
 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
-CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
-REQ_DATE	TIMESTAMP(6)	Yes		3	Timestamp when the batch was originally created.
-BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	Initial remarks provided by the creator upon create.
-TOTAL_ROWS	NUMBER	Yes	0	5	Total number of valid transaction rows contained in this batch.
-TOTAL_DEBIT	NUMBER(25,4)	Yes	0	6	Sum of all debit transaction amounts in the batch.
-TOTAL_CREDIT	NUMBER(25,4)	Yes	0	7	Sum of all credit transaction amounts in the batch.
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	Current workflow state (e.g., PENDING, ACCEPTED, REJECTED, ERROR).
-EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	User ID of the person who approved or rejected the batch.
-EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rejected.
-EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
-
-
-JOURNAL_REQUEST
-REQ_ID	NUMBER	No		1	
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	3	
-CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
-EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
-EXECUTION_DATE	DATE	Yes		6	Timestamp when this specific row was processed.
-EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
-PAYLOAD	CLOB	Yes		8	
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		9	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		10	Unique identifier for the individual request.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		11	Remarks inherited from the batch creation process.
-CREATOR_ROLE	NUMBER(10,0)	Yes		12	
-REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		13	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		14	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 BYTE)	Yes		15	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		16	Raw requested amount 
-REQ_CSV_DATE	DATE	Yes		17	The transaction date provided in the uploaded file.
-REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		18	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		19	The product  code requested.
-CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		20	
-
-
-MASTER_JOURNAL
-JOURNAL_ID	NUMBER(19,0)	No		1	Unique sequential identifier for the master journal entry.
-JOURNAL_AMT	NUMBER(38,2)	Yes		2	Absolute transaction amount. Always positive; Txn Type determines debit/credit.
-AR_FLAG	VARCHAR2(1 CHAR)	Yes		3	Status flag indicating the record state. Default is A for Approved/Active.
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		4	Reference to the parent batch from JOURNAL_BATCH_MASTER.
-JOURNAL_BRANCH	VARCHAR2(50 CHAR)	Yes		5	The branch code where the transaction is booked.
-JOURNAL_CGL	VARCHAR2(50 CHAR)	Yes		6	The 10-digit Common General Ledger (CGL) account code.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Batch-level remarks provided by the executor during approval.
-CURRENCY	VARCHAR2(3 CHAR)	Yes		8	The 3-character currency code (e.g., INR, USD) for the transaction.
-JOURNAL_ID_REF	VARCHAR2(50 CHAR)	Yes		9	Reference back to the original row ID from the JOURNAL_REQUEST staging table.
-JOURNAL_PDATE	DATE	Yes		10	CSV date of the journal entry.
-PRODUCT_TYPE	VARCHAR2(20 CHAR)	Yes		11	The 8-digit product code
-REMARKS	VARCHAR2(50 CHAR)	Yes		12	specific remarks for this individual entry.
-TXN_TYPE	VARCHAR2(20 CHAR)	Yes		13	Specifies if the entry is a Debit or Credit.
-AC_CLASSIFICATION	VARCHAR2(255 CHAR)	Yes		14	
-
-
-
+```
+### What you should KEEP:
+Everything in **JOURNAL_BATCH_MASTER** is perfectly lean and necessary for auditing and pagination. Do not drop anything there. Similarly, the AR_FLAG in MASTER_JOURNAL and COMMON_BATCH_REMARKS in JOURNAL_REQUEST might seem redundant, but they are lightweight and often required by downstream reporting tools, so they are safe to leave alone.
