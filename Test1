@@ -1,128 +1,173 @@
-Brilliant! With the database procedures safely updated and waiting for the Java layer, we can now fix the **Big Async Transaction Bug (Group 2)**.
-If this Java bug was left in production, any database error during a background approval would crash the thread, but Oracle would permanently save half of the data because the Spring Boot @Transactional rollback wouldn't trigger.
-Here are the two exact code replacements you need to make in **JournalRequestServiceImpl.java**.
-### 1. Fix the @Transactional + @Async Conflict (C-2)
-You cannot have @Async and @Transactional on the exact same method, because the transaction gets left behind when Spring spawns the new background thread. We must split the method into two: one to start the background thread, and a separate one to manage the strict Oracle transaction.
-**File:** JournalRequestServiceImpl.java
-Locate your executeAsyncBatchProcessing method. **Delete it entirely, and replace it with these TWO methods**:
+Excellent progress! You are now entering **Group 4: K8s & HDFS Stability**.
+These fixes are critical for running your microservice in a Kubernetes cluster without running out of memory, and they ensure that if your Big Data cluster (Hive/HDFS) goes down, you don't permanently lose financial data.
+Here are the exact replacements for Group 4:
+### 1. Stop Swallowing HDFS Exceptions (NC-7)
+Because syncToDataLake is currently marked as @Async, when it throws a database error, the main thread never hears about it, so it never queues the data for retry.
+**File:** HdfsSyncService.java
+Locate your syncToDataLake method. Remove @Async and remove the try-catch block that swallows the error:
+**Replace with:**
 ```java
-    @Override
-    @Async("bulkExecutor")
-    public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
-        String batchId = dto.getBatchId();
-        MDC.put("batchId", batchId);
-        MDC.put("user", executorId);
-        long start = System.currentTimeMillis();
+    // CRITICAL FIX: Removed @Async. The caller is already on a background thread.
+    // Letting this run synchronously allows the caller to catch exceptions and queue for retry.
+    public void syncToDataLake(List<HdfsSyncDto> data) {
+        if (data == null || data.isEmpty()) return;
+        
+        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
+        long startTime = System.currentTimeMillis();
 
         try {
-            // Note: If 'self' is not yet defined in your class, you must inject it at the top of your service:
-            // @Autowired @Lazy private JournalRequestServiceImpl self;
-            self.executeApprovalInTransaction(dto, executorId);
-            
-            log.info("BATCH_PROCESSING_DONE | Batch: {} | Status: {} | Duration: {}ms", batchId, dto.getStatus(), System.currentTimeMillis() - start);
+            String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
+                    "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
 
-        } catch (org.springframework.dao.PessimisticLockingFailureException e) {
-            log.error("DATABASE_LOCK_TIMEOUT | Batch: {} | Status: GL_BALANCE row locked", batchId);
-            handleAsyncFailure(batchId, executorId, null, "System is busy. Please retry in 1 minute.");
-        } catch (DataAccessException e) {
-            log.error("PROCEDURE_EXEC_FAIL | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-            handleAsyncFailure(batchId, executorId, null, "Database execution error during approval.");
-        } catch (Exception e) {
-            log.error("INTERNAL_PROCESSING_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-            handleAsyncFailure(batchId, executorId, null, "An internal logic error occurred.");
-        } finally {
-            MDC.clear();
-        }
-    }
-
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void executeApprovalInTransaction(BulkProcessJournalRequestDto dto, String executorId) {
-        String batchId = dto.getBatchId();
-        String creatorId = jdbcTemplate.queryForObject(
-            "SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
-
-        progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Executing Oracle Core Business Logic...");
-
-        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            List<HdfsSyncDto> syncData = jdbcTemplate.execute(
-                "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
-                (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
-                    cs.setString(1, batchId);
-                    cs.setString(2, executorId);
-                    cs.setString(3, dto.getRemarks());
-                    cs.setString(4, "A");
-                    cs.registerOutParameter(5, -10);
-                    cs.execute();
-                    List<HdfsSyncDto> list = new ArrayList<>();
-                    try (ResultSet rs = (ResultSet) cs.getObject(5)) {
-                        while (rs.next()) {
-                            list.add(new HdfsSyncDto(
-                                rs.getString("BRANCH"), rs.getString("CURRENCY"), rs.getString("CGL"),
-                                rs.getDate("BAL_DATE") != null ? rs.getDate("BAL_DATE").toLocalDate() : null,
-                                rs.getBigDecimal("NEW_BALANCE"), rs.getBigDecimal("NEW_INR_BALANCE")
-                            ));
-                        }
-                    }
-                    return list;
+            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(PreparedStatement ps, int i) throws SQLException {
+                    HdfsSyncDto dto = data.get(i);
+                    ps.setBigDecimal(1, dto.getNewBalance());
+                    ps.setBigDecimal(2, dto.getNewInrBalance());
+                    ps.setString(3, dto.getBranch());
+                    ps.setString(4, dto.getCurrency());
+                    ps.setString(5, dto.getCgl());
+                    ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate()));
                 }
-            );
 
-            jdbcTemplate.update(
-                "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ACCEPTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
-                executorId, dto.getRemarks(), batchId);
+                @Override
+                public int getBatchSize() {
+                    return data.size();
+                }
+            });
 
-            // HDFS sync is fire-and-forget; failure queues for retry
-            try {
-                hdfsSyncService.syncToDataLake(syncData);
-            } catch (DataAccessException hdfsEx) {
-                log.error("HDFS_SYNC_FAIL | Batch: {} | Status: Background recovery queued", batchId);
-                jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
-            }
+            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
+                    (System.currentTimeMillis() - startTime), data.size());
 
-            progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
-            notificationWriterService.createBatchApprovedNotification(batchId, creatorId, executorId);
-
-        } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
-            jdbcTemplate.update(
-                "UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
-                executorId, dto.getRemarks(), batchId);
-            jdbcTemplate.update(
-                "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
-                executorId, dto.getRemarks(), batchId);
-
-            progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
-            notificationWriterService.createBatchRejectedNotification(batchId, creatorId, executorId, dto.getRemarks());
-        }
-    }
-
-```
-*(Note: I updated the notification lines at the bottom of this snippet to use your new clean notificationWriterService helper methods we created earlier!)*
-### 2. Fix handleAsyncFailure Status Silencing (NC-6)
-Your current failure handler accidentally deletes the master tracking record right before trying to update the error message on it, causing the batch to disappear without a trace.
-**File:** JournalRequestServiceImpl.java
-Locate your handleAsyncFailure method and **replace it with this updated version**:
-```java
-    private void handleAsyncFailure(String batchId, String creatorId, String requestId, String message) {
-        try {
-            // 1. First: Delete orphaned journal request rows only so GL stays balanced
-            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-
-            // 2. Then: UPSERT the master record with error status (don't delete it!)
-            int updated = jdbcTemplate.update(
-                "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
-                message, batchId);
-
-            // If master record doesn't exist yet, insert it so there's a permanent audit trace
-            if (updated == 0) {
-                jdbcTemplate.update(
-                    "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, BATCH_STATUS, EXECUTOR_REMARKS, REQ_DATE) VALUES (?, 'ERROR', ?, SYSTIMESTAMP)",
-                    batchId, message);
-            }
         } catch (DataAccessException e) {
-            log.error("CLEANUP_CRITICAL_FAIL | Batch: {} | Cannot record failure state", batchId);
+            log.error("HDFS_SYNC_DB_FAIL | Status: Connectivity or Syntax error | Type: {}", e.getClass().getSimpleName());
+            // CRITICAL FIX: DO NOT SWALLOW IT. Throw it so JournalRequestServiceImpl queues it!
+            throw e; 
         }
-        progressService.sendProgress(batchId, creatorId, 0, "FAILED", message);
     }
 
 ```
-Once you make these two changes, the core transactional safety of your application will be 100% enterprise-ready! Save the file and ensure your IDE isn't throwing any red syntax errors. Are you ready to tackle **Group 4 (K8s & HDFS Stability)** next?
+### 2. Fix the Dead Retry Service & Redis Lock (H-2 & NM-8)
+We need to fix the bug where the Redis lock deletes someone else's lock, and extend the lock TTL from 4 minutes to 10 minutes so pods don't overlap.
+**File:** HdfsRecoveryService.java
+Replace your entire retryFailedHdfsSyncs method:
+```java
+    @Scheduled(fixedDelay = 300000)
+    public void retryFailedHdfsSyncs() {
+        String lockKey = "SYSTEM_LOCK_HDFS_RECOVERY";
+        boolean lockAcquired = false;
+
+        try {
+            // CRITICAL FIX: Lock TTL extended to 10 mins to prevent race conditions under load
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                .setIfAbsent(lockKey, "LOCKED", 10, java.util.concurrent.TimeUnit.MINUTES);
+            lockAcquired = Boolean.TRUE.equals(acquired);
+
+            if (!lockAcquired) {
+                log.debug("HDFS_RECOVERY_SKIPPED | Status: Another node is currently processing.");
+                return;
+            }
+
+            String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
+            List<String> failedBatches;
+            try {
+                failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
+            } catch (DataAccessException e) {
+                log.error("HDFS_RECOVERY_QUERY_FAIL | Error: {}", e.getMessage());
+                return;
+            }
+
+            if (failedBatches.isEmpty()) return;
+
+            log.info("HDFS RECOVERY: Found {} failed batches.", failedBatches.size());
+            for (String batchId : failedBatches) {
+                try {
+                    processRetry(batchId);
+                } catch (DataAccessException | CustomExceptions.DatabaseOperationException e) {
+                    log.error("HDFS_RECOVERY_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+                    incrementRetryCount(batchId);
+                }
+            }
+        } catch (org.springframework.data.redis.RedisConnectionFailureException e) {
+            log.error("HDFS_RECOVERY_REDIS_FAIL | Cannot acquire distributed lock.");
+        } finally {
+            // CRITICAL FIX: Only release if THIS thread actually acquired it!
+            if (lockAcquired) {
+                try { stringRedisTemplate.delete(lockKey); }
+                catch (Exception e) { log.warn("HDFS_LOCK_RELEASE_FAIL"); }
+            }
+        }
+    }
+
+```
+### 3. Prevent K8s Pod Out-Of-Sync Errors (NH-6)
+Your application is currently using an in-memory cache for permissions. In Kubernetes, this means Pod A won't know about permissions updated on Pod B. We must switch this to Redis.
+**File:** CacheConfig.java
+Replace the entire class to use the Redis-backed CacheManager:
+```java
+package com.fincore.JournalService.Config; // Update with your actual package
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@EnableCaching
+@Slf4j
+public class CacheConfig {
+
+    @Bean
+    public org.springframework.cache.CacheManager cacheManager(
+            org.springframework.data.redis.connection.RedisConnectionFactory connectionFactory) {
+
+        log.info("CACHE_CONFIG_INIT | Using Redis-backed CacheManager for K8s compatibility");
+
+        org.springframework.data.redis.cache.RedisCacheConfiguration config =
+            org.springframework.data.redis.cache.RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(java.time.Duration.ofMinutes(30))
+                .disableCachingNullValues()
+                .serializeValuesWith(
+                    org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair
+                        .fromSerializer(new org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer()));
+
+        return org.springframework.data.redis.cache.RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(config)
+                .withCacheConfiguration("notification_configs",
+                    config.entryTtl(java.time.Duration.ofHours(1)))
+                .build();
+    }
+}
+
+```
+### 4. Prevent K8s Out-Of-Memory Crashes (NM-7)
+If you generate a large Excel error file, Apache POI creates temporary files on the container's disk. If you don't call .dispose(), the pod's disk fills up and Kubernetes will kill the pod.
+**File:** JournalBulkValidationService.java
+Find the generateErrorExcelFast method and modify the try block:
+**Change this:**
+```java
+    try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
+        // ... build workbook ...
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        workbook.write(out);
+        return out.toByteArray();
+    }
+
+```
+**To this:**
+```java
+    SXSSFWorkbook workbook = new SXSSFWorkbook(100);
+    try {
+        // ... build workbook (keep your existing sheet building logic here) ...
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        workbook.write(out);
+        return out.toByteArray();
+    } finally {
+        workbook.dispose();  // CRITICAL FIX: Cleans up temp files on K8s disk
+        workbook.close();
+    }
+
+```
+*(Make the exact same fix for generateTemplateBytes() if you are using SXSSFWorkbook there too!)*
+Save your changes and compile! Let me know when you are ready to tackle the final bits of **Group 5 (General Java Bugs & Security)**.
