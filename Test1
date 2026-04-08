@@ -1,98 +1,98 @@
-Thank you for providing the file! I can see exactly where the misleading messages are coming from.
-In your JournalRequestApproval component, there are two functions that handle approvals: handleSubmitAction (for the whole batch) and handleSubmitPartialAction (for selected rows). Both of these are currently hardcoding a "success" message without reading the backend's response.
-Here are the exact replacements you need to make in this file to fix the issue:
-### 1. Update handleSubmitAction (Lines ~255 - 280)
-Find your handleSubmitAction function and update the try block to capture the backend's response and use an "info" snackbar instead of "success".
-**Change this:**
-```javascript
-    try {
-      await callApi(
-        "/JS/journals/process-bulk",
-        {
-          batchId: selectedBatch.batchId,
-          status: modalMode,
-          remarks: executorRemarks.trim(),
-        },
-        "POST"
-      );
-      showSnackBar(
-        modalMode === "ACCEPTED"
-          ? "Request Accepted Successfully"
-          : "Request Rejected Successfully",
-        "success"
-      );
-      handleCloseModal();
-      fetchPendingBatches();
-    } catch (e) {
+Hello Adesh, you are exactly right to question the backend here!
+I have reviewed your backend code, and I can tell you precisely why the notifications are not showing up on the frontend screen, even though the logs show NOTIFICATION_SAVED.
+### The Missing Link: Database vs. Real-time Broadcast
+If you look at your ProgressService.java, it does two things: it updates the status, **and** it broadcasts a message to Redis using stringRedisTemplate.convertAndSend(...). This live broadcast is what triggers real-time UI updates on the frontend.
+However, your NotificationWriterService.java currently **only saves the notification to the Oracle Database** (notificationRepository.save(notification)). It never broadcasts the alert to your Redis/WebSocket live stream! Because it only sits quietly in the database, the frontend never receives the "ping" to show the notification bell or popup.
+### The Fix: Broadcast Notifications to Redis
+To fix this, we need to update your NotificationWriterService.java to inject your Redis template and broadcast the notification immediately after saving it to the database.
+Here is the fully updated **NotificationWriterService.java**:
+```java
+package com.fincore.JournalService.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Models.Notifications;
+import com.fincore.JournalService.Repository.NotificationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * Service for persisting system alerts and user notifications.
+ * Uses REQUIRES_NEW to ensure notifications commit independently of batch transactions,
+ * which is required for successful delivery during asynchronous processing.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+    
+    // NEW: Inject Redis and Jackson for live broadcasting
+    private final StringRedisTemplate stringRedisTemplate;
+    private final ObjectMapper objectMapper;
+
+    // NEW: Define the live notification topic
+    @Value("${notification.alert.topic:notifications:alerts}")
+    private String alertTopic;
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        // Validation: Ensure we have at least one recipient type
+        if (userId == null && targetRole == null) {
+            log.warn("NOTIFICATION_SKIPPED | Reason: Recipient missing | AggregateID: {}", aggregateId);
+            return;
+        }
+
+        // Validation: Ensure message is not blank
+        if (message == null || message.isBlank()) {
+            log.error("NOTIFICATION_VALIDATION_FAIL | Status: BLANK_MESSAGE | AggregateID: {}", aggregateId);
+            throw new IllegalArgumentException("Notification message content is required.");
+        }
+
+        try {
+            Notifications notification = Notifications.builder()
+                    .userId(userId)
+                    .targetRole(targetRole)
+                    .message(message)
+                    .linkUrl(linkUrl)
+                    .aggregateId(aggregateId)
+                    .eventSource(eventSource)
+                    .build();
+            
+            // 1. Save to Database
+            Notifications savedNotification = notificationRepository.save(notification);
+
+            // 2. NEW: Broadcast to Redis so the Frontend receives it in real-time
+            try {
+                String jsonPayload = objectMapper.writeValueAsString(savedNotification);
+                stringRedisTemplate.convertAndSend(alertTopic, jsonPayload);
+            } catch (JsonProcessingException e) {
+                log.error("NOTIFICATION_BROADCAST_FAIL | AggregateID: {} | Reason: JSON Serialization failed", aggregateId);
+            }
+
+            // Logging metadata only to satisfy PII requirements
+            if (userId != null) {
+                log.info("NOTIFICATION_SAVED_AND_BROADCAST | Type: DIRECT | UserID: {} | Ref: {}", userId, aggregateId);
+            } else {
+                log.info("NOTIFICATION_SAVED_AND_BROADCAST | Type: BROADCAST | Role: {} | Ref: {}", targetRole, aggregateId);
+            }
+
+        } catch (DataAccessException e) {
+            // Catching specific Spring DAO exception for DB issues
+            log.error("NOTIFICATION_DB_FAIL | AggregateID: {} | Reason: Database persistence failure", aggregateId);
+            throw e;
+        }
+    }
+}
 
 ```
-**To this:**
-```javascript
-    try {
-      const response = await callApi(
-        "/JS/journals/process-bulk",
-        {
-          batchId: selectedBatch.batchId,
-          status: modalMode,
-          remarks: executorRemarks.trim(),
-        },
-        "POST"
-      );
-      
-      // FIX: Read the backend message or default to async processing message
-      const displayMessage = response?.message || "Approval process started in background. You will be notified upon completion.";
-      showSnackBar(displayMessage, "info");
-      
-      handleCloseModal();
-      fetchPendingBatches();
-    } catch (e) {
-
-```
-### 2. Update handleSubmitPartialAction (Lines ~295 - 325)
-Do the exact same thing for the partial submission logic.
-**Change this:**
-```javascript
-    try {
-      await callApi(
-        "/JS/journals/process-bulk",
-        {
-          batchId: viewingBatchId,
-          journalIdPrefixes: selectedJournalPrefixes,
-          status: mode,
-          remarks: partialExecutorRemarks.trim(),
-        },
-        "POST"
-      );
-      showSnackBar(
-        mode === "ACCEPTED"
-          ? "Selected Entries Accepted Successfully"
-          : "Selected Entries Rejected Successfully",
-        "success"
-      );
-      handleCloseViewModal();
-    } catch (e) {
-
-```
-**To this:**
-```javascript
-    try {
-      const response = await callApi(
-        "/JS/journals/process-bulk",
-        {
-          batchId: viewingBatchId,
-          journalIdPrefixes: selectedJournalPrefixes,
-          status: mode,
-          remarks: partialExecutorRemarks.trim(),
-        },
-        "POST"
-      );
-      
-      // FIX: Read the backend message or default to async processing message
-      const displayMessage = response?.message || "Partial approval process started in background. You will be notified upon completion.";
-      showSnackBar(displayMessage, "info");
-      
-      handleCloseViewModal();
-    } catch (e) {
-
-```
-By making these two changes, the moment a user clicks "Confirm", the UI will immediately dismiss the modal and show a blue "Info" popup stating that the process has started in the background. It perfectly aligns the frontend UX with what your backend is actually doing!
+### Why this solves it:
+By adding the stringRedisTemplate.convertAndSend, the moment the backend creates the "Batch Approved Successfully" or "Batch Requires Approval" notification, it pushes the alert directly to the live notifications:alerts topic. Assuming your frontend websocket is listening to this Redis topic (similar to the progress topic), the notification bell will update instantly without needing a page refresh!
