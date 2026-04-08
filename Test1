@@ -1,22 +1,57 @@
-package com.fincore.JournalService.Service;
+package com.tcs.fincore.CommonRequestService.repository;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+
+import java.util.UUID;
+
+/**
+ * Repository interface for managing {@link NotificationTable} entities.
+ *
+ * This interface extends {@link JpaRepository} to provide standard CRUD (Create, Read, Update, Delete)
+ * operations and querying capabilities for the {@link NotificationTable} entity. The primary key
+ * type for the entity is {@link UUID}.
+ *
+ * Spring Data JPA automatically provides an implementation of this interface at runtime,
+ * allowing data access methods to be used without manual boilerplate code.
+ *
+ * @author [Author Name/Team Name - Optional]
+ * @since [Date or Version - Optional]
+ */
+@Repository
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID>{
+
+}
+
+
+service
+
+vpackage com.tcs.fincore.CommonRequestService.service;
+
+
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Models.Notifications;
-import com.fincore.JournalService.Repository.NotificationRepository;
+import com.tcs.fincore.CommonRequestService.model.CGLMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.NotificationRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+
 /**
- * Service for persisting system alerts and user notifications.
- * Uses REQUIRES_NEW to ensure notifications commit independently of batch transactions,
- * which is required for successful delivery during asynchronous processing.
+ * A service to create and save Notification events to the outbox table.
+ * This is designed to be called from within a parent @Transactional method
+ * in RequestServiceImpl to ensure atomic operations.
  */
 @Service
 @RequiredArgsConstructor
@@ -24,73 +59,244 @@ import org.springframework.transaction.annotation.Transactional;
 public class NotificationWriterService {
 
     private final NotificationRepository notificationRepository;
-    
-    // NEW: Inject Redis and Jackson for live broadcasting
-    private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
 
-    // NEW: Define the live notification topic
-    @Value("${notification.alert.topic:notifications:alerts}")
-    private String alertTopic;
-
     /**
-     * Persists a notification event and broadcasts it to Redis for real-time UI updates.
-     * Propagation set to REQUIRES_NEW to support @Async callers and ensure
-     * visibility regardless of the parent transaction status.
-     * * @param userId Targeted user ID (null for broadcast)
-     * @param targetRole Targeted role (null for direct user)
-     * @param message The alert content
-     * @param linkUrl Redirect URL for the frontend
-     * @param aggregateId Reference ID (e.g., Batch ID)
-     * @param eventSource Service identifier
+     * Creates and saves a notification outbox event.
+     * This method joins the existing transaction from the calling service.
+     *
+     * @param userId       The specific user to notify (for 1-to-1). Null if using targetRole.
+     * @param targetRole   The role to notify (for 1-to-many). Null if using userId.
+     * @param message      The human-readable message.
+     * @param linkUrl      The frontend link for the notification.
+     * @param aggregateId  The ID of the business object (e.g., the CommonReq ID).
+     * @param eventSource  The name of this service.
      */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.MANDATORY) // Ensures this is only called from within an existing transaction
     public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
 
-        // Validation: Ensure we have at least one recipient type
         if (userId == null && targetRole == null) {
-            log.warn("NOTIFICATION_SKIPPED | Reason: Recipient missing | AggregateID: {}", aggregateId);
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            // In a real scenario, you might want to throw an exception here
+            // if one of them is strictly required, to roll back the parent transaction.
             return;
         }
 
-        // Validation: Ensure message is not blank
         if (message == null || message.isBlank()) {
-            log.error("NOTIFICATION_VALIDATION_FAIL | Status: BLANK_MESSAGE | AggregateID: {}", aggregateId);
-            throw new IllegalArgumentException("Notification message content is required.");
+            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            // Throwing an exception ensures the parent transaction rolls back.
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
         }
 
-        try {
-            Notifications notification = Notifications.builder()
-                    .userId(userId)
-                    .targetRole(targetRole)
-                    .message(message)
-                    .linkUrl(linkUrl)
-                    .aggregateId(aggregateId)
-                    .eventSource(eventSource)
-                    .build();
+        NotificationTable notification = NotificationTable.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .eventTimestamp(LocalDateTime.now(ZoneId.of("Asia/Kolkata")))
+                .build();
 
-            // 1. Save to Database
-            Notifications savedNotification = notificationRepository.save(notification);
+        // The EVENT_ID (UUID)
+        // will be set automatically by the NotificationTable entity.
 
-            // 2. NEW: Broadcast to Redis so the Frontend receives it in real-time
-            try {
-                String jsonPayload = objectMapper.writeValueAsString(savedNotification);
-                stringRedisTemplate.convertAndSend(alertTopic, jsonPayload);
-            } catch (JsonProcessingException e) {
-                log.error("NOTIFICATION_BROADCAST_FAIL | AggregateID: {} | Reason: JSON Serialization failed", aggregateId);
-            }
+        notificationRepository.save(notification);
 
-            // Logging metadata only to satisfy PII requirements
-            if (userId != null) {
-                log.info("NOTIFICATION_SAVED_AND_BROADCAST | Type: DIRECT | UserID: {} | Ref: {}", userId, aggregateId);
-            } else {
-                log.info("NOTIFICATION_SAVED_AND_BROADCAST | Type: BROADCAST | Role: {} | Ref: {}", targetRole, aggregateId);
-            }
-
-        } catch (DataAccessException e) {
-            // Catching specific Spring DAO exception for DB issues
-            log.error("NOTIFICATION_DB_FAIL | AggregateID: {} | Reason: Database persistence failure", aggregateId);
-            throw e;
+        if (targetRole != null) {
+            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        } else {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
         }
     }
+
+
+    @SneakyThrows
+    public void createRequestApprovedNotification(CommonReq request, String approverId) {
+        // 1. Custom check for update/block request message
+        String action = request.getChangeType().name(); // Default is UPDATE
+
+        // Custom logic to detect "Block" action
+        if (request.getReqType() == RequestType.CGL_CODE && request.getChangeType() == ChangeType.UPDATE) {
+            // Parse payload to check if status is 0 (Blocked)
+            CGLMaster payload = objectMapper.readValue(request.getPayload(), CGLMaster.class);
+            if (payload.getStatus() == 0) {
+                action = "BLOCK"; // Override action name for the message
+            }
+        }
+
+        // 2. Prepare the success notification message
+        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() +" "+action
+                + " request for '" + request.getTargetId() + "' has been approved by " + approverId;
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests", // Or specific link
+                request.getId().toString(),
+                "CommonRequestService"
+        );
+    }
+
+    @SneakyThrows
+    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
+        // 2. Prepare the rejection notification message
+        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() +" "+request.getChangeType().name()
+                + " request for '" + request.getTargetId() + "' was rejected by " + rejectorId;
+        if (reason != null && reason.isBlank()) {
+            notificationMessage += " Reason: " + reason;
+        }
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests",
+                request.getId().toString(),
+                "CommonRequestService"
+        );
+    }
 }
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp; // Import this
+import org.hibernate.annotations.SourceType;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant; // This is the correct type
+import java.time.LocalDateTime;
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ * This entity maps to the {@code notification_table} in the database. It captures all necessary details
+ * for a notification to be processed and displayed to a user or a group of users (via roles).
+ * <p>
+ * The {@code @CreationTimestamp} annotation ensures that the {@code eventTimestamp} is automatically
+ * populated upon entity creation, providing an accurate record of when the event occurred.
+ * </p>
+ */
+@Entity
+@Table(name = "notifications")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class NotificationTable implements Serializable {
+
+    /**
+     * Unique primary key for the outbox event.
+     * Uses a generated {@link UUID} strategy, which is suitable for Oracle's SYS_GUID() or RAW(16) columns.
+     */
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private UUID eventId;
+
+    /**
+     * The ID of the user who should receive this notification (for 1-to-1 notifications).
+     * This field is used when targeting a specific user.
+     */
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    /**
+     * The human-readable message to be displayed in the UI.
+     * This is the main content of the notification.
+     */
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    /**
+     * The relative URL the user should be taken to when clicking the notification.
+     * Provides a direct link to the relevant business object or view.
+     */
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    /**
+     * The microservice that generated this event.
+     * Helps in tracing the origin of the notification within a microservice architecture.
+     */
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    /**
+     * The primary key of the related business object (e.g., the Common Request ID).
+     * Used to link the notification back to the original business data.
+     */
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    /**
+     * The timestamp when the event was created.
+     * Automatically populated using {@link CreationTimestamp} and stored as an {@link Instant}.
+     * The column is both non-nullable and non-updatable after creation.
+     */
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private LocalDateTime eventTimestamp;
+
+    /**
+     * For 1-to-Many notifications. If {@code userId} is null, this role is used to determine the recipients.
+     * Enables broadcasting notifications to all users within a specific role.
+     */
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
+
+    /**
+     * Compares this NotificationTable entity with another object for equality based solely on the {@code eventId}.
+     *
+     * @param o The object to compare with.
+     * @return true if the objects are equal (have the same eventId), false otherwise.
+     */
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NotificationTable that = (NotificationTable) o;
+        return Objects.equals(eventId, that.eventId);
+    }
+
+    /**
+     * Generates a hash code for the NotificationTable entity based solely on the {@code eventId}.
+     *
+     * @return The hash code.
+     */
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    /**
+     * Provides a string representation of the NotificationTable entity, primarily for logging and debugging purposes.
+     *
+     * @return A string containing key fields of the entity.
+     */
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", targetRole='" + targetRole + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
+    }
+}
+
+i see my frd code how he is doing this is how he is doing it is working i think we also need to do in same way for working 
