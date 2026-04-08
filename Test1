@@ -1,179 +1,165 @@
+I have reviewed your current procedures, and they exactly match the buggy versions identified in the architectural review. While they might appear to be "working" during happy-path testing, they contain severe transactional risks when interacting with your Java code.
+Here is exactly what is wrong with your current scripts and why they must be replaced:
+ 1. **The Table Lock Bug (NC-1):** Your PROCESS_JOURNAL_BATCH uses /*+ APPEND PARALLEL... */. The APPEND hint triggers a direct-path load, which places an exclusive lock on the table. If two users approve batches at the same time, the second user's process will crash with an ORA-12838 error.
+ 2. **The Spring Boot Transaction Killer (C-6 & H-9):** Both procedures contain explicit COMMIT; statements. Because your Java service uses @Transactional, Spring Boot thinks it is controlling the transaction. If your Java code fails *after* calling the procedure, Spring will try to issue a ROLLBACK, but it will fail because the procedure already committed the data directly to Oracle.
+ 3. **The HDFS Data Corruption Race (NC-2):** In PROCESS_JOURNAL_BATCH, you are opening the o_cursor *after* the COMMIT. If another user merges data into GL_BALANCE exactly at that millisecond, your cursor will pick up their balances too, sending corrupted data to your HDFS Data Lake.
+Here are the fully corrected replacements. Run these in your Oracle SQL client to overwrite the dangerous versions.
+### 1. The Fixed PROCESS_JOURNAL_BATCH
+This version removes the APPEND hints, reorders the cursor to prevent dirty reads, and removes the explicit COMMIT so your Java @Transactional annotation can actually protect the data:
+```sql
 create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
     p_batch_id      IN VARCHAR2,
     p_executor_id   IN VARCHAR2,
     p_remarks       IN VARCHAR2,
-    p_status        IN VARCHAR2, 
+    p_status        IN VARCHAR2,
     o_cursor        OUT SYS_REFCURSOR
 ) AS
     v_missing_rates NUMBER;
 BEGIN
-
-    -- ==========================================================
     -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
-    -- ==========================================================
-    -- Rule 3: Validates that every non-INR currency in the batch has an active rate.
-    -- This prevents corrupted balances in the GL_BALANCE table.
-    SELECT COUNT(*)
-    INTO v_missing_rates
+    SELECT COUNT(*) INTO v_missing_rates
     FROM (
-        SELECT DISTINCT REQ_CURRENCY 
-        FROM JOURNAL_REQUEST 
+        SELECT DISTINCT REQ_CURRENCY FROM JOURNAL_REQUEST
         WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
     ) req
-    LEFT JOIN CURRENCY_MASTER cm 
+    LEFT JOIN CURRENCY_MASTER cm
         ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
     WHERE req.REQ_CURRENCY <> 'INR'
       AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
     IF v_missing_rates > 0 THEN
-        -- Rule 1 & 2: Specific error code for Java to catch without leaking schema details.
         RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
     END IF;
 
-    -- START ATOMIC TRANSACTION
-    BEGIN
-        -- ==========================================================
-        -- 1. Insert into GL_TRANSACTIONS
-        -- ==========================================================
-        -- Safe for Parallelism: New row inserts do not lock existing data rows.
-        INSERT /*+ APPEND PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
-            TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
-            BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
-        )
-        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-            GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID, NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
-            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
-            CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, 
-            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, 
-            'J'
-        FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    -- 1. Insert GL_TRANSACTIONS (REMOVED APPEND hint — prevents DML conflict)
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
+    )
+    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END,
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
+        'J'
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        -- ==========================================================
-        -- 2. Insert into MASTER_JOURNAL 
-        -- ==========================================================
-        INSERT /*+ APPEND PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
-            JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH, 
-            JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF, 
-            JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
-        )
-        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-            MASTER_JOURNAL_SEQ.nextval, 
-            ABS(REQ_AMOUNT), 
-            'A', 
-            BATCH_ID, 
-            REQ_BRANCH_CODE, 
-            REQ_CGL, 
-            p_remarks, 
-            REQ_CURRENCY, 
-            JOURNAL_ID, 
-            NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), 
-            REQ_PRODUCT, 
-            REQ_NARRATION, 
-            CASE WHEN REQ_AMOUNT > 0 THEN 'Debit' ELSE 'Credit' END
-        FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    -- 2. Insert MASTER_JOURNAL (REMOVED APPEND hint)
+    INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
+        JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
+        JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF,
+        JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
+    )
+    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+        MASTER_JOURNAL_SEQ.nextval, ABS(REQ_AMOUNT), 'A', BATCH_ID,
+        REQ_BRANCH_CODE, REQ_CGL, p_remarks, REQ_CURRENCY, JOURNAL_ID,
+        NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), REQ_PRODUCT, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN 'Debit'
+             WHEN REQ_AMOUNT < 0 THEN 'Credit'
+             ELSE 'Zero' END
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        -- ==========================================================
-        -- 3. Merge Balances (CONCURRENCY FIX)
-        -- ==========================================================
+    -- 3. Merge GL Balances
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM JOURNAL_REQUEST j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
 
-        MERGE INTO GL_BALANCE target
-        USING (
-            SELECT 
-                j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
-                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
-                CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE 
-            FROM JOURNAL_REQUEST j
-            LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1 
-            WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
-            GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
-        ) source
-        ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE 
-            AND target.CURRENCY = source.REQ_CURRENCY 
-            AND target.CGL = source.REQ_CGL 
-            AND target.BALANCE_DATE = source.BAL_DATE)
-        WHEN MATCHED THEN
-            UPDATE SET 
-                target.BALANCE = target.BALANCE + source.TXN_AMOUNT, 
-                target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
-        WHEN NOT MATCHED THEN
-            INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
-            VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE, 
-                    source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT, 
-                    (source.TXN_AMOUNT * source.EXCH_RATE));
+    -- 4. Capture sync data BEFORE status update (fixes cursor-after-commit race)
+    -- Use cursor directly — no explicit COMMIT (let Spring manage tx)
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE
+        FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE));
 
-        -- ==========================================================
-        -- 4. Final Status Update
-        -- ==========================================================
-        UPDATE JOURNAL_REQUEST
-        SET REQ_STATUS = p_status, 
-            EXECUTOR_ID = p_executor_id, 
-            EXECUTION_DATE = SYSTIMESTAMP, 
-            EXECUTOR_REMARKS = p_remarks
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    -- 5. Update status AFTER cursor capture
+    UPDATE JOURNAL_REQUEST
+    SET REQ_STATUS = p_status,
+        EXECUTOR_ID = p_executor_id,
+        EXECUTION_DATE = SYSTIMESTAMP,
+        EXECUTOR_REMARKS = p_remarks
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        COMMIT; 
+    -- NO EXPLICIT COMMIT — Spring @Transactional manages this
 
-        -- ==========================================================
-        -- 5. Return Sync Cursor to Java
-        -- ==========================================================
-        OPEN o_cursor FOR
-        SELECT 
-            j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL, 
-            j.REQ_CSV_DATE AS BAL_DATE, g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
-        FROM (SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
-              FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id) j
-        JOIN GL_BALANCE g 
-            ON g.BRANCH_CODE = j.REQ_BRANCH_CODE 
-            AND g.CURRENCY = j.REQ_CURRENCY 
-            AND g.CGL = j.REQ_CGL 
-            AND g.BALANCE_DATE = j.REQ_CSV_DATE;
-
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-            -- Rule 2: Re-raising for Java, but Java must be configured to log only the Code, not the Message.
-            RAISE; 
-    END;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
 END;
 
-
-2nd 
+```
+### 2. The Fixed PURGE_JOURNAL_BATCH
+This version removes the chunked loop loop so a database crash doesn't leave a batch half-deleted. It also adds a proper ownership verification wrap to ensure users cannot delete each other's data:
+```sql
 create or replace PROCEDURE PURGE_JOURNAL_BATCH(
     p_batch_id IN VARCHAR2,
-    p_user_id IN VARCHAR2
+    p_user_id  IN VARCHAR2
 ) AS
     v_status VARCHAR2(20);
+    v_deleted NUMBER;
 BEGIN
-    -- 1. Security Check
-    SELECT BATCH_STATUS INTO v_status
-    FROM JOURNAL_BATCH_MASTER
-    WHERE BATCH_ID = p_batch_id AND CREATOR_ID = p_user_id;
+    -- 1. Security + Ownership Check
+    BEGIN
+        SELECT BATCH_STATUS INTO v_status
+        FROM JOURNAL_BATCH_MASTER
+        WHERE BATCH_ID = p_batch_id AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(p_user_id));
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+    END;
 
-    -- ALLOW 'PENDING' OR 'QUEUED' (Locked by Java)
     IF v_status NOT IN ('PENDING', 'QUEUED', 'ERROR') THEN
         RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
     END IF;
 
-    -- 2. Fast Chunked Delete
-    LOOP
-        DELETE FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id
-          AND REQ_STATUS IN ('P', 'R') -- Clean PENDING or REJECTED
-          AND ROWNUM <= 50000;
-
-        EXIT WHEN SQL%ROWCOUNT = 0;
-        COMMIT; 
-    END LOOP;
+    -- 2. Delete all rows (no chunked commits — let Spring manage tx)
+    DELETE FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id
+      AND REQ_STATUS IN ('P', 'R');
 
     -- 3. Delete Master
     DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
-    COMMIT;
+
+    -- NO EXPLICIT COMMIT — Spring @Transactional handles it
 
 EXCEPTION
-    WHEN NO_DATA_FOUND THEN
-        RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
 END;
 
-
+```
