@@ -1,12 +1,69 @@
+These are fantastic, senior-level architectural questions. Asking "why don't we just store the data to save time?" shows you are thinking deeply about database performance and system design.
+Let me break down exactly where the code does this, and then I will explain why your current architectural design (not storing the payload) is actually a brilliant safety feature.
+### 1. The Recovery Query (How we find the data)
+When the Thrift server comes back online, the HdfsRecoveryService uses the following exact SQL query to figure out what data needs to go to the Data Lake.
+**File:** com/fincore/JournalService/Service/HdfsRecoveryService.java
+```sql
+SELECT 
+    j.REQ_BRANCH_CODE AS BRANCH, 
+    j.REQ_CURRENCY AS CURRENCY, 
+    j.REQ_CGL AS CGL, 
+    j.REQ_CSV_DATE AS BAL_DATE,
+    g.BALANCE AS NEW_BALANCE,
+    g.INR_BALANCE AS NEW_INR_BALANCE
+FROM (
+    SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
+    FROM JOURNAL_REQUEST 
+    WHERE BATCH_ID = ?
+) j
+JOIN GL_BALANCE g ON 
+    g.BRANCH_CODE = j.REQ_BRANCH_CODE AND 
+    g.CURRENCY = j.REQ_CURRENCY AND 
+    g.CGL = j.REQ_CGL AND 
+    g.BALANCE_DATE = j.REQ_CSV_DATE
 
+```
+### 2. The Data Lake Matching Logic & Values
+Once the recovery query (or the initial live sync) gathers the data, it packages it into the HdfsSyncDto.
+**File:** com/fincore/JournalService/Service/HdfsSyncService.java
+Here is the exact code showing the matching logic and what values are updated.
+```java
+String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
+        "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
 
-how we are doing this how give the Query where we are doing this 
-and in Data lakh what or from this what are the values we are getting 
+hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+    @Override
+    public void setValues(PreparedStatement ps, int i) throws SQLException {
+        HdfsSyncDto dto = data.get(i);
+        ps.setBigDecimal(1, dto.getNewBalance());    // Value we are setting
+        ps.setBigDecimal(2, dto.getNewInrBalance()); // Value we are setting
+        ps.setString(3, dto.getBranch());            // Matching Logic 
+        ps.setString(4, dto.getCurrency());          // Matching Logic 
+        ps.setString(5, dto.getCgl());               // Matching Logic 
+        ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate())); // Matching Logic
+    }
+    // ...
 
-show me in the code 
-
-where is the matching logic in the code 
-
-also give mi line by line expin nation for the recovery code 
-
-and tell me cant we do like instude again searching in with batch id cant we store that payload or it will take time at the time of reacovery when we store the batch id only in the recovery table cant we store other data also so we dont need to find
+```
+ * **What we are updating:** BALANCE and INR_BALANCE.
+ * **The Matching Logic:** It updates the row WHERE the Branch, Currency, CGL, and Date exactly match the transaction.
+### 3. Line-by-Line Explanation of the Recovery Code
+Here is the breakdown of the processRetry method in HdfsRecoveryService.
+ 1. private void processRetry(String batchId) { -> Method starts, taking the ID of the failed batch.
+ 2. String freshDataSql = """ ... """ -> Defines the SQL query shown above to join the requested accounts with the live GL_BALANCE table.
+ 3. List<HdfsSyncDto> freshSyncData = oracleJdbcTemplate.query(...) -> Executes the query against the Oracle database.
+ 4. (rs, rowNum) -> new HdfsSyncDto(...) -> Loops through the database results, reading the columns (BRANCH, CURRENCY, NEW_BALANCE, etc.) and mapping them into a list of Java DTO objects.
+ 5. if (!freshSyncData.isEmpty()) { -> Checks if the query actually found any matching balances.
+ 6. hdfsSyncService.syncToDataLake(freshSyncData); -> Calls the other service to push this fresh list of data to the Data Lake via the Thrift server.
+ 7. oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET STATUS = 'COMPLETED' WHERE BATCH_ID = ?", batchId); -> If the sync succeeds without throwing an exception, it marks the queue record as COMPLETED so it isn't retried again.
+### 4. Why don't we just store the payload in the recovery table?
+Your idea to store the payload as JSON in the recovery table to avoid the JOIN query is a great thought for performance optimization.
+However, **not storing the payload is actually a critical safety mechanism.**
+Imagine this scenario:
+ 1. At 10:00 AM, User A approves Batch 1. The account balance becomes $1,000. The Thrift server is down, so we store the payload (Balance = $1,000) in the recovery table.
+ 2. At 10:15 AM, User B approves Batch 2 for the *exact same account*. The balance becomes $1,500. The Thrift server is back online! The live sync works, and the Data Lake now correctly shows $1,500.
+ 3. At 10:20 AM, the HdfsRecoveryService wakes up to process Batch 1.
+**If we stored the payload:** The recovery service would read the saved payload (Balance = $1,000) and push it to the Data Lake. We just overwrote the correct $1,500 balance with stale data from 10:00 AM. **This causes severe data corruption.**
+**How your code prevents this:**
+By storing *only* the BATCH_ID, the system is forced to run that JOIN query against GL_BALANCE at the exact millisecond the recovery runs. At 10:20 AM, the query sees the live balance is $1,500, and pushes $1,500 to the Data Lake again.
+It trades a tiny bit of database lookup time for absolute data integrity. It is an excellent pattern for distributed systems!
