@@ -1,55 +1,39 @@
-    @Override
-    @Transactional
-    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
-        String batchId = sequenceService.getNextBatchId();
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+Understood perfectly. Keeping COMMON_BATCH_REMARKS is a valid architectural choice, especially if you have existing frontend views or reports that expect to find the remark directly on the row-level data without having to perform a JOIN. We will leave it exactly as it is.
+Let's finalize the cleanup for the specific columns you targeted: **PAYLOAD**, **CHANGE_TYPE**, and **AC_CLASSIFICATION**.
+Here is your exact action plan to safely remove these from the system.
+### Phase 1: The Java Cleanup
+Since we already removed the PAYLOAD insertion logic from JournalRequestServiceImpl.java, you just need to clean up your JPA Entity models so Hibernate stops looking for these columns.
+**1. In JournalRequest.java:**
+Delete the mappings for Payload and Change Type.
+```java
+    // DELETE THESE LINES:
+    // @Column(name = "PAYLOAD")
+    // private String payload;
 
-        List<JournalRequest> entities = new ArrayList<>();
-        BigDecimal totalDebit = BigDecimal.ZERO;
-        BigDecimal totalCredit = BigDecimal.ZERO;
-        int rowIndex = 1;
+    // @Column(name = "CHANGE_TYPE")
+    // private String changeType;
 
-        for (BatchRequestDto.JournalRequestRow row : dto.getRows()) {
-            JournalRequest entity = new JournalRequest();
-            entity.setRequestStatus(RequestStatus.PENDING);
-            entity.setRequestDate(LocalDateTime.now());
-            entity.setCreatorId(creatorId);
-            entity.setCreatorRole(creatorRole);
-            entity.setBatchId(batchId);
-            entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
+```
+**2. In MasterJournal.java (or whatever your entity name is for the master table):**
+Delete the mapping for AC Classification.
+```java
+    // DELETE THIS LINE:
+    // @Column(name = "AC_CLASSIFICATION")
+    // private String acClassification;
 
-            String journalId = batchId + "-" + rowIndex;
-            entity.setJournalId(journalId);
-            entity.setBranchCode(row.getBranch());
-            entity.setCurrency(row.getCurrency());
-            entity.setCgl(row.getCgl());
+```
+### Phase 2: The Oracle Stored Procedure Audit
+Before you run the drop command on the database, you **must** check your Oracle Stored Procedure: PROCESS_JOURNAL_BATCH.
+If that procedure contains an INSERT INTO MASTER_JOURNAL (...) statement that explicitly lists the AC_CLASSIFICATION column, you need to edit the procedure to remove it. If you drop the column while the procedure is still trying to insert into it, batch approvals will fail.
+### Phase 3: The Database Drop Scripts
+Once your updated Java code is deployed and your Stored Procedure is cleared of AC_CLASSIFICATION, you can execute these exact SQL statements in your Oracle database to permanently delete the technical debt:
+```sql
+-- 1. Drop the legacy columns from the Staging Table
+ALTER TABLE JOURNAL_REQUEST DROP (PAYLOAD, CHANGE_TYPE);
 
-            BigDecimal amount = row.getAmount();
-            entity.setAmount(amount);
-            entity.setCsvDate(row.getCsvDate() != null ? row.getCsvDate() : LocalDate.now());
-            entity.setNarration(row.getRemarks());
-            entity.setProductCode(row.getProductType());
+-- 2. Drop the classification column from the Master Table
+ALTER TABLE MASTER_JOURNAL DROP COLUMN AC_CLASSIFICATION;
 
-            // Legacy JSON Payload logic has been completely removed from here.
-
-            // Calculate totals (Credit is negative amount, Debit is positive)
-            if (amount.compareTo(BigDecimal.ZERO) < 0) {
-                totalCredit = totalCredit.add(amount.abs());
-            } else {
-                totalDebit = totalDebit.add(amount.abs());
-            }
-
-            entities.add(entity);
-            rowIndex++;
-        }
-
-        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
-
-        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-        jdbcTemplate.update(sumSql, batchId, creatorId, ts, dto.getCommonBatchRemarks(), entities.size(), totalDebit, totalCredit, "PENDING");
-
-        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Manual Batch " + batchId + " Created");
-        sendNotification(creatorId, null, "Manual Batch " + batchId + " created successfully.", batchId);
-
-        return savedEntities;
-    }
+```
+By completing this, you will have successfully modernized the codebase, eliminated redundant memory overhead, and reclaimed significant storage space in the Oracle database.
+Are there any other areas of this Journal Service, perhaps the caching strategy or the frontend React grids, that you would like to review next?
