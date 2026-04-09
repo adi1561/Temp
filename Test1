@@ -1,42 +1,63 @@
-This is exactly why we do a "Frontend Audit" before dropping a database column! You made the right call by checking these files.
-I have reviewed all three files. **Yes, your frontend is still using the payload column**, specifically in the **JournalRequestApproval.js** file. If you dropped the column from Oracle today, the "View Details" modal on the approval screen would completely crash.
-Here is the exact breakdown of what I found in your code:
-### 1. The Culprit: JournalRequestApproval.js
-In the fetchBatchDetailsPaginated function, I can see that you (or another developer) already started the migration. You are correctly mapping the new, optimized database columns:
-```javascript
-// You are successfully grabbing the new columns here!
-branch: req.reqBranchCode,
-currency: req.reqCurrency,
-cgl: req.reqCgl,
+Awesome work on that frontend audit, Adesh. Since the UI is now safely using the individual fields, you are fully unblocked to finish deprecating that PAYLOAD column in the backend whenever you're ready.
+For now, let's pivot and knock out the **4th and final critical bug on our list: The Dangling Redis Lock**.
+### The Problem
+In JournalRequestServiceImpl.java, the entry point for creating a batch is a method that handles the /create-batch-from-cache API request.
+Before it hands the work off to the @Async background thread (executeAsyncBatchCreation), it places a Redis lock for 60 minutes (setIfAbsent(lockKey, ...)). The logic is designed so that the background thread will delete this lock inside its finally block when it finishes.
+**The Edge Case:** If 500 users upload files simultaneously, your bulkExecutor queue will become 100% full. When user 501 clicks "Submit", Spring tries to submit the task to the queue and gets a TaskRejectedException.
+ * The background thread *never starts*.
+ * The finally block *never executes*.
+ * The 60-minute Redis lock stays active in the database.
+ * User 501 is permanently locked out of retrying their batch for an entire hour, seeing a "Batch is already processing" error every time they click submit.
+### The Fix
+We need to wrap the asynchronous method call in a try-catch block specifically to catch thread pool rejections, allowing us to immediately release the lock if the system is too busy.
+**File:** com/fincore/JournalService/Service/JournalRequestServiceImpl.java
+**Find the method that triggers the batch creation (likely named createBatchFromCache or similar). Look for this existing logic:**
+```java
+        // ... (existing cache checks) ...
+
+        String lockKey = "LOCK_REQ_" + requestId;
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, "LOCKED", 60, TimeUnit.MINUTES);
+        
+        if (Boolean.FALSE.equals(acquired)) {
+            log.warn("BATCH_LOCK_REJECTED | RequestId: {} is already processing.", requestId);
+            throw new CustomExceptions.DuplicateRequestException("This batch is currently being processed.");
+        }
+
+        // The dangerous part: If this throws a rejection exception, the lock is never cleared.
+        executeAsyncBatchCreation(batchId, requestId, requestDto.getCommonBatchRemarks(), creatorId, creatorRole);
+
+        // ... return response ...
 
 ```
-**However, in the HTML/JSX further down the page, it is still pointing to the old nested payload object!** Look around line 430 in the TableBody of your View Modal:
-```javascript
-<TableCell align="center">
-  {row.payload.branch}  <-- Still using legacy payload!
-</TableCell>
-<TableCell align="center">
-  {row.payload.currency} <-- Still using legacy payload!
-</TableCell>
-<TableCell align="center">
-  {row.payload.cgl}      <-- Still using legacy payload!
-</TableCell>
+**Replace that specific execution section with this resilient version:**
+```java
+        // ... (existing cache checks) ...
+
+        String lockKey = "LOCK_REQ_" + requestId;
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, "LOCKED", 60, TimeUnit.MINUTES);
+        
+        if (Boolean.FALSE.equals(acquired)) {
+            log.warn("BATCH_LOCK_REJECTED | RequestId: {} is already processing.", requestId);
+            throw new CustomExceptions.DuplicateRequestException("This batch is currently being processed.");
+        }
+
+        try {
+            // Attempt to hand off to the asynchronous background worker
+            executeAsyncBatchCreation(batchId, requestId, requestDto.getCommonBatchRemarks(), creatorId, creatorRole);
+        } catch (org.springframework.core.task.TaskRejectedException e) {
+            // FIX: If the thread pool is completely full, release the lock immediately!
+            redisTemplate.delete(lockKey);
+            log.error("SYSTEM_OVERLOAD | Batch: {} | Status: Thread pool rejected the task. Lock released.", batchId);
+            throw new CustomExceptions.BatchProcessingException("System is currently under heavy load. Please try submitting your batch again in a few minutes.");
+        } catch (Exception e) {
+            // Failsafe for any other unexpected synchronous errors during submission
+            redisTemplate.delete(lockKey);
+            log.error("SYSTEM_FAULT | Batch: {} | Status: Unexpected error before async execution. Lock released.", batchId);
+            throw new CustomExceptions.BatchProcessingException("An internal error occurred while starting the batch.");
+        }
+
+        // ... return response ...
 
 ```
-**The Fix:**
-You need to change those lines in JournalRequestApproval.js to use the flat properties you already mapped:
-```javascript
-<TableCell align="center">{row.branch}</TableCell>
-<TableCell align="center">{row.currency}</TableCell>
-<TableCell align="center">{row.cgl}</TableCell>
-
-```
-### 2. Safe: JournalBulkUpload.js
-This file is safe. I see the word payload in this file, but it is just being used as a local JavaScript variable name (const payload = { ... }) to send data *to* the backend. It is not trying to read the PAYLOAD column *from* the database.
-### 3. Safe: JournalPosting.js
-This file is also safe. Similar to the bulk upload, it uses variable names like rowPayloads and finalPayload to construct the HTTP POST request. It does not read the database column.
-### Next Steps for the Deprecation Plan
- 1. Make the JSX fix in JournalRequestApproval.js mentioned above.
- 2. Deploy the updated React UI.
- 3. Once the React UI is no longer looking for row.payload, you can safely proceed with removing the PAYLOAD logic from your Java JournalRequestServiceImpl and JournalRequest Entity.
- 4. *Then* you can drop the column in Oracle.
+By adding this try-catch around the @Async method call, you guarantee that your system will gracefully handle traffic spikes without permanently locking out user sessions.
+With all 4 of these architectural bugs patched, your system is exponentially safer for a production environment. What would you like to tackle next? We can proceed with the Java phase of the PAYLOAD column removal, or look into something entirely new.
