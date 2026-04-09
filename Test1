@@ -1,161 +1,55 @@
-This is the perfect time to strip out that legacy PAYLOAD logic and complete Phase 2 of the deprecation plan. This will immediately reduce your JVM memory footprint since you won't be building thousands of JSON strings in memory anymore.
-Here are the exact methods you need to replace or delete in JournalRequestServiceImpl.java.
-### 1. Update processChunkRaw
-We need to remove PAYLOAD from the native SQL INSERT statement and shift the PreparedStatement index numbers down.
-**Find this existing method:**
-```java
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
-                                String batchId,
-                                String commonRemarks,
-                                String creatorId,
-                                Integer creatorRole,
-                                int globalOffset,
-                                LongAdder globalDebit,
-                                LongAdder globalCredit) {
-
-        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-// ... (skipping middle for brevity) ...
-                    ps.setString(6, jId);
-                    ps.setString(7, commonRemarks);
-                    ps.setString(8, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
-                    ps.setString(9, r.branch);
-                    ps.setString(10, r.currency);
-                    ps.setString(11, r.cgl);
-                    ps.setBigDecimal(12, signedAmt);
-                    ps.setDate(13, java.sql.Date.valueOf(rDate));
-                    ps.setString(14, r.remarks);
-                    ps.setString(15, r.productCode);
-                }
-// ...
-
-```
-**Replace it entirely with this updated version:**
-```java
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
-                                String batchId,
-                                String commonRemarks,
-                                String creatorId,
-                                Integer creatorRole,
-                                int globalOffset,
-                                LongAdder globalDebit,
-                                LongAdder globalCredit) {
-
-        // 1. PAYLOAD removed from INSERT statement
-        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = sequenceService.getNextBatchId();
         Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-        final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
 
-        try {
-            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
-                    JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal totalDebit = BigDecimal.ZERO;
+        BigDecimal totalCredit = BigDecimal.ZERO;
+        int rowIndex = 1;
 
-                    int globalIdx = globalOffset + i + 1;
-                    String jId = batchId + "-" + globalIdx;
+        for (BatchRequestDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setRequestDate(LocalDateTime.now());
+            entity.setCreatorId(creatorId);
+            entity.setCreatorRole(creatorRole);
+            entity.setBatchId(batchId);
+            entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
 
-                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                    boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+            String journalId = batchId + "-" + rowIndex;
+            entity.setJournalId(journalId);
+            entity.setBranchCode(row.getBranch());
+            entity.setCurrency(row.getCurrency());
+            entity.setCgl(row.getCgl());
 
-                    LocalDate rDate = LocalDate.now();
-                    if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                        try {
-                            rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
-                        } catch (DateTimeParseException ignored) {}
-                    }
+            BigDecimal amount = row.getAmount();
+            entity.setAmount(amount);
+            entity.setCsvDate(row.getCsvDate() != null ? row.getCsvDate() : LocalDate.now());
+            entity.setNarration(row.getRemarks());
+            entity.setProductCode(row.getProductType());
 
-                    ps.setString(1, "P");
-                    ps.setTimestamp(2, ts);
-                    ps.setString(3, creatorId);
-                    ps.setInt(4, creatorRole != null ? creatorRole : 0);
-                    ps.setString(5, batchId);
-                    ps.setString(6, jId);
-                    ps.setString(7, commonRemarks);
-                    
-                    // 2. Indexes shifted up since Payload is gone
-                    ps.setString(8, r.branch);
-                    ps.setString(9, r.currency);
-                    ps.setString(10, r.cgl);
-                    ps.setBigDecimal(11, signedAmt);
-                    ps.setDate(12, java.sql.Date.valueOf(rDate));
-                    ps.setString(13, r.remarks);
-                    ps.setString(14, r.productCode);
-                }
+            // Legacy JSON Payload logic has been completely removed from here.
 
-                @Override
-                public int getBatchSize() {
-                    return chunk.size();
-                }
-            });
-
-            for (JournalBulkValidationService.ExcelRowData r : chunk) {
-                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                long scaledValue = absAmt.multiply(SCALE_FACTOR).longValue();
-
-                if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
-                    globalCredit.add(scaledValue);
-                } else {
-                    globalDebit.add(scaledValue);
-                }
+            // Calculate totals (Credit is negative amount, Debit is positive)
+            if (amount.compareTo(BigDecimal.ZERO) < 0) {
+                totalCredit = totalCredit.add(amount.abs());
+            } else {
+                totalDebit = totalDebit.add(amount.abs());
             }
 
-        } catch (org.springframework.dao.DataAccessException e) {
-            log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+            entities.add(entity);
+            rowIndex++;
         }
+
+        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        jdbcTemplate.update(sumSql, batchId, creatorId, ts, dto.getCommonBatchRemarks(), entities.size(), totalDebit, totalCredit, "PENDING");
+
+        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Manual Batch " + batchId + " Created");
+        sendNotification(creatorId, null, "Manual Batch " + batchId + " created successfully.", batchId);
+
+        return savedEntities;
     }
-
-```
-### 2. Update createBatchRequest (Manual Upload)
-Remove the payload mapping block from the manual API entry point.
-**Find this existing code block inside createBatchRequest:**
-```java
-            entity.setNarration(row.getRemarks());
-            entity.setProductCode(row.getProductType());
-
-            Map<String, Object> payloadMap = new HashMap<>();
-            payloadMap.put("csvDate", entity.getCsvDate().toString());
-            payloadMap.put("branch", row.getBranch());
-            payloadMap.put("currency", row.getCurrency());
-            payloadMap.put("cgl", row.getCgl());
-            payloadMap.put("amount", amount);
-            payloadMap.put("productType", row.getProductType());
-            payloadMap.put("remarks", row.getRemarks());
-            payloadMap.put("arFlag", "A");
-            payloadMap.put("acClassification", "A");
-            payloadMap.put("batchId", batchId);
-            payloadMap.put("journalId", journalId);
-            payloadMap.put("commonBatchRemarks", dto.getCommonBatchRemarks());
-            payloadMap.put("transactionCount", rowIndex);
-
-            entity.setPayload(objectMapper.writeValueAsString(payloadMap));
-
-            if (amount.compareTo(BigDecimal.ZERO) < 0) totalCredit = totalCredit.add(amount.abs());
-
-```
-**Replace it with:**
-```java
-            entity.setNarration(row.getRemarks());
-            entity.setProductCode(row.getProductType());
-
-            // Payload mapping logic completely removed
-
-            if (amount.compareTo(BigDecimal.ZERO) < 0) totalCredit = totalCredit.add(amount.abs());
-
-```
-### 3. Delete Dead Helper Methods
-Scroll down to the bottom of your file (around section 4) and **completely delete** these two methods. They are no longer used anywhere:
- 1. private String buildJsonPayloadFast(...) { ... }
- 2. private String escapeJson(...) { ... }
-### 4. Final Entity Cleanup
-To complete Phase 2, don't forget to open your **JournalRequest.java** entity class and delete the payload variable:
-```java
-    // DELETE THIS:
-    // @Column(name = "PAYLOAD")
-    // private String payload;
-
-```
-Once you deploy this, your Java backend will run faster, use less memory, and completely ignore the PAYLOAD column in the database!
