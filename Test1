@@ -1,11 +1,63 @@
+You are getting the "Unknown Command" error because you copied just a fragment of the SQL statement into your database client.
+In SQL, SUM(...) cannot run by itself. It has to be part of a complete SELECT ... FROM ... statement. Your SQL client doesn't know what table to look at or how to group the data, so it rejects it as an unknown command.
+If you want to test that logic directly in your Oracle database, you need to run the **complete query** exactly as it is written inside your JournalRequestRepository.java file.
+Here is the **full legacy query** that you can copy and paste into your SQL client right now to see it work:
+```sql
+SELECT 
+    BATCH_ID, 
+    MAX(CREATOR_ID) as CREATOR, 
+    MAX(REQ_DATE) as RDATE, 
+    MAX(COMMON_BATCH_REMARKS) as REM,
+    COUNT(*) as CNT,
+    SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
+    SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR
+FROM JOURNAL_REQUEST 
+WHERE TRIM(REQ_STATUS) IN ('P', 'PENDING')
+GROUP BY BATCH_ID
+ORDER BY MAX(REQ_DATE) DESC;
 
-Error starting at line : 1 in command -
-SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR
-Error report -
-Unknown Command
+```
+### The Refactoring Fix (Removing the PAYLOAD dependency)
+Since we know this JSON_VALUE parsing is slow and acting as technical debt, we can update your Java code to use the optimized columns you already built.
+To fix this in your codebase, open com/fincore/JournalService/Repository/JournalRequestRepository.java.
+**Find this existing method:**
+```java
+    @Query(value = """
+        SELECT 
+            BATCH_ID, 
+            MAX(CREATOR_ID) as CREATOR, 
+            MAX(REQ_DATE) as RDATE, 
+            MAX(COMMON_BATCH_REMARKS) as REM,
+            COUNT(*) as CNT,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR
+        FROM JOURNAL_REQUEST 
+        WHERE TRIM(REQ_STATUS) IN ('P', 'PENDING')
+        GROUP BY BATCH_ID
+        ORDER BY MAX(REQ_DATE) DESC
+    """, nativeQuery = true)
+    List<Object[]> findPendingBatchSummariesNative();
 
+```
+**Replace it with the optimized version utilizing REQ_AMOUNT:**
+```java
+    @Query(value = """
+        SELECT 
+            BATCH_ID, 
+            MAX(CREATOR_ID) as CREATOR, 
+            MAX(REQ_DATE) as RDATE, 
+            MAX(COMMON_BATCH_REMARKS) as REM,
+            COUNT(*) as CNT,
+            SUM(CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END) as TOT_DR,
+            SUM(CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END) as TOT_CR
+        FROM JOURNAL_REQUEST 
+        WHERE TRIM(REQ_STATUS) IN ('P', 'PENDING')
+        GROUP BY BATCH_ID
+        ORDER BY MAX(REQ_DATE) DESC
+    """, nativeQuery = true)
+    List<Object[]> findPendingBatchSummariesNative();
 
-Error starting at line : 1 in command -
-SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END)
-Error report -
-Unknown Command
+```
+*(Note: You will also want to make the exact same REQ_AMOUNT replacement in the findAllBatchSummariesNative method right below it).*
+Once you deploy these updated native queries, your backend will completely ignore the PAYLOAD column when calculating summaries, resulting in much faster database response times.
+Shall we tackle the 4th and final critical bug on our list now (The Dangling Redis Lock)?
