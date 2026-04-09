@@ -1,69 +1,55 @@
-These are fantastic, senior-level architectural questions. Asking "why don't we just store the data to save time?" shows you are thinking deeply about database performance and system design.
-Let me break down exactly where the code does this, and then I will explain why your current architectural design (not storing the payload) is actually a brilliant safety feature.
-### 1. The Recovery Query (How we find the data)
-When the Thrift server comes back online, the HdfsRecoveryService uses the following exact SQL query to figure out what data needs to go to the Data Lake.
-**File:** com/fincore/JournalService/Service/HdfsRecoveryService.java
-```sql
-SELECT 
-    j.REQ_BRANCH_CODE AS BRANCH, 
-    j.REQ_CURRENCY AS CURRENCY, 
-    j.REQ_CGL AS CGL, 
-    j.REQ_CSV_DATE AS BAL_DATE,
-    g.BALANCE AS NEW_BALANCE,
-    g.INR_BALANCE AS NEW_INR_BALANCE
-FROM (
-    SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
-    FROM JOURNAL_REQUEST 
-    WHERE BATCH_ID = ?
-) j
-JOIN GL_BALANCE g ON 
-    g.BRANCH_CODE = j.REQ_BRANCH_CODE AND 
-    g.CURRENCY = j.REQ_CURRENCY AND 
-    g.CGL = j.REQ_CGL AND 
-    g.BALANCE_DATE = j.REQ_CSV_DATE
+JOURNAL_REQUEST
 
-```
-### 2. The Data Lake Matching Logic & Values
-Once the recovery query (or the initial live sync) gathers the data, it packages it into the HdfsSyncDto.
-**File:** com/fincore/JournalService/Service/HdfsSyncService.java
-Here is the exact code showing the matching logic and what values are updated.
-```java
-String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
-        "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
 
-hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-    @Override
-    public void setValues(PreparedStatement ps, int i) throws SQLException {
-        HdfsSyncDto dto = data.get(i);
-        ps.setBigDecimal(1, dto.getNewBalance());    // Value we are setting
-        ps.setBigDecimal(2, dto.getNewInrBalance()); // Value we are setting
-        ps.setString(3, dto.getBranch());            // Matching Logic 
-        ps.setString(4, dto.getCurrency());          // Matching Logic 
-        ps.setString(5, dto.getCgl());               // Matching Logic 
-        ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate())); // Matching Logic
-    }
-    // ...
+REQ_ID	NUMBER	No		1	
+REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
+REQ_DATE	DATE	No	SYSDATE 	3	
+CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
+EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
+EXECUTION_DATE	DATE	Yes		6	Timestamp when this specific row was processed.
+EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		8	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		9	Unique identifier for the individual request.
+COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		10	Remarks inherited from the batch creation process.
+REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		11	The branch code requested for the transaction.
+REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		12	The 3-character currency code requested.
+REQ_CGL	VARCHAR2(50 BYTE)	Yes		13	The 10-digit CGL account code requested.
+REQ_AMOUNT	NUMBER(25,4)	Yes		14	Raw requested amount 
+REQ_CSV_DATE	DATE	Yes		15	The transaction date provided in the uploaded file.
+REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		16	remarks from the uploaded file.
+REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		17	The product  code requested.
+CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		18	
+CREATOR_ROLE	NUMBER(10,0)	Yes		19	
+PAYLOAD	CLOB	Yes		20	
 
-```
- * **What we are updating:** BALANCE and INR_BALANCE.
- * **The Matching Logic:** It updates the row WHERE the Branch, Currency, CGL, and Date exactly match the transaction.
-### 3. Line-by-Line Explanation of the Recovery Code
-Here is the breakdown of the processRetry method in HdfsRecoveryService.
- 1. private void processRetry(String batchId) { -> Method starts, taking the ID of the failed batch.
- 2. String freshDataSql = """ ... """ -> Defines the SQL query shown above to join the requested accounts with the live GL_BALANCE table.
- 3. List<HdfsSyncDto> freshSyncData = oracleJdbcTemplate.query(...) -> Executes the query against the Oracle database.
- 4. (rs, rowNum) -> new HdfsSyncDto(...) -> Loops through the database results, reading the columns (BRANCH, CURRENCY, NEW_BALANCE, etc.) and mapping them into a list of Java DTO objects.
- 5. if (!freshSyncData.isEmpty()) { -> Checks if the query actually found any matching balances.
- 6. hdfsSyncService.syncToDataLake(freshSyncData); -> Calls the other service to push this fresh list of data to the Data Lake via the Thrift server.
- 7. oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET STATUS = 'COMPLETED' WHERE BATCH_ID = ?", batchId); -> If the sync succeeds without throwing an exception, it marks the queue record as COMPLETED so it isn't retried again.
-### 4. Why don't we just store the payload in the recovery table?
-Your idea to store the payload as JSON in the recovery table to avoid the JOIN query is a great thought for performance optimization.
-However, **not storing the payload is actually a critical safety mechanism.**
-Imagine this scenario:
- 1. At 10:00 AM, User A approves Batch 1. The account balance becomes $1,000. The Thrift server is down, so we store the payload (Balance = $1,000) in the recovery table.
- 2. At 10:15 AM, User B approves Batch 2 for the *exact same account*. The balance becomes $1,500. The Thrift server is back online! The live sync works, and the Data Lake now correctly shows $1,500.
- 3. At 10:20 AM, the HdfsRecoveryService wakes up to process Batch 1.
-**If we stored the payload:** The recovery service would read the saved payload (Balance = $1,000) and push it to the Data Lake. We just overwrote the correct $1,500 balance with stale data from 10:00 AM. **This causes severe data corruption.**
-**How your code prevents this:**
-By storing *only* the BATCH_ID, the system is forced to run that JOIN query against GL_BALANCE at the exact millisecond the recovery runs. At 10:20 AM, the query sees the live balance is $1,500, and pushes $1,500 to the Data Lake again.
-It trades a tiny bit of database lookup time for absolute data integrity. It is an excellent pattern for distributed systems!
+
+JOURNAL_BATCH_MASTER
+
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
+CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
+REQ_DATE	TIMESTAMP(6)	Yes		3	Timestamp when the batch was originally created.
+BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	Initial remarks provided by the creator upon create.
+TOTAL_ROWS	NUMBER	Yes	0	5	Total number of valid transaction rows contained in this batch.
+TOTAL_DEBIT	NUMBER(25,4)	Yes	0	6	Sum of all debit transaction amounts in the batch.
+TOTAL_CREDIT	NUMBER(25,4)	Yes	0	7	Sum of all credit transaction amounts in the batch.
+BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	Current workflow state (e.g., PENDING, ACCEPTED, REJECTED, ERROR).
+EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	User ID of the person who approved or rejected the batch.
+EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rejected.
+EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
+
+MASTER_JOURNAL
+
+JOURNAL_ID	NUMBER(19,0)	No		1	Unique sequential identifier for the master journal entry.
+JOURNAL_AMT	NUMBER(38,2)	Yes		2	Absolute transaction amount. Always positive; Txn Type determines debit/credit.
+AR_FLAG	VARCHAR2(1 CHAR)	Yes		3	Status flag indicating the record state. Default is A for Approved/Active.
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		4	Reference to the parent batch from JOURNAL_BATCH_MASTER.
+JOURNAL_BRANCH	VARCHAR2(50 CHAR)	Yes		5	The branch code where the transaction is booked.
+JOURNAL_CGL	VARCHAR2(50 CHAR)	Yes		6	The 10-digit Common General Ledger (CGL) account code.
+COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Batch-level remarks provided by the executor during approval.
+CURRENCY	VARCHAR2(3 CHAR)	Yes		8	The 3-character currency code (e.g., INR, USD) for the transaction.
+JOURNAL_ID_REF	VARCHAR2(50 CHAR)	Yes		9	Reference back to the original row ID from the JOURNAL_REQUEST staging table.
+JOURNAL_PDATE	DATE	Yes		10	CSV date of the journal entry.
+PRODUCT_TYPE	VARCHAR2(20 CHAR)	Yes		11	The 8-digit product code
+REMARKS	VARCHAR2(50 CHAR)	Yes		12	specific remarks for this individual entry.
+TXN_TYPE	VARCHAR2(20 CHAR)	Yes		13	Specifies if the entry is a Debit or Credit.
+AC_CLASSIFICATION	VARCHAR2(255 CHAR)	Yes		14	
