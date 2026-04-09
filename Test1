@@ -1,89 +1,33 @@
-This is the perfect next step! Stripping out the PAYLOAD CLOB column will drastically reduce your database storage costs, speed up your API responses (since Java doesn't have to serialize massive JSON strings), and reduce CPU load on the frontend.
-We will do this in three safe steps: decoupling React, decoupling Java, and then finally dropping the column in Oracle.
-### Step 1: Update React (fetchBatchDetailsPaginated)
-We need to tell the frontend to completely ignore the payload and instead map the native relational fields that Spring Boot is already sending (like reqBranchCode, reqAmount, etc.).
-**File:** JournalRequestApproval.js
-Replace your fetchBatchDetailsPaginated function with this clean, payload-free version:
-```javascript
-  const fetchBatchDetailsPaginated = async (batchId, page, size) => {
-    setDetailLoading(true);
-    try {
-      const res = await callApi(
-        `/JS/journals/by-batch-paginated/${batchId}?page=${page}&size=${size}`,
-        null,
-        "GET"
-      );
-      
-      const contentArray = res?.content || (Array.isArray(res) ? res : []);
-      
-      if (contentArray && isMounted.current) {
-        setDetailTotalCount(res?.totalElements || contentArray.length || 0);
-        const journalGroups = new Map();
-        
-        contentArray.forEach((req, index) => {
-          try {
-            // ✅ DECOUPLED: No more JSON.parse(req.payload)!
-            
-            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
-            const prefix = String(jId).split("-")[0];
-            
-            // ✅ Read directly from the relational entity fields
-            const amount = parseFloat(req.reqAmount) || 0;
-            
-            const row = {
-              ...req,
-              journalPrefix: prefix,
-              amount: Math.abs(amount),
-              transactionType: amount < 0 ? "Credit" : "Debit",
-              
-              // ✅ Map the DB columns to simple names so your UI table doesn't break
-              branch: req.reqBranchCode,
-              currency: req.reqCurrency,
-              cgl: req.reqCgl,
-              remarks: req.reqNarration,
-              product: req.reqProduct,
-              date: req.reqCsvDate
-            };
-            
-            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
-            journalGroups.get(prefix).push(row);
-            
-          } catch (e) {
-            console.error("Failed to map row details:", req, e);
-          }
-        });
-        setBatchDetails(Array.from(journalGroups.values()));
-      }
-    } catch (e) {
-      if (isMounted.current) showSnackBar("Failed to load details", "error");
-    } finally {
-      if (isMounted.current) setDetailLoading(false);
-    }
-  };
-
-```
-### Step 2: Update React UI Render Logic
-Scroll through the rest of your JournalRequestApproval.js file (specifically where the <TableCell> UI elements are built).
-If you have any remaining code that looks like this:
-row.payload.branch or row.payload.cgl
-You must delete .payload so it just reads:
-row.branch or row.cgl
-*(Because we mapped them beautifully in the row object above, your UI won't even know the difference!)*
-### Step 3: Delete from Java Entity
-Now that React doesn't need it, we can tell Spring Boot to stop fetching it from the database.
-**File:** JournalRequest.java
-Find the payload variable and completely delete it from the entity class.
-```java
-    // ❌ DELETE THESE LINES ENTIRELY:
-    @Lob
-    @Column(name = "PAYLOAD")
-    private String payload;
-
-```
-### Step 4: Drop the Column in Oracle
-Once you have tested the React UI and confirmed the modal still displays all the rows perfectly without the JSON string, you can confidently run the final cleanup command in your database:
-```sql
-ALTER TABLE JOURNAL_REQUEST DROP COLUMN PAYLOAD;
-
-```
-Are you able to run the React app and open the "View Details" modal right now to verify the data displays correctly with the new payload-free logic?
+This is a great request, Adesh. To fully understand a distributed system, you have to trace the data flow from the moment a user clicks "Approve" all the way down to the final file modification in the Hadoop cluster.
+Let's break down exactly how your system calculates and pushes updates to the Data Lake, file by file.
+### Step 1: The Trigger & Core Calculation
+**File:** com.fincore.JournalService.Service.JournalRequestServiceImpl
+When an executor approves a batch, the system does not calculate the final balances in Java. Instead, it delegates the heavy lifting directly to the Oracle database.
+ 1. Inside the executeAsyncBatchProcessing method, if the status is ACCEPTED, the service executes an Oracle Stored Procedure called PROCESS_JOURNAL_BATCH [cite: 784-785].
+ 2. This stored procedure updates the transactional Oracle tables (MASTER_JOURNAL and GL_BALANCE).
+ 3. [cite_start]Crucially, the stored procedure uses an OUT parameter (an Oracle Cursor) to immediately return the newly updated balances back to the Java application [cite: 786-787].
+ 4. [cite_start]The Java code reads this cursor and maps it into a list of HdfsSyncDto objects [cite: 787-789].
+### Step 2: The Data Transfer Object (What is being updated)
+**File:** com.fincore.JournalService.Dto.HdfsSyncDto
+This file defines the exact payload that needs to be synchronized. [cite_start]The stored procedure cursor populates this DTO with the following specific data points needed to identify and update the correct record in HDFS [cite: 215-216, 466-467]:
+ * branch
+ * currency
+ * cgl
+ * balanceDate
+ * newBalance
+ * newInrBalance
+### Step 3: Pushing to the Data Lake (The Live Sync)
+**File:** com.fincore.JournalService.Service.HdfsSyncService
+[cite_start]Once JournalRequestServiceImpl has the list of HdfsSyncDto objects, it calls hdfsSyncService.syncToDataLake() to push them to the Hive server.
+ 1. This service uses the hiveJdbcTemplate, which is configured to connect to your Data Lake (Thrift server) instead of Oracle.
+ 2. It executes a raw SQL UPDATE statement against the GL_BALANCE_HDFS table [cite: 483-484].
+ 3. **The Matching Logic:** It finds the exact row to update by matching four composite keys: WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? [cite_start]AND BALANCE_DATE = ?.
+ 4. It then sets the new values: SET BALANCE = ?, INR_BALANCE = ?.
+### Step 4: The Recovery Query (How it finds data if the live sync fails)
+**File:** com.fincore.JournalService.Service.HdfsRecoveryService
+[cite_start]If the Thrift server goes down (like the bug we saw earlier), the live sync fails, and the batch ID is saved into the HDFS_SYNC_RETRY_QUEUE [cite: 794-795]. When the scheduler wakes up to retry, it has a problem: **It only has the BATCH_ID. It lost the HdfsSyncDto list that was in memory.**
+[cite_start]To find out exactly what data needs to be updated in HDFS, it executes a highly specific query in the processRetry method [cite: 461-462]:
+ 1. [cite_start]**Find the Touched Accounts:** It runs a subquery against JOURNAL_REQUEST to find the distinct REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, and REQ_CSV_DATE associated with that specific BATCH_ID [cite: 463-464].
+ 2. [cite_start]**Get the Latest Balances:** It then JOINs those distinct accounts against the live GL_BALANCE table in Oracle [cite: 464-465].
+ 3. [cite_start]**Why this is clever:** By joining against GL_BALANCE, the recovery service guarantees it pulls the absolute *latest* BALANCE and INR_BALANCE for those accounts [cite: 462-463]. [cite_start]This prevents race conditions—if another batch updated those same accounts while the Thrift server was down, the recovery service will safely push the most current total [cite: 461-462, 468-469].
+ 4. [cite_start]It maps this fresh data back into HdfsSyncDto objects and attempts the sync again [cite: 466-468].
