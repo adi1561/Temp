@@ -1,41 +1,8 @@
-This is a fantastic edge case to run into, and it perfectly highlights why distributed systems are tricky.
-Here is exactly what happened:
- 1. When you clicked "Approve", the system started the HDFS_SYNC_START phase.
- 2. Because this is the *very first time* your application tried to talk to the Data Lake since Spring Boot started, your **Hikari Connection Pool (HikariPool-2) tried to initialize and open a socket to the Spark Thrift Server.**
- 3. **The Thrift Server is currently unreachable** (either it is offline, or your application.properties URL is wrong).
- 4. Because it couldn't connect, Hikari threw a fatal PoolInitializationException.
-### The Bug (Why it failed the batch)
-If you remember our fallback logic, we wrapped the HDFS sync in a try-catch block designed to catch DataAccessException so it could quietly queue the failure and leave the batch as ACCEPTED.
-However, PoolInitializationException is a raw Hikari exception—it is **not** a Spring DataAccessException. It slipped right past our safety net, crashed the thread, and triggered the global Exception catch block at the bottom, which immediately marked your batch as ERROR!
-### The Fix
-We need to broaden the catch block in your JournalRequestServiceImpl to intercept *any* exception thrown by the Hive connection so that network/pool failures don't ruin a successful Oracle database approval.
-**File:** com/fincore/JournalService/Service/JournalRequestServiceImpl.java
-**Find this block inside executeApprovalInTransaction (around line 793):**
-```java
-            // HDFS sync is fire-and-forget; failure queues for retry
-            try {
-                hdfsSyncService.syncToDataLake(syncData);
-            } catch (DataAccessException hdfsEx) {
-                log.error("HDFS_SYNC_FAIL | Batch: {} | Status: Background recovery queued", batchId);
-                jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
-            }
+2026-04-10T11:25:40.065+05:30  INFO 2756 --- [JournalService] [nio-9999-exec-7] c.f.J.C.JournalRequestController         : BULK_PROCESS_START | User: 3333333 | Batch: 0002312 | Action: ACCEPTED
+2026-04-10T11:25:40.225+05:30  INFO 2756 --- [JournalService] [    BulkCoord-3] c.f.J.Service.HdfsSyncService            : HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: 1
+2026-04-10T11:25:40.225+05:30  INFO 2756 --- [JournalService] [    BulkCoord-3] com.zaxxer.hikari.HikariDataSource       : HikariPool-2 - Starting...
+2026-04-10T11:25:41.245+05:30 ERROR 2756 --- [JournalService] [    BulkCoord-3] c.f.J.Service.JournalRequestServiceImpl  : HDFS_SYNC_FAIL | Batch: 0002312 | Error: PoolInitializationException | Status: Background recovery queued
+2026-04-10T11:25:41.288+05:30  INFO 2756 --- [JournalService] [    BulkCoord-3] c.f.J.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 1021256 | Ref: 0002312
+2026-04-10T11:25:41.324+05:30  INFO 2756 --- [JournalService] [    BulkCoord-3] c.f.J.Service.JournalRequestServiceImpl  : BATCH_PROCESSING_DONE | Batch: 0002312 | Status: ACCEPTED | Duration: 1222ms
 
-```
-**Replace it entirely with this:**
-```java
-            // HDFS sync is fire-and-forget; failure queues for retry
-            try {
-                hdfsSyncService.syncToDataLake(syncData);
-            } catch (Exception hdfsEx) { 
-                // FIX: Catch ALL exceptions (including Hikari PoolInitializationException)
-                log.error("HDFS_SYNC_FAIL | Batch: {} | Error: {} | Status: Background recovery queued", batchId, hdfsEx.getClass().getSimpleName());
-                jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
-            }
-
-```
-### Next Steps
-Once you make this change and restart:
- 1. If you approve the batch again, it will successfully mark it as **ACCEPTED** in Oracle.
- 2. The HikariPool will still fail to initialize, but this time it will be caught, and the batch ID will be safely inserted into HDFS_SYNC_RETRY_QUEUE.
-**However, you still have an infrastructure problem:** Your Spring Boot app cannot reach the Thrift server.
- * Double-check your application.properties. If your URL says jdbc:hive2://spark-thrift:10000, and you are running the app locally on your laptop, your laptop doesn't know what spark-thrift is. You must change it to the actual IP address of the Kubernetes node/load balancer, or map it in your hosts file.
+what is this why i am failing
