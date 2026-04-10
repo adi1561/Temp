@@ -1,49 +1,23 @@
-E0410 11:56:35.635790   12888 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp [::1]:8080: connectex: No connection could be made because the target machine actively refused it."
-Unable to connect to the server: dial tcp [::1]:8080: connectex: No connection could be made because the target machine actively refused it.
+I see exactly what is happening. Take a deep breath—you provided the perfect debugging information. I can confidently tell you that your Java code is 100% correct, and this is entirely an infrastructure issue.
+Let's break down exactly what your terminal output just revealed.
+### 1. Why did the second kubectl command fail?
+Your first command (kubectl get pods) worked perfectly, but the second one (kubectl get svc) failed with that localhost:8080 error.
+This happened because **you forgot to add the --kubeconfig flag** to the second command. Without that flag, your terminal tried to look for a local Kubernetes cluster on your computer instead of connecting to your remote server.
+**Run this exact command to see the service:**
+```bash
+kubectl get svc hdfs-namenode-1-svc -n cbops --kubeconfig h06vksuatcbopscls.conf
 
-kubectl get pods -n cbops --kubeconfig h06vksuatcbopscls.conf
-NAME                                                    READY   STATUS      RESTARTS       AGE
-airflow-api-server-67bc48f7c4-dwtmz                     1/1     Running     0              6m23s
-airflow-dag-processor-77697d89-jglvj                    2/2     Running     0              6m23s
-airflow-redis-0                                         1/1     Running     0              16h
-airflow-scheduler-d95f8c69d-prktw                       2/2     Running     0              6m23s
-airflow-statsd-848cff7966-nlq59                         1/1     Running     0              16h
-airflow-triggerer-0                                     2/2     Running     0              6m20s
-airflow-worker-0                                        2/2     Running     0              6m17s
-beeline-query-k8tzw                                     0/1     Completed   0              22h
-delta-table-register-2ps7z                              0/1     Completed   0              23h
-grafana-965694fdf-6zvt8                                 1/1     Running     0              15d
-hive-schematool-92ztl                                   0/1     Error       0              23h
-hive-schematool-dchr4                                   0/1     Error       0              23h
-hive-schematool-hzhxz                                   0/1     Error       0              23h
-hive-schematool-jq5kj                                   0/1     Error       0              23h
-hive-schematool-mwtwl                                   0/1     Error       0              23h
-hive-schematool-rbdt7                                   0/1     Error       0              23h
-hive-schematool-v7nww                                   0/1     Error       0              23h
-hive-schematool111-22wdx                                0/1     Error       0              23h
-hive-schematool111-7k7tr                                0/1     Error       0              23h
-hive-schematool111-jgs8q                                0/1     Error       0              23h
-hive-schematool111-qzm2q                                0/1     Error       0              23h
-hive-schematool111-rpccr                                0/1     Error       0              23h
-hive-schematool111-t75gn                                0/1     Error       0              23h
-hive-schematool111-vkdjg                                0/1     Error       0              23h
-kubernetes-dashboard-api-86896f4cd4-j4vjp               1/1     Running     0              44h
-kubernetes-dashboard-auth-6f6f475657-c5675              1/1     Running     0              44h
-kubernetes-dashboard-kong-6fdd448cc9-7jnb2              1/1     Running     0              15d
-kubernetes-dashboard-metrics-scraper-5ccdc7cf4c-jfpb4   1/1     Running     0              113d
-kubernetes-dashboard-web-779dff9c96-s4zrg               1/1     Running     0              113d
-react-app-deployment-867f4c884f-nvvpd                   1/1     Running     0              9d
-spark-operator-controller-556bdf4d94-jj5qs              1/1     Running     15 (11d ago)   86d
-spark-operator-webhook-788b47b5d6-lggzr                 1/1     Running     15 (11d ago)   86d
-spark-thrift-fcd94b98d-5kmtd                            1/1     Running     0              23h
-
-
-kubectl get svc hdfs-namenode-1-svc -n cbops
-
-E0410 11:57:51.141025   33448 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp [::1]:8080: connectex: No connection could be made because the target machine actively refused it."
-E0410 11:57:51.147297   33448 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp [::1]:8080: connectex: No connection could be made because the target machine actively refused it."
-E0410 11:57:51.149890   33448 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp [::1]:8080: connectex: No connection could be made because the target machine actively refused it."
-E0410 11:57:51.153512   33448 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp [::1]:8080: connectex: No connection could be made because the target machine actively refused it."
-E0410 11:57:51.157745   33448 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp [::1]:8080: connectex: No connection could be made because the target machine actively refused it."
-Unable to connect to the server: dial tcp [::1]:8080: connectex: No connection could be made because the target machine actively refused it.
-
+```
+### 2. The Real Reason for "Connection Refused"
+Look very closely at the output of your successful kubectl get pods command.
+You have Airflow running, Grafana, Kubernetes Dashboards, and your spark-thrift pod.
+**But there are absolutely NO HDFS pods running in your cbops namespace.** There is no namenode, and there are no datanodes.
+This is exactly why Spark threw the Connection refused error! Your Spark Thrift server is trying to send the journal data to the HDFS Namenode, but **the HDFS database does not exist in this namespace.** Spark is knocking on a door where nobody is home.
+### 3. The Secondary Issue: Hive Schematool Errors
+I also notice in your pod list that you have several hive-schematool pods sitting in an **Error** state from 23 hours ago. This means when your infrastructure was spun up yesterday, the Hive Metastore failed to initialize properly (likely because it couldn't connect to the Postgres database or HDFS).
+### Your Immediate Next Steps
+Since you are on a tight deadline, you need to pivot away from your Java code and look at your Kubernetes cluster deployment:
+ 1. **Find HDFS:** Did someone deploy Hadoop/HDFS into a different namespace? (Run kubectl get pods -A --kubeconfig h06vksuatcbopscls.conf | grep namenode to search the whole cluster).
+ 2. **Deploy HDFS:** If HDFS is completely missing, you (or your DevOps team) need to deploy the HDFS Namenode and Datanodes into the cbops namespace.
+ 3. **Fix the Service URL:** If HDFS is intentionally hosted on a completely different server (outside of Kubernetes), then your core-site.xml configuration has the wrong IP address. It is currently pointing to an internal Kubernetes service (10-177-103-199.hdfs-namenode-1-svc.cbops.svc.cluster.local) that doesn't seem to have any pods attached to it.
+Your Java backend is doing exactly what it is supposed to do. It successfully talked to Spark, and now Spark is complaining that its hard drive (HDFS) is missing. You just need to get HDFS running!
