@@ -195,4 +195,508 @@ spec:
       restartPolicy: Never
 
 
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-thrift
+  namespace: asd
+  labels:
+    app: spark-thrift
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-thrift
+  template:
+    metadata:
+      labels:
+        app: spark-thrift
+    spec:
+      containers:
+      - name: spark-thrift
+        image: asdas.asdasd.asdasd.asdas/cbops/dev-thirft-server:v1
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            $SPARK_HOME/sbin/start-thriftserver.sh  \
+              --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension  \
+              --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog  \
+              --conf spark.sql.warehouse.dir=hdfs://ip:8022/data-lake/warehouse  \
+              --conf spark.eventLog.enabled=true   \
+              --conf spark.eventLog.dir=hdfs://ip:8022/data-lake/thriftlogs   \
+              --jars /opt/spark/jars/delta-spark_2.12-3.2.0.jar,/opt/spark/jars/delta-storage-3.2.0.jar,/opt/spark/jars/postgresql-42.7.3.jar && \
+            tail -f /dev/null
+ 
+        resources:
+          requests:
+            memory: "3Gi"
+            cpu: "1"
+          limits:
+            memory: "16Gi"
+            cpu: "4"
+        ports:
+        - containerPort: 10000
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: spark-thrift
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: spark-thrift
+#   template:
+#     metadata:
+#       labels:
+#         app: spark-thrift
+#     spec:
+#       containers:
+#         - name: spark-thrift
+#           image: asdasdasdas.asd.as.as/cbops/triftimagefinal:latest
+#           command: ["/bin/bash", "-c"]
+#           args:
+#             - |
+#               EXPORT HOME=/temp
+#               mkdir -p /temp/.beeline
+#               exec /opt/spark/bin/spark-class /
+#                 org.apache.spark.sql.hive.thriftserver.HiveThriftServer2 \
+#                 --master k8s://https://ip:6443 \
+#                 --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+#                 --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+#                 --conf spark.sql.warehouse.dir=hdfs://ip:8022/data-lake/warehouse \
+#                 --conf spark.eventLog.enabled=true \
+#                 --conf spark.eventLog.dir=hdfs://ip:8022/data-lake/thriftlogs \
+#                 --jars /opt/spark/jars/delta-spark_2.12-3.2.0.jar,/opt/spark/jars/delta-storage-3.2.0.jar,/opt/spark/jars/postgresql-42.7.3.jar \
+#           ports:
+#             - containerPort: 10000
+#           resources:
+#             requests:
+#               memory: "6Gi"
+#               cpu: "2"
+#             limits:
+#               memory: "16Gi"
+#               cpu: "4"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-thrift
+  namespace: asd 
+spec:
+  type: ClusterIP
+  selector:
+    app: spark-thrift
+  ports:
+    - port: 10000
+      targetPort: 10000
+ 
+---
+# -------------------------------
+# 3. Job to Register Delta Tables
+# -------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: delta-table-register
+  namespace: asd 
+spec:
+  template:
+    spec:
+      containers:
+      - name: spark-thrift-table-register
+        image: h06vksharbor.corp.ad.sbi/cbops/dev-thirft-server:v1
+        command:
+        - /bin/bash
+        - -c
+        - |
+          /opt/spark/bin/spark-sql <<EOF
+          -- Create Database
+          CREATE DATABASE IF NOT EXISTS fincoredatalakejournal;
+ 
+          -- Register Tables (already in Delta Lake on HDFS)
+          CREATE TABLE IF NOT EXISTS fincoredatalakejournal.gl_balance
+          USING DELTA
+          LOCATION 'hdfs://ip:8022/DATA-LAKE/Journal_Posting/gl_balance_journal';
+ 
+          CREATE TABLE IF NOT EXISTS fincoredatalakejournal.cbs_balance
+          USING DELTA
+          LOCATION 'hdfs://ip:8022/DATA-LAKE/Journal_Posting/cbs_balance_journal';
+
+          CREATE TABLE IF NOT EXISTS fincoredatalakejournal.diffrence
+          USING DELTA
+          LOCATION 'hdfs://ip:8022/DATA-LAKE/Journal_Posting/difference_jounral';
+          EOF
+      restartPolicy: Never
+
+
+
+i am giving u the config file which i am using for creating the threft server but for privacy reson i am providing the exect information for the ip and namespaces and all 
+in place of that i am entering the random value ignore that 
+according to this config
+
+i want to cheak where i am getting the error that i am not able to update the data in the data lakh
+package com.fincore.JournalService.config;
+
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.sql.DataSource;
+
+/**
+ * Configures the connection to the Data Lake (Delta Lake).
+ * Uses JdbcTemplate for direct SQL execution, suitable for high-volume analytics.
+ */
+@Configuration
+@Slf4j
+public class HiveDbConfig {
+
+    /**
+     * Configures the Hive/Thrift DataSource for Data Lake synchronization.
+     * Connection properties are externalized with the prefix 'spring.datasource.hive'.
+     */
+    @Bean(name = "hiveDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.hive")
+    public DataSource hiveDataSource() {
+        log.info("HIVE_DB_INIT | Initializing Secondary Hive/Thrift DataSource for Data Lake");
+        return DataSourceBuilder.create().build();
+    }
+
+    /**
+     * Provides a dedicated JdbcTemplate for interacting with the Hive Data Lake.
+     * The @Qualifier ensures the correct secondary datasource is injected.
+     */
+    @Bean(name = "hiveJdbcTemplate")
+    public JdbcTemplate hiveJdbcTemplate(@Qualifier("hiveDataSource") DataSource dataSource) {
+        log.info("HIVE_JDBC_TEMPLATE_INIT | Providing dedicated Hive JdbcTemplate bean");
+        return new JdbcTemplate(dataSource);
+    }
+}
+
+package com.fincore.JournalService.config;
+
+import jakarta.persistence.EntityManagerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.boot.orm.jpa.EntityManagerFactoryBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.orm.jpa.JpaTransactionManager;
+import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.sql.DataSource;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Ensures that all existing JPA Repositories and Entities are correctly mapped to the Oracle database.
+ * Marking beans as @Primary ensures this datasource is the default for injection into existing services.
+ */
+@Configuration
+@EnableTransactionManagement
+@EnableJpaRepositories(
+        basePackages = "com.fincore.JournalService.Repository",
+        entityManagerFactoryRef = "oracleEntityManagerFactory",
+        transactionManagerRef = "oracleTransactionManager"
+)
+@Slf4j
+public class OracleDbConfig {
+
+    /**
+     * Configures the primary Oracle DataSource.
+     * Connection properties are externalized with the prefix 'spring.datasource.oracle'.
+     */
+    @Primary
+    @Bean(name = "oracleDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.oracle")
+    public DataSource oracleDataSource() {
+        log.info("ORACLE_DB_INIT | Initializing Primary Oracle DataSource");
+        return DataSourceBuilder.create().build();
+    }
+
+    /**
+     * Configures the EntityManagerFactory for Oracle using Hibernate as the JPA provider.
+     * Preserves original dialect and ddl-auto properties.
+     */
+    @Primary
+    @Bean(name = "oracleEntityManagerFactory")
+    public LocalContainerEntityManagerFactoryBean oracleEntityManagerFactory(
+            EntityManagerFactoryBuilder builder,
+            @Qualifier("oracleDataSource") DataSource dataSource) {
+
+        log.info("ORACLE_EMF_INIT | Building EntityManagerFactory for com.fincore.JournalService.Models");
+
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("hibernate.dialect", "org.hibernate.dialect.OracleDialect");
+//        properties.put("hibernate.hbm2ddl.auto", "update");
+        properties.put("hibernate.hbm2ddl.auto", "validate");
+        return builder
+                .dataSource(dataSource)
+                .packages("com.fincore.JournalService.Models")
+                .persistenceUnit("oracle")
+                .properties(properties)
+                .build();
+    }
+
+    /**
+     * Configures the Transaction Manager for the primary Oracle database.
+     */
+    @Primary
+    @Bean(name = "oracleTransactionManager")
+    public PlatformTransactionManager oracleTransactionManager(
+            @Qualifier("oracleEntityManagerFactory") EntityManagerFactory entityManagerFactory) {
+        log.info("ORACLE_TX_MANAGER_INIT | Initializing JpaTransactionManager for Oracle");
+        return new JpaTransactionManager(entityManagerFactory);
+    }
+
+    /**
+     * Provides a primary JdbcTemplate for direct SQL operations against Oracle.
+     */
+    @Primary
+    @Bean(name = "oracleJdbcTemplate")
+    public JdbcTemplate oracleJdbcTemplate(@Qualifier("oracleDataSource") DataSource dataSource) {
+        log.info("ORACLE_JDBC_TEMPLATE_INIT | Providing primary JdbcTemplate bean");
+        return new JdbcTemplate(dataSource);
+    }
+}
+
+package com.fincore.JournalService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class HdfsSyncDto {
+    private String branch;
+    private String currency;
+    private String cgl;
+    private LocalDate balanceDate;
+    private BigDecimal newBalance;
+    private BigDecimal newInrBalance;
+}
+
+package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Dto.HdfsSyncDto;
+import com.fincore.JournalService.Exception.CustomExceptions;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsRecoveryService {
+
+    private final HdfsSyncService hdfsSyncService;
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate oracleJdbcTemplate;
+
+    // Injecting StringRedisTemplate for Distributed Locking
+    @Autowired
+    private org.springframework.data.redis.core.StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * Scheduled task to retry PENDING syncs from the retry queue.
+     * Runs every 5 minutes with fixed delay to prevent overlapping executions.
+     */
+
+    @Scheduled(fixedDelay = 300000)
+    public void retryFailedHdfsSyncs() {
+        String lockKey = "SYSTEM_LOCK_HDFS_RECOVERY";
+        boolean lockAcquired = false;
+
+        try {
+//            Lock TTL extended to 10 mins to prevent race conditions under load
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 10, java.util.concurrent.TimeUnit.MINUTES);
+            lockAcquired = Boolean.TRUE.equals(acquired);
+
+            if (!lockAcquired) {
+                log.debug("HDFS_RECOVERY_SKIPPED | Status: Another node is currently processing.");
+                return;
+            }
+
+            String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
+            List<String> failedBatches;
+            try {
+                failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
+            } catch (DataAccessException e) {
+                log.error("HDFS_RECOVERY_QUERY_FAIL | Error: {}", e.getMessage());
+                return;
+            }
+
+            if (failedBatches.isEmpty()) return;
+
+            log.info("HDFS RECOVERY: Found {} failed batches.", failedBatches.size());
+            for (String batchId : failedBatches) {
+                try {
+                    processRetry(batchId);
+                } catch (DataAccessException | CustomExceptions.DatabaseOperationException e) {
+                    log.error("HDFS_RECOVERY_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+                    incrementRetryCount(batchId);
+                }
+            }
+        } catch (org.springframework.data.redis.RedisConnectionFailureException e) {
+            log.error("HDFS_RECOVERY_REDIS_FAIL | Cannot acquire distributed lock.");
+        } finally {
+           // Only release if THIS thread actually acquired it!
+            if (lockAcquired) {
+                try { stringRedisTemplate.delete(lockKey); }
+                catch (Exception e) { log.warn("HDFS_LOCK_RELEASE_FAIL"); }
+            }
+        }
+    }
+    /**
+     * Performs a fresh join between Journal Requests and GL Balances to push
+     * the most current data to HDFS, resolving possible race conditions.
+     */
+    private void processRetry(String batchId) {
+        String freshDataSql = """
+            SELECT 
+                j.REQ_BRANCH_CODE AS BRANCH, 
+                j.REQ_CURRENCY AS CURRENCY, 
+                j.REQ_CGL AS CGL, 
+                j.REQ_CSV_DATE AS BAL_DATE,
+                g.BALANCE AS NEW_BALANCE,
+                g.INR_BALANCE AS NEW_INR_BALANCE
+            FROM (
+                SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
+                FROM JOURNAL_REQUEST 
+                WHERE BATCH_ID = ?
+            ) j
+            JOIN GL_BALANCE g ON 
+                g.BRANCH_CODE = j.REQ_BRANCH_CODE AND 
+                g.CURRENCY = j.REQ_CURRENCY AND 
+                g.CGL = j.REQ_CGL AND 
+                g.BALANCE_DATE = j.REQ_CSV_DATE
+        """;
+
+        List<HdfsSyncDto> freshSyncData = oracleJdbcTemplate.query(freshDataSql,
+                (rs, rowNum) -> new HdfsSyncDto(
+                        rs.getString("BRANCH"),
+                        rs.getString("CURRENCY"),
+                        rs.getString("CGL"),
+                        rs.getDate("BAL_DATE").toLocalDate(),
+                        rs.getBigDecimal("NEW_BALANCE"),
+                        rs.getBigDecimal("NEW_INR_BALANCE")
+                ), batchId);
+
+        if (!freshSyncData.isEmpty()) {
+            // 3. Push the LATEST/CURRENT balance to HDFS
+            hdfsSyncService.syncToDataLake(freshSyncData);
+            log.info("HDFS RECOVERY: Successfully synced batch {}. Data is now consistent.", batchId);
+        }
+
+        // 4. Mark as Completed
+        oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET STATUS = 'COMPLETED' WHERE BATCH_ID = ?", batchId);
+    }
+    private void incrementRetryCount(String batchId) {
+        try {
+            oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
+        } catch (DataAccessException e) {
+            log.error("HDFS_RECOVERY_META_UPDATE_FAIL | Batch: {} | Failed to increment retry count", batchId);
+        }
+    }
+}package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Dto.HdfsSyncDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.List;
+
+/**
+ * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
+ * Updates are performed asynchronously using the high-performance 'bulkExecutor' pool.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsSyncService {
+
+    @Autowired
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hiveJdbcTemplate;
+
+    /**
+     * Executes a batch update to HDFS. This is a fire-and-forget background task.
+     * Failed syncs should be handled by the HdfsRecoveryService heartbeat.
+     * * @param data List of balance updates to be persisted.
+     */
+    public void syncToDataLake(List<HdfsSyncDto> data) {
+        if (data == null || data.isEmpty()) return;
+
+        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
+        long startTime = System.currentTimeMillis();
+
+        try {
+            // Updated to match the new Data Lake schema
+            String sql = "UPDATE gl_balance SET closing_balance = ?, INR_BALANCE = ? " +
+                    "WHERE glcc = ? AND BALANCE_DATE = ?";
+
+            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(PreparedStatement ps, int i) throws SQLException {
+                    HdfsSyncDto dto = data.get(i);
+
+                    // Dynamically construct the composite GLCC key
+                    String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+
+                    ps.setBigDecimal(1, dto.getNewBalance());    // Maps to closing_balance
+                    ps.setBigDecimal(2, dto.getNewInrBalance()); // Maps to INR_BALANCE
+                    ps.setString(3, glccKey);                    // Maps to glcc (e.g., 1000USD7002070601)
+                    ps.setDate(4, java.sql.Date.valueOf(dto.getBalanceDate())); // Maps to BALANCE_DATE
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return data.size();
+                }
+            });
+
+
+            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
+                    (System.currentTimeMillis() - startTime), data.size());
+
+        } catch (DataAccessException e) {
+            log.error("HDFS_SYNC_DB_FAIL | Status: Connectivity or Syntax error | Type: {}", e.getClass().getSimpleName());
+                throw e;
+        }
+    }
+}
+
+this is my current config files from the service and cheak where is the problem 
 
