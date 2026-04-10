@@ -1,63 +1,198 @@
-Based on the screenshot and details you provided, the Data Lake schema has changed significantly from what was originally mapped in your application.
-Here is exactly what changed:
- 1. **The Table Name:** It is now gl_balance instead of GL_BALANCE_HDFS.
- 2. **The Balance Column:** It is now closing_balance instead of BALANCE.
- 3. **The Matching Logic (WHERE Clause):** Instead of checking BRANCH_CODE, CURRENCY, and CGL separately, you now need to concatenate them into a single string to match the glcc column.
-Because you properly separated your database models using Data Transfer Objects (HdfsSyncDto), you **only need to change one file**. The Oracle retrieval logic and your recovery services can stay exactly the same.
-Here is the exact file and the replacement code.
-### The File to Update
-[cite_start]**com/fincore/JournalService/Service/HdfsSyncService.java** [cite: 474-475]
-### The Code Replacement
-**Find this existing code block inside the syncToDataLake method:**
-```java
-        try {
-            String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
-                    "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
+config to store meta data 
 
-            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(PreparedStatement ps, int i) throws SQLException {
-                    HdfsSyncDto dto = data.get(i);
-                    ps.setBigDecimal(1, dto.getNewBalance());
-                    ps.setBigDecimal(2, dto.getNewInrBalance());
-                    ps.setString(3, dto.getBranch());
-                    ps.setString(4, dto.getCurrency());
-                    ps.setString(5, dto.getCgl());
-                    ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate()));
-                }
+docker file
 
-                @Override
-                public int getBatchSize() {
-                    return data.size();
-                }
-            });
+FROM bde2020/hive:2.3.2-postgresql-metastore
+USER root
 
-```
-**Replace it entirely with this updated code:**
-```java
-        try {
-            // Updated to match the new Data Lake schema
-            String sql = "UPDATE gl_balance SET closing_balance = ?, INR_BALANCE = ? " +
-                    "WHERE glcc = ? AND BALANCE_DATE = ?";
+# Create spark user with UID 185 (if not already present)
+RUN id -u spark >/dev/null 2>&1 || \
+    useradd -u 185 -m -s /bin/bash spark
 
-            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(PreparedStatement ps, int i) throws SQLException {
-                    HdfsSyncDto dto = data.get(i);
-                    
-                    // Dynamically construct the composite GLCC key
-                    String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+# Copy hive-site.xml
+COPY hive-site.xml /opt/hive/conf/hive-site.xml
 
-                    ps.setBigDecimal(1, dto.getNewBalance());    // Maps to closing_balance
-                    ps.setBigDecimal(2, dto.getNewInrBalance()); // Maps to INR_BALANCE
-                    ps.setString(3, glccKey);                    // Maps to glcc (e.g., 1000USD7002070601)
-                    ps.setDate(4, java.sql.Date.valueOf(dto.getBalanceDate())); // Maps to BALANCE_DATE
-                }
+# Set permissions and ownership
+RUN chown spark:spark /opt/hive/conf/hive-site.xml && \
+    chmod 644 /opt/hive/conf/hive-site.xml
 
-                @Override
-                public int getBatchSize() {
-                    return data.size();
-                }
-            });
+# Switch back to spark user
+USER spark
 
-```
+
+
+2nd file 
+
+hite-site.xml
+
+<configuration>
+ 
+ 
+<property>
+<name>javax.jdo.option.ConnectionURL</name>
+<value>jdbc:postgresql://10.177.103.196:5432/fincore</value>
+</property>
+ 
+ 
+<property>
+<name>javax.jdo.option.ConnectionDriverName</name>
+<value>org.postgresql.Driver</value>
+</property>
+ 
+ 
+<property>
+<name>javax.jdo.option.ConnectionUserName</name>
+<value>fcdev</value>
+</property>
+ 
+ 
+<property>
+<name>javax.jdo.option.ConnectionPassword</name>
+<value>Password#1234</value>
+</property>
+ 
+ 
+<property>
+<name>hive.metastore.warehouse.dir</name>
+<value>hdfs://ip:8022/datalake/warehouse</value>
+</property>
+ 
+ 
+</configuration>
+
+site-thift-metaastore.yaml
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hive-schematool
+  namespace: namespace_test
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:                                                         
+        runAsUser: 185
+        runAsGroup: 185
+      containers:
+        - name: schematool
+          image: asd.asdas.sd/namespace_test/dev-thirft-metastore:v1
+          command:
+            - /bin/bash
+            - -c
+            - schematool -dbType postgres -initSchema
+
+
+original thrift server config 
+core-site.config
+<configuration>
+<property>
+<name>fs.defaultFS</name>
+<value>hdfs://ip:8022</value>
+</property>
+</configuration>
+
+hdfs-site.xml
+<configuration>
+<property>
+<name>dfs.replication</name>
+<value>1</value>
+</property>
+</configuration>
+
+hive-site.xml
+
+<configuration>
+
+    <property>
+        <name>javax.jdo.option.ConnectionURL</name>
+        <value>jdbc:postgresql://ip:5432/asasda</value>
+    </property>
+
+
+    <property>
+        <name>javax.jdo.option.ConnectionDriverName</name>
+        <value>org.postgresql.Driver</value>
+    </property>
+
+
+    <property>
+        <name>javax.jdo.option.ConnectionUserName</name>
+        <value>asdasdad</value>
+    </property>
+
+
+    <property>
+        <name>javax.jdo.option.ConnectionPassword</name>
+        <value>asdasd#12asd34</value>
+    </property>
+
+
+    <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>hdfs://asdasdasd:8022/data-lake/warehouse</value>
+    </property>
+
+</configuration>
+
+
+docker file 
+FROM adityakr123/thirftserverdev:v1
+USER root
+RUN rm -rf /opt/hadoop/conf
+copy conf /opt/hadoop/conf
+ENV HIVE_CONF_DIR=/opt/hadoop/conf
+RUN chown -R 185:185 /opt/hadoop/conf
+USER 185
+
+insertitnotable.yaml
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: beeline-query
+spec:
+  template:
+    spec:
+      containers:
+      - name: beeline
+        image: asdasd.asdasd.asdasd.asd/cbops/triftimagefinal:latest
+        env:
+        - name: HOME
+          value: /tmp
+        command:
+        - /bin/bash
+        - -c
+        - |
+          /opt/spark/bin/beeline \
+            -u jdbc:hive2://spark-thrift:10000 \
+            -e "Insert into table fincoredatalake.diffrence VALUES (1,'aa');"
+      restartPolicy: Never
+
+showtable. yaml
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: beeline-query
+spec:
+  template:
+    spec:
+      containers:
+      - name: beeline
+        image: asdas.asda.asd.asd/cbops/triftimagefinal:latest
+        env:
+        - name: HOME
+          value: /tmp
+        command:
+        - /bin/bash
+        - -c
+        - |
+          /opt/spark/bin/beeline \
+            -u jdbc:hive2://spark-thrift:10000 \
+            -e "SELECT count(*) FROM fincoredatalakefinal.testtable1;"
+      restartPolicy: Never
+
+
+
