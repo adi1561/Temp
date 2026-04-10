@@ -1,10 +1,61 @@
-2026-04-10T11:44:28.420+05:30  INFO 33912 --- [JournalService] [nio-9999-exec-5] c.f.J.C.JournalRequestController         : BULK_PROCESS_START | User: 1021256 | Batch: 0002315 | Action: ACCEPTED
-2026-04-10T11:44:28.560+05:30  INFO 33912 --- [JournalService] [    BulkCoord-3] c.f.J.Service.HdfsSyncService            : HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: 1
-2026-04-10T11:44:28.561+05:30  INFO 33912 --- [JournalService] [    BulkCoord-3] com.zaxxer.hikari.HikariDataSource       : HikariPool-2 - Starting...
-2026-04-10T11:44:28.766+05:30  INFO 33912 --- [JournalService] [    BulkCoord-3] com.zaxxer.hikari.pool.PoolBase          : HikariPool-2 - Driver does not support get/set network timeout for connections. (Method not supported)
-2026-04-10T11:44:28.797+05:30  INFO 33912 --- [JournalService] [    BulkCoord-3] com.zaxxer.hikari.pool.HikariPool        : HikariPool-2 - Added connection org.apache.hive.jdbc.HiveConnection@2497e09b
-2026-04-10T11:44:28.797+05:30  INFO 33912 --- [JournalService] [    BulkCoord-3] com.zaxxer.hikari.HikariDataSource       : HikariPool-2 - Start completed.
-2026-04-10T11:44:28.804+05:30 ERROR 33912 --- [JournalService] [    BulkCoord-3] c.f.J.Service.HdfsSyncService            : HDFS_SYNC_DB_FAIL | Status: Connectivity or Syntax error | Type: InvalidDataAccessApiUsageException
-2026-04-10T11:44:28.804+05:30 ERROR 33912 --- [JournalService] [    BulkCoord-3] c.f.J.Service.JournalRequestServiceImpl  : HDFS_SYNC_FAIL | Batch: 0002315 | Error: InvalidDataAccessApiUsageException | Status: Background recovery queued
-2026-04-10T11:44:28.823+05:30  INFO 33912 --- [JournalService] [    BulkCoord-3] c.f.J.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 3333333 | Ref: 0002315
-2026-04-10T11:44:28.860+05:30  INFO 33912 --- [JournalService] [    BulkCoord-3] c.f.J.Service.JournalRequestServiceImpl  : BATCH_PROCESSING_DONE | Batch: 0002315 | Status: ACCEPTED | Duration: 401ms
+package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Dto.HdfsSyncDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+/**
+ * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsSyncService {
+
+    @Autowired
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hiveJdbcTemplate;
+
+    public void syncToDataLake(List<HdfsSyncDto> data) {
+        if (data == null || data.isEmpty()) return;
+
+        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
+        long startTime = System.currentTimeMillis();
+
+        try {
+            // Loop through the data and execute statements individually.
+            // Hive JDBC driver does not support addBatch()/executeBatch().
+            for (HdfsSyncDto dto : data) {
+                
+                // Dynamically construct the composite GLCC key
+                String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+
+                // Construct literal SQL strings. 
+                String sql = String.format(
+                    "UPDATE fincoredatalakejournal.gl_balance SET closing_balance = %s, INR_BALANCE = %s WHERE glcc = '%s' AND BALANCE_DATE = '%s'",
+                    dto.getNewBalance().toPlainString(),
+                    dto.getNewInrBalance().toPlainString(),
+                    glccKey,
+                    dto.getBalanceDate().toString()
+                );
+                
+                // Execute the literal SQL string directly
+                hiveJdbcTemplate.execute(sql);
+            }
+
+            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
+                    (System.currentTimeMillis() - startTime), data.size());
+
+        } catch (DataAccessException e) {
+            log.error("HDFS_SYNC_DB_FAIL | Status: Connectivity or Syntax error | Type: {}", e.getClass().getSimpleName());
+            throw e;
+        }
+    }
+}
