@@ -1,320 +1,434 @@
-Let's go super deep into every line of that `RedisCacheManager` config!
+Let's go super deep into `RedisTemplate`!
 
 ---
 
-## The Full Config We Are Explaining
+## What is RedisTemplate?
+
+`@Cacheable` is **automatic** — Spring handles everything.
+
+`RedisTemplate` is **manual** — YOU control everything.
+
+```
+@Cacheable          RedisTemplate
+-----------         -------------
+Automatic           Manual
+Limited control     Full control
+Only cache          Store anything
+Simple              Flexible
+```
+
+---
+
+## Setup First
+
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
 
 ```java
 @Configuration
 public class RedisConfig {
 
     @Bean
-    public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
+    public RedisTemplate<String, Object> redisTemplate(
+                            RedisConnectionFactory factory) {
+        
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        
+        // Connect to Redis server
+        template.setConnectionFactory(factory);
 
-        RedisCacheConfiguration defaultConfig = RedisCacheConfiguration
-            .defaultCacheConfig()
-            .entryTtl(Duration.ofMinutes(10))
-            .serializeValuesWith(
-                RedisSerializationContext.SerializationPair.fromSerializer(
-                    new GenericJackson2JsonRedisSerializer()
-                )
-            );
+        // Keys stored as plain String
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setHashKeySerializer(new StringRedisSerializer());
 
-        RedisCacheConfiguration deptStatsConfig = RedisCacheConfiguration
-            .defaultCacheConfig()
-            .entryTtl(Duration.ofHours(1));
+        // Values stored as JSON
+        template.setValueSerializer(
+            new GenericJackson2JsonRedisSerializer());
+        template.setHashValueSerializer(
+            new GenericJackson2JsonRedisSerializer());
 
-        RedisCacheConfiguration userConfig = RedisCacheConfiguration
-            .defaultCacheConfig()
-            .entryTtl(Duration.ofMinutes(5));
-
-        return RedisCacheManager.builder(factory)
-            .cacheDefaults(defaultConfig)
-            .withCacheConfiguration("deptStats", deptStatsConfig)
-            .withCacheConfiguration("userCache", userConfig)
-            .build();
+        template.afterPropertiesSet();
+        return template;
     }
 }
 ```
 
 ---
 
-## Part 1 - @Configuration and @Bean
+## Redis Data Structures
 
-```java
-@Configuration  
-// Tells Spring → this class contains Bean definitions
-// Spring reads this class at startup
+This is the most important thing to understand.
 
-public class RedisConfig {
+**Redis is NOT just key-value.** It has 5 data structures:
 
-    @Bean
-    // Tells Spring → this method returns an object
-    // put it in ApplicationContext
-    // Other classes can @Autowired it
-    public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
+```
+String  → single value
+Hash    → like a Java Map (object fields)
+List    → like a Java List (ordered)
+Set     → unique values (no duplicates)
+ZSet    → Set with score/ranking
 ```
 
-`RedisConnectionFactory` is **auto injected** by Spring Boot.
-It holds → host, port, password of your Redis server from `application.properties`.
-
-```properties
-spring.redis.host=localhost
-spring.redis.port=6379
-# factory reads these automatically
-```
+Each has its own operations in RedisTemplate.
 
 ---
 
-## Part 2 - RedisCacheConfiguration
+## 1. String Operations (opsForValue)
 
-This is the **rules object**. It defines HOW cache should behave.
-
-### defaultCacheConfig()
+Most common. Store single value against a key.
 
 ```java
-RedisCacheConfiguration defaultConfig = RedisCacheConfiguration
-    .defaultCacheConfig()
+@Service
+public class StringRedisService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public void stringExamples() {
+
+        ValueOperations<String, Object> ops = 
+                            redisTemplate.opsForValue();
+
+        // SET - store value
+        ops.set("username:1", "John");
+
+        // SET with TTL
+        ops.set("username:1", "John", Duration.ofMinutes(10));
+
+        // GET - retrieve value
+        String name = (String) ops.get("username:1");
+
+        // SET only if key does NOT exist (used in locking!)
+        Boolean created = ops.setIfAbsent("lock::key", "1",
+                                         Duration.ofSeconds(10));
+
+        // Increment counter
+        ops.increment("visitCount");         // +1
+        ops.increment("visitCount", 5);      // +5
+        ops.decrement("visitCount");         // -1
+
+        // Get and Set at same time
+        String oldValue = (String) ops.getAndSet("username:1", "Jane");
+        // returns "John", stores "Jane"
+    }
+}
 ```
 
-`defaultCacheConfig()` gives you a starting config with:
-```
-TTL          → no expiry (lives forever)
-KeyPrefix    → enabled (cacheName::key)
-NullValues   → allowed
-Serializer   → JDK serialization (ugly bytes)
-```
-
-You then **override** what you want to change.
-
----
-
-### entryTtl()
-
-```java
-.entryTtl(Duration.ofMinutes(10))
-```
-
-**TTL = Time To Live.** After this time Redis **auto deletes** the key.
-
-```
-Duration.ofSeconds(30)    → 30 seconds
-Duration.ofMinutes(10)    → 10 minutes
-Duration.ofHours(1)       → 1 hour
-Duration.ofDays(1)        → 1 day
-Duration.ZERO             → never expires (careful!)
-```
-
-What happens in Redis:
-```bash
-SET deptStats::HR-2024  "data"  EX 3600
-#                                  ↑
-#                             Redis TTL in seconds
-```
-
----
-
-### serializeValuesWith()
-
-This is the most important part!
-
-```java
-.serializeValuesWith(
-    RedisSerializationContext.SerializationPair.fromSerializer(
-        new GenericJackson2JsonRedisSerializer()
-    )
-)
-```
-
-This decides **how your Java object is converted** before storing in Redis.
-
-#### Without this (default JDK serialization):
-```
 Redis stores:
-deptStats::HR-2024 → ¬í sr java.util.ArrayListx...
-                      ← UGLY UNREADABLE BYTES
+```
+username:1   → "John"
+visitCount   → 42
+lock::key    → "1"  (TTL: 10 sec)
 ```
 
-#### With JSON serializer:
+---
+
+## 2. Hash Operations (opsForHash)
+
+Store object fields separately. Like a Map inside Redis.
+
+```java
+public void hashExamples() {
+
+    HashOperations<String, String, Object> ops = 
+                        redisTemplate.opsForHash();
+
+    // Store individual fields
+    ops.put("user:1", "name",   "John");
+    ops.put("user:1", "email",  "john@gmail.com");
+    ops.put("user:1", "salary", 95000);
+
+    // Store entire map at once
+    Map<String, Object> userMap = new HashMap<>();
+    userMap.put("name",   "John");
+    userMap.put("email",  "john@gmail.com");
+    userMap.put("salary", 95000);
+    ops.putAll("user:1", userMap);
+
+    // Get single field
+    String name = (String) ops.get("user:1", "name");
+
+    // Get all fields
+    Map<String, Object> user = ops.entries("user:1");
+
+    // Get specific fields only
+    List<Object> values = ops.multiGet("user:1",
+                          List.of("name", "email"));
+
+    // Update single field (no need to reload whole object!)
+    ops.put("user:1", "salary", 100000);
+
+    // Delete single field
+    ops.delete("user:1", "email");
+
+    // Check field exists
+    Boolean exists = ops.hasKey("user:1", "name");
+}
 ```
+
 Redis stores:
-deptStats::HR-2024 → [{"department":"HR","count":12,"avgSalary":65000}]
-                      ← CLEAN READABLE JSON ✅
+```
+user:1
+  ├── name   → "John"
+  ├── email  → "john@gmail.com"
+  └── salary → 95000
 ```
 
-Why JSON is better:
-```
-✅ Human readable (debug easily)
-✅ Works across different Java versions
-✅ Other services (Python, Node) can read same cache
-❌ Slightly larger size than bytes
-```
-
----
-
-## Part 3 - Multiple Cache Configurations
-
-Here is the key concept:
+### String vs Hash — When to use which?
 
 ```
-defaultConfig    → applies to ALL caches
-specific config  → overrides default for THAT cache only
-```
+String → store entire User object as JSON
+Hash   → store each field separately
 
-```java
-// Rule for ALL caches
-RedisCacheConfiguration defaultConfig = RedisCacheConfiguration
-    .defaultCacheConfig()
-    .entryTtl(Duration.ofMinutes(10));  // 10 min default
+String:
+user:1 → {"name":"John","email":"john@gmail.com","salary":95000}
+→ To update salary, fetch whole object, change, store back
 
-// Rule only for "deptStats" cache
-RedisCacheConfiguration deptStatsConfig = RedisCacheConfiguration
-    .defaultCacheConfig()
-    .entryTtl(Duration.ofHours(1));     // 1 hour (overrides default)
-
-// Rule only for "userCache" cache
-RedisCacheConfiguration userConfig = RedisCacheConfiguration
-    .defaultCacheConfig()
-    .entryTtl(Duration.ofMinutes(5));   // 5 min (overrides default)
-```
-
-Why different TTLs?
-
-```
-userCache   → 5 min  (user data changes frequently)
-deptStats   → 1 hour (aggregate changes rarely)
-default     → 10 min (everything else)
+Hash:
+user:1 → {name, email, salary}
+→ To update salary, just ops.put("user:1", "salary", 100000)
+→ Much more efficient! ✅
 ```
 
 ---
 
-## Part 4 - RedisCacheManager.builder()
+## 3. List Operations (opsForList)
 
-This is where everything is **assembled together**.
-
-```java
-return RedisCacheManager.builder(factory)
-```
-`factory` = your Redis connection (host, port).
-Builder pattern starts here.
+Ordered list. Can add from left or right.
 
 ```java
-.cacheDefaults(defaultConfig)
+public void listExamples() {
+
+    ListOperations<String, Object> ops = 
+                    redisTemplate.opsForList();
+
+    // Push to RIGHT (end of list)
+    ops.rightPush("notifications:user1", "Order placed");
+    ops.rightPush("notifications:user1", "Order shipped");
+    ops.rightPush("notifications:user1", "Order delivered");
+
+    // Push to LEFT (start of list)
+    ops.leftPush("notifications:user1", "New message");
+
+    // Get all items (0 to -1 means all)
+    List<Object> all = ops.range("notifications:user1", 0, -1);
+
+    // Get first 5 items
+    List<Object> first5 = ops.range("notifications:user1", 0, 4);
+
+    // Pop from left (remove and return)
+    String first = (String) ops.leftPop("notifications:user1");
+
+    // Size of list
+    Long size = ops.size("notifications:user1");
+
+    // Keep only last 100 items (trim old notifications)
+    ops.trim("notifications:user1", -100, -1);
+}
 ```
-Apply `defaultConfig` to ALL caches that don't have specific config.
 
-```java
-.withCacheConfiguration("deptStats", deptStatsConfig)
+Redis stores:
 ```
-Cache named `"deptStats"` uses `deptStatsConfig` (1 hour TTL).
-This overrides `cacheDefaults` for this specific cache.
-
-```java
-.withCacheConfiguration("userCache", userConfig)
-```
-Cache named `"userCache"` uses `userConfig` (5 min TTL).
-
-```java
-.build()
-```
-Creates and returns the final `RedisCacheManager` object.
-
----
-
-## How Cache Name Links to Config
-
-```java
-// Service class
-@Cacheable(value = "deptStats", ...)   // uses deptStatsConfig → 1 hour
-@Cacheable(value = "userCache", ...)   // uses userConfig → 5 min
-@Cacheable(value = "products", ...)    // uses defaultConfig → 10 min
-```
-
-```
-"deptStats" in @Cacheable
-      ↓
-RedisCacheManager looks up "deptStats"
-      ↓
-Finds deptStatsConfig → TTL 1 hour
-      ↓
-Stores in Redis with 1 hour expiry
+notifications:user1 → ["New message",
+                        "Order placed",
+                        "Order shipped",
+                        "Order delivered"]
 ```
 
 ---
 
-## Full Picture - What Sits in Redis
+## 4. Set Operations (opsForSet)
 
-```bash
-redis-cli KEYS *
-
-# userCache keys (5 min TTL)
-userCache::1
-userCache::2
-
-# deptStats keys (1 hour TTL)  
-deptStats::Engineering-2024
-deptStats::HR-2024
-
-# products keys (10 min TTL - default)
-products::101
-products::102
-
-
-redis-cli TTL userCache::1
-# 287  ← seconds remaining (5 min)
-
-redis-cli TTL deptStats::Engineering-2024
-# 3547 ← seconds remaining (1 hour)
-```
-
----
-
-## Additional Config Options You Can Add
+Unique values only. No duplicates.
 
 ```java
-RedisCacheConfiguration config = RedisCacheConfiguration
-    .defaultCacheConfig()
-    .entryTtl(Duration.ofMinutes(10))
+public void setExamples() {
 
-    // Disable null values (don't cache null results)
-    .disableCachingNullValues()
+    SetOperations<String, Object> ops = 
+                    redisTemplate.opsForSet();
 
-    // Change key prefix
-    // default: "cacheName::key"
-    // custom:  "myapp:cacheName:key"
-    .prefixCacheNameWith("myapp:")
+    // Add members
+    ops.add("onlineUsers", "user1", "user2", "user3");
+    ops.add("onlineUsers", "user1"); // duplicate - ignored!
 
-    // Disable key prefix entirely
-    .disableKeyPrefix()
+    // Check if member exists
+    Boolean isOnline = ops.isMember("onlineUsers", "user1");
 
-    // Serialize keys as String
-    .serializeKeysWith(
-        RedisSerializationContext.SerializationPair.fromSerializer(
-            new StringRedisSerializer()
-        )
-    )
+    // Get all members
+    Set<Object> allOnline = ops.members("onlineUsers");
 
-    // Serialize values as JSON
-    .serializeValuesWith(
-        RedisSerializationContext.SerializationPair.fromSerializer(
-            new GenericJackson2JsonRedisSerializer()
-        )
-    );
+    // Remove member
+    ops.remove("onlineUsers", "user1");
+
+    // Count members
+    Long count = ops.size("onlineUsers");
+
+    // Set operations
+    Set<Object> common  = ops.intersect("onlineUsers", "premiumUsers");
+    Set<Object> allUsers = ops.union("onlineUsers", "premiumUsers");
+    Set<Object> diff    = ops.difference("onlineUsers", "premiumUsers");
+}
 ```
 
 ---
 
-## Summary
+## 5. ZSet - Sorted Set (opsForZSet)
 
-| Method | What it does |
-|---|---|
-| `defaultCacheConfig()` | Start with default settings |
-| `entryTtl()` | Set expiry time for keys |
-| `serializeValuesWith()` | How to convert Java object to Redis storage |
-| `cacheDefaults()` | Apply config to all caches |
-| `withCacheConfiguration()` | Override config for specific cache |
-| `disableCachingNullValues()` | Don't store null in Redis |
-| `prefixCacheNameWith()` | Custom prefix for all keys |
-| `build()` | Create final CacheManager |
+Like Set but each member has a **score** for ranking.
 
-Want to go into **RedisTemplate** — which gives you more manual control over Redis beyond just caching?
+```java
+public void zsetExamples() {
+
+    ZSetOperations<String, Object> ops = 
+                    redisTemplate.opsForZSet();
+
+    // Add with score
+    ops.add("leaderboard", "PlayerA", 9500);
+    ops.add("leaderboard", "PlayerB", 8200);
+    ops.add("leaderboard", "PlayerC", 9800);
+    ops.add("leaderboard", "PlayerD", 7100);
+
+    // Get top 3 (highest score first)
+    Set<Object> top3 = ops.reverseRange("leaderboard", 0, 2);
+    // Returns: [PlayerC, PlayerA, PlayerB]
+
+    // Get rank of a player
+    Long rank = ops.reverseRank("leaderboard", "PlayerA");
+    // Returns: 1 (0 based, PlayerC is 0)
+
+    // Get score
+    Double score = ops.score("leaderboard", "PlayerA");
+    // Returns: 9500.0
+
+    // Increment score
+    ops.incrementScore("leaderboard", "PlayerB", 500);
+    // PlayerB score becomes 8700
+}
+```
+
+Redis stores:
+```
+leaderboard
+  PlayerD → 7100
+  PlayerB → 8200
+  PlayerA → 9500
+  PlayerC → 9800  ← highest
+```
+
+---
+
+## Key Management
+
+```java
+public void keyOperations() {
+
+    // Check if key exists
+    Boolean exists = redisTemplate.hasKey("user:1");
+
+    // Delete single key
+    redisTemplate.delete("user:1");
+
+    // Delete multiple keys
+    redisTemplate.delete(List.of("user:1", "user:2", "user:3"));
+
+    // Set TTL on existing key
+    redisTemplate.expire("user:1", Duration.ofMinutes(30));
+
+    // Get remaining TTL
+    Long seconds = redisTemplate.getExpire("user:1", 
+                                TimeUnit.SECONDS);
+
+    // Get all keys matching pattern
+    Set<String> keys = redisTemplate.keys("user:*");
+    // Returns: [user:1, user:2, user:3]
+
+    // Remove TTL (make key permanent)
+    redisTemplate.persist("user:1");
+}
+```
+
+---
+
+## Real World Example - User Session
+
+```java
+@Service
+public class SessionService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // Store session when user logs in
+    public void createSession(String sessionId, User user) {
+
+        HashOperations<String, String, Object> ops =
+                        redisTemplate.opsForHash();
+
+        String key = "session:" + sessionId;
+
+        ops.put(key, "userId",   user.getId());
+        ops.put(key, "username", user.getName());
+        ops.put(key, "role",     user.getRole());
+
+        // Session expires in 30 min
+        redisTemplate.expire(key, Duration.ofMinutes(30));
+    }
+
+    // Get session on each request
+    public Map<String, Object> getSession(String sessionId) {
+        HashOperations<String, String, Object> ops =
+                        redisTemplate.opsForHash();
+
+        return ops.entries("session:" + sessionId);
+    }
+
+    // Extend session on activity
+    public void extendSession(String sessionId) {
+        redisTemplate.expire("session:" + sessionId,
+                             Duration.ofMinutes(30));
+    }
+
+    // Delete session on logout
+    public void deleteSession(String sessionId) {
+        redisTemplate.delete("session:" + sessionId);
+    }
+}
+```
+
+---
+
+## RedisTemplate vs @Cacheable
+
+```
+Use @Cacheable when:
+✅ Simple method result caching
+✅ Don't want to write boilerplate
+✅ TTL based expiry is enough
+
+Use RedisTemplate when:
+✅ Need Lists, Sets, ZSets
+✅ Need to update single fields (Hash)
+✅ Building leaderboards, sessions
+✅ Need manual control over keys
+✅ Pub/Sub messaging
+✅ Distributed locking
+```
+
+---
+
+## Summary of Operations
+
+| Structure | Method | Use Case |
+|---|---|---|
+| String | `opsForValue()` | Simple cache, counters |
+| Hash | `opsForHash()` | Object fields, sessions |
+| List | `opsForList()` | Notifications, queues |
+| Set | `opsForSet()` | Online users, tags |
+| ZSet | `opsForZSet()` | Leaderboards, rankings |
+
+Want to go into **Redis Pub/Sub** — real time messaging between services using Redis?
