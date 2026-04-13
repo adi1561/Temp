@@ -1,231 +1,78 @@
-Great questions! Let me answer each one clearly.
+spring.application.name=JournalService
 
----
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.profiles.active=dev
+server.port=9999
 
-## 1. RedisTemplate vs @Cacheable — Which is Better?
+#todo Expose all actuator endpoints over HTTP.
+management.endpoints.web.exposure.include=*
 
-**Neither is universally better. Use both together!**
+# Always show full details on the health endpoint (e.g., database connection status)
+management.endpoint.health.show-details=always
 
-```
-@Cacheable → for method result caching
-RedisTemplate → for everything else
+# Add some custom info to the /info endpoint
+info.app.name=JournalService
+info.app.description=Service for managing journals.
+info.app.version=1.0.0
 
-Real project uses BOTH:
+# notification topic name
+notification.progress.topic:notifications:progress
 
-@Cacheable("users")          ← automatic cache for DB queries
-redisTemplate.opsForZSet()   ← leaderboard
-redisTemplate.opsForList()   ← notifications
-redisTemplate.opsForValue()  ← distributed lock
-```
-
-Think of it like:
-```
-@Cacheable = automatic car (easy, limited)
-RedisTemplate = manual car (more control, more work)
-
-You don't throw away automatic just because manual exists!
-```
-
----
-
-## 2. JSON Serializer — Is it Stored as JSON or String?
-
-**Both are correct — JSON IS stored as a String in Redis!**
-
-Redis internally only understands **bytes/string**. JSON is just a formatted string.
-
-```
-Java Object → JsonSerializer → JSON String → Redis stores as bytes
-
-User{id=1, name="John"}
-        ↓  GenericJackson2JsonRedisSerializer
-{"id":1,"name":"John"}        ← this is a String
-        ↓
-Redis stores: \x22\x7b\x22...  ← bytes of that string
-```
-
-When you do `redis-cli GET user:1` you see:
-```bash
-"{\"id\":1,\"name\":\"John\"}"
-# Looks like String but it IS JSON inside
-```
-
----
-
-## 3. RedisTemplate Generic Types
-
-Yes! You can use anything, not just `String, Object`.
-
-```java
-// Most common - flexible
-RedisTemplate<String, Object> template
-
-// String keys, String values
-RedisTemplate<String, String> template
-
-// String keys, User object values  
-RedisTemplate<String, User> template
-
-// String keys, List values
-RedisTemplate<String, List<DeptStats>> template
-```
-
-### Which to use when?
-
-```java
-// StringRedisTemplate → shortcut for <String, String>
-// Use when storing simple strings, numbers, flags
-@Autowired
-StringRedisTemplate stringTemplate;
-
-stringTemplate.opsForValue().set("count", "42");
-stringTemplate.opsForValue().set("flag",  "true");
+# --- Redis Configuration ---
+# Ensure timeouts are set so a Redis glitch doesn't hang the app
+spring.data.redis.host=10.0.17.242
+spring.data.redis.port=6379
+spring.data.redis.timeout=2000
+spring.data.redis.jedis.pool.max-active=50
+spring.data.redis.jedis.pool.max-idle=10
+spring.data.redis.jedis.pool.min-idle=5
 
 
-// RedisTemplate<String, Object> → most flexible
-// Use when storing Java objects (User, List, Map etc)
-@Autowired
-RedisTemplate<String, Object> objectTemplate;
+# --- 3. FILE UPLOAD LIMITS ---
+# 600k rows in Excel can be 50MB+. Ensure Spring accepts it.
+spring.servlet.multipart.max-file-size=100MB
+spring.servlet.multipart.max-request-size=100MB
 
-objectTemplate.opsForValue().set("user:1", userObject);
-objectTemplate.opsForHash().putAll("session:1", sessionMap);
+# --- 4. ASYNC EXECUTOR TUNING (Matches our Java Config) ---
+# Verify these match the AsyncConfig.java values
+app.async.core-pool-size=5
+app.async.max-pool-size=20
+app.async.queue-capacity=500
+# ----------------------------------
 
 
-// RedisTemplate<String, User> → type safe
-// Use when ONE specific type only
-@Autowired
-RedisTemplate<String, User> userTemplate;
+# LOGIN SERVICE KEY
+jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
 
-userTemplate.opsForValue().set("user:1", user); // no casting needed!
-User u = userTemplate.opsForValue().get("user:1"); // no casting!
-```
+spring.datasource.oracle.jdbc-url=
+spring.datasource.oracle.username
+spring.datasource.oracle.password=Password
+spring.datasource.oracle.driver-class-name=oracle.jdbc.OracleDriver
+# --- 1. ORACLE CONNECTION POOL (HikariCP) ---
+# Critical: We are doing parallel inserts (8 threads).
+# If pool is too small, threads will wait.
 
----
+#Connection Pool Settings for High-Volume Uploads
 
-## 4. Do You Need RedisCacheManager with RedisTemplate?
+spring.datasource.hikari.maximum-pool-size=65
+spring.datasource.hikari.minimum-idle=10
+spring.datasource.hikari.idle-timeout=300000
+spring.datasource.hikari.connection-timeout=60000
+spring.datasource.hikari.max-lifetime=1800000
 
-**No! They are completely independent.**
+# Hibernate specific config for Oracle
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.OracleDialect
+spring.jpa.show-sql=false
 
-```
-RedisCacheManager → only needed for @Cacheable
-RedisTemplate     → works on its own, needs only RedisConfig
+# --- 2. Secondary DataSource ( Delta Lake) ---
+# Used for Data Lake connectivity
+#spring.datasource.hive.jdbc-url=jdbc:hive2://spark-thrift:10000/cbops
 
-@Cacheable uses  → RedisCacheManager
-RedisTemplate    → directly talks to Redis
-```
+spring.datasource.hive.jdbc-url=jdbc:hive2://localhost:10000/fincoredatalakejournal
+spring.datasource.hive.driver-class-name=org.apache.hive.jdbc.HiveDriver
+# Validation query to ensure connection is alive (Hive specific)
+spring.datasource.hive.test-on-borrow=true
+spring.datasource.hive.validation-query=SELECT 1
 
-```java
-// RedisTemplate only needs this:
-@Bean
-public RedisTemplate<String, Object> redisTemplate(
-                        RedisConnectionFactory factory) {
-    RedisTemplate<String, Object> template = new RedisTemplate<>();
-    template.setConnectionFactory(factory);
-    template.setKeySerializer(new StringRedisSerializer());
-    template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
-    return template;
-}
 
-// RedisCacheManager only needed if you also use @Cacheable
-@Bean
-public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
-    ...
-}
-```
-
----
-
-## 5. Serializer Decides Format
-
-```java
-// StringRedisSerializer for keys → stores as plain text
-template.setKeySerializer(new StringRedisSerializer());
-// Redis key: user:1  ← clean readable
-
-// JdkSerializationRedisSerializer (DEFAULT) → ugly bytes
-template.setValueSerializer(new JdkSerializationRedisSerializer());
-// Redis value: \xac\xed\x00\x05t\x00...  ← unreadable!
-
-// GenericJackson2JsonRedisSerializer → clean JSON
-template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
-// Redis value: {"id":1,"name":"John"}  ← readable ✅
-
-// Jackson2JsonRedisSerializer → JSON but for specific type
-template.setValueSerializer(new Jackson2JsonRedisSerializer<>(User.class));
-// Same as above but only for User type
-```
-
-### Difference between two JSON serializers:
-
-```java
-// GenericJackson2JsonRedisSerializer
-// Stores class name inside JSON
-// {"@class":"com.example.User","id":1,"name":"John"}
-// ✅ Can deserialize back to correct type automatically
-// ❌ Slightly larger storage
-
-// Jackson2JsonRedisSerializer
-// Does NOT store class name
-// {"id":1,"name":"John"}
-// ✅ Smaller storage
-// ❌ You must tell it which class to deserialize to
-```
-
----
-
-## Full Config Showing Everything
-
-```java
-@Configuration
-public class RedisConfig {
-
-    // For @Cacheable → needs CacheManager
-    @Bean
-    public RedisCacheManager cacheManager(
-                        RedisConnectionFactory factory) {
-        RedisCacheConfiguration config = RedisCacheConfiguration
-            .defaultCacheConfig()
-            .entryTtl(Duration.ofMinutes(10))
-            .serializeValuesWith(
-                RedisSerializationContext.SerializationPair
-                .fromSerializer(
-                    new GenericJackson2JsonRedisSerializer()
-                )
-            );
-        return RedisCacheManager.builder(factory)
-            .cacheDefaults(config)
-            .build();
-    }
-
-    // For RedisTemplate → direct Redis operations
-    @Bean
-    public RedisTemplate<String, Object> redisTemplate(
-                        RedisConnectionFactory factory) {
-        RedisTemplate<String, Object> template = new RedisTemplate<>();
-        template.setConnectionFactory(factory);
-        template.setKeySerializer(
-            new StringRedisSerializer());        // key as String
-        template.setValueSerializer(
-            new GenericJackson2JsonRedisSerializer()); // value as JSON
-        template.setHashKeySerializer(
-            new StringRedisSerializer());        // hash field as String
-        template.setHashValueSerializer(
-            new GenericJackson2JsonRedisSerializer()); // hash value as JSON
-        return template;
-    }
-}
-```
-
----
-
-## Summary
-
-| Question | Answer |
-|---|---|
-| RedisTemplate better than @Cacheable? | No, use both together |
-| JSON stored as String? | Yes, JSON is a formatted String |
-| Can use other than String,Object? | Yes, String/String, String/User etc |
-| Need CacheManager with RedisTemplate? | No, independent |
-| Which serializer to use? | GenericJackson2Json for most cases |
-
-Want to go into how `@Cacheable` and `RedisTemplate` can work **together in same service** with a real world example?
+spring.datasource.hive.username=spark
