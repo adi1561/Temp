@@ -1,1 +1,320 @@
-spring.datasource.hive.username=spark
+Let's go super deep into every line of that `RedisCacheManager` config!
+
+---
+
+## The Full Config We Are Explaining
+
+```java
+@Configuration
+public class RedisConfig {
+
+    @Bean
+    public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
+
+        RedisCacheConfiguration defaultConfig = RedisCacheConfiguration
+            .defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(10))
+            .serializeValuesWith(
+                RedisSerializationContext.SerializationPair.fromSerializer(
+                    new GenericJackson2JsonRedisSerializer()
+                )
+            );
+
+        RedisCacheConfiguration deptStatsConfig = RedisCacheConfiguration
+            .defaultCacheConfig()
+            .entryTtl(Duration.ofHours(1));
+
+        RedisCacheConfiguration userConfig = RedisCacheConfiguration
+            .defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(5));
+
+        return RedisCacheManager.builder(factory)
+            .cacheDefaults(defaultConfig)
+            .withCacheConfiguration("deptStats", deptStatsConfig)
+            .withCacheConfiguration("userCache", userConfig)
+            .build();
+    }
+}
+```
+
+---
+
+## Part 1 - @Configuration and @Bean
+
+```java
+@Configuration  
+// Tells Spring → this class contains Bean definitions
+// Spring reads this class at startup
+
+public class RedisConfig {
+
+    @Bean
+    // Tells Spring → this method returns an object
+    // put it in ApplicationContext
+    // Other classes can @Autowired it
+    public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
+```
+
+`RedisConnectionFactory` is **auto injected** by Spring Boot.
+It holds → host, port, password of your Redis server from `application.properties`.
+
+```properties
+spring.redis.host=localhost
+spring.redis.port=6379
+# factory reads these automatically
+```
+
+---
+
+## Part 2 - RedisCacheConfiguration
+
+This is the **rules object**. It defines HOW cache should behave.
+
+### defaultCacheConfig()
+
+```java
+RedisCacheConfiguration defaultConfig = RedisCacheConfiguration
+    .defaultCacheConfig()
+```
+
+`defaultCacheConfig()` gives you a starting config with:
+```
+TTL          → no expiry (lives forever)
+KeyPrefix    → enabled (cacheName::key)
+NullValues   → allowed
+Serializer   → JDK serialization (ugly bytes)
+```
+
+You then **override** what you want to change.
+
+---
+
+### entryTtl()
+
+```java
+.entryTtl(Duration.ofMinutes(10))
+```
+
+**TTL = Time To Live.** After this time Redis **auto deletes** the key.
+
+```
+Duration.ofSeconds(30)    → 30 seconds
+Duration.ofMinutes(10)    → 10 minutes
+Duration.ofHours(1)       → 1 hour
+Duration.ofDays(1)        → 1 day
+Duration.ZERO             → never expires (careful!)
+```
+
+What happens in Redis:
+```bash
+SET deptStats::HR-2024  "data"  EX 3600
+#                                  ↑
+#                             Redis TTL in seconds
+```
+
+---
+
+### serializeValuesWith()
+
+This is the most important part!
+
+```java
+.serializeValuesWith(
+    RedisSerializationContext.SerializationPair.fromSerializer(
+        new GenericJackson2JsonRedisSerializer()
+    )
+)
+```
+
+This decides **how your Java object is converted** before storing in Redis.
+
+#### Without this (default JDK serialization):
+```
+Redis stores:
+deptStats::HR-2024 → ¬í sr java.util.ArrayListx...
+                      ← UGLY UNREADABLE BYTES
+```
+
+#### With JSON serializer:
+```
+Redis stores:
+deptStats::HR-2024 → [{"department":"HR","count":12,"avgSalary":65000}]
+                      ← CLEAN READABLE JSON ✅
+```
+
+Why JSON is better:
+```
+✅ Human readable (debug easily)
+✅ Works across different Java versions
+✅ Other services (Python, Node) can read same cache
+❌ Slightly larger size than bytes
+```
+
+---
+
+## Part 3 - Multiple Cache Configurations
+
+Here is the key concept:
+
+```
+defaultConfig    → applies to ALL caches
+specific config  → overrides default for THAT cache only
+```
+
+```java
+// Rule for ALL caches
+RedisCacheConfiguration defaultConfig = RedisCacheConfiguration
+    .defaultCacheConfig()
+    .entryTtl(Duration.ofMinutes(10));  // 10 min default
+
+// Rule only for "deptStats" cache
+RedisCacheConfiguration deptStatsConfig = RedisCacheConfiguration
+    .defaultCacheConfig()
+    .entryTtl(Duration.ofHours(1));     // 1 hour (overrides default)
+
+// Rule only for "userCache" cache
+RedisCacheConfiguration userConfig = RedisCacheConfiguration
+    .defaultCacheConfig()
+    .entryTtl(Duration.ofMinutes(5));   // 5 min (overrides default)
+```
+
+Why different TTLs?
+
+```
+userCache   → 5 min  (user data changes frequently)
+deptStats   → 1 hour (aggregate changes rarely)
+default     → 10 min (everything else)
+```
+
+---
+
+## Part 4 - RedisCacheManager.builder()
+
+This is where everything is **assembled together**.
+
+```java
+return RedisCacheManager.builder(factory)
+```
+`factory` = your Redis connection (host, port).
+Builder pattern starts here.
+
+```java
+.cacheDefaults(defaultConfig)
+```
+Apply `defaultConfig` to ALL caches that don't have specific config.
+
+```java
+.withCacheConfiguration("deptStats", deptStatsConfig)
+```
+Cache named `"deptStats"` uses `deptStatsConfig` (1 hour TTL).
+This overrides `cacheDefaults` for this specific cache.
+
+```java
+.withCacheConfiguration("userCache", userConfig)
+```
+Cache named `"userCache"` uses `userConfig` (5 min TTL).
+
+```java
+.build()
+```
+Creates and returns the final `RedisCacheManager` object.
+
+---
+
+## How Cache Name Links to Config
+
+```java
+// Service class
+@Cacheable(value = "deptStats", ...)   // uses deptStatsConfig → 1 hour
+@Cacheable(value = "userCache", ...)   // uses userConfig → 5 min
+@Cacheable(value = "products", ...)    // uses defaultConfig → 10 min
+```
+
+```
+"deptStats" in @Cacheable
+      ↓
+RedisCacheManager looks up "deptStats"
+      ↓
+Finds deptStatsConfig → TTL 1 hour
+      ↓
+Stores in Redis with 1 hour expiry
+```
+
+---
+
+## Full Picture - What Sits in Redis
+
+```bash
+redis-cli KEYS *
+
+# userCache keys (5 min TTL)
+userCache::1
+userCache::2
+
+# deptStats keys (1 hour TTL)  
+deptStats::Engineering-2024
+deptStats::HR-2024
+
+# products keys (10 min TTL - default)
+products::101
+products::102
+
+
+redis-cli TTL userCache::1
+# 287  ← seconds remaining (5 min)
+
+redis-cli TTL deptStats::Engineering-2024
+# 3547 ← seconds remaining (1 hour)
+```
+
+---
+
+## Additional Config Options You Can Add
+
+```java
+RedisCacheConfiguration config = RedisCacheConfiguration
+    .defaultCacheConfig()
+    .entryTtl(Duration.ofMinutes(10))
+
+    // Disable null values (don't cache null results)
+    .disableCachingNullValues()
+
+    // Change key prefix
+    // default: "cacheName::key"
+    // custom:  "myapp:cacheName:key"
+    .prefixCacheNameWith("myapp:")
+
+    // Disable key prefix entirely
+    .disableKeyPrefix()
+
+    // Serialize keys as String
+    .serializeKeysWith(
+        RedisSerializationContext.SerializationPair.fromSerializer(
+            new StringRedisSerializer()
+        )
+    )
+
+    // Serialize values as JSON
+    .serializeValuesWith(
+        RedisSerializationContext.SerializationPair.fromSerializer(
+            new GenericJackson2JsonRedisSerializer()
+        )
+    );
+```
+
+---
+
+## Summary
+
+| Method | What it does |
+|---|---|
+| `defaultCacheConfig()` | Start with default settings |
+| `entryTtl()` | Set expiry time for keys |
+| `serializeValuesWith()` | How to convert Java object to Redis storage |
+| `cacheDefaults()` | Apply config to all caches |
+| `withCacheConfiguration()` | Override config for specific cache |
+| `disableCachingNullValues()` | Don't store null in Redis |
+| `prefixCacheNameWith()` | Custom prefix for all keys |
+| `build()` | Create final CacheManager |
+
+Want to go into **RedisTemplate** — which gives you more manual control over Redis beyond just caching?
