@@ -1,67 +1,77 @@
-Ah, my apologies! We created the CacheBatchRequestDto, but I need to show you exactly how to wire it into your controller so it actually replaces the old Map<String, String> implementation.
-We only need to touch one file to make this work. We are going to update the /create-batch-from-cache endpoint in your controller to consume this new DTO. This is where the @Valid annotation intercepts the request and enforces the rules we just wrote.
-Here is the exact replacement:
-### File: JournalRequestController.java
-**Existing Code**
+Excellent. Now that the input validation and DTO structures are solid for batch creation, we are going to tackle the next phase of enterprise hardening.
+I have analyzed your new frontend code alongside the backend, and we need to do three things next:
+ 1. Apply the same SOLID principles to your deletion endpoint.
+ 2. Fix a "Decimal Leak" where your Java backend isn't enforcing the strict INR rules your React frontend uses.
+ 3. **Address a massive, silent financial bug regarding Partial Approvals.**
+Here are the precise steps.
+### Step 1: SOLID Refactoring for the Delete Endpoint
+In your backend JournalRequestController, the partial deletion endpoint uses a raw List<String> as the request body. Just like the Map we fixed earlier, using raw collections violates the Open/Closed Principle and prevents Spring from validating the elements inside the list.
+**1. Create a New File: JournalListRequestDto.java**
+Place this in your Dto folder.
 ```java
-    /**
-     * Creates a batch from pre-validated cache data.
-     * Uses fire-and-forget logic; returns 202 Accepted immediately.
-     */
-    @PostMapping("/create-batch-from-cache")
-    public ResponseEntity<Map<String, Object>> createBatchFromCache(
-            @RequestBody Map<String, String> payload,
-            @RequestHeader("Authorization") String token) throws IOException {
+package com.fincore.JournalService.Dto;
 
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotNull;
+import java.util.List;
+import lombok.Data;
 
-        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.get("requestId"));
-        String batchId = journalRequestService.createBatchFromCacheAsync(
-                payload.get("requestId"),
-                payload.get("commonBatchRemarks"),
-                userId,
-                userRole
-        );
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING",
-                "message", "Batch creation initiated in background.",
-                "batchId", batchId
-        ));
+@Data
+public class JournalListRequestDto {
+    
+    @NotEmpty(message = "You must select at least one entry")
+    private List<@NotNull(message = "Journal ID cannot be null") String> journalIds;
+}
+
+```
+**2. Update JournalRequestController.java**
+**Existing Code:**
+```java
+    @DeleteMapping("/my-requests/by-journal-list")
+    public ResponseEntity<Map<String, String>> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @RequestBody List<String> list) {
+        journalRequestService.cancelMyRequestsByJournalPrefixes(list, jwtUtil.getUserIdFromToken(token));
+        return ResponseEntity.ok(Map.of("status", "SUCCESS"));
     }
 
 ```
-**Replace Code**
+**Replace Code:**
 ```java
-    /**
-     * Creates a batch from pre-validated cache data.
-     * Uses fire-and-forget logic; returns 202 Accepted immediately.
-     */
-    @PostMapping("/create-batch-from-cache")
-    public ResponseEntity<Map<String, Object>> createBatchFromCache(
-            @Valid @RequestBody CacheBatchRequestDto payload,
-            @RequestHeader("Authorization") String token) throws IOException {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-        // Using getter methods from the new DTO instead of .get() from a Map
-        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
-        String batchId = journalRequestService.createBatchFromCacheAsync(
-                payload.getRequestId(),
-                payload.getCommonBatchRemarks(),
-                userId,
-                userRole
-        );
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING",
-                "message", "Batch creation initiated in background.",
-                "batchId", batchId
-        ));
+    @DeleteMapping("/my-requests/by-journal-list")
+    public ResponseEntity<Map<String, String>> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @Valid @RequestBody JournalListRequestDto payload) {
+        journalRequestService.cancelMyRequestsByJournalPrefixes(payload.getJournalIds(), jwtUtil.getUserIdFromToken(token));
+        return ResponseEntity.ok(Map.of("status", "SUCCESS"));
     }
 
 ```
-### Why this works:
- 1. **The @Valid Annotation:** When Spring Boot sees @Valid @RequestBody CacheBatchRequestDto payload, it automatically checks the payload against the @NotBlank and @Pattern rules we defined inside CacheBatchRequestDto.
- 2. **Automatic Rejection:** If the frontend sends an invalid remark (like one with special characters) or forgets the requestId, Spring Boot will instantly block the request and throw a MethodArgumentNotValidException before the code inside the method even runs.
- 3. **Clean Data Access:** Instead of using payload.get("keyName") (which is prone to typos), we now use strictly typed getter methods like payload.getRequestId().
+### Step 2: The INR "Decimal Leak"
+In your React code (JournalPosting.js), you have excellent dynamic logic that restricts INR to 2 decimal places while allowing 4 decimal places for other currencies.
+However, in the Java backend (BatchRequestDto), our @Digits(fraction = 4) allows 4 decimals for *everything*. Because DTO annotations can't easily cross-reference other fields (checking amount based on currency), we must enforce this explicitly in the Service layer to prevent API manipulation.
+**File: JournalRequestServiceImpl.java (Inside createBatchRequest)**
+**Existing Code:**
+```java
+            entity.setCurrency(row.getCurrency());
+            entity.setCgl(row.getCgl());
+            BigDecimal amount = row.getAmount();
+            entity.setAmount(amount);
+
+```
+**Replace Code:**
+```java
+            entity.setCurrency(row.getCurrency());
+            entity.setCgl(row.getCgl());
+            BigDecimal amount = row.getAmount();
+            
+            // Strict Cross-Field Validation for INR
+            if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
+                throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
+            }
+            
+            entity.setAmount(amount);
+
+```
+### Step 3: CRITICAL WARNING — The "Phantom" Partial Approval Bug
+While analyzing your frontend JournalAuthorization.js, I noticed that when a user selects specific rows and clicks "Accept", the frontend sends the journalIdPrefixes array to /JS/journals/process-bulk.
+However, looking at the backend implementation in JournalRequestServiceImpl (executeApprovalInTransaction), Java takes the batchId and hands it off to the Oracle Stored Procedure PROCESS_JOURNAL_BATCH. **The stored procedure only accepts the batchId and has no parameter for the specific journal IDs**.
+**What this means:** If a user selects 2 out of 500 rows in the frontend and clicks "Approve", the backend ignores the specific selection and silently approves **all 500 rows** in the database.
+This is a massive financial risk. Since Oracle PL/SQL doesn't easily accept Java arrays/lists as parameters, we need to architect a solution to fix this.
+Would you like to tackle the PL/SQL / Partial Approval bug next? We can either handle the row-by-row approval in Java, or implement a state-flagging workaround before the PL/SQL executes.
