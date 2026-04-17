@@ -1,74 +1,75 @@
-    @Override
-    @Transactional
-    public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+I completely understand what is happening here. This is a very common issue when removing a JSON payload column and switching to normalized database columns.
+The problem is a **JSON Key Mismatch**. Your React frontend is looking for specific variable names (like req.branchCode), but depending on exactly how your Java JournalRequest entity variables are named, Spring Boot might be sending them as req.reqBranchCode or something slightly different. If the names don't match perfectly, JavaScript silently assigns undefined, and your table cells show up completely blank or just -!
+To fix this instantly, we will use a **"Catch-All" Mapping strategy**. We will update the JavaScript to look for *both* possible Spring Boot naming conventions.
+Here are the exact fixes for both screen files:
+### 1. File: JournalAuthorization.js
+Find the fetchBatchDetailsPaginated function and replace the row mapping logic with this "catch-all" version:
+**Replace Code:**
+```javascript
+            // Use 'amount' or 'reqAmount' based on what Spring Boot sends
+            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
 
-        // 1. Intercept Partial Approvals: The "Batch Split" Pattern
-        if (dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty()) {
-            String originalBatchId = dto.getBatchId();
+            const row = {
+              ...req,
+              journalPrefix: prefix,
+              amount: Math.abs(amountVal),
+              transactionType: amountVal < 0 ? "Credit" : "Debit",
 
-            // Generate a unique split ID
-            String splitBatchId = originalBatchId + "-P" + (System.currentTimeMillis() % 10000);
+              // Bullet-proof catch-all mapping to handle any Java Entity naming convention
+              branch: req.branchCode || req.reqBranchCode || "-",
+              currency: req.currency || req.reqCurrency || "-",
+              cgl: req.cgl || req.reqCgl || "-",
+              remarks: req.narration || req.reqNarration || "-",
+              product: req.productCode || req.reqProduct || "-",
+              date: req.csvDate || req.reqCsvDate || "-"
+            };
 
-            log.info("PARTIAL_APPROVAL_DETECTED | Splitting Batch: {} -> {}", originalBatchId, splitBatchId);
+```
+### 2. File: JournalPostingStatus.js
+Similarly, find the fetchDetailRows function and replace its mapping logic:
+**Replace Code:**
+```javascript
+        res.content.forEach((req, index) => {
+          try {
+            // Log the exact response to your browser console so you can see the true keys!
+            console.log("Backend Row Data:", req); 
 
-            // Clone the master record so the split batch has a valid audit trail
-            jdbcTemplate.update(
-                    "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, BATCH_STATUS, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT) " +
-                            "SELECT ?, 'PENDING', CREATOR_ID, CURRENT_TIMESTAMP, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT " +
-                            "FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?",
-                    splitBatchId, originalBatchId
-            );
-
-            // Migrate selected rows to the new split batch using high-speed JDBC batch updates
-            List<String> prefixes = dto.getJournalIdPrefixes();
-            jdbcTemplate.batchUpdate(
-                    "UPDATE JOURNAL_REQUEST SET BATCH_ID = ? WHERE BATCH_ID = ? AND JOURNAL_ID LIKE ?",
-                    new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
-                        @Override
-                        public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
-                            ps.setString(1, splitBatchId);
-                            ps.setString(2, originalBatchId);
-                            ps.setString(3, prefixes.get(i) + "-%"); // Matches exact prefix pattern
-                        }
-
-                        @Override
-                        public int getBatchSize() {
-                            return prefixes.size();
-                        }
-                    }
-            );
-
-            // Re-route the DTO to point to our newly isolated batch!
-            dto.setBatchId(splitBatchId);
+            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
+            const prefix = String(jId).split("-")[0];
             
-            // --- ADDED RECALIBRATION LOGIC ---
-            log.info("RECALCULATING_TOTALS | Syncing master headers for {} and {}", originalBatchId, splitBatchId);
+            // Use 'amount' or 'reqAmount' based on what Spring Boot sends
+            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
+            
+            const row = {
+              ...req,
+              journalPrefix: prefix,
+              amount: Math.abs(amountVal),
+              transactionType: amountVal < 0 ? "Credit" : "Debit",
+              
+              // Bullet-proof catch-all mapping
+              branch: req.branchCode || req.reqBranchCode || "-",
+              currency: req.currency || req.reqCurrency || "-",
+              cgl: req.cgl || req.reqCgl || "-",
+              remarks: req.narration || req.reqNarration || "-",
+              product: req.productCode || req.reqProduct || "-",
+              date: req.csvDate || req.reqCsvDate || "-"
+            };
+            
+            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
+            journalGroups.get(prefix).push(row);
+          } catch (e) {
+             console.error("Failed to map row details:", e);
+          }
+        });
 
-            // Dynamically recalculate and update the totals for BOTH batches simultaneously
-            String recalcSql = 
-                "UPDATE JOURNAL_BATCH_MASTER M " +
-                "SET (TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT) = (" +
-                "    SELECT COUNT(1), " +
-                "           NVL(SUM(CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END), 0), " +
-                "           NVL(SUM(CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END), 0) " +
-                "    FROM JOURNAL_REQUEST " +
-                "    WHERE BATCH_ID = M.BATCH_ID" +
-                ") " +
-                "WHERE BATCH_ID IN (?, ?)";
+```
+### 3. Double Check Your HTML Table Cells!
+Finally, ensure that inside your <TableBody> in JournalPostingStatus.js, your <TableCell> components look exactly like this. **They must NOT say .payload anywhere**:
+```javascript
+  <TableCell align="center">{row.branch}</TableCell>
+  <TableCell align="center">{row.currency}</TableCell>
+  <TableCell align="center">{row.cgl}</TableCell>
+  <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
 
-            jdbcTemplate.update(recalcSql, originalBatchId, splitBatchId);
-            // --- END RECALIBRATION LOGIC ---
-        }
-
-        // 2. Lock the target batch (either the original, or the newly split one)
-        String lockSql = "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS = 'PENDING'";
-        int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
-
-        if (updated == 0) {
-            log.warn("APPROVAL_LOCK_FAIL | Batch: {} | Status: Batch already processing", dto.getBatchId());
-            throw new IllegalStateException("Batch is already being processed or is not in PENDING status.");
-        }
-
-        progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
-        self.executeAsyncBatchProcessing(dto, executorId);
-    }
+```
+**Debugging Tip:** Notice that I added console.log("Backend Row Data:", req); inside the loop. If the UI is *still* showing blanks after applying this fix, open your browser's Developer Tools (F12), click the "Console" tab, and click the eye icon. You will see the exact JSON object Spring Boot is sending. It will instantly tell you exactly what keys the backend is using!
