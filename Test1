@@ -1,26 +1,134 @@
-That is a great UI polish. Since you configured the Amount input text to start typing from the right side, shifting the helper text to the right or center will make it look much more balanced!
-You just need to add the textAlign property inside the sx prop of those specific <Typography> tags.
-Here is exactly what to change. I will set them to "right" to match your Amount typing direction, but you can easily change the word "right" to "center" if you prefer it exactly in the middle.
-### Step 1: Update the Amount Helper Text
-**Find this exact line right below your Amount <TextField> (around line 522):**
-```javascript
-                  <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, display: "block" }}>
+Now that your frontend is completely locked down, moving to the backend DTO validation is the perfect next step. A golden rule of system design is: **Never trust the client.** Even with the best React validation, someone could bypass the UI and hit your API via Postman.
+To enforce these exact rules in Spring Boot, we will use jakarta.validation.constraints.* annotations (or javax if you are on Spring Boot 2.x). We will also use a clever Spring Boot trick (@AssertTrue) to handle that complex dynamic currency decimal logic!
+Here is how to set up your DTOs and Controller.
+### 1. The Parent Batch DTO
+Create a DTO to catch the entire JSON payload. This validates the common remarks and ensures the row list isn't empty.
+```java
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.Pattern;
+import java.util.List;
+
+public class JournalBatchRequestDto {
+
+    // Allows empty string, OR exactly 2-30 alphanumeric characters
+    @Pattern(regexp = "^$|^[a-zA-Z0-9]{2,30}$", message = "Common Batch Remarks must be empty or between 2 and 30 alphanumeric characters")
+    private String commonBatchRemarks;
+
+    // Ensures the list exists and has at least one item
+    @NotEmpty(message = "Batch must contain at least one journal row")
+    @Valid // CRITICAL: This tells Spring to dive inside the list and validate each row individually!
+    private List<JournalRowDto> rows;
+
+    // Getters and Setters
+    public String getCommonBatchRemarks() { return commonBatchRemarks; }
+    public void setCommonBatchRemarks(String commonBatchRemarks) { this commonBatchRemarks = commonBatchRemarks; }
+    public List<JournalRowDto> getRows() { return rows; }
+    public void setRows(List<JournalRowDto> rows) { this.rows = rows; }
+}
 
 ```
-**Replace it with this (adds textAlign: "right"):**
-```javascript
-                  <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, display: "block", textAlign: "right" }}>
+### 2. The Individual Row DTO
+This is where the heavy lifting happens. Notice how we allow an optional - (minus sign) in the amount regex, because your frontend converts "Credit" into negative numbers before submitting!
+```java
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.AssertTrue;
+
+public class JournalRowDto {
+
+    @NotBlank(message = "Branch is mandatory")
+    private String branch;
+
+    @NotBlank(message = "Currency is mandatory")
+    private String currency;
+
+    @NotBlank(message = "CGL is mandatory")
+    private String cgl;
+
+    // Allows optional '-', up to 16 digits, and optional decimal up to 4 places
+    @NotBlank(message = "Amount is mandatory")
+    @Pattern(regexp = "^-?\\d{1,16}(\\.\\d{1,4})?$", message = "Amount must be a valid number with up to 16 digits and a maximum of 4 decimal places")
+    private String amount;
+
+    // Optional field, so we just restrict it to 0-8 digits
+    @Pattern(regexp = "^\\d{0,8}$", message = "Product Code must be a maximum of 8 digits")
+    private String productType;
+
+    @NotBlank(message = "Remarks are mandatory")
+    @Pattern(regexp = "^[a-zA-Z0-9]{2,30}$", message = "Remarks must be between 2 and 30 alphanumeric characters")
+    private String remarks;
+
+    @NotBlank(message = "AR Flag is mandatory")
+    @Pattern(regexp = "^A$", message = "AR Flag must be exactly 'A'")
+    private String arFlag;
+
+    // --- CROSS-FIELD VALIDATION (The Currency/Decimal Rule) ---
+    // Spring Boot will automatically run any method annotated with @AssertTrue during validation
+    @AssertTrue(message = "INR currency allows a maximum of 2 decimal places. Other currencies allow up to 4.")
+    public boolean isAmountDecimalValid() {
+        if (amount == null || currency == null) return true; // Skip if null, let @NotBlank handle the error
+        
+        String[] parts = amount.replace("-", "").split("\\.");
+        int fractionLength = parts.length > 1 ? parts[1].length() : 0;
+
+        if ("INR".equalsIgnoreCase(currency)) {
+            return fractionLength <= 2;
+        } else {
+            return fractionLength <= 4;
+        }
+    }
+
+    // Getters and Setters...
+}
 
 ```
-### Step 2: Update the Product Code Helper Text
-**Find this exact line right below your Product Code <TextField> (around line 564):**
-```javascript
-                  <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, display: "block" }}>
+### 3. Activating it in your Controller
+To make Spring Boot actually execute these annotations, you **must** add the @Valid annotation next to the @RequestBody in your JournalRequestController.
+```java
+import jakarta.validation.Valid;
+// ...
+
+@PostMapping("/create-batch")
+public ResponseEntity<?> createBatch(@Valid @RequestBody JournalBatchRequestDto request) {
+    // If Spring reaches this line, you are 100% guaranteed the payload 
+    // exactly matches your strict frontend rules.
+    
+    // Pass to service...
+}
 
 ```
-**Replace it with this (adds textAlign: "right"):**
-```javascript
-                  <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, display: "block", textAlign: "right" }}>
+### 4. Handling the Errors Gracefully (Global Exception Handler)
+If a validation fails, Spring Boot throws a MethodArgumentNotValidException. By default, this returns a massive, ugly stack trace to the frontend.
+If you don't already have a @RestControllerAdvice class in your project, add this one. It catches the validation errors and formats them cleanly so your frontend useCustomSnackbar can easily display them!
+```java
+import org.springframework.http.HttpStatus;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@RestControllerAdvice
+public class GlobalValidationExceptionHandler {
+
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public Map<String, String> handleValidationExceptions(MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new HashMap<>();
+        
+        ex.getBindingResult().getAllErrors().forEach((error) -> {
+            String fieldName = ((FieldError) error).getField();
+            String errorMessage = error.getDefaultMessage();
+            errors.put(fieldName, errorMessage);
+        });
+        
+        return errors;
+    }
+}
 
 ```
-Save the file and check your UI. The text will now sit perfectly aligned under the right side of the input boxes! If you decide you want it perfectly in the middle instead, just change "right" to "center" in those two lines.
+With this setup, your Java backend is now a fortress. If Postman sends a product code with 9 digits, or an INR amount with 3 decimal places, Spring Boot will instantly reject it with a clean 400 Bad Request and your custom error message!
