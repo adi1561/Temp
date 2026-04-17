@@ -1,39 +1,56 @@
-Excellent. You have successfully implemented the hardest architectural pattern in the system. However, doing so introduced a new **Accounting Discrepancy** that we must immediately recalibrate.
-### The Accounting Discrepancy Bug
-In our previous step, when we created the new Split Batch, we cloned the master record using SELECT ... TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT.
-This means if the original batch had 100 rows totaling ₹50,000, and a manager only approved 2 rows totaling ₹1,000, **both** the new split batch and the old batch will currently claim they contain ₹50,000 in their Master table headers. This will completely break your UI's summary grid and ruin financial reporting.
-We must dynamically recalculate the totals for *both* batches immediately after the rows are moved.
-### File: JournalRequestServiceImpl.java
-Inside the processBulkRequestsAsync method we just modified, we need to add an Oracle Aggregate Recalculation query right after the jdbcTemplate.batchUpdate finishes moving the rows, but *before* the lock is acquired.
-**Insert this specific block of code right after dto.setBatchId(splitBatchId);:**
-```java
-            // --- NEW RECALIBRATION LOGIC START ---
-            
+ @Override
+    @Transactional
+    public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+
+        // 1. Intercept Partial Approvals: The "Batch Split" Pattern
+        if (dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty()) {
+            String originalBatchId = dto.getBatchId();
+
+            // Generate a unique split ID
+            String splitBatchId = originalBatchId + "-P" + (System.currentTimeMillis() % 10000);
+
+            log.info("PARTIAL_APPROVAL_DETECTED | Splitting Batch: {} -> {}", originalBatchId, splitBatchId);
+
+            // Clone the master record so the split batch has a valid audit trail
+            jdbcTemplate.update(
+                    "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, BATCH_STATUS, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT) " +
+                            "SELECT ?, 'PENDING', CREATOR_ID, CURRENT_TIMESTAMP, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT " +
+                            "FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?",
+                    splitBatchId, originalBatchId
+            );
+
+            // Migrate selected rows to the new split batch using high-speed JDBC batch updates
+            List<String> prefixes = dto.getJournalIdPrefixes();
+            jdbcTemplate.batchUpdate(
+                    "UPDATE JOURNAL_REQUEST SET BATCH_ID = ? WHERE BATCH_ID = ? AND JOURNAL_ID LIKE ?",
+                    new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                        @Override
+                        public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                            ps.setString(1, splitBatchId);
+                            ps.setString(2, originalBatchId);
+                            ps.setString(3, prefixes.get(i) + "-%"); // Matches exact prefix pattern
+                        }
+
+                        @Override
+                        public int getBatchSize() {
+                            return prefixes.size();
+                        }
+                    }
+            );
+
             // Re-route the DTO to point to our newly isolated batch!
             dto.setBatchId(splitBatchId);
-            
-            log.info("RECALCULATING_TOTALS | Syncing master headers for {} and {}", originalBatchId, splitBatchId);
+        }
 
-            // Dynamically recalculate and update the totals for BOTH batches simultaneously
-            String recalcSql = 
-                "UPDATE JOURNAL_BATCH_MASTER M " +
-                "SET (TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT) = (" +
-                "    SELECT COUNT(1), " +
-                "           NVL(SUM(CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END), 0), " +
-                "           NVL(SUM(CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END), 0) " +
-                "    FROM JOURNAL_REQUEST " +
-                "    WHERE BATCH_ID = M.BATCH_ID" +
-                ") " +
-                "WHERE BATCH_ID IN (?, ?)";
+        // 2. Lock the target batch (either the original, or the newly split one)
+        String lockSql = "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS = 'PENDING'";
+        int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
 
-            jdbcTemplate.update(recalcSql, originalBatchId, splitBatchId);
+        if (updated == 0) {
+            log.warn("APPROVAL_LOCK_FAIL | Batch: {} | Status: Batch already processing", dto.getBatchId());
+            throw new IllegalStateException("Batch is already being processed or is not in PENDING status.");
+        }
 
-            // --- NEW RECALIBRATION LOGIC END ---
-
-```
-### Why this is the perfect fix:
- 1. **Absolute Accuracy:** By using SUM() and COUNT() directly on the JOURNAL_REQUEST table, the Master table will perfectly reflect the exact mathematical reality of the rows inside each batch.
- 2. **Oracle Optimization:** Instead of pulling thousands of rows into Java, doing the math, and sending it back, we offload the heavy lifting entirely to Oracle. The database performs this recalculation in a fraction of a millisecond.
- 3. **Audit Integrity:** Your React frontend's JournalAuthorization page will now accurately show the manager that the remaining pending batch only has 98 rows left, instead of lying and saying it still has 100.
-With this final mathematical recalibration, your bulk processing engine is 100% complete, secure, and financially accurate.
-To proceed, would you like to review the **HdfsSyncService / Delta Lake Recovery Queue**, or should we shift to optimizing the React frontend state management?
+        progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
+        self.executeAsyncBatchProcessing(dto, executorId);
+    }
