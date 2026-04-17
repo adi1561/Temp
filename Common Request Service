@@ -1,4 +1,4 @@
- @Override
+    @Override
     @Transactional
     public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
 
@@ -40,6 +40,24 @@
 
             // Re-route the DTO to point to our newly isolated batch!
             dto.setBatchId(splitBatchId);
+            
+            // --- ADDED RECALIBRATION LOGIC ---
+            log.info("RECALCULATING_TOTALS | Syncing master headers for {} and {}", originalBatchId, splitBatchId);
+
+            // Dynamically recalculate and update the totals for BOTH batches simultaneously
+            String recalcSql = 
+                "UPDATE JOURNAL_BATCH_MASTER M " +
+                "SET (TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT) = (" +
+                "    SELECT COUNT(1), " +
+                "           NVL(SUM(CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END), 0), " +
+                "           NVL(SUM(CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END), 0) " +
+                "    FROM JOURNAL_REQUEST " +
+                "    WHERE BATCH_ID = M.BATCH_ID" +
+                ") " +
+                "WHERE BATCH_ID IN (?, ?)";
+
+            jdbcTemplate.update(recalcSql, originalBatchId, splitBatchId);
+            // --- END RECALIBRATION LOGIC ---
         }
 
         // 2. Lock the target batch (either the original, or the newly split one)
