@@ -98,3 +98,54 @@ This is the core engine for Excel/CSV validation. We need to update the manual p
 ```
 With these updates, your JournalBulkValidationService will reject bad rows in the Excel/CSV files with the exact same logic your UI uses, preventing any dirty data from ever hitting your GL_BALANCE table!
 What's the next set of changes you'd like to tackle?
+
+
+
+You have a remarkably sharp eye for API security! You caught a critical structural flaw.
+We can write all the strict constraints we want inside our DTOs, but **if we forget to put the @Valid annotation on the Controller endpoint, Spring Boot will completely ignore those constraints** and let bad data pass straight through to your service layer.
+Additionally, your BulkProcessJournalRequestDto is missing a mandatory check on the batchId itself. If a frontend bug sends a null batchId, the backend will waste time processing a broken query.
+Here are the precise fixes to seal these final gaps.
+### 1. File: JournalRequestController.java
+We need to add the @Valid annotation to the updateRequestStatus endpoint. Without this, the strict remarks validation we added to ProcessJournalRequestDto will never be triggered.
+**Existing Code**
+```java
+    @PatchMapping("/update-request")
+    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token, @RequestBody ProcessJournalRequestDto dto) throws JsonProcessingException {
+        return journalRequestService.updateRequestStatus(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token))
+                .orElseThrow(() -> new CustomExceptions.FileProcessingException("Request Update Failed"));
+    }
+
+```
+**Replace Code**
+```java
+    @PatchMapping("/update-request")
+    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token, @Valid @RequestBody ProcessJournalRequestDto dto) throws JsonProcessingException {
+        return journalRequestService.updateRequestStatus(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token))
+                .orElseThrow(() -> new CustomExceptions.FileProcessingException("Request Update Failed"));
+    }
+
+```
+### 2. File: BulkProcessJournalRequestDto.java
+The batchId is the most critical piece of data for bulk approvals/rejections, yet it currently has no validation preventing it from being null or blank. Let's lock it down.
+**Existing Code**
+```java
+public class BulkProcessJournalRequestDto {
+     
+    private String batchId;
+    private List<String> journalIdPrefixes;
+
+```
+**Replace Code**
+```java
+public class BulkProcessJournalRequestDto {
+     
+    @jakarta.validation.constraints.NotBlank(message = "Batch ID is required")
+    private String batchId;
+    
+    private List<String> journalIdPrefixes;
+
+```
+### An Architectural Note on /create-batch-from-cache
+Just a quick heads-up: in your JournalRequestController, the endpoint @PostMapping("/create-batch-from-cache") accepts a raw @RequestBody Map<String, String> payload.
+Because it uses a raw Map instead of a dedicated DTO, Spring's @Valid engine cannot automatically validate it. It works fine for now, but in the future, converting that Map into a proper CacheBatchRequestDto would allow you to add @NotBlank to the requestId and strictly enforce the commonBatchRemarks regex directly at the controller level!
+Everything else in your validation chain looks absolutely airtight now. Do you want to tackle that Map to DTO conversion, or are we ready to move on to the next feature?
