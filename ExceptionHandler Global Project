@@ -1,117 +1,100 @@
+Awesome, let's dive into the bulk operations!
+For the bulk upload, the validation happens in two different places:
+ 1. **The DTOs:** Used when a user *Approves* or *Rejects* a batch (where they enter remarks).
+ 2. **The Validation Service:** Used when the file is parsed row-by-row. We need to update the programmatic if/else checks to enforce the exact same lengths and Regex patterns.
+Here are the precise changes required for both the DTOs and the Validation Service.
+### 1. File: BulkProcessJournalRequestDto.java
+This DTO handles the payload when you click "Accept" or "Reject" on a batch. We need to lock down the executor remarks.
+**Existing Code**
+```java
+    @NotNull
+    private RequestStatus status; 
+    
+    @Size(max = 50)
+    private String remarks;
 
-?? Part 1: The Example Project (Bank API)
-Scenario: A user tries to withdraw money.
-Rules:
- * If the Account ID doesn't exist -> Throw AccountNotFoundException.
- * If Balance < Amount -> Throw InsufficientFundsException.
-1. The Custom Exceptions (The "Flags")
-First, we create simple classes that represent our errors.
-// 1. For when the ID is wrong
-public class AccountNotFoundException extends RuntimeException {
-    public AccountNotFoundException(String message) {
-        super(message);
-    }
-}
+```
+**Replace Code**
+```java
+    @NotNull
+    private RequestStatus status; 
 
-// 2. For when money is low
-public class InsufficientFundsException extends RuntimeException {
-    public InsufficientFundsException(String message) {
-        super(message);
-    }
-}
+    @jakarta.validation.constraints.NotBlank(message = "Remarks are required")
+    @jakarta.validation.constraints.Pattern(regexp = "^[a-zA-Z0-9 ]{2,30}$", message = "Remarks must be 2-30 alphanumeric characters and spaces only")
+    private String remarks;
 
-2. The Global Handler (The "Safety Net") ???
-This is the magic file. It sits above your whole app and catches any error thrown anywhere.
-@RestControllerAdvice // <--- 1. Tells Spring: "I handle all errors globally"
-public class GlobalExceptionHandler {
+```
+### 2. File: ProcessJournalRequestDto.java
+This is used for partial approvals/rejections. We must apply the exact same constraint here.
+**Existing Code**
+```java
+    @NotNull(message = "Status is required")
+    private RequestStatus status;
 
-    // Catch AccountNotFoundException
-    @ExceptionHandler(AccountNotFoundException.class)
-    public ResponseEntity<String> handleNotFound(AccountNotFoundException ex) {
-        // Return 404 Not Found + The Error Message
-        return new ResponseEntity<>(ex.getMessage(), HttpStatus.NOT_FOUND);
-    }
+    @Size(max = 50)
+    private String remarks;
 
-    // Catch InsufficientFundsException
-    @ExceptionHandler(InsufficientFundsException.class)
-    public ResponseEntity<String> handleNoMoney(InsufficientFundsException ex) {
-        // Return 400 Bad Request + The Error Message
-        return new ResponseEntity<>(ex.getMessage(), HttpStatus.BAD_REQUEST);
-    }
-}
+```
+**Replace Code**
+```java
+    @NotNull(message = "Status is required")
+    private RequestStatus status;
 
-3. The Service (Where we throw the bomb ??)
-Notice: No try-catch here! We just throw the error and let the Global Handler catch it.
-@Service
-public class BankService {
+    @jakarta.validation.constraints.NotBlank(message = "Remarks are required")
+    @jakarta.validation.constraints.Pattern(regexp = "^[a-zA-Z0-9 ]{2,30}$", message = "Remarks must be 2-30 alphanumeric characters and spaces only")
+    private String remarks;
 
-    @Autowired
-    private AccountRepo repo;
+```
+### 3. File: JournalBulkValidationService.java (Regex Definitions)
+Your React frontend allows product codes to be *up to* 8 digits (^\d{0,8}$). However, your backend regex strictly demanded *exactly* 8 digits (^\d{8}$). Let's fix that so perfectly valid 4-digit product codes don't get rejected.
+**Existing Code**
+```java
+    private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
+    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
+    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
 
-    public Account withdraw(Long id, double amount) {
-        // 1. Try to find the account
-        Account account = repo.findById(id)
-            .orElseThrow(() -> new AccountNotFoundException("Account ID " + id + " does not exist!")); 
-            // ^^^ If not found, THROW bomb immediately. Code stops here.
+```
+**Replace Code**
+```java
+    private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
+    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{1,8}$");
+    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
 
-        // 2. Check Balance
-        if (account.getBalance() < amount) {
-            throw new InsufficientFundsException("You only have " + account.getBalance());
-            // ^^^ If low balance, THROW bomb.
-        }
+```
+### 4. File: JournalBulkValidationService.java (Method: runFormatCheck)
+This is the core engine for Excel/CSV validation. We need to update the manual programmatic checks to align with the strictly 5-character branch, and the strict alphanumeric 2-30 character remarks.
+**Existing Code**
+```java
+            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches())
+                d.formatErrors.add("Product Code must be 8 digits or Blank");
 
-        // 3. Success Logic
-        account.setBalance(account.getBalance() - amount);
-        return repo.save(account);
-    }
-}
+            if (d.remarks == null || d.remarks.trim().isEmpty()) d.formatErrors.add("Remarks is Mandatory");
+            else if (d.remarks.length() > 30) d.formatErrors.add("Remarks length must be <= 30 chars");
 
-?? Part 2: Your Challenge (The Inventory System)
-Now it is your turn.
-Scenario: An E-Commerce Warehouse.
-Goal: A user wants to buyProduct(Long productId, int quantity).
-The Exceptions You Must Handle:
- * ProductNotFoundException: If the ID is wrong (Return 404).
- * OutOfStockException: If quantity > stock (Return 400).
- * InvalidQuantityException: If quantity <= 0 (e.g., user asks for -5 items) (Return 400).
-I have written the Entity and DTO for you.
-You must write:
- * The 3 Custom Exception Classes.
- * The GlobalExceptionHandler class.
- * The ProductService (Logic + Throwing).
-?? The Code I Provide
-Entity: Product.java
-@Entity
-@Data
-public class Product {
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-    private String name;
-    private int stock; // e.g., 10 items available
-    private double price;
-}
+            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency must be exactly 3 characters");
 
-DTO: OrderRequest.java
-@Data
-public class OrderRequest {
-		private Long productId;
-		private int quantity;
-}
+            if (d.cgl == null || d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
+            else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("CGL must be 10 digits");
 
-Repository: ProductRepo.java
-public interface ProductRepo extends JpaRepository<Product, Long> {}
+            if (d.branch == null || d.branch.trim().isEmpty()) d.formatErrors.add("Branch is Mandatory");
 
-?? Your Task
-Write the code for:
- * ProductNotFoundException.java
- * OutOfStockException.java
- * GlobalExceptionHandler.java (Handle both)
- * ProductService.java (The buyProduct method)
-Hint:
-Inside Service:
- * First check if (quantity <= 0) -> Throw Invalid.
- * Then find Product -> .orElseThrow(...).
- * Then check if (product.getStock() < quantity) -> Throw OutOfStock.
- * Else -> Reduce stock & Save.
-Show me the code! ??
+```
+**Replace Code**
+```java
+            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches())
+                d.formatErrors.add("Product Code must be up to 8 digits or Blank");
+
+            if (d.remarks == null || d.remarks.trim().isEmpty()) d.formatErrors.add("Remarks is Mandatory");
+            else if (!d.remarks.matches("^[a-zA-Z0-9 ]{2,30}$")) d.formatErrors.add("Remarks must be 2-30 alphanumeric characters and spaces only");
+
+            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency must be exactly 3 characters");
+
+            if (d.cgl == null || d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
+            else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("CGL must be 10 digits");
+
+            if (d.branch == null || d.branch.trim().isEmpty()) d.formatErrors.add("Branch is Mandatory");
+            else if (d.branch.trim().length() != 5) d.formatErrors.add("Branch code must be exactly 5 characters");
+
+```
+With these updates, your JournalBulkValidationService will reject bad rows in the Excel/CSV files with the exact same logic your UI uses, preventing any dirty data from ever hitting your GL_BALANCE table!
+What's the next set of changes you'd like to tackle?
