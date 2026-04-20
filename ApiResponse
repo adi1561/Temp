@@ -1,9 +1,167 @@
-1) in branch and cgl search still we are allwing the special char we should not allow not first not last we are not allwoing that char 
-2) the main change is like until and unless we are not filling common batch submit button is not enable 
-which should not happen there are indual remarks are there make that required or compsalrey
-dont make the common batch remarks compasary
+You are making the application highly robust! Adding real-time snackbar warnings provides excellent user feedback, and splitting the validation so that the **Common Remarks are optional** while **Row Remarks are compulsory** is exactly how an enterprise financial ledger should behave.
+To implement this, we will create a dedicated filterAndWarn function inside your component that strictly checks for invalid characters, triggers the Snackbar instantly if the user types one, and strips it out before it ever reaches the input box.
+Here are the precise replacements to make in JournalPosting.js:
+### 1. Update Validation & Add the filterAndWarn Helper
+Find where isRemarksValid and filterSearchInput were defined (around line 97) and **replace them completely** with this block. Make sure this goes *inside* the JournalPosting function so it can use showSnackBar:
+**Replace Code:**
+```javascript
+  // 1. Common remarks can be empty. If filled, must be 2-30.
+  const isCommonRemarksValid = (val) => val.trim().length === 0 || (val.trim().length >= 2 && val.trim().length <= 30);
+  
+  // 2. Row remarks are STRICTLY compulsory (2-30 chars).
+  const isRowRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
 
-3)and also add the snakbar warning if user type not allowed char
-show him warning on each trigger which is allowed
-like add this in every place common batch remarks amount branch cgl every where as i type wrong it show snakbar 
-only char and digits are allowed with full spell
+  // 3. Real-time filter & Snackbar Warning Engine
+  const filterAndWarn = (val, type) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphabets and digits are allowed.";
+
+    if (type === "alphanumeric_space") {
+      filtered = val.replace(/[^a-zA-Z0-9 ]/g, ""); // Strip special chars
+      if (filtered !== val) {
+        hasError = true;
+      }
+      
+      // Strip leading space and collapse double spaces
+      const beforeSpaceTrim = filtered;
+      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+      if (beforeSpaceTrim !== filtered && !hasError) {
+        hasError = true;
+        msg = "Leading or multiple spaces are not allowed.";
+      }
+    }
+
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+    return filtered;
+  };
+
+```
+### 2. Update handleSubmit Logic
+Find your handleSubmit function. We need to apply the separated logic so Common Remarks don't block submission.
+**Find this block at the top of handleSubmit:**
+```javascript
+    if (!isRemarksValid(commonBatchRemarks)) {
+      showSnackBar("Common Batch Remarks are compulsory and must be 2-30 characters.", "error");
+      return;
+    }
+
+```
+**Replace with:**
+```javascript
+    if (!isCommonRemarksValid(commonBatchRemarks)) {
+      showSnackBar("Common Batch Remarks must be 2-30 characters if provided.", "error");
+      return;
+    }
+
+```
+**Find this block further down inside the row loop:**
+```javascript
+        !row.txnType ||
+        !isRemarksValid(row.remarks)
+      ) {
+
+```
+**Replace with:**
+```javascript
+        !row.txnType ||
+        !isRowRemarksValid(row.remarks)
+      ) {
+
+```
+### 3. Update the Common Batch Remarks Input
+Locate the TextField for **Common Batch Remarks**.
+**Replace its onChange and error props with this:**
+```javascript
+            onChange={(e) => {
+              const newValue = filterAndWarn(e.target.value, "alphanumeric_space");
+              if (newValue.length <= 30) {
+                setCommonBatchRemarks(newValue);
+                if (checked) {
+                  setRows(rows.map((row) => ({ ...row, remarks: newValue })));
+                }
+              }
+            }}
+            // ... (keep other props like fullWidth, multiline, etc.)
+            error={commonBatchRemarks.length > 0 && !isCommonRemarksValid(commonBatchRemarks)}
+
+```
+### 4. Update Branch and CGL Autocomplete Inputs
+Locate the onInputChange prop inside the **Branch Autocomplete**.
+**Replace the onInputChange prop with this:**
+```javascript
+                    onInputChange={(event, newInputValue) => {
+                      if (event && event.type === 'change') {
+                        // User typed something -> filter & warn
+                        const cleanInput = filterAndWarn(newInputValue, "alphanumeric_space");
+                        setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+                        searchBranches(cleanInput, row.id);
+                      } else {
+                        // Dropdown selection occurred
+                        setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
+                      }
+                    }}
+
+```
+*(Make this exact same replacement for the **CGL Autocomplete** onInputChange as well!)*
+### 5. Update Amount and Product Code Warnings
+Locate the **Amount** TextField and replace its onChange prop to add the digits/decimal warning:
+**Replace Amount onChange:**
+```javascript
+                    onChange={(e) => {
+                      const rawVal = e.target.value;
+                      const cleanVal = rawVal.replace(/[^0-9.]/g, "");
+                      
+                      if (rawVal !== cleanVal) {
+                        showSnackBar("Only numbers and decimal point are allowed.", "warning");
+                      } else if (cleanVal === "" || amountRegex.test(cleanVal)) {
+                        handleRowChange(row.id, "amount", cleanVal);
+                      } else {
+                        showSnackBar("Exceeded maximum digits or decimal places.", "warning");
+                      }
+                    }}
+
+```
+Locate the **Product Code** TextField and replace its onChange prop:
+**Replace Product Code onChange:**
+```javascript
+                    onChange={(e) => {
+                      const rawVal = e.target.value;
+                      const cleanVal = rawVal.replace(/[^0-9]/g, "");
+                      
+                      if (rawVal !== cleanVal) {
+                        showSnackBar("Only digits are allowed.", "warning");
+                      }
+                      if (cleanVal.length <= 8) {
+                        handleRowChange(row.id, "productCode", cleanVal);
+                      }
+                    }}
+
+```
+### 6. Update Row Remarks Input
+Locate the TextField for **Remarks (Individual)** inside the row grid.
+**Replace its onChange and error props:**
+```javascript
+                    onChange={(e) => {
+                      const val = filterAndWarn(e.target.value, "alphanumeric_space");
+                      if (val.length <= 30) {
+                        handleRowChange(row.id, "remarks", val);
+                      }
+                    }}
+                    // ... (keep other props like fullWidth, disabled={checked}, etc.)
+                    error={row.remarks.length > 0 && !isRowRemarksValid(row.remarks)}
+
+```
+### 7. Re-enable the Submit Button
+Finally, go to the very bottom of the file where the **Submit button** is located.
+**Replace its disabled prop:**
+```javascript
+              disabled={isSubmitting || !isCommonRemarksValid(commonBatchRemarks)}
+
+```
+### Why this is the perfect solution:
+ 1. **No More Button Locking:** The Submit button will now always be clickable as long as the Common Remarks aren't in a broken state (e.g. exactly 1 character).
+ 2. **Instant Feedback:** The exact millisecond the user types @, #, or an invalid space, the character is instantly deleted from the input box, and a Snackbar pops up saying "Only alphabets and digits are allowed."
+ 3. **Smart Autocomplete:** The Branch and CGL fields will filter out special characters immediately while typing, preventing database errors from bad search queries.
