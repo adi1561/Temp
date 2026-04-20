@@ -1,126 +1,28 @@
-I see exactly what happened here.
- 1. **Why special characters still appeared in Branch/CGL:** In Material UI (MUI), an <Autocomplete> manages its own internal text unless you explicitly tell it to use your state by adding the inputValue prop. Because that prop was missing, it fired the warning, cleaned the state, but *visually* allowed the character to stay in the box.
- 2. **Why CGL search broke:** You accidentally pasted the onChange logic meant for the **Amount** field into the **CGL** dropdown! That completely broke the dropdown's ability to select a CGL item.
- 3. **Amount field warning:** The logic for the Amount field didn't get updated in the last copy-paste.
-Let's fix all of this right now. Here are the precise replacements to make your form perfectly strict.
-### 1. Fix the Branch Autocomplete (Strict Input)
-Find the <Autocomplete> component for **Branch** (around line 527). We are going to add the inputValue prop to control the text, and clean up the onInputChange.
-**Find this block:**
+I see exactly why that is happening! When you applied the updates earlier, you successfully added the 3-character rule to the searchBranches function, but it looks like the searchCgls function was accidentally skipped. It is still checking for length === 0.
+Let's fix that specific function so it strictly requires 3 characters before hitting your backend API.
+### Fix the searchCgls Function
+Find the searchCgls function definition (around line 225 in your file).
+**Find this exact block:**
 ```javascript
-                    value={row.branch}
-                    onChange={(event, newValue) =>
-                      handleRowChange(row.id, "branch", newValue)
-                    }
-                  onInputChange={(event, newInputValue) => {
-                      if (event && event.type === 'change') {
-                        // User typed something -> filter & warn
-                        const cleanInput = filterAndWarn(newInputValue, "alphanumeric_space");
-                        setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                        searchBranches(cleanInput, row.id);
-                      } else {
-                        // Dropdown selection occurred
-                        setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                      }
-                    }}
-                    loading={branchSearch.loadingId === row.id}
+  const searchCgls = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query || query.trim().length === 0) {
+        setCglSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
 
 ```
-**Replace with:**
+**Replace it with this:**
 ```javascript
-                    value={row.branch}
-                    onChange={(event, newValue) =>
-                      handleRowChange(row.id, "branch", newValue)
-                    }
-                    // This forces the input box to strictly show ONLY the filtered value
-                    inputValue={branchInputValues[row.id] || ""}
-                    onInputChange={(event, newInputValue, reason) => {
-                      if (reason === 'input') {
-                        const cleanInput = filterAndWarn(newInputValue, "alphanumeric_space");
-                        setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                        searchBranches(cleanInput, row.id);
-                      } else {
-                        setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                      }
-                    }}
-                    loading={branchSearch.loadingId === row.id}
+  const searchCgls = useCallback(
+    debounce(async (query, rowId) => {
+      // Changed from === 0 to < 3 to enforce the minimum character limit
+      if (!query || query.trim().length < 3) {
+        setCglSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
 
 ```
-### 2. Fix the CGL Autocomplete (Broken Dropdown + Strict Input)
-Find the <Autocomplete> component for **CGL** (around line 656). We need to restore the correct onChange handler and apply the same inputValue fix.
-**Find this block:**
-```javascript
-                    value={row.cgl}
-                   onChange={(e) => {
-                      const rawVal = e.target.value;
-                      const cleanVal = rawVal.replace(/[^0-9.]/g, "");
-                      
-                      if (rawVal !== cleanVal) {
-                        showSnackBar("Only numbers and decimal point are allowed.", "warning");
-                      } else if (cleanVal === "" || amountRegex.test(cleanVal)) {
-                        handleRowChange(row.id, "amount", cleanVal);
-                      } else {
-                        showSnackBar("Exceeded maximum digits or decimal places.", "warning");
-                      }
-                    }}
-                    onInputChange={(event, newInputValue) => {
-                      // Apply real-time strict filtering
-                      const cleanInput = filterSearchInput(newInputValue);
-                      setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                      searchCgls(cleanInput, row.id);
-                    }}
-
-```
-**Replace with:**
-```javascript
-                    value={row.cgl}
-                    // Restored the correct onChange for selecting a CGL option
-                    onChange={(event, newValue) =>
-                      handleRowChange(row.id, "cgl", newValue)
-                    }
-                    // This forces the input box to strictly show ONLY the filtered value
-                    inputValue={cglInputValues[row.id] || ""}
-                    onInputChange={(event, newInputValue, reason) => {
-                      if (reason === 'input') {
-                        const cleanInput = filterAndWarn(newInputValue, "alphanumeric_space");
-                        setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                        searchCgls(cleanInput, row.id);
-                      } else {
-                        setCglInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                      }
-                    }}
-
-```
-### 3. Fix the Amount Field (Add Snackbar Warning)
-Find the <TextField> for **Amount** (around line 720).
-**Find this block:**
-```javascript
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      // Dynamic strict validation based on selected currency
-                      if (val === "" || amountRegex.test(val)) {
-                        handleRowChange(row.id, "amount", val);
-                      }
-                    }}
-
-```
-**Replace with:**
-```javascript
-                    onChange={(e) => {
-                      const rawVal = e.target.value;
-                      
-                      // 1. Check for totally illegal characters instantly
-                      if (/[^0-9.]/.test(rawVal)) {
-                        showSnackBar("Only numbers and decimal point are allowed.", "warning");
-                        return; // Block the character
-                      }
-
-                      // 2. Enforce the strict digit/decimal limits
-                      if (rawVal === "" || amountRegex.test(rawVal)) {
-                        handleRowChange(row.id, "amount", rawVal);
-                      } else {
-                        showSnackBar("Exceeded maximum digits or decimal places.", "warning");
-                      }
-                    }}
-
-```
-By adding inputValue={...} to your Autocompletes, React will actively block the special characters from rendering on the screen the moment filterAndWarn strips them out! Your CGL selection will also start working perfectly again.
+Once you make this single line change, the CGL dropdown will behave exactly like the Branch dropdown and will wait until you type at least 3 characters before attempting to search!
