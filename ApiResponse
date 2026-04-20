@@ -1,18 +1,144 @@
-You are making the application highly robust! Adding real-time snackbar warnings provides excellent user feedback, and splitting the validation so that the **Common Remarks are optional** while **Row Remarks are compulsory** is exactly how an enterprise financial ledger should behave.
-To implement this, we will create a dedicated filterAndWarn function inside your component that strictly checks for invalid characters, triggers the Snackbar instantly if the user types one, and strips it out before it ever reaches the input box.
-Here are the precise replacements to make in JournalPosting.js:
-### 1. Update Validation & Add the filterAndWarn Helper
-Find where isRemarksValid and filterSearchInput were defined (around line 97) and **replace them completely** with this block. Make sure this goes *inside* the JournalPosting function so it can use showSnackBar:
-**Replace Code:**
-```javascript
-  // 1. Common remarks can be empty. If filled, must be 2-30.
+still there are many issues in this 
+
+branch is giving warning on type but main thing is we should not allow him to to even enter 
+now its just giving the error 
+
+same for cgl
+
+
+and min thing is i am not able to search in the cgl it is not working 
+on amount there is no snakbar 
+
+cheak properly and tell mi what changes need to be Done 
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Grid,
+  TextField,
+  Button,
+  Paper,
+  IconButton,
+  MenuItem,
+  CircularProgress,
+  Autocomplete,
+  Tooltip,
+  Checkbox,
+  FormControlLabel,
+  Chip,
+  FormHelperText
+} from "@mui/material";
+import AddIcon from "@mui/icons-material/Add";
+import DeleteIcon from "@mui/icons-material/Delete";
+import { debounce } from "lodash";
+
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+const initialRowState = {
+  id: Date.now(),
+  branch: null,
+  currency: "",
+  cgl: null,
+  amount: "",
+  txnType: "",
+  remarks: "",
+  productCode: "",
+};
+
+const formatBigIntForDisplay = (val) => {
+  if (typeof val !== "bigint") {
+    val = BigInt(val || 0);
+  }
+  const str = val.toString().padStart(5, "0");
+  const integer = str.slice(0, -4);
+  const fractional = str.slice(-4);
+  return `${integer || "0"}.${fractional}`;
+};
+export default function JournalPosting() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [rows, setRows] = useState([initialRowState]);
+  const [currencyOptions, setCurrencyOptions] = useState([]);
+
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
+  const [postingDate, setPostingDate] = useState("");
+
+  const [checked, setChecked] = useState(false);
+
+  // Track input values to prevent empty dropdown tray on focus
+  const [branchInputValues, setBranchInputValues] = useState({});
+  const [cglInputValues, setCglInputValues] = useState({});
+
+  const [branchSearch, setBranchSearch] = useState({
+    loadingId: null,
+    options: [],
+  });
+  const [cglSearch, setCglSearch] = useState({
+    loadingId: null,
+    options: []
+  });
+
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        const dateResponse = await callApi(
+          "/JS/journals/current-posting-date",
+          null,
+          "GET"
+        );
+
+        if (dateResponse) {
+          try {
+            const [year, month, day] = dateResponse.split("-");
+            const formattedDate = `${day}-${month}-${year}`;
+            setPostingDate(formattedDate);
+          } catch (e) {
+            console.error("Could not parse date:", dateResponse, e);
+            setPostingDate(dateResponse);
+          }
+        } else {
+          showSnackBar("Failed to load official posting date.", "error");
+          setPostingDate("Error");
+        }
+
+        const currencyResponse = await callApi("/CM/common-master/currency", null, "GET");
+        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
+          const uniqueCurrencies = [...new Set(currencyResponse.data)];
+          setCurrencyOptions(uniqueCurrencies);
+        } else {
+          showSnackBar("Failed to load currencies.", "error");
+        }
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+        showSnackBar("An error occurred while loading page data.", "error");
+      } 
+    };
+
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+  const filterRemarks = (val) => {
+    let filtered = val.replace(/[^a-zA-Z0-9 ]/g, ""); // Allow only alphanumeric and spaces
+    filtered = filtered.replace(/^\s+/, ""); // Remove leading spaces
+    filtered = filtered.replace(/\s{2,}/g, " "); // Replace multiple consecutive spaces with a single space
+    return filtered;
+  };
+
+  // Search input filter: No leading space or special chars allowed
+  // const filterSearchInput = (val) => {
+  //   return val.replace(/[^a-zA-Z0-9 ]/g, "").replace(/^\s+/, "");
+  // };
+    // 1. Common remarks can be empty. If filled, must be 2-30.
   const isCommonRemarksValid = (val) => val.trim().length === 0 || (val.trim().length >= 2 && val.trim().length <= 30);
   
   // 2. Row remarks are STRICTLY compulsory (2-30 chars).
   const isRowRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
 
-  // 3. Real-time filter & Snackbar Warning Engine
-  const filterAndWarn = (val, type) => {
+   const filterAndWarn = (val, type) => {
     let filtered = val;
     let hasError = false;
     let msg = "Only alphabets and digits are allowed.";
@@ -38,61 +164,391 @@ Find where isRemarksValid and filterSearchInput were defined (around line 97) an
     return filtered;
   };
 
-```
-### 2. Update handleSubmit Logic
-Find your handleSubmit function. We need to apply the separated logic so Common Remarks don't block submission.
-**Find this block at the top of handleSubmit:**
-```javascript
-    if (!isRemarksValid(commonBatchRemarks)) {
-      showSnackBar("Common Batch Remarks are compulsory and must be 2-30 characters.", "error");
+  // Both Common Batch Remarks and Row Remarks are now strictly compulsory (2-30 chars)
+  const isRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+  const handleAddRow = () => {
+    const lastRow = rows[rows.length - 1];
+
+    if (
+      !lastRow.branch ||
+      !lastRow.currency ||
+      !lastRow.cgl ||
+      !lastRow.amount ||
+      !lastRow.txnType
+    ) {
+      showSnackBar(
+        "Please fill all required fields (*) in the current row before adding a new one.",
+        "warning"
+      );
       return;
     }
 
-```
-**Replace with:**
-```javascript
+    const newRow = {
+      ...initialRowState,
+      id: Date.now(),
+      remarks: checked ? commonBatchRemarks : "",
+    };
+    setRows([...rows, newRow]);
+  };
+
+  const handleRemarksSync = (event) => {
+    const isChecked = event.target.checked;
+    setChecked(isChecked);
+
+    if (isChecked) {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: commonBatchRemarks,
+      }));
+      setRows(newRows);
+    } else {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: "",
+      }));
+      setRows(newRows);
+    }
+  };
+
+  const handleDeleteRow = (id) => {
+    if (rows.length > 1) {
+      setRows(rows.filter((row) => row.id !== id));
+      // Cleanup input tracking
+      const newBranchInputs = { ...branchInputValues };
+      delete newBranchInputs[id];
+      setBranchInputValues(newBranchInputs);
+      const newCglInputs = { ...cglInputValues };
+      delete newCglInputs[id];
+      setCglInputValues(newCglInputs);
+    } else {
+      showSnackBar("Cannot delete the first row.", "warning");
+    }
+  };
+
+const handleRowChange = (id, field, value) => {
+    setRows((prevRows) =>
+      prevRows.map((row) => {
+        if (row.id === id) {
+          return { ...row, [field]: value };
+        }
+        return row;
+      })
+    );
+  };
+
+  const searchBranches = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query || query.trim().length < 3)  {
+        setBranchSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
+      try {
+        const response = await callApi(
+          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setBranchSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("Branch search failed.", "error");
+        setBranchSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const searchCgls = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query || query.trim().length === 0) {
+        setCglSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
+      try {
+        const response = await callApi(
+          `/JS/cgl-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setCglSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("CGL search failed.", "error");
+        setCglSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+const handleSubmit = async () => {
     if (!isCommonRemarksValid(commonBatchRemarks)) {
       showSnackBar("Common Batch Remarks must be 2-30 characters if provided.", "error");
       return;
     }
 
-```
-**Find this block further down inside the row loop:**
-```javascript
-        !row.txnType ||
-        !isRemarksValid(row.remarks)
-      ) {
+    setIsSubmitting(true);
 
-```
-**Replace with:**
-```javascript
-        !row.txnType ||
+    const cglCheck = new Map();
+    for (const row of rows) {
+      if (!row.branch || !row.currency || !row.cgl) {
+        continue;
+      }
+      const key = `${row.branch.code}-${row.currency}`;
+      const cgl = row.cgl.cglNumber;
+
+      if (!cglCheck.has(key)) {
+        cglCheck.set(key, new Set());
+      }
+
+      const cglSet = cglCheck.get(key);
+      if (cglSet.has(cgl)) {
+        showSnackBar(
+          `Duplicate CGL entry: "${cgl}" is used more than once for branch "${row.branch.name}" and currency "${row.currency}".`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+      cglSet.add(cgl);
+    }
+
+    const branchCurrencyTotals = new Map();
+    const branchEntryCheck = new Map();
+    const rowPayloads = [];
+
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch ||
+        !row.currency ||
+        !row.cgl ||
+        !row.amount ||
+!row.txnType ||
         !isRowRemarksValid(row.remarks)
       ) {
 
-```
-### 3. Update the Common Batch Remarks Input
-Locate the TextField for **Common Batch Remarks**.
-**Replace its onChange and error props with this:**
-```javascript
+        showSnackBar(
+          `Row ${index + 1} is incomplete or has invalid remarks. Please fill all fields (*) and ensure remarks are 2-30 characters.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+
+      const branchCode = row.branch.code;
+      const branchName = row.branch.name;
+      const currency = row.currency;
+
+      const cglNumber = String(row.cgl.cglNumber);
+      const isMemo = cglNumber.startsWith("5");
+      const type = isMemo ? "MEMO" : "NORMAL";
+
+      const [integerPart = "0", fractionalPart = "0"] = (
+        row.amount || "0"
+      ).split(".");
+      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
+      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
+
+      const compositeKey = `${branchCode}-${currency}-${type}`;
+
+      if (!branchCurrencyTotals.has(compositeKey)) {
+        branchCurrencyTotals.set(compositeKey, {
+          totalDebit: 0n,
+          totalCredit: 0n,
+          branchName: branchName,
+          branchCode: branchCode,
+          currency: currency,
+          type: type,
+        });
+      }
+      const currencyTotals = branchCurrencyTotals.get(compositeKey);
+
+      if (row.txnType === "Debit") {
+        currencyTotals.totalDebit += amountAsBigInt;
+      } else if (row.txnType === "Credit") {
+        currencyTotals.totalCredit += amountAsBigInt;
+      }
+
+      if (!branchEntryCheck.has(branchCode)) {
+        branchEntryCheck.set(branchCode, {
+          hasDebit: false,
+          hasCredit: false,
+          branchName: branchName,
+        });
+      }
+      const branchCheck = branchEntryCheck.get(branchCode);
+
+      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
+        branchCheck.hasDebit = true;
+      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
+        branchCheck.hasCredit = true;
+      }
+
+      const finalAmount =
+        row.txnType === "Credit" ? "-" + row.amount : row.amount;
+
+      rowPayloads.push({
+        branch: row.branch.code,
+        currency: row.currency,
+        cgl: row.cgl.cglNumber,
+        amount: finalAmount,
+        productType: row.productCode,
+        remarks: row.remarks,
+        arFlag: "A",
+      });
+    }
+
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit, branchName } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar(
+          `Submission failed. Branch "${branchName}" (${branchCode}) must have at least one Debit and one Credit entry.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit, branchName, branchCode, currency, type } =
+        totals;
+
+      if (totalDebit !== totalCredit) {
+        showSnackBar(
+          `Submission failed. Totals for ${type} entries in branch "${branchName}" (${branchCode}) and currency "${currency}" do not match.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    const finalPayload = {
+      commonBatchRemarks: commonBatchRemarks.trim(),
+      rows: rowPayloads,
+    };
+
+    try {
+      const response = await callApi(
+        "/JS/journals/create-batch",
+        finalPayload,
+        "POST"
+      );
+
+      const newBatchId = response?.[0]?.batchId || "N/A";
+
+      showSnackBar(
+        `All ${response.length} Journal entries submitted successfully! Batch ID: ${newBatchId}`,
+        "success"
+      );
+      setRows([{ ...initialRowState, id: Date.now() }]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+      setBranchInputValues({});
+      setCglInputValues({});
+    } catch (error) {
+      showSnackBar("Journal Batch submission failed", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Box sx={{ p: 3, maxWidth: "98%" }}>
+      <Paper elevation={3} sx={{ p: 3 }}>
+        <Box>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+            <Typography variant="body1" fontWeight="bold" component="span">
+              Posting Date:
+            </Typography>
+            <Typography variant="body1" fontWeight="bold" component="span">
+              {postingDate}
+            </Typography>
+          </Box>
+          <Box sx={{ marginTop: 0.5 }}>
+            <Typography
+              variant="body2"
+              component="span"
+              sx={{ color: "#ec0101ff" }}
+            >
+              Note: All Journals will be Posted on this Date
+            </Typography>
+          </Box>
+        </Box>
+
+        <Grid item xs={12} md={12} sx={{ margin: "1% 0%", width: "95%" }}>
+          <TextField
+            label="Common Batch Remarks"
+            value={commonBatchRemarks}
             onChange={(e) => {
               const newValue = filterAndWarn(e.target.value, "alphanumeric_space");
-              if (newValue.length <= 30) {
+       if (newValue.length <= 30) {
                 setCommonBatchRemarks(newValue);
                 if (checked) {
                   setRows(rows.map((row) => ({ ...row, remarks: newValue })));
                 }
               }
             }}
-            // ... (keep other props like fullWidth, multiline, etc.)
-            error={commonBatchRemarks.length > 0 && !isCommonRemarksValid(commonBatchRemarks)}
+            fullWidth
+            required
+            multiline
+            rows={1}
+            inputProps={{
+              maxLength: 30,
+            }}
+           error={commonBatchRemarks.length > 0 && !isCommonRemarksValid(commonBatchRemarks)}
+          />
+<FormHelperText sx={{ color: "text.secondary" }}>
+            Allowed 2-30 characters (alphabets, numbers, single spaces). Compulsory.
+          </FormHelperText>
+          <Box sx={{ display: "flex", alignItems: "center" }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={checked}
+                  onChange={handleRemarksSync}
+                  color="primary"
+                  disabled={commonBatchRemarks.length > 0 && !isRemarksValid(commonBatchRemarks)}
+                />
+              }
+              label="Apply This Remark To All Below Transaction"
+            />
+          </Box>
+        </Grid>
 
-```
-### 4. Update Branch and CGL Autocomplete Inputs
-Locate the onInputChange prop inside the **Branch Autocomplete**.
-**Replace the onInputChange prop with this:**
-```javascript
-                    onInputChange={(event, newInputValue) => {
+        <Box>
+         {rows.map((row, index) => {
+            // Dynamic regex logic for Amount based on selected currency
+            const isINR = row.currency === "INR";
+            const amountRegex = isINR ? /^\d{0,16}(\.\d{0,2})?$/ : /^\d{0,16}(\.\d{0,4})?$/;
+
+            return (
+            <React.Fragment key={row.id}>
+              <Grid container spacing={2} alignItems="flex-start">
+                {/* Branch */}
+                <Grid item xs={12} md={3} size={1.8}>
+                  <Autocomplete
+                    open={Boolean(branchInputValues[row.id] && branchInputValues[row.id].length > 0)}
+                    onClose={() => setBranchInputValues(prev => ({ ...prev, [row.id]: "" }))}
+                    popupIcon={null}
+                    autoHighlight
+                    options={branchSearch.options}
+                    getOptionLabel={(option) =>
+                      `${option.code} - ${option.name}`
+                    }
+                    value={row.branch}
+                    onChange={(event, newValue) =>
+                      handleRowChange(row.id, "branch", newValue)
+                    }
+                  //  onInputChange={(event, newInputValue) => {
+                  //     // Apply real-time strict filtering
+                  //     const cleanInput = filterSearchInput(newInputValue);
+                  //     setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+                  //     searchBranches(cleanInput, row.id);
+                  //   }}
+                  onInputChange={(event, newInputValue) => {
                       if (event && event.type === 'change') {
                         // User typed something -> filter & warn
                         const cleanInput = filterAndWarn(newInputValue, "alphanumeric_space");
@@ -103,14 +559,95 @@ Locate the onInputChange prop inside the **Branch Autocomplete**.
                         setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
                       }
                     }}
-
-```
-*(Make this exact same replacement for the **CGL Autocomplete** onInputChange as well!)*
-### 5. Update Amount and Product Code Warnings
-Locate the **Amount** TextField and replace its onChange prop to add the digits/decimal warning:
-**Replace Amount onChange:**
-```javascript
+                    loading={branchSearch.loadingId === row.id}
+                    filterOptions={(x) => x}
+                    isOptionEqualToValue={(option, value) =>
+                      option.code === value.code
+                    }
+                    noOptionsText={
+                      (branchInputValues[row.id] || "").length < 3 
+                        ? "Type at least 3 characters..." 
+                        : "Branch not found"
+                    }
+                    renderInput={(params) => (
+                      <Tooltip
+                        title="Search by Branch name or Branch code"
+                        placement="top-start"
+                      >
+                        <TextField
+                          {...params}
+                          label="Branch *"
+                          placeholder="Type to search..."
+                          InputLabelProps={{ shrink: true }}
+                          InputProps={{
+                            ...params.InputProps,
+                            endAdornment: (
+                              <Box>
+                                {branchSearch.loadingId === row.id ? (
+                                  <CircularProgress color="inherit" size={20} />
+                                ) : null}
+                                {params.InputProps.endAdornment}
+                              </Box>
+                            ),
+                          }}
+                        />
+                      </Tooltip>
+                    )}
+             />
+                  <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, display: "block", textAlign: "center" }}>
+                    Min 3 characters required
+                  </Typography>
+                </Grid>
+                {/* Currency */}
+                <Grid item xs={12} md={1.5} size={1.5}>
+                  <TextField
+                    select
+                    label="Currency *"
+                    value={row.currency}
                     onChange={(e) => {
+                      handleRowChange(row.id, "currency", e.target.value);
+                      handleRowChange(row.id, "amount", ""); // Clear amount if currency changes
+                    }}
+                    fullWidth
+                    InputLabelProps={{ shrink: true }}
+                    SelectProps={{
+                      displayEmpty: true,
+                      renderValue: (selected) => {
+                        // If nothing is selected, show this placeholder text in the box
+                        if (!selected) {
+                          return <span style={{ color: 'gray', opacity: 0.8 }}>Select Currency</span>;
+                        }
+                        // Otherwise, show the selected value
+                        return selected;
+                      },
+                      MenuProps: {
+                        anchorOrigin: { vertical: "bottom", horizontal: "left" },
+                        transformOrigin: { vertical: "top", horizontal: "left" },
+                        PaperProps: { style: { maxHeight: 250 } }
+                      }
+                    }}
+                  >
+                    {currencyOptions.map((c) => (
+                      <MenuItem key={c} value={c}>
+                        {c}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+
+                {/* CGL */}
+                <Grid item xs={12} md={2} size={1.8}>
+                  <Autocomplete
+                    open={Boolean(cglInputValues[row.id] && cglInputValues[row.id].length > 0)}
+                    onClose={() => setCglInputValues(prev => ({ ...prev, [row.id]: "" }))}
+                    popupIcon={null}
+                    autoHighlight
+                    options={cglSearch.options}
+                    getOptionLabel={(option) =>
+                      `${option.cglNumber} - ${option.description}`
+                    }
+                    value={row.cgl}
+                   onChange={(e) => {
                       const rawVal = e.target.value;
                       const cleanVal = rawVal.replace(/[^0-9.]/g, "");
                       
@@ -122,11 +659,117 @@ Locate the **Amount** TextField and replace its onChange prop to add the digits/
                         showSnackBar("Exceeded maximum digits or decimal places.", "warning");
                       }
                     }}
+                    onInputChange={(event, newInputValue) => {
+                      // Apply real-time strict filtering
+                      const cleanInput = filterSearchInput(newInputValue);
+                      setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+                      searchCgls(cleanInput, row.id);
+                    }}
+                    loading={cglSearch.loadingId === row.id}
+                    filterOptions={(x) => x}
+                    isOptionEqualToValue={(option, value) =>
+                      option.cglNumber === value.cglNumber
+                    }
+                    noOptionsText={
+                      (cglInputValues[row.id] || "").length < 3 
+                        ? "Type at least 3 characters..." 
+                        : "CGL not found"
+                    }
+                    renderInput={(params) => (
+                      <Tooltip
+                        title="Search by CGL or CGL Description"
+                        placement="top-start"
+                      >
+                        <TextField
+                          {...params}
+                          label="CGL *"
+                          placeholder="Type to search..."
+                          InputLabelProps={{ shrink: true }}
+                          InputProps={{
+                            ...params.InputProps,
+                            endAdornment: (
+                              <Box sx={{ marginLeft: "2%", display: "flex", alignItems: "center" }}>
+                                {row.cgl && String(row.cgl.cglNumber).startsWith("5") && (
+                                  <Chip label="MEMO" size="small" color="warning" sx={{ height: 20, fontSize: "0.7rem", mr: 1 }} />
+                                )}
+                                {cglSearch.loadingId === row.id ? (
+                                  <CircularProgress color="inherit" size={20} />
+                                ) : null}
+                                {params.InputProps.endAdornment}
+                              </Box>
+                            ),
+                          }}
+                        />
+                      </Tooltip>
+                    )}
+                  />
+                  <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, display: "block", textAlign: "center" }}>
+                    Min 3 characters required
+                  </Typography>
+                </Grid>
 
-```
-Locate the **Product Code** TextField and replace its onChange prop:
-**Replace Product Code onChange:**
-```javascript
+                {/* Amount */}
+                <Grid item xs={12} md={2} size={1.5}>
+                  <TextField
+                    label="Amount *"
+                    type="text"
+                    value={row.amount}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      // Dynamic strict validation based on selected currency
+                      if (val === "" || amountRegex.test(val)) {
+                        handleRowChange(row.id, "amount", val);
+                      }
+                    }}
+                    disabled={!row.currency} 
+                    fullWidth
+                    placeholder={isINR ? "0.00" : "0.0000"}
+                    inputProps={{
+                      style: { textAlign: "right" } 
+                    }}
+                  />
+                 <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2 ,display: "block", textAlign: "left" }}>
+                    {!row.currency
+                      ? "Select Currency first"
+                      : isINR
+                        ? "Max 16 digits, 2 decimals"
+                        : "Max 16 digits, 4 decimals"}
+                  </Typography>
+                </Grid>
+
+                {/* Txn Type */}
+                <Grid item xs={12} md={1} size={1.3}>
+                  <TextField
+                    select
+                    label="Type *"
+                    value={row.txnType}
+                    onChange={(e) =>
+                      handleRowChange(row.id, "txnType", e.target.value) 
+                    }
+                    fullWidth
+                    InputLabelProps={{ shrink: true }}
+                    SelectProps={{
+                      displayEmpty: true,
+                      renderValue: (selected) => {
+                        if (!selected) {
+                          return <span style={{ color: 'gray', opacity: 0.8 }}>Type</span>;
+                        }
+                        return selected;
+                      }
+                    }}
+                  >
+
+                    <MenuItem value="Debit">Debit</MenuItem>
+                    <MenuItem value="Credit">Credit</MenuItem>
+                  </TextField>
+                </Grid>
+
+                {/* Product Code */}
+                <Grid item xs={12} md={2} size={1.5}>
+                  <TextField
+
+                    label="Product Code"
+                    value={row.productCode}
                     onChange={(e) => {
                       const rawVal = e.target.value;
                       const cleanVal = rawVal.replace(/[^0-9]/g, "");
@@ -139,29 +782,84 @@ Locate the **Product Code** TextField and replace its onChange prop:
                       }
                     }}
 
-```
-### 6. Update Row Remarks Input
-Locate the TextField for **Remarks (Individual)** inside the row grid.
-**Replace its onChange and error props:**
-```javascript
-                    onChange={(e) => {
+                    fullWidth
+                    inputProps={{
+                      maxLength: 8,
+                    }}
+                  />
+                <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5,ml: 1.2 ,  display: "block", textAlign: "left" }}>
+
+                    Max 8 digits
+                  </Typography>
+                </Grid>
+
+                {/* Remarks (Individual) */}
+                <Grid item xs={12} md={2} size={2}>
+                  <TextField
+                    label="Remarks *"
+                    value={row.remarks}
+                     onChange={(e) => {
                       const val = filterAndWarn(e.target.value, "alphanumeric_space");
                       if (val.length <= 30) {
                         handleRowChange(row.id, "remarks", val);
                       }
                     }}
-                    // ... (keep other props like fullWidth, disabled={checked}, etc.)
+                    fullWidth
+                    inputProps={{
+                      maxLength: 30,
+                    }}
+                    disabled={checked}
                     error={row.remarks.length > 0 && !isRowRemarksValid(row.remarks)}
+                  />
+                  <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary" }}>
+                    Allowed 2-30 characters (alphabets, numbers only)
+                  </Typography>
+                </Grid>
 
-```
-### 7. Re-enable the Submit Button
-Finally, go to the very bottom of the file where the **Submit button** is located.
-**Replace its disabled prop:**
-```javascript
+                {/* Actions */}
+                <Grid item xs={12} md={0.5} sx={{ textAlign: "center" }}>
+                  <IconButton
+                    onClick={() => handleDeleteRow(row.id)}
+                    aria-label="delete row"
+                  >
+                    <DeleteIcon />
+                  </IconButton>
+                </Grid>
+              </Grid>
+
+                {index < rows.length - 1 && (
+                <Box
+                  sx={{
+                    borderBottom: 1,
+                    borderColor: "divider",
+                    my: 2,
+                  }}
+                />
+              )}
+            </React.Fragment>
+            );
+          })}
+
+          <Box sx={{ mt: 3, display: "flex", gap: 2, justifyContent: "right" }}>
+            <Button
+              variant="contained"
+              startIcon={<AddIcon />}
+              onClick={handleAddRow}
+            >
+              Add Row
+            </Button>
+
+            <Button
+              variant="contained"
+              color="success"
+              onClick={handleSubmit}
               disabled={isSubmitting || !isCommonRemarksValid(commonBatchRemarks)}
-
-```
-### Why this is the perfect solution:
- 1. **No More Button Locking:** The Submit button will now always be clickable as long as the Common Remarks aren't in a broken state (e.g. exactly 1 character).
- 2. **Instant Feedback:** The exact millisecond the user types @, #, or an invalid space, the character is instantly deleted from the input box, and a Snackbar pops up saying "Only alphabets and digits are allowed."
- 3. **Smart Autocomplete:** The Branch and CGL fields will filter out special characters immediately while typing, preventing database errors from bad search queries.
+            >
+              {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
+            </Button>
+          </Box>
+        </Box>
+      </Paper>
+    </Box>
+  );
+}
