@@ -1,60 +1,87 @@
-Here are the two exact fixes you need.
-The reason the data is "overriding" the headers when you scroll is because your header background color is currently set to alpha(theme.palette.primary.main, 0.08). The alpha makes it **transparent**, meaning you can see the text scrolling underneath it! We will change it to a solid color.
-We will also completely remove the Journal ID grouping from the table.
-### 1. Fix the Scrolling Overlap (Update Styles)
-Find the styles object at the top of your file. We need to change the tableHeaderCell to have a solid background color so scrolling rows hide behind it properly.
-**Find this block (around line 47):**
+I know exactly what is causing this "shock" effect!
+Currently, when you click the "Next" page arrow, detailLoading becomes true. Because of how the code is written, **it completely destroys the entire table and pagination UI** and replaces it with a tiny loading spinner. The modal height instantly collapses, and then when the data arrives a second later, it violently snaps back to full size.
+To fix this and make it perfectly smooth, we will stop unmounting the table. Instead, we will keep the table and the pagination locked in place, and simply show a semi-transparent white loading overlay *on top* of the table while the next page fetches.
+Here is the exact replacement for the View Details Modal content (around line 535 in JournalAuthorization.js):
+**Replace your entire <DialogContent> block with this:**
 ```javascript
-  tableHeaderCell: {
-    fontWeight: "bold",
-    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
-    whiteSpace: "nowrap",
-    zIndex: 10,
-  },
+        <DialogContent dividers sx={{ p: 0 }}>
+          <Box sx={styles.fixedContentBox}>
+            
+            <TableContainer component={Paper} sx={{ ...styles.tableContainer, position: "relative", minHeight: 350 }}>
+              
+              {/* NEW: SMOOTH LOADING OVERLAY */}
+              {detailLoading && (
+                <Box
+                  sx={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: "100%",
+                    backgroundColor: "rgba(255, 255, 255, 0.6)", // Slight transparent white fade
+                    display: "flex",
+                    justifyContent: "center",
+                    alignItems: "center",
+                    zIndex: 999, // Puts spinner on top of the table
+                  }}
+                >
+                  <CircularProgress />
+                </Box>
+              )}
 
-```
-**Replace it with this:**
-```javascript
-  tableHeaderCell: {
-    fontWeight: "bold",
-    backgroundColor: "#f5f6f8", // FIX: Solid light-grey background so text doesn't show through!
-    color: "text.primary",
-    whiteSpace: "nowrap",
-    zIndex: 10,
-  },
-
-```
-*(Note: You can also safely delete stickyHeaderColumn and stickyBodyColumn from the styles object since we are removing the Journal ID column completely).*
-### 2. Remove "Journal ID" from the Table
-Scroll down to your View Details modal's <DialogContent> (around line 550). We are removing the Journal ID header and the grouped rendering logic.
-**Replace your entire <TableHead> and <TableBody> with this:**
-```javascript
-                    <TableHead>
+              <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                <TableHead>
+                  <TableRow>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Branch</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {batchDetails.length > 0 ? (
+                    batchDetails.map((group) =>
+                      group.map((row) => (
+                        <TableRow key={row.id} hover>
+                          <TableCell align="center">{row.branch}</TableCell>
+                          <TableCell align="center">{row.currency}</TableCell>
+                          <TableCell align="center">{row.cgl}</TableCell>
+                          <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
+                          <TableCell align="center">
+                            <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" />
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    )
+                  ) : (
+                    !detailLoading && (
                       <TableRow>
-                        <TableCell align="center" sx={styles.tableHeaderCell}>Branch</TableCell>
-                        <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
-                        <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
-                        <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
-                        <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
+                        <TableCell colSpan={5} align="center" sx={{ py: 5 }}>
+                          <Typography>No details found.</Typography>
+                        </TableCell>
                       </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {batchDetails.map((group) => {
-                        return group.map((row) => (
-                          <TableRow key={row.id} hover>
-                            <TableCell align="center">{row.branch}</TableCell>
-                            <TableCell align="center">{row.currency}</TableCell>
-                            <TableCell align="center">{row.cgl}</TableCell>
-                            <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
-                            <TableCell align="center">
-                              <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" />
-                            </TableCell>
-                          </TableRow>
-                        ));
-                      })}
-                    </TableBody>
+                    )
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+
+            {/* Pagination is now permanently anchored at the bottom */}
+            <TablePagination
+              component="div"
+              count={detailTotalCount}
+              page={detailPage}
+              onPageChange={handleDetailPageChange}
+              rowsPerPage={detailRowsPerPage}
+              onRowsPerPageChange={handleDetailRowsPerPageChange}
+              rowsPerPageOptions={[10, 25, 50]}
+            />
+          </Box>
+        </DialogContent>
 
 ```
-That's it!
- 1. The table will now correctly show exactly the 5 columns you requested.
- 2. The sticky header will remain firmly locked at the top as you scroll, and the solid background will hide the rows sliding underneath it!
+### Why this fixes it:
+ 1. **No More UI Destruction:** The <TablePagination> and <TableContainer> are no longer inside a ternary ? : operator. They are rendered permanently.
+ 2. **Min Height:** Added minHeight: 350 to the table container so the modal never physically shrinks.
+ 3. **Smooth Overlay:** When you click next, the current rows stay on screen, get a slight white fade, the spinner spins in the center, and then the new rows smoothly pop in.
