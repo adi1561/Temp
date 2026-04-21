@@ -1,87 +1,154 @@
-I know exactly what is causing this "shock" effect!
-Currently, when you click the "Next" page arrow, detailLoading becomes true. Because of how the code is written, **it completely destroys the entire table and pagination UI** and replaces it with a tiny loading spinner. The modal height instantly collapses, and then when the data arrives a second later, it violently snaps back to full size.
-To fix this and make it perfectly smooth, we will stop unmounting the table. Instead, we will keep the table and the pagination locked in place, and simply show a semi-transparent white loading overlay *on top* of the table while the next page fetches.
-Here is the exact replacement for the View Details Modal content (around line 535 in JournalAuthorization.js):
-**Replace your entire <DialogContent> block with this:**
-```javascript
-        <DialogContent dividers sx={{ p: 0 }}>
-          <Box sx={styles.fixedContentBox}>
-            
-            <TableContainer component={Paper} sx={{ ...styles.tableContainer, position: "relative", minHeight: 350 }}>
-              
-              {/* NEW: SMOOTH LOADING OVERLAY */}
-              {detailLoading && (
-                <Box
-                  sx={{
-                    position: "absolute",
-                    top: 0,
-                    left: 0,
-                    width: "100%",
-                    height: "100%",
-                    backgroundColor: "rgba(255, 255, 255, 0.6)", // Slight transparent white fade
-                    display: "flex",
-                    justifyContent: "center",
-                    alignItems: "center",
-                    zIndex: 999, // Puts spinner on top of the table
-                  }}
-                >
-                  <CircularProgress />
-                </Box>
-              )}
-
-              <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
-                <TableHead>
-                  <TableRow>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>Branch</TableCell>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {batchDetails.length > 0 ? (
-                    batchDetails.map((group) =>
-                      group.map((row) => (
-                        <TableRow key={row.id} hover>
-                          <TableCell align="center">{row.branch}</TableCell>
-                          <TableCell align="center">{row.currency}</TableCell>
-                          <TableCell align="center">{row.cgl}</TableCell>
-                          <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
-                          <TableCell align="center">
-                            <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" />
-                          </TableCell>
-                        </TableRow>
-                      ))
-                    )
-                  ) : (
-                    !detailLoading && (
-                      <TableRow>
-                        <TableCell colSpan={5} align="center" sx={{ py: 5 }}>
-                          <Typography>No details found.</Typography>
-                        </TableCell>
-                      </TableRow>
-                    )
-                  )}
-                </TableBody>
-              </Table>
-            </TableContainer>
-
-            {/* Pagination is now permanently anchored at the bottom */}
-            <TablePagination
-              component="div"
-              count={detailTotalCount}
-              page={detailPage}
-              onPageChange={handleDetailPageChange}
-              rowsPerPage={detailRowsPerPage}
-              onRowsPerPageChange={handleDetailRowsPerPageChange}
-              rowsPerPageOptions={[10, 25, 50]}
-            />
-          </Box>
-        </DialogContent>
+This is a great feature. It allows the checker to easily download the batch data, verify it offline, and then return to the system to approve or reject.
+Since you already process Excel files for bulk uploads, you already have the Apache POI library available in your backend.
+Here is the complete implementation for both the Backend API and the Frontend React updates.
+### 1. BACKEND: Add the Service Method
+Open your **JournalRequestService.java** interface and add this method signature:
+```java
+byte[] generateBatchExcel(String batchId);
 
 ```
-### Why this fixes it:
- 1. **No More UI Destruction:** The <TablePagination> and <TableContainer> are no longer inside a ternary ? : operator. They are rendered permanently.
- 2. **Min Height:** Added minHeight: 350 to the table container so the modal never physically shrinks.
- 3. **Smooth Overlay:** When you click next, the current rows stay on screen, get a slight white fade, the spinner spins in the center, and then the new rows smoothly pop in.
+Then, open your **JournalRequestServiceImpl.java** and add the implementation. This method fetches all the rows for the batchId and dynamically builds an Excel file in memory:
+```java
+    @Override
+    public byte[] generateBatchExcel(String batchId) {
+        // Fetch all rows belonging to this batch
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+        
+        if (requests == null || requests.isEmpty()) {
+            throw new CustomExceptions.InvalidDataException("No records found for batch: " + batchId);
+        }
+
+        // Use Apache POI to create the Excel file
+        try (org.apache.poi.xssf.usermodel.XSSFWorkbook workbook = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
+             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+
+            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
+
+            // 1. Create Header Row
+            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
+            String[] headers = {"Journal ID", "Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product", "Date"};
+            
+            for (int i = 0; i < headers.length; i++) {
+                org.apache.poi.ss.usermodel.Cell cell = headerRow.createCell(i);
+                cell.setCellValue(headers[i]);
+            }
+
+            // 2. Populate Data Rows
+            int rowIdx = 1;
+            for (JournalRequest req : requests) {
+                org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx++);
+                
+                row.createCell(0).setCellValue(req.getJournalId() != null ? req.getJournalId() : "");
+                row.createCell(1).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
+                row.createCell(2).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
+                row.createCell(3).setCellValue(req.getCgl() != null ? req.getCgl() : "");
+
+                BigDecimal amount = req.getAmount();
+                if (amount != null) {
+                    row.createCell(4).setCellValue(amount.abs().doubleValue());
+                    row.createCell(5).setCellValue(amount.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
+                } else {
+                    row.createCell(4).setCellValue(0);
+                    row.createCell(5).setCellValue("");
+                }
+
+                row.createCell(6).setCellValue(req.getNarration() != null ? req.getNarration() : "");
+                row.createCell(7).setCellValue(req.getProductCode() != null ? req.getProductCode() : "");
+                row.createCell(8).setCellValue(req.getCsvDate() != null ? req.getCsvDate().toString() : "");
+            }
+
+            workbook.write(out);
+            return out.toByteArray();
+
+        } catch (java.io.IOException e) {
+            log.error("EXCEL_GEN_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e);
+        }
+    }
+
+```
+### 2. BACKEND: Add the Controller Endpoint
+Open your **JournalRequestController.java** and add this API endpoint to serve the generated byte array as a downloadable .xlsx file.
+```java
+    @GetMapping("/download-batch/{batchId}")
+    public org.springframework.http.ResponseEntity<byte[]> downloadBatchExcel(@PathVariable String batchId) {
+        byte[] excelData = journalRequestService.generateBatchExcel(batchId);
+
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
+        headers.setContentDispositionFormData("attachment", "Batch_" + batchId + ".xlsx");
+        headers.setCacheControl("must-revalidate, post-check=0, pre-check=0");
+
+        return new org.springframework.http.ResponseEntity<>(excelData, headers, org.springframework.http.HttpStatus.OK);
+    }
+
+```
+### 3. FRONTEND: Add the Download Logic (JournalAuthorization.js)
+At the top of the file, make sure you import the download icon:
+```javascript
+import { FileDownload as FileDownloadIcon } from "@mui/icons-material";
+
+```
+Next, add this function to handle the API call and trigger the file download. You can place this function anywhere near your other handle... functions (like right below handleCloseViewModal):
+```javascript
+  const handleDownloadExcel = async () => {
+    if (!viewingBatchId) return;
+    
+    try {
+      showSnackBar("Downloading Excel...", "info");
+      // Use 'blob' as the response type!
+      const response = await callApi(
+        `/JS/journals/download-batch/${viewingBatchId}`, 
+        null, 
+        "GET", 
+        "blob", 
+        null, 
+        {}, 
+        false
+      );
+      
+      const blobData = response.data || response;
+      const blob = new Blob([blobData], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = window.URL.createObjectURL(blob);
+      
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", `Batch_${viewingBatchId}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      
+      showSnackBar("Download complete.", "success");
+    } catch (e) {
+      showSnackBar("Failed to download Excel file.", "error");
+    }
+  };
+
+```
+### 4. FRONTEND: Add the Export Button to the Modal
+Find the DialogTitle of your View Details Modal (around line 530). We will add a nice "Export Excel" button right next to the Close icon.
+**Replace your current <DialogTitle> with this:**
+```javascript
+        <DialogTitle sx={styles.dialogTitle}>
+          <Typography variant="h6">
+            Batch Details: {viewingBatchId}
+          </Typography>
+          <Stack direction="row" spacing={2} alignItems="center">
+            <Button 
+              variant="outlined" 
+              size="small" 
+              startIcon={<FileDownloadIcon />} 
+              onClick={handleDownloadExcel}
+              disabled={detailLoading || !viewingBatchId}
+              sx={{ textTransform: "none", borderRadius: 1.5 }}
+            >
+              Export Excel
+            </Button>
+            <IconButton onClick={handleCloseViewModal}>
+              <CloseIcon />
+            </IconButton>
+          </Stack>
+        </DialogTitle>
+
+```
