@@ -1,93 +1,104 @@
-To implement your new regex (const REMARKS_REGEX = /^(?!.* {2})[a-zA-Z0-9\s/&(),.-]*$/;), we need to update the filterAndWarn function so it allows your new special characters (/, &, (), ,, ., -) and continues to automatically prevent double spaces.
-*(Note: The **JournalPostingStatus.js** file does not currently have a "Remarks" text field for deleting batches. If you plan to add one later, you can reuse this exact same logic there!)*
-Here are the precise replacements for **JournalPosting.js** and **JournalAuthorization.js**.
-### 1. Replace the Validation Logic (in BOTH Posting & Authorization files)
-Find your current filterAndWarn function and replace it with this updated block. I have added your requested Regex as a comment at the top of the function for developer reference.
+To prevent a 0 (zero) amount from being accepted in both manual entry and bulk uploads, we need to update the backend manual batch creation logic and the frontend submission logic.
+*(Note: Your **Bulk Upload Backend** (JournalBulkValidationService.java at line 580) actually **already** has a strict zero-check built in: if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) d.formatErrors.add("Amount cannot be Zero or Null");. So bulk upload is already perfectly protected!)*
+Here are the exact replacements to completely block zero amounts for Manual Posting.
+### 1. Backend: Block Zero in JournalRequestServiceImpl.java
+Find the createBatchRequest method (around line 852). We need to throw an error if the amount is zero.
 **Find this block:**
+```java
+            // Strict Cross-Field Validation for INR
+            if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
+                throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
+            }
+
+            entity.setAmount(amount);
+
+```
+**Replace it with this:**
+```java
+            // Strict Cross-Field Validation for INR
+            if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
+                throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
+            }
+
+            // PREVENT ZERO AMOUNT
+            if (amount.compareTo(BigDecimal.ZERO) == 0) {
+                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
+            }
+
+            entity.setAmount(amount);
+
+```
+### 2. Frontend: Disable Submit Button in JournalPosting.js
+We need to update the form-readiness check so the Submit button stays grayed out if any row has an amount of 0 or 0.00.
+**Find this block (right above the return ( statement at the bottom of JournalPosting.js):**
 ```javascript
-const filterAndWarn = (val, type) => {
-    let filtered = val;
-    let hasError = false;
-    let msg = "Only alphabets and digits are allowed.";
-    // ...
+    // NEW LOGIC: Check if EVERY row is completely filled, including the compulsory 2-30 char remarks
+    const isFormReadyToSubmit = rows.every(
+      (row) =>
+        row.branch &&
+        row.currency &&
+        row.cgl &&
+        row.amount &&
+        row.txnType &&
+        isRowRemarksValid(row.remarks)
+    );
 
 ```
 **Replace it with this:**
 ```javascript
-  // Validation Rule: No double spaces, allowed chars: alphanumeric, spaces, / & ( ) , . -
-  // const REMARKS_REGEX = /^(?!.* {2})[a-zA-Z0-9\s/&(),.-]*$/;
+    // NEW LOGIC: Check if EVERY row is completely filled, and amount is strictly greater than 0
+    const isFormReadyToSubmit = rows.every(
+      (row) =>
+        row.branch &&
+        row.currency &&
+        row.cgl &&
+        row.amount &&
+        parseFloat(row.amount) > 0 && // Blocks 0, 0.0, 0.00
+        row.txnType &&
+        isRowRemarksValid(row.remarks)
+    );
 
-  const filterAndWarn = (val, type) => {
-    let filtered = val;
-    let hasError = false;
-    let msg = "Only alphanumeric and / & ( ) , . - are allowed.";
-
-    if (type === "alphanumeric_space") {
-      // 1. Strip any character that is NOT alphanumeric or in the allowed special chars list
-      filtered = val.replace(/[^a-zA-Z0-9\s/&(),.-]/g, ""); 
-      if (filtered !== val) {
-        hasError = true;
+```
+### 3. Frontend: Block Zero in the handleSubmit loop
+To be absolutely safe, we will also block the submission in the handleSubmit function loop and show a Snackbar warning if they somehow bypass the button.
+**Find this block inside your handleSubmit function:**
+```javascript
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch ||
+        !row.currency ||
+        !row.cgl ||
+        !row.amount ||
+        !row.txnType ||
+        !isRowRemarksValid(row.remarks)
+      ) {
+        showSnackBar(
+          `Row ${index + 1} is incomplete or has invalid remarks. Please fill all fields (*) and ensure remarks are 2-30 characters.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
       }
-      
-      // 2. Strip leading space and collapse double spaces (enforces the (?!.* {2}) regex rule)
-      const beforeSpaceTrim = filtered;
-      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
-      if (beforeSpaceTrim !== filtered && !hasError) {
-        hasError = true;
-        msg = "Remark should not start with space or contain consecutive spaces.";
+
+```
+**Replace it with this:**
+```javascript
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch ||
+        !row.currency ||
+        !row.cgl ||
+        !row.amount ||
+        parseFloat(row.amount) === 0 || // Explicitly block zero amounts
+        !row.txnType ||
+        !isRowRemarksValid(row.remarks)
+      ) {
+        showSnackBar(
+          `Row ${index + 1} is incomplete or has a zero amount. Amount must be greater than 0, and remarks must be 2-30 characters.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
       }
-    }
-
-    if (hasError) {
-      showSnackBar(msg, "warning");
-    }
-    return filtered;
-  };
-
-```
-### 2. Update the Helper Text in JournalPosting.js
-So the user knows they can now use those special characters, find the helper texts under the text boxes and update them.
-**Find this (under Common Batch Remarks):**
-```javascript
-<FormHelperText sx={{ color: "text.secondary" }}>
-  Allowed 2-30 characters (alphabets, numbers, single spaces). Compulsory.
-</FormHelperText>
-
-```
-**Replace with:**
-```javascript
-<FormHelperText sx={{ color: "text.secondary" }}>
-  Allowed 2-30 chars (alphanumeric, single spaces, / & ( ) , . -). Compulsory.
-</FormHelperText>
-
-```
-**Find this (under the Row Remarks):**
-```javascript
-<Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary" }}>
-  Allowed 2-30 characters (alphabets, numbers only)
-</Typography>
-
-```
-**Replace with:**
-```javascript
-<Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary" }}>
-  Allowed 2-30 chars (alphanumeric, single spaces, / & ( ) , . -)
-</Typography>
-
-```
-### 3. Update the Helper Text in JournalAuthorization.js
-Update the text under the Main Dialog and Partial Dialog remarks.
-**Find this (in two places in the Dialogs):**
-```javascript
-<Typography sx={styles.helperText}>
-  Allowed 2-30 characters (alphabets, numbers)
-</Typography>
-
-```
-**Replace with:**
-```javascript
-<Typography sx={styles.helperText}>
-  Allowed 2-30 chars (alphanumeric, single spaces, / & ( ) , . -). Compulsory.
-</Typography>
 
 ```
