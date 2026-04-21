@@ -1,60 +1,138 @@
-This is the final piece of the puzzle for a perfect user experience!
-Because your "Apply This Remark" checkbox already copies the text into every row's remarks field in the background, all we have to do is tell the Submit button to look at the rows and ask: *"Are all required fields and remarks filled out?"*
-If any row is missing a valid remark (or a branch, currency, etc.), the button stays gray. The moment you check the box and those remarks copy down, the button will instantly turn green!
-Here are the exact two steps to add this logic to JournalPosting.js.
-### 1. Create the Form Readiness Check
-Find the return ( statement where your JSX UI begins (around line 430, right after the handleSubmit function ends).
-**Insert this logic right *above* the return statement:**
-```javascript
-    // ... end of handleSubmit function ...
+This is an excellent architectural decision. If a batch fails to sync to the Data Lake (HDFS) or fails inside Oracle, rolling back the entire transaction guarantees strict financial consistency.
+By mapping the locked state (QUEUED) to **PROCESSING** on the frontend, the user gets immediate visual feedback that the system is working on their request. If it fails, rolling it back to **PENDING** and sending them a notification gives them full control to retry the action.
+Here are the **5 exact method replacements** you need to make in your **JournalRequestServiceImpl.java** file.
+### 1. Update executeAsyncBatchProcessing
+*We are updating the catch blocks to pass dto.getStatus() so the error handler knows if the user was trying to Approve or Reject.*
+```java
+    @Override
+    @Async("bulkExecutor")
+    public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
+        String batchId = dto.getBatchId();
+        MDC.put("batchId", batchId);
+        MDC.put("user", executorId);
+        long start = System.currentTimeMillis();
 
-    // NEW LOGIC: Check if EVERY row is completely filled, including the compulsory 2-30 char remarks
-    const isFormReadyToSubmit = rows.every(
-      (row) =>
-        row.branch &&
-        row.currency &&
-        row.cgl &&
-        row.amount &&
-        row.txnType &&
-        isRowRemarksValid(row.remarks)
-    );
-
-    return (
-      <Box sx={{ p: 3, maxWidth: "98%" }}>
-
-```
-### 2. Update the Submit Button
-Scroll to the very bottom of the file where the **Submit** button is located. We will add the new isFormReadyToSubmit check to the disabled property.
-**Find this block:**
-```javascript
-            <Button
-              variant="contained"
-              color="success"
-              onClick={handleSubmit}
-              disabled={isSubmitting || !isCommonRemarksValid(commonBatchRemarks)}
-            >
-              {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
-            </Button>
+        try {
+            self.executeApprovalInTransaction(dto, executorId);
+            log.info("BATCH_PROCESSING_DONE | Batch: {} | Status: {} | Duration: {}ms", batchId, dto.getStatus(), System.currentTimeMillis() - start);
+        } catch (org.springframework.dao.PessimisticLockingFailureException e) {
+            log.error("DATABASE_LOCK_TIMEOUT | Batch: {} | Status: GL_BALANCE row locked", batchId);
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "System is busy. Please retry in 1 minute.");
+        } catch (DataAccessException e) {
+            log.error("PROCEDURE_EXEC_FAIL | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "Database execution error during approval.");
+        } catch (Exception e) {
+            log.error("INTERNAL_PROCESSING_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "An internal logic error occurred.");
+        } finally {
+            MDC.clear();
+        }
+    }
 
 ```
-**Replace it with this:**
-```javascript
-            <Button
-              variant="contained"
-              color="success"
-              onClick={handleSubmit}
-              // Button is disabled if submitting, if common remarks are invalid, OR if any row is missing data/remarks!
-              disabled={
-                isSubmitting || 
-                !isCommonRemarksValid(commonBatchRemarks) || 
-                !isFormReadyToSubmit
-              }
-            >
-              {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
-            </Button>
+### 2. Update executeApprovalInTransaction (The HDFS Block)
+*Find the try-catch block for hdfsSyncService. We are now forcing it to throw an exception if HDFS fails. Because this method is @Transactional, throwing the exception will **instantly roll back all Oracle changes**!*
+```java
+            try {
+                hdfsSyncService.syncToDataLake(syncData);
+            } catch (Exception hdfsEx) {
+                log.error("HDFS_SYNC_FAIL | Batch: {} | Error: {} | Status: Rolling back Oracle transaction", batchId, hdfsEx.getClass().getSimpleName());
+                // Throwing this exception triggers the @Transactional rollback in Oracle!
+                throw new CustomExceptions.DatabaseOperationException("Data Lake Sync Failed. Oracle changes rolled back.", hdfsEx);
+            }
+
+            progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
+            notificationWriterService.createBatchApprovedNotification(batchId, creatorId, executorId);
 
 ```
-### How it works now:
- 1. When you load the page, the Submit button is **disabled** because the first row doesn't have a remark yet.
- 2. If you manually type a remark into Row 1 (along with the branch, amount, etc.), the Submit button **enables**.
- 3. If you clear Row 1's remark, type "Monthly Adjustment" into the Common Batch Remarks, and click the **"Apply This Remark To All"** checkbox... React instantly copies "Monthly Adjustment" into Row 1, sees that all rows are now valid, and **instantly enables the Submit button!**
+### 3. Update handleAsyncApprovalError
+*This now takes the actionStatus to determine the notification message, resets the batch to PENDING, and alerts the user.*
+```java
+    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String msg) {
+        // Revert to PENDING and wipe the error message from remarks
+        jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?", batchId);
+        progressService.sendProgress(batchId, executorId, 0, "FAILED", msg);
+        
+        // Send notification to the user who tried to perform the action
+        String actionName = (actionStatus == RequestStatus.ACCEPTED) ? "approve" : "reject";
+        String notifMsg = String.format("Failed to %s Journal Batch '%s'. It has been returned to PENDING.", actionName, batchId);
+        
+        try {
+            notificationWriterService.createNotification(executorId, null, notifMsg, "/journal-view/" + batchId, batchId, "JournalService");
+        } catch (Exception e) {
+            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notification to {}", batchId, executorId);
+        }
+    }
+
+```
+### 4. Update getPendingBatchSummaries
+*This maps the locked database state to **PROCESSING** so the user visually sees the progress tag in the UI grid.*
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchSummaries() {
+        // Query QUEUED and ERROR to catch any locked/legacy records so they don't vanish
+        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS " +
+                "FROM JOURNAL_BATCH_MASTER WHERE BATCH_STATUS IN ('PENDING', 'QUEUED', 'ERROR') ORDER BY REQ_DATE DESC";
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
+            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
+            
+            String dbStatus = rs.getString("BATCH_STATUS");
+            if ("QUEUED".equals(dbStatus)) {
+                // Show as PROCESSING in the UI while the backend is working
+                map.put("requestStatus", "PROCESSING");
+            } else {
+                map.put("requestStatus", "PENDING");
+            }
+            
+            // Completely hide any error messages from the frontend UI
+            map.put("errorMessage", null);
+            
+            return map;
+        });
+    }
+
+```
+### 5. Update getAllBatchSummaries
+*This applies the exact same status mapping rules to the History screen.*
+```java
+    @Override
+    public List<Map<String, Object>> getAllBatchSummaries() {
+        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_ID, EXECUTOR_REMARKS " +
+                "FROM JOURNAL_BATCH_MASTER ORDER BY REQ_DATE DESC FETCH FIRST 100 ROWS ONLY";
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
+            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
+            
+            String dbStatus = rs.getString("BATCH_STATUS");
+            if ("QUEUED".equals(dbStatus)) {
+                map.put("requestStatus", "PROCESSING");
+                map.put("executorRemarks", null); // Wipe error remarks
+            } else if ("ERROR".equals(dbStatus)) {
+                map.put("requestStatus", "PENDING");
+                map.put("executorRemarks", null); // Wipe error remarks
+            } else {
+                map.put("requestStatus", dbStatus);
+                map.put("executorRemarks", rs.getString("EXECUTOR_REMARKS"));
+            }
+            
+            map.put("executorId", rs.getString("EXECUTOR_ID"));
+            return map;
+        });
+    }
+
+```
