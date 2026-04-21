@@ -1,32 +1,76 @@
-Ah, I see it! You almost had it, but the detailLoading condition is still sitting inside the button's disabled property. That is what's causing the grey flash when you click the next arrow.
-If you look around **line 546** in the code you just pasted, your button currently looks like this:
-```javascript
-            <Button
-              variant="outlined"
-              size="small"
-              startIcon={<FileDownloadIcon />}
-              onClick={handleDownloadExcel}
-              
-              disabled={detailLoading || !viewingBatchId} // <-- This detailLoading is causing the flash!
-              sx={{ textTransform: "none", borderRadius: 1.5  }}
-            >
-              Export Excel
-            </Button>
-
-```
-### The Fix:
-Simply delete detailLoading || from that line. **Replace that whole <Button> block with this exact code:**
-```javascript
-            <Button
-              variant="outlined"
-              size="small"
-              startIcon={<FileDownloadIcon />}
-              onClick={handleDownloadExcel}
-              disabled={!viewingBatchId} // <-- detailLoading is removed!
-              sx={{ textTransform: "none", borderRadius: 1.5  }}
-            >
-              Export Excel
-            </Button>
-
-```
-Once you remove that, the button will stay perfectly white and clickable while the table smoothly loads the next page!
+This is the perfect time to do a "dead code" sweep. Since we successfully shifted the architecture to an **All-or-Nothing Batch Level** system (meaning you approve, reject, or delete entire batches, never individual rows or partial selections), we have several methods and endpoints that are now completely useless.
+Deleting these will significantly reduce your technical debt and make the codebase much easier to maintain.
+Here is the exact list of files and the specific methods/variables you need to **completely delete** from your backend:
+### 1. The Controller (Endpoints no longer used by React)
+**File:** src/main/java/com/fincore/JournalService/Controllers/JournalRequestController.java
+ * **DELETE this entire method:**
+   ```java
+   @DeleteMapping("/my-requests/by-journal-list")
+   public ResponseEntity<Map<String, String>> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @RequestBody List<String> list) {
+       journalRequestService.cancelMyRequestsByJournalPrefixes(list, jwtUtil.getUserIdFromToken(token));
+       return ResponseEntity.ok(Map.of("status", "SUCCESS"));
+   }
+   
+   ```
+   *Why?* You removed the "Delete Selected" button from the UI, so this endpoint will never be called again.
+### 2. The DTO (Fields no longer sent by React)
+**File:** src/main/java/com/fincore/JournalService/Dto/BulkProcessJournalRequestDto.java
+ * **DELETE this variable:**
+   ```java
+   private List<String> journalIdPrefixes;
+   
+   ```
+   *Why?* The React handleSubmitAction now only sends batchId, status, and remarks. It no longer sends an array of selected prefixes.
+### 3. The Repository (Unused Custom Queries)
+**File:** src/main/java/com/fincore/JournalService/Repository/JournalRequestRepository.java
+ * **DELETE this native query method:**
+   ```java
+   @Modifying
+   @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE JOURNAL_ID IN (:journalIds) AND CREATOR_ID = :userId", nativeQuery = true)
+   void deleteJournalsNative(@Param("journalIds") List<String> journalIds, @Param("userId") String userId);
+   
+   ```
+ * **DELETE this finder method:**
+   ```java
+   List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
+   
+   ```
+### 4. The Service Interface (Dead Definitions)
+**File:** src/main/java/com/fincore/JournalService/Service/JournalRequestService.java
+ * **DELETE all of these method signatures:**
+   ```java
+   // Delete all of these. They are either partial-approvals or old synchronous versions
+   String createBulkBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
+   String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException;
+   List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole);
+   void cancelMyRequestsByBatchId(String batchId, String userId);
+   void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId);
+   void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId);
+   // You can also delete this commented out line:
+   // int deleteBatchChunk(String batchId, String userId);
+   
+   ```
+### 5. The Service Implementation (Dead Logic)
+**File:** src/main/java/com/fincore/JournalService/Service/JournalRequestServiceImpl.java
+ * Scroll to the bottom of the file (around line 876 in your provided code) where the @Override methods are bunched together.
+ * **DELETE all of these implementation blocks:**
+   ```java
+   @Override @Transactional public void cancelMyRequestsByBatchId(String b, String u) { cancelMyRequestsByBatchIdAsync(b, u); }
+   @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> l, String u) { journalRequestRepository.deleteJournalsNative(l, u); }
+   @Override @Transactional public void cancelMyRequestsByJournalPrefix(String p, String u) {}
+   @Override public String createBulkBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException { return ""; }
+   @Override public String createBatchFromCache(String r, String m, String u, Integer o) throws IOException { return createBatchFromCacheAsync(r, m, u, o); }
+   @Override public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto d, String u, Integer r) { processBulkRequestsAsync(d, u, r); return Collections.emptyList(); }
+   
+   ```
+### 6. The UI Validation Model (Optional cleanup)
+**File:** src/main/java/com/fincore/JournalService/Service/JournalBulkValidationService.java
+ * In the ExcelRowData class at the very bottom, you can technically delete:
+   ```java
+   @JsonProperty("16") // sysDate (or whatever number it was mapped to)
+   public String sysDate = "";
+   // along with sysSite, sysYear, sysPeriod IF you no longer use the "01" System file format. 
+   
+   ```
+   *(Note: Only delete the sys... variables if you are strictly doing Standard CSV uploads now and have completely abandoned the old legacy System format parsing).*
+Once you delete these 5 sections, your codebase will perfectly mirror your new, optimized UI design!
