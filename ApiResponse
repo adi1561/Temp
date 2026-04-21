@@ -1,98 +1,56 @@
-I know exactly what is happening! This error proves that the handleDownloadExcel function is still physically **outside** of your main React component.
-Because it is outside the component, it has no idea what viewingBatchId is (since that is a React state variable safely locked *inside* your component).
-Here is exactly how to fix it:
-### Step 1: CUT the function from its current location
-Right now, your code looks something like this around line 115-135. **Delete or Cut** this entire block from where it currently is:
-```javascript
-// --- DELETE IT FROM HERE ---
-const getTxnTypeColor = (txnType) =>
-  txnType === "Credit" ? "error" : "success";
+    @Override
+    public byte[] generateBatchExcel(String batchId) {
+        // Fetch all rows belonging to this batch
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+        
+        if (requests == null || requests.isEmpty()) {
+            throw new CustomExceptions.InvalidDataException("No records found for batch: " + batchId);
+        }
 
-const handleDownloadExcel = async () => {
-    if (!viewingBatchId) return;
-    
-    try {
-      showSnackBar("Downloading Excel...", "info");
-      // ... rest of the function ...
-    } catch (e) {
-      showSnackBar("Failed to download Excel file.", "error");
+        // Use Apache POI to create the Excel file
+        try (org.apache.poi.xssf.usermodel.XSSFWorkbook workbook = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
+             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+
+            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
+
+            // 1. Create Header Row (Journal ID removed)
+            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
+            String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product", "Date"};
+            
+            for (int i = 0; i < headers.length; i++) {
+                org.apache.poi.ss.usermodel.Cell cell = headerRow.createCell(i);
+                cell.setCellValue(headers[i]);
+            }
+
+            // 2. Populate Data Rows
+            int rowIdx = 1;
+            for (JournalRequest req : requests) {
+                org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx++);
+                
+                // Shifted all indexes down by 1 since Journal ID is gone
+                row.createCell(0).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
+                row.createCell(1).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
+                row.createCell(2).setCellValue(req.getCgl() != null ? req.getCgl() : "");
+
+                BigDecimal amount = req.getAmount();
+                if (amount != null) {
+                    row.createCell(3).setCellValue(amount.abs().doubleValue());
+                    row.createCell(4).setCellValue(amount.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
+                } else {
+                    row.createCell(3).setCellValue(0);
+                    row.createCell(4).setCellValue("");
+                }
+
+                row.createCell(5).setCellValue(req.getNarration() != null ? req.getNarration() : "");
+                row.createCell(6).setCellValue(req.getProductCode() != null ? req.getProductCode() : "");
+                row.createCell(7).setCellValue(req.getCsvDate() != null ? req.getCsvDate().toString() : "");
+            }
+
+            workbook.write(out);
+            return out.toByteArray();
+
+        } catch (java.io.IOException e) {
+            log.error("EXCEL_GEN_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e);
+        }
     }
-};
-
-function CustomNoRowsOverlay() {
-// ----------------------------
-
-```
-### Step 2: PASTE it inside the component
-Scroll down to where your main component starts (export default function JournalAuthorization() {).
-Look for your list of useState variables (around line 175). **Paste the function right below your state variables**, like this:
-```javascript
-export default function JournalAuthorization() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-  const isMounted = useRef(true);
-  const [currentUserId, setCurrentUserId] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState([]);
-
-  // ... (other state variables) ...
-  const [detailPage, setDetailPage] = useState(0);
-  const [detailRowsPerPage, setDetailRowsPerPage] = useState(10);
-  const [detailTotalCount, setDetailTotalCount] = useState(0);
-
-  // 👇 PASTE IT EXACTLY HERE, INSIDE THE COMPONENT 👇
-  const handleDownloadExcel = async () => {
-    console.log("Export button clicked! Batch ID is:", viewingBatchId);
-
-    if (!viewingBatchId) {
-      showSnackBar("Error: Batch ID is missing!", "error");
-      return;
-    }
-    
-    try {
-      showSnackBar("Downloading Excel...", "info");
-      
-      const response = await callApi(
-        `/JS/journals/download-batch/${viewingBatchId}`, 
-        null, 
-        "GET", 
-        "blob", 
-        null, 
-        {}, 
-        false
-      );
-      
-      const blobData = response.data || response;
-      if (!blobData) {
-        throw new Error("No data received from backend");
-      }
-
-      const blob = new Blob([blobData], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      const url = window.URL.createObjectURL(blob);
-      
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", `Batch_${viewingBatchId}.xlsx`);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
-      
-      showSnackBar("Download complete.", "success");
-    } catch (e) {
-      console.error("Download failed:", e);
-      let errorMsg = "Failed to download Excel file.";
-      if (e.response && e.status === 404) {
-          errorMsg = "API endpoint not found (404).";
-      }
-      showSnackBar(errorMsg, "error");
-    }
-  };
-  // 👆 ------------------------------------------- 👆
-
-  useEffect(() => {
-    isMounted.current = true;
-// ...
-
-```
-By moving it **inside** export default function JournalAuthorization() { ... }, the function will finally be able to see the viewingBatchId variable and the callApi function! Save the file and try clicking the button again.
