@@ -1,23 +1,168 @@
-i think u miss understand me why are u showing the branch there should batch only 
-Batch Details: 0002356
-this batch
+Ah, I completely understand now. I took your previous question about "branch-wise" too literally and led us down the wrong path. Let's completely scrap the branch grouping!
+You want **Batch ID** (e.g., 0002356) to be used for the whole batch, and a **completely different number for the Journal Prefix** (e.g., 0004977 from JRNL_SEQ) so they don't look identical. And in the View Details modal, it should just group by that new, distinct Journal Prefix.
+Here is exactly how to fix the backend to generate two different numbers, and revert the frontend back to grouping by the Journal Prefix.
+### 1. BACKEND: Generate Different Numbers (JournalRequestServiceImpl.java)
+You need to fetch the two sequences separately and pass the distinct Journal Prefix down to where the IDs are created.
+**A. Manual Upload (createBatchRequest)**
+Find the createBatchRequest method. Generate both IDs and use the journalPrefix for the rows.
+```java
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = sequenceService.getNextBatchId(); // e.g., 0002356
+        String journalPrefix = sequenceService.getNextJournalIdPrefix(); // e.g., 0004977
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
 
-and when full batch is accepted it should be using the 0002356 batch id not using the branch
-Dont show branch there show batch
+        List<JournalRequest> entities = new ArrayList<>();
+        // ... (skip down to the loop) ...
 
-0002356-1	USD	1122505001	1000.0000	
-Credit
-0002356-2	USD	1208505003	1000.0000	
-Debit
-0002356-5	USD	1122505001	1000.0000	
-Credit
-0002356-6	USD	1208505003	1000.0000	
-Debit
-0002356-9	USD	1122505001	1000.0000	
-Credit
-0002356-10
+        for (BatchRequestDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            entity.setBatchId(batchId); // Master Batch gets 0002356
 
-this is what we are genrating 
-but i told u i dont want this 
+            // FIX: Rows get the distinct prefix 0004977-1, 0004977-2
+            String journalId = journalPrefix + "-" + rowIndex; 
+            entity.setJournalId(journalId);
+            
+            // ... rest of entity setting
 
-0002356 and 0002356 prefix should not be same i told u still are doing the same 
+```
+**B. Bulk Upload Init (createBatchFromCacheAsync)**
+Find createBatchFromCacheAsync. Generate both IDs here and pass them to the async worker.
+```java
+        try {
+            String batchId = sequenceService.getNextBatchId(); // e.g., 0002356
+            String journalPrefix = sequenceService.getNextJournalIdPrefix(); // e.g., 0004977
+            
+            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
+            
+            // Pass BOTH down!
+            self.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole);
+            return batchId;
+        }
+
+```
+**C. Bulk Upload Worker (executeAsyncBatchCreation & processChunkRaw)**
+Update the signatures to accept both strings.
+```java
+    // 1. Update signature
+    @Override
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+// ...
+// 2. Pass it into the chunk processor
+                                self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+
+```
+Update processChunkRaw to use the prefix for the jId:
+```java
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
+                                String batchId,
+                                String journalPrefix, // Add this to signature
+                                String commonRemarks, // ...
+// ...
+// Inside the batchUpdate loop:
+                    int globalIdx = globalOffset + i + 1;
+                    // FIX: Use distinct prefix! Result: 0004977-1
+                    String jId = journalPrefix + "-" + globalIdx; 
+
+```
+### 2. FRONTEND: Group by the Distinct Journal Prefix (JournalAuthorization.js)
+We will undo the branch logic and ensure the View Details table groups perfectly by the journalPrefix (which will now be 0004977).
+**A. Revert fetchBatchDetailsPaginated to group by Prefix:**
+```javascript
+            // Inside the loop:
+            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
+            const prefix = String(jId).split("-")[0]; // Extracts 0004977
+
+            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
+
+            const row = {
+              ...req,
+              journalPrefix: prefix, // Save the distinct prefix
+              amount: Math.abs(amountVal),
+              transactionType: amountVal < 0 ? "Credit" : "Debit",
+              branch: req.branchCode || req.reqBranchCode || "-",
+              currency: req.currency || req.reqCurrency || "-",
+              cgl: req.cgl || req.reqCgl || "-",
+              remarks: req.narration || req.reqNarration || "-",
+              product: req.productCode || req.reqProduct || "-",
+            };
+            
+            // Group by the distinct Journal Prefix!
+            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
+            journalGroups.get(prefix).push(row);
+
+```
+**B. Revert the Table Rendering to group by journalPrefix:**
+Replace the <TableHead> and <TableBody> inside the Dialog with this block so it groups the rows by the distinct Journal Prefix, allowing them to Accept/Reject that specific group:
+```javascript
+                    <TableHead>
+                      <TableRow>
+                        <TableCell padding="checkbox" sx={styles.stickyHeaderColumn(0)}>
+                          <Checkbox
+                            color="primary"
+                            indeterminate={selectedJournalPrefixes.length > 0 && selectedJournalPrefixes.length < batchDetails.length}
+                            checked={batchDetails.length > 0 && selectedJournalPrefixes.length === batchDetails.length}
+                            onChange={handleSelectAllClick}
+                            disabled={isViewingSelfCreated || isLargeBatch}
+                          />
+                        </TableCell>
+                        <TableCell align="center" sx={styles.stickyHeaderColumn(48)}>
+                          Journal ID
+                        </TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Branch</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => {
+                        const prefix = group[0].journalPrefix; // Use Journal Prefix!
+                        const isSelected = selectedJournalPrefixes.includes(prefix);
+                        
+                        return group.map((row, rowIndex) => (
+                          <TableRow
+                            key={row.id}
+                            hover={!isViewingSelfCreated && !isLargeBatch}
+                            onClick={() => !isViewingSelfCreated && !isLargeBatch && handleRowCheckboxClick(null, prefix)}
+                            selected={isSelected}
+                            sx={{
+                              cursor: (isViewingSelfCreated || isLargeBatch) ? "not-allowed" : "pointer",
+                              ...(rowIndex === 0 && groupIndex > 0 && { borderTop: 1, borderColor: "divider" }),
+                            }}
+                          >
+                            {rowIndex === 0 && (
+                              <>
+                                <TableCell padding="checkbox" rowSpan={group.length} sx={styles.stickyBodyColumn(0)}>
+                                  <Checkbox
+                                    color="primary"
+                                    checked={isSelected}
+                                    disabled={isViewingSelfCreated || isLargeBatch}
+                                    onClick={(e) => handleRowCheckboxClick(e, prefix)}
+                                  />
+                                </TableCell>
+                                <TableCell align="center" rowSpan={group.length} sx={styles.stickyBodyColumn(48)}>
+                                  <Typography variant="body2" fontWeight="bold" color="primary">
+                                    {prefix}
+                                  </Typography>
+                                </TableCell>
+                              </>
+                            )}
+                            <TableCell align="center">{row.branch}</TableCell>
+                            <TableCell align="center">{row.currency}</TableCell>
+                            <TableCell align="center">{row.cgl}</TableCell>
+                            <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
+                            <TableCell align="center">
+                              <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" />
+                            </TableCell>
+                          </TableRow>
+                        ));
+                      })}
+                    </TableBody>
+
+```
+**What this achieves:** The main list will show Batch ID 0002356. Clicking the Eye icon will open the details, and the rows will be beautifully grouped by 0004977, 0004978, etc. (the actual distinct Journal Prefix). Clicking "Approve" on the main screen approves 0002356, while selecting checkboxes inside approves the distinct Journal Prefixes.
