@@ -1,26 +1,30 @@
-To prevent a 0 (zero) amount from being accepted in both manual entry and bulk uploads, we need to update the backend manual batch creation logic and the frontend submission logic.
-*(Note: Your **Bulk Upload Backend** (JournalBulkValidationService.java at line 580) actually **already** has a strict zero-check built in: if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) d.formatErrors.add("Amount cannot be Zero or Null");. So bulk upload is already perfectly protected!)*
-Here are the exact replacements to completely block zero amounts for Manual Posting.
-### 1. Backend: Block Zero in JournalRequestServiceImpl.java
-Find the createBatchRequest method (around line 852). We need to throw an error if the amount is zero.
-**Find this block:**
+Based on the full backend code you provided earlier, **no, there is no condition blocking zero amounts for manual uploads in your current backend.**
+In your BatchRequestDto, the amount is only marked as @NotNull, which means it will happily accept 0 or 0.00.
+If you look at your createBatchRequest method in JournalRequestServiceImpl.java (around line 856), it only checks for the INR decimal limit, but it does **not** check for zero:
 ```java
+            // Existing code in your file
+            BigDecimal amount = row.getAmount();
+
             // Strict Cross-Field Validation for INR
             if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
                 throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
             }
 
-            entity.setAmount(amount);
+            entity.setAmount(amount); // <-- It saves 0 directly to the database here!
 
 ```
-**Replace it with this:**
+### How to fix it:
+To protect the backend, you must manually add the zero-check right before entity.setAmount(amount);.
+**Replace that section with this:**
 ```java
-            // Strict Cross-Field Validation for INR
+            BigDecimal amount = row.getAmount();
+
+            // 1. Strict Cross-Field Validation for INR
             if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
                 throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
             }
 
-            // PREVENT ZERO AMOUNT
+            // 2. ADD THIS NEW CONDITION TO BLOCK ZERO
             if (amount.compareTo(BigDecimal.ZERO) == 0) {
                 throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
             }
@@ -28,77 +32,4 @@ Find the createBatchRequest method (around line 852). We need to throw an error 
             entity.setAmount(amount);
 
 ```
-### 2. Frontend: Disable Submit Button in JournalPosting.js
-We need to update the form-readiness check so the Submit button stays grayed out if any row has an amount of 0 or 0.00.
-**Find this block (right above the return ( statement at the bottom of JournalPosting.js):**
-```javascript
-    // NEW LOGIC: Check if EVERY row is completely filled, including the compulsory 2-30 char remarks
-    const isFormReadyToSubmit = rows.every(
-      (row) =>
-        row.branch &&
-        row.currency &&
-        row.cgl &&
-        row.amount &&
-        row.txnType &&
-        isRowRemarksValid(row.remarks)
-    );
-
-```
-**Replace it with this:**
-```javascript
-    // NEW LOGIC: Check if EVERY row is completely filled, and amount is strictly greater than 0
-    const isFormReadyToSubmit = rows.every(
-      (row) =>
-        row.branch &&
-        row.currency &&
-        row.cgl &&
-        row.amount &&
-        parseFloat(row.amount) > 0 && // Blocks 0, 0.0, 0.00
-        row.txnType &&
-        isRowRemarksValid(row.remarks)
-    );
-
-```
-### 3. Frontend: Block Zero in the handleSubmit loop
-To be absolutely safe, we will also block the submission in the handleSubmit function loop and show a Snackbar warning if they somehow bypass the button.
-**Find this block inside your handleSubmit function:**
-```javascript
-    for (const [index, row] of rows.entries()) {
-      if (
-        !row.branch ||
-        !row.currency ||
-        !row.cgl ||
-        !row.amount ||
-        !row.txnType ||
-        !isRowRemarksValid(row.remarks)
-      ) {
-        showSnackBar(
-          `Row ${index + 1} is incomplete or has invalid remarks. Please fill all fields (*) and ensure remarks are 2-30 characters.`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
-      }
-
-```
-**Replace it with this:**
-```javascript
-    for (const [index, row] of rows.entries()) {
-      if (
-        !row.branch ||
-        !row.currency ||
-        !row.cgl ||
-        !row.amount ||
-        parseFloat(row.amount) === 0 || // Explicitly block zero amounts
-        !row.txnType ||
-        !isRowRemarksValid(row.remarks)
-      ) {
-        showSnackBar(
-          `Row ${index + 1} is incomplete or has a zero amount. Amount must be greater than 0, and remarks must be 2-30 characters.`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
-      }
-
-```
+Once you add that amount.compareTo(BigDecimal.ZERO) == 0 check, your manual upload backend will be 100% protected against zero amounts!
