@@ -1,36 +1,35 @@
-You are completely right to check this. When dealing with hundreds or thousands of journal entries, if the scrolling isn't handled perfectly, the user will lose sight of the Table Headers or the "Accept/Reject" buttons will get pushed off the bottom of the screen.
-Your main screen (<DataGrid>) is actually already perfectly safe because Material-UI's DataGrid naturally implements internal scrolling whenever a height is provided (which you have set to 600). The headers will stay locked, and the rows will scroll inside it.
-However, for the **View (Eye button) Modal**, standard HTML tables do *not* scroll natively unless we explicitly force them to. We need to update your CSS styles object to force the TableContainer to handle vertical scrolling (overflowY: "auto") and change the fixed heights to maxHeight so it perfectly adapts.
-Here is the exact replacement you need to make at the very top of your JournalAuthorization.js file inside the styles object:
-### Find this exact block (around line 43):
-```javascript
-  tableContainer: { height: 450, border: 1, borderColor: "divider", mt: 1 },
-  fixedContentBox: {
-    height: 500,
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "space-between",
-  },
+The reason the batch isn't disappearing automatically is because of the status mapping we just applied.
+When you click "Approve", the database instantly locks the row and changes its status to QUEUED while it processes in the background. Because we told the backend to mask QUEUED as PENDING so the user doesn't see weird statuses, your frontend refreshes, sees the batch is still labeled as "PENDING", and puts it right back on the screen!
+To fix this, we need to tell the **Pending Authorization API** to completely ignore QUEUED batches. This way, the moment you click approve, it instantly drops off your screen. If the background process fails, it will revert to PENDING and magically reappear for you to try again.
+Here is the exact replacement for the getPendingBatchSummaries method in your **JournalRequestServiceImpl.java** file:
+### Replace this method:
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchSummaries() {
+        // FIX: Removed 'QUEUED' from the SQL IN clause.
+        // Now, the moment a user clicks Approve/Reject, it locks into QUEUED in the database and instantly vanishes from their Pending screen.
+        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS " +
+                "FROM JOURNAL_BATCH_MASTER WHERE BATCH_STATUS IN ('PENDING', 'ERROR') ORDER BY REQ_DATE DESC";
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
+            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
+            
+            // Strictly force the frontend to only see "PENDING"
+            map.put("requestStatus", "PENDING");
+            
+            // Completely hide any error messages from the frontend UI
+            map.put("errorMessage", null);
+            
+            return map;
+        });
+    }
 
 ```
-### Replace it with this:
-```javascript
-  tableContainer: { 
-    maxHeight: 450,      // Stops the table from growing infinitely
-    overflowY: "auto",   // Forces an internal vertical scrollbar
-    border: 1, 
-    borderColor: "divider", 
-    mt: 1 
-  },
-  fixedContentBox: {
-    minHeight: 400,      // Ensures the modal doesn't collapse awkwardly if empty
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "space-between",
-  },
-
-```
-### Why this is the perfect fix:
- 1. **maxHeight: 450 + overflowY: "auto":** If there are only 2 rows, the table wraps nicely around them without leaving massive empty whitespace. If there are 50 rows, the table stops growing at 450px and creates an internal scrollbar.
- 2. **stickyHeader:** Because you already have the stickyHeader prop on your <Table>, the moment you apply overflowY: "auto", your column titles (Branch, Currency, Amount) will magically lock to the top of the modal while the rows scroll underneath them!
- 3. **Locked Action Buttons:** Your Dialog footer (with the text box and Accept/Reject buttons) will now permanently stay visible at the bottom of the screen, regardless of how far down the user scrolls inside the table.
+By removing 'QUEUED' from the WHERE BATCH_STATUS IN (...) SQL query, your React frontend's automatic refresh will work perfectly again, immediately clearing the approved row from your view!
