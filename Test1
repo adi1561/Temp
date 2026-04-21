@@ -1,140 +1,149 @@
-Got it. To ensure absolutely no error text leaks into the UI remarks, we will wipe out the error messages entirely when a batch reverts to PENDING. The frontend will only ever see a clean PENDING, ACCEPTED, or REJECTED status.
-Here are the **6 verified methods** you need to replace in your **JournalRequestServiceImpl.java** file. Copy and paste these exactly as written to completely lock down the statuses and hide all backend errors from the user's view.
-### 1. Update handleAsyncFailure
-*This wipes the error message from the database and resets to PENDING.*
-```java
-    private void handleAsyncFailure(String batchId, String creatorId, String requestId, String message) {
-        try {
-            // 1. Delete orphaned journal request rows only so GL stays balanced
-            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-
-            // 2. UPSERT the master record back to PENDING and WIPE the error remarks (NULL)
-            int updated = jdbcTemplate.update(
-                    "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?",
-                    batchId);
-
-            // If master record doesn't exist yet, insert it clean
-            if (updated == 0) {
-                jdbcTemplate.update(
-                        "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, BATCH_STATUS, EXECUTOR_REMARKS, REQ_DATE) VALUES (?, 'PENDING', NULL, SYSTIMESTAMP)",
-                        batchId);
-            }
-        } catch (DataAccessException e) {
-            log.error("CLEANUP_CRITICAL_FAIL | Batch: {} | Cannot record failure state", batchId);
-        }
-        progressService.sendProgress(batchId, creatorId, 0, "FAILED", message);
-    }
+To bring that same buttery-smooth pagination and fix the scrolling overlap for the **Status screen**, we need to apply the exact same two UI tricks to **JournalPostingStatus.js**.
+Here are the 2 exact replacements you need to make in your JournalPostingStatus.js file:
+### 1. Fix the Scrolling Overlap (Update Styles)
+Find the styles object at the top of your file. We need to change tableHeaderCell to a solid background so the rows slide cleanly underneath it without bleeding through.
+**Find this block:**
+```javascript
+  tableHeaderCell: {
+    fontWeight: "bold",
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+    whiteSpace: "nowrap",
+    zIndex: 10,
+  },
 
 ```
-### 2. Update handleAsyncApprovalError
-*This handles approval failures cleanly.*
-```java
-    private void handleAsyncApprovalError(String batchId, String executorId, String msg) {
-        // Revert to PENDING and wipe the error message from remarks
-        jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?", batchId);
-        progressService.sendProgress(batchId, executorId, 0, "FAILED", msg);
-    }
+**Replace it with this:**
+```javascript
+  tableHeaderCell: {
+    fontWeight: "bold",
+    backgroundColor: "#f5f6f8", // Solid light-grey background prevents overlap
+    color: "text.primary",
+    whiteSpace: "nowrap",
+    zIndex: 10,
+  },
 
 ```
-### 3. Update executeAsyncBatchCancellation (Catch Block)
-*Find the catch block inside executeAsyncBatchCancellation and replace it.*
-```java
-        } catch (DataAccessException e) {
-            log.error("PURGE_DB_ERROR | Batch: {} | Status: SQL operation failed", batchId);
-            // Revert back to PENDING and wipe the error
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?", batchId);
-            progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: System error");
-        } finally {
-            MDC.clear();
-        }
-
-```
-### 4. Update the Integrity Check inside executeAsyncBatchCreation
-*Find the batchStatus logic (around line 200 in your Async method) and replace it with this:*
-```java
-            String batchStatus = "PENDING";
-            String finalRemarks = commonRemarks;
-
-            if (actualCommittedRows != totalRows) {
-                // Keep it PENDING so user can retry, but log it internally for DevOps
-                log.error("BATCH_INTEGRITY_FAILED | Batch: {} | Expected: {} | Actual: {}", batchId, totalRows, actualCommittedRows);
-            }
-
-            // 7. FINAL MASTER RECORD: Insert the summary record
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-
-            // Force NULL for executor remarks so no error leaks
-            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, actualCommittedRows,
-                    finalDebit, finalCredit, batchStatus, null);
-
-            // Audit and Notification Logic (Preserved Business Logic)
-            if (actualCommittedRows != totalRows) {
-                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Integrity Failure: Row count mismatch.");
-            } else {
-
-```
-### 5. Update getPendingBatchSummaries
-*This completely masks QUEUED and legacy ERROR statuses, forcing the frontend to only see PENDING with no error remarks.*
-```java
-    @Override
-    public List<Map<String, Object>> getPendingBatchSummaries() {
-        // Query QUEUED and ERROR to catch any locked/legacy records so they don't vanish
-        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS " +
-                "FROM JOURNAL_BATCH_MASTER WHERE BATCH_STATUS IN ('PENDING', 'QUEUED', 'ERROR') ORDER BY REQ_DATE DESC";
-
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
-            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
+### 2. Smooth Loading Overlay (Update the View Modal)
+Find the View Details Modal's <DialogContent> (around line 585 in JournalPostingStatus.js). We will stop unmounting the table and instead float a semi-transparent loading spinner over it.
+**Replace your entire <DialogContent> block with this:**
+```javascript
+        <DialogContent dividers sx={{ p: 0 }}>
+          <Box sx={styles.fixedContentBox}>
             
-            // Strictly force the frontend to only see "PENDING"
-            map.put("requestStatus", "PENDING");
-            
-            // Completely hide any error messages from the frontend UI
-            map.put("errorMessage", null);
-            
-            return map;
-        });
-    }
+            <TableContainer component={Paper} sx={{ ...styles.tableContainer, position: "relative", minHeight: 350 }}>
+              
+              {/* NEW: SMOOTH LOADING OVERLAY */}
+              {detailLoading && (
+                <Box
+                  sx={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: "100%",
+                    backgroundColor: "rgba(255, 255, 255, 0.6)", // Slight transparent white fade
+                    display: "flex",
+                    justifyContent: "center",
+                    alignItems: "center",
+                    zIndex: 999, // Puts spinner on top of the table
+                  }}
+                >
+                  <CircularProgress />
+                </Box>
+              )}
 
-```
-### 6. Update getAllBatchSummaries
-*This maps the statuses cleanly for the "All Requests" history screen and clears remarks for anything that failed.*
-```java
-    @Override
-    public List<Map<String, Object>> getAllBatchSummaries() {
-        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_ID, EXECUTOR_REMARKS " +
-                "FROM JOURNAL_BATCH_MASTER ORDER BY REQ_DATE DESC FETCH FIRST 100 ROWS ONLY";
+              <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                <TableHead>
+                  <TableRow>
+                    {viewingBatchStatus === "PENDING" && (
+                      <TableCell padding="checkbox" sx={styles.stickyHeaderColumn(0)}>
+                        <Checkbox
+                          color="primary"
+                          indeterminate={selectedJournalPrefixes.length > 0 && selectedJournalPrefixes.length < batchDetails.length}
+                          checked={batchDetails.length > 0 && selectedJournalPrefixes.length === batchDetails.length}
+                          onChange={handleSelectAllClick}
+                        />
+                      </TableCell>
+                    )}
+                    <TableCell align="center" sx={styles.stickyHeaderColumn(viewingBatchStatus === "PENDING" ? 48 : 0)}>
+                      Journal ID
+                    </TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Status</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Branch</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {batchDetails.length > 0 ? (
+                    batchDetails.map((group, groupIndex) => {
+                      const isSelected = selectedJournalPrefixes.includes(group[0].journalPrefix);
+                      return group.map((row, rowIndex) => (
+                        <TableRow
+                          key={row.id}
+                          hover={viewingBatchStatus === "PENDING"}
+                          onClick={() => viewingBatchStatus === "PENDING" && handleRowCheckboxClick(null, row.journalPrefix)}
+                          selected={viewingBatchStatus === "PENDING" && isSelected}
+                          sx={{
+                            cursor: viewingBatchStatus === "PENDING" ? "pointer" : "default",
+                            ...(rowIndex === 0 && groupIndex > 0 && { borderTop: 1, borderColor: "divider" }),
+                          }}
+                        >
+                          {viewingBatchStatus === "PENDING" && rowIndex === 0 && (
+                            <TableCell padding="checkbox" rowSpan={group.length} sx={styles.stickyBodyColumn(0)}>
+                              <Checkbox
+                                color="primary"
+                                checked={isSelected}
+                                onClick={(e) => handleRowCheckboxClick(e, row.journalPrefix)}
+                              />
+                            </TableCell>
+                          )}
+                          {rowIndex === 0 && (
+                            <TableCell align="center" rowSpan={group.length} sx={styles.stickyBodyColumn(viewingBatchStatus === "PENDING" ? 48 : 0)}>
+                              {row.journalPrefix}
+                            </TableCell>
+                          )}
+                          {rowIndex === 0 && (
+                            <TableCell align="center" rowSpan={group.length} sx={{ ...styles.stickyBodyColumn(viewingBatchStatus === "PENDING" ? 150 : 100), zIndex: 4 }}>
+                              <Chip label={row.requestStatus} color={getStatusChipColor(row.requestStatus)} size="small" />
+                            </TableCell>
+                          )}
+                          <TableCell align="center">{row.branch}</TableCell>
+                          <TableCell align="center">{row.currency}</TableCell>
+                          <TableCell align="center">{row.cgl}</TableCell>
+                          <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
+                          <TableCell align="center">
+                            <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" />
+                          </TableCell>
+                        </TableRow>
+                      ));
+                    })
+                  ) : (
+                    !detailLoading && (
+                      <TableRow>
+                        <TableCell colSpan={8} align="center" sx={{ py: 5 }}>
+                          <Typography>No details found.</Typography>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
 
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
-            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
-            
-            // Map QUEUED and legacy ERROR rows back to PENDING for the UI
-            String dbStatus = rs.getString("BATCH_STATUS");
-            if ("QUEUED".equals(dbStatus) || "ERROR".equals(dbStatus)) {
-                map.put("requestStatus", "PENDING");
-                map.put("executorRemarks", null); // Wipe error remarks
-            } else {
-                map.put("requestStatus", dbStatus);
-                map.put("executorRemarks", rs.getString("EXECUTOR_REMARKS"));
-            }
-            
-            map.put("executorId", rs.getString("EXECUTOR_ID"));
-            return map;
-        });
-    }
+            {/* Pagination is now anchored permanently */}
+            <TablePagination
+              component="div"
+              count={detailTotalCount}
+              page={detailPage}
+              onPageChange={handleDetailPageChange}
+              rowsPerPage={detailRowsPerPage}
+              onRowsPerPageChange={handleDetailRowsPerPageChange}
+              rowsPerPageOptions={[10, 25, 50]}
+            />
+          </Box>
+        </DialogContent>
 
 ```
