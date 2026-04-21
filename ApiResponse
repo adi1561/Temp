@@ -1,83 +1,60 @@
-Here are the exact, specific blocks you need to replace in your JournalRequestServiceImpl.java file to meet these business rules, without pasting the whole file.
-### 1. Update the HDFS Try-Catch (Do not rollback Oracle)
-Find the try-catch block for hdfsSyncService.syncToDataLake(syncData); inside the executeApprovalInTransaction method.
-**Replace the HDFS try-catch block with this:**
+Here is the complete, updated code for both methods. You can copy and paste these directly into your JournalRequestServiceImpl.java file.
+These methods guarantee that the frontend will **never** see QUEUED, PROCESSING, or ERROR statuses, and any background error messages are completely hidden from the user interface.
 ```java
-            try {
-                hdfsSyncService.syncToDataLake(syncData);
-            } catch (Exception hdfsEx) {
-                // Silently catch the HDFS error. DO NOT roll back Oracle.
-                log.error("HDFS_SYNC_FAIL | Batch: {} | Error: {} | Status: Background recovery queued", batchId, hdfsEx.getClass().getSimpleName());
-                // Put it in the retry queue so the HdfsRecoveryService picks it up later
-                jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
-            }
+    @Override
+    public List<Map<String, Object>> getPendingBatchSummaries() {
+        // Query QUEUED and ERROR to catch any locked/legacy records so they don't vanish from the UI
+        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS " +
+                "FROM JOURNAL_BATCH_MASTER WHERE BATCH_STATUS IN ('PENDING', 'QUEUED', 'ERROR') ORDER BY REQ_DATE DESC";
 
-            // Oracle succeeded! The user will see 100% success even if HDFS failed.
-            progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
-            notificationWriterService.createBatchApprovedNotification(batchId, creatorId, executorId);
-
-```
-### 2. Update the Async Error Handler (Send "Failed to Approve/Reject" Notification)
-Find the handleAsyncApprovalError method definition. We are ensuring it takes the RequestStatus so it can tell the user exactly what failed.
-**Replace the entire handleAsyncApprovalError method with this:**
-```java
-    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String msg) {
-        // Revert to PENDING and wipe the error message from remarks
-        jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?", batchId);
-        progressService.sendProgress(batchId, executorId, 0, "FAILED", msg);
-
-        // Send specific notification based on what Oracle failed to do
-        String actionName = (actionStatus == RequestStatus.ACCEPTED) ? "approve" : "reject";
-        String notifMsg = String.format("Failed to %s Journal Batch '%s'. It has been returned to PENDING.", actionName, batchId);
-
-        try {
-            notificationWriterService.createNotification(executorId, null, notifMsg, "/journal-view/" + batchId, batchId, "JournalService");
-        } catch (Exception e) {
-            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notification", batchId);
-        }
-    }
-
-```
-### 3. Update the Catch Blocks in executeAsyncBatchProcessing
-Find the try-catch blocks inside executeAsyncBatchProcessing. We need to pass dto.getStatus() to the updated error handler.
-**Replace the catch blocks with this:**
-```java
-        } catch (org.springframework.dao.PessimisticLockingFailureException e) {
-            log.error("DATABASE_LOCK_TIMEOUT | Batch: {} | Status: GL_BALANCE row locked", batchId);
-            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "System is busy. Please retry in 1 minute.");
-        } catch (DataAccessException e) {
-            log.error("PROCEDURE_EXEC_FAIL | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "Database execution error during approval.");
-        } catch (Exception e) {
-            log.error("INTERNAL_PROCESSING_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "An internal logic error occurred.");
-        } finally {
-            MDC.clear();
-        }
-
-```
-*(Note: You will also need to add dto.getStatus(), as the 3rd argument inside the Maker-Checker security check if you haven't already).*
-### 4. Remove PROCESSING Status Mapping
-Find getPendingBatchSummaries() and getAllBatchSummaries(). Ensure QUEUED maps strictly to PENDING with no error remarks.
-**Inside getPendingBatchSummaries(), use this mapping logic:**
-```java
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
+            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
+            
             // Strictly force the frontend to only see "PENDING"
             map.put("requestStatus", "PENDING");
             
             // Completely hide any error messages from the frontend UI
             map.put("errorMessage", null);
+            
+            return map;
+        });
+    }
 
-```
-**Inside getAllBatchSummaries(), use this mapping logic:**
-```java
+    @Override
+    public List<Map<String, Object>> getAllBatchSummaries() {
+        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_ID, EXECUTOR_REMARKS " +
+                "FROM JOURNAL_BATCH_MASTER ORDER BY REQ_DATE DESC FETCH FIRST 100 ROWS ONLY";
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
+            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
+            
             // Map QUEUED and legacy ERROR rows back to PENDING for the UI
             String dbStatus = rs.getString("BATCH_STATUS");
             if ("QUEUED".equals(dbStatus) || "ERROR".equals(dbStatus)) {
                 map.put("requestStatus", "PENDING");
-                map.put("executorRemarks", null); // Wipe error remarks
+                map.put("executorRemarks", null); // Wipe error remarks so they don't show in the grid
             } else {
                 map.put("requestStatus", dbStatus);
                 map.put("executorRemarks", rs.getString("EXECUTOR_REMARKS"));
             }
+            
+            map.put("executorId", rs.getString("EXECUTOR_ID"));
+            return map;
+        });
+    }
 
 ```
