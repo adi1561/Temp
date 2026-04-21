@@ -1,76 +1,74 @@
-This is the perfect time to do a "dead code" sweep. Since we successfully shifted the architecture to an **All-or-Nothing Batch Level** system (meaning you approve, reject, or delete entire batches, never individual rows or partial selections), we have several methods and endpoints that are now completely useless.
-Deleting these will significantly reduce your technical debt and make the codebase much easier to maintain.
-Here is the exact list of files and the specific methods/variables you need to **completely delete** from your backend:
-### 1. The Controller (Endpoints no longer used by React)
-**File:** src/main/java/com/fincore/JournalService/Controllers/JournalRequestController.java
- * **DELETE this entire method:**
-   ```java
-   @DeleteMapping("/my-requests/by-journal-list")
-   public ResponseEntity<Map<String, String>> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @RequestBody List<String> list) {
-       journalRequestService.cancelMyRequestsByJournalPrefixes(list, jwtUtil.getUserIdFromToken(token));
-       return ResponseEntity.ok(Map.of("status", "SUCCESS"));
-   }
-   
-   ```
-   *Why?* You removed the "Delete Selected" button from the UI, so this endpoint will never be called again.
-### 2. The DTO (Fields no longer sent by React)
-**File:** src/main/java/com/fincore/JournalService/Dto/BulkProcessJournalRequestDto.java
- * **DELETE this variable:**
-   ```java
-   private List<String> journalIdPrefixes;
-   
-   ```
-   *Why?* The React handleSubmitAction now only sends batchId, status, and remarks. It no longer sends an array of selected prefixes.
-### 3. The Repository (Unused Custom Queries)
-**File:** src/main/java/com/fincore/JournalService/Repository/JournalRequestRepository.java
- * **DELETE this native query method:**
-   ```java
-   @Modifying
-   @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE JOURNAL_ID IN (:journalIds) AND CREATOR_ID = :userId", nativeQuery = true)
-   void deleteJournalsNative(@Param("journalIds") List<String> journalIds, @Param("userId") String userId);
-   
-   ```
- * **DELETE this finder method:**
-   ```java
-   List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
-   
-   ```
-### 4. The Service Interface (Dead Definitions)
-**File:** src/main/java/com/fincore/JournalService/Service/JournalRequestService.java
- * **DELETE all of these method signatures:**
-   ```java
-   // Delete all of these. They are either partial-approvals or old synchronous versions
-   String createBulkBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
-   String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException;
-   List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole);
-   void cancelMyRequestsByBatchId(String batchId, String userId);
-   void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId);
-   void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId);
-   // You can also delete this commented out line:
-   // int deleteBatchChunk(String batchId, String userId);
-   
-   ```
-### 5. The Service Implementation (Dead Logic)
-**File:** src/main/java/com/fincore/JournalService/Service/JournalRequestServiceImpl.java
- * Scroll to the bottom of the file (around line 876 in your provided code) where the @Override methods are bunched together.
- * **DELETE all of these implementation blocks:**
-   ```java
-   @Override @Transactional public void cancelMyRequestsByBatchId(String b, String u) { cancelMyRequestsByBatchIdAsync(b, u); }
-   @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> l, String u) { journalRequestRepository.deleteJournalsNative(l, u); }
-   @Override @Transactional public void cancelMyRequestsByJournalPrefix(String p, String u) {}
-   @Override public String createBulkBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException { return ""; }
-   @Override public String createBatchFromCache(String r, String m, String u, Integer o) throws IOException { return createBatchFromCacheAsync(r, m, u, o); }
-   @Override public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto d, String u, Integer r) { processBulkRequestsAsync(d, u, r); return Collections.emptyList(); }
-   
-   ```
-### 6. The UI Validation Model (Optional cleanup)
-**File:** src/main/java/com/fincore/JournalService/Service/JournalBulkValidationService.java
- * In the ExcelRowData class at the very bottom, you can technically delete:
-   ```java
-   @JsonProperty("16") // sysDate (or whatever number it was mapped to)
-   public String sysDate = "";
-   // along with sysSite, sysYear, sysPeriod IF you no longer use the "01" System file format. 
-   
-   ```
-   *(Note: Only delete the sys... variables if you are strictly doing Standard CSV uploads now and have completely abandoned the old legacy System format parsing).*
-Once you delete these 5 sections, your codebase will perfectly mirror your new, optimized UI design!
+ @Override
+    @Transactional
+    public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+
+        // 1. Intercept Partial Approvals: The "Batch Split" Pattern
+        if (dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty()) {
+            String originalBatchId = dto.getBatchId();
+
+            // Generate a unique split ID
+            String splitBatchId = originalBatchId + "-P" + (System.currentTimeMillis() % 10000);
+
+            log.info("PARTIAL_APPROVAL_DETECTED | Splitting Batch: {} -> {}", originalBatchId, splitBatchId);
+
+            // Clone the master record so the split batch has a valid audit trail
+            jdbcTemplate.update(
+                    "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, BATCH_STATUS, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT) " +
+                            "SELECT ?, 'PENDING', CREATOR_ID, CURRENT_TIMESTAMP, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT " +
+                            "FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?",
+                    splitBatchId, originalBatchId
+            );
+
+            // Migrate selected rows to the new split batch using high-speed JDBC batch updates
+            List<String> prefixes = dto.getJournalIdPrefixes();
+            jdbcTemplate.batchUpdate(
+                    "UPDATE JOURNAL_REQUEST SET BATCH_ID = ? WHERE BATCH_ID = ? AND JOURNAL_ID LIKE ?",
+                    new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                        @Override
+                        public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                            ps.setString(1, splitBatchId);
+                            ps.setString(2, originalBatchId);
+                            ps.setString(3, prefixes.get(i) + "-%"); // Matches exact prefix pattern
+                        }
+
+                        @Override
+                        public int getBatchSize() {
+                            return prefixes.size();
+                        }
+                    }
+            );
+
+            // Re-route the DTO to point to our newly isolated batch!
+            dto.setBatchId(splitBatchId);
+
+            // --- ADDED RECALIBRATION LOGIC ---
+            log.info("RECALCULATING_TOTALS | Syncing master headers for {} and {}", originalBatchId, splitBatchId);
+
+            // Dynamically recalculate and update the totals for BOTH batches simultaneously
+            String recalcSql =
+                    "UPDATE JOURNAL_BATCH_MASTER M " +
+                            "SET (TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT) = (" +
+                            "    SELECT COUNT(1), " +
+                            "           NVL(SUM(CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END), 0), " +
+                            "           NVL(SUM(CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END), 0) " +
+                            "    FROM JOURNAL_REQUEST " +
+                            "    WHERE BATCH_ID = M.BATCH_ID" +
+                            ") " +
+                            "WHERE BATCH_ID IN (?, ?)";
+
+            jdbcTemplate.update(recalcSql, originalBatchId, splitBatchId);
+            // --- END RECALIBRATION LOGIC ---
+        }
+
+        // 2. Lock the target batch (either the original, or the newly split one)
+        String lockSql = "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS = 'PENDING'";
+        int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
+
+        if (updated == 0) {
+            log.warn("APPROVAL_LOCK_FAIL | Batch: {} | Status: Batch already processing", dto.getBatchId());
+            throw new IllegalStateException("Batch is already being processed or is not in PENDING status.");
+        }
+
+        progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
+        self.executeAsyncBatchProcessing(dto, executorId);
+    }
