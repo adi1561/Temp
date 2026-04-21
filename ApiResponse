@@ -1,104 +1,142 @@
-This is a great feature. It allows the checker to easily download the batch data, verify it offline, and then return to the system to approve or reject.
-Since you already process Excel files for bulk uploads, you already have the Apache POI library available in your backend.
-Here is the complete implementation for both the Backend API and the Frontend React updates.
-### 1. BACKEND: Add the Service Method
-Open your **JournalRequestService.java** interface and add this method signature:
-```java
-byte[] generateBatchExcel(String batchId);
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+  TablePagination,
+  Alert,
+  FormHelperText,
+} from "@mui/material";
 
-```
-Then, open your **JournalRequestServiceImpl.java** and add the implementation. This method fetches all the rows for the batchId and dynamically builds an Excel file in memory:
-```java
-    @Override
-    public byte[] generateBatchExcel(String batchId) {
-        // Fetch all rows belonging to this batch
-        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
-        
-        if (requests == null || requests.isEmpty()) {
-            throw new CustomExceptions.InvalidDataException("No records found for batch: " + batchId);
-        }
 
-        // Use Apache POI to create the Excel file
-        try (org.apache.poi.xssf.usermodel.XSSFWorkbook workbook = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
-             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
 
-            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
 
-            // 1. Create Header Row
-            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
-            String[] headers = {"Journal ID", "Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product", "Date"};
-            
-            for (int i = 0; i < headers.length; i++) {
-                org.apache.poi.ss.usermodel.Cell cell = headerRow.createCell(i);
-                cell.setCellValue(headers[i]);
-            }
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Check as CheckIcon,
+  Clear as ClearIcon,
+  Visibility as VisibilityIcon,
+  FileDownload as FileDownloadIcon ,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import { alpha } from "@mui/material/styles";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-            // 2. Populate Data Rows
-            int rowIdx = 1;
-            for (JournalRequest req : requests) {
-                org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx++);
-                
-                row.createCell(0).setCellValue(req.getJournalId() != null ? req.getJournalId() : "");
-                row.createCell(1).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
-                row.createCell(2).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
-                row.createCell(3).setCellValue(req.getCgl() != null ? req.getCgl() : "");
+const styles = {
+  mainContainer: {
+    padding: 3,
+    height: "100%",
+    width: "100%",
+  },
+  dataGridContainer: {
+    height: 600,
+    width: "100%",
+    backgroundColor: "background.paper",
+    boxShadow: 2,
+    borderRadius: 2,
+    border: 1,
+    borderColor: "divider",
+    "& .MuiDataGrid-columnHeaders": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+      fontWeight: "bold",
+      fontSize: "0.95rem",
+    },
+    "& .MuiDataGrid-row:hover": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
+    },
+  },
+  tableContainer: {
+    maxHeight: 450,
+    overflowY: "auto",
+    border: 1,
+    borderColor: "divider",
+    mt: 1
+  },
+  fixedContentBox: {
+    minHeight: 400,
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+  },
+  tableHeaderCell: {
+    fontWeight: "bold",
+    backgroundColor: "#f5f6f8",
+    color: "text.primary",
+    whiteSpace: "nowrap",
+    zIndex: 10,
+  },
+  stickyHeaderColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    top: 0,
+    zIndex: 20,
+    backgroundColor: "background.paper",
+    borderBottom: 1,
+    borderRight: 1,
+    borderColor: "divider",
+    fontWeight: "bold",
+  }),
+  stickyBodyColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    zIndex: 5,
+    backgroundColor: "background.paper",
+    borderRight: 1,
+    borderColor: "divider",
+  }),
+  dialogTitle: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    pb: 1,
+  },
+  dialogActions: { p: 2, borderTop: 1, borderColor: "divider" },
+  loadingContainer: {
+    height: "100%",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  helperText: {
+    fontSize: "0.75rem",
+    color: "text.secondary",
+    marginTop: "4px",
+  }
+};
 
-                BigDecimal amount = req.getAmount();
-                if (amount != null) {
-                    row.createCell(4).setCellValue(amount.abs().doubleValue());
-                    row.createCell(5).setCellValue(amount.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
-                } else {
-                    row.createCell(4).setCellValue(0);
-                    row.createCell(5).setCellValue("");
-                }
-
-                row.createCell(6).setCellValue(req.getNarration() != null ? req.getNarration() : "");
-                row.createCell(7).setCellValue(req.getProductCode() != null ? req.getProductCode() : "");
-                row.createCell(8).setCellValue(req.getCsvDate() != null ? req.getCsvDate().toString() : "");
-            }
-
-            workbook.write(out);
-            return out.toByteArray();
-
-        } catch (java.io.IOException e) {
-            log.error("EXCEL_GEN_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e);
-        }
-    }
-
-```
-### 2. BACKEND: Add the Controller Endpoint
-Open your **JournalRequestController.java** and add this API endpoint to serve the generated byte array as a downloadable .xlsx file.
-```java
-    @GetMapping("/download-batch/{batchId}")
-    public org.springframework.http.ResponseEntity<byte[]> downloadBatchExcel(@PathVariable String batchId) {
-        byte[] excelData = journalRequestService.generateBatchExcel(batchId);
-
-        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-        headers.setContentType(org.springframework.http.MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
-        headers.setContentDispositionFormData("attachment", "Batch_" + batchId + ".xlsx");
-        headers.setCacheControl("must-revalidate, post-check=0, pre-check=0");
-
-        return new org.springframework.http.ResponseEntity<>(excelData, headers, org.springframework.http.HttpStatus.OK);
-    }
-
-```
-### 3. FRONTEND: Add the Download Logic (JournalAuthorization.js)
-At the top of the file, make sure you import the download icon:
-```javascript
-import { FileDownload as FileDownloadIcon } from "@mui/icons-material";
-
-```
-Next, add this function to handle the API call and trigger the file download. You can place this function anywhere near your other handle... functions (like right below handleCloseViewModal):
-```javascript
-  const handleDownloadExcel = async () => {
+const formatCurrency = (num) => Number(num).toFixed(4);
+const getTxnTypeColor = (txnType) =>
+  txnType === "Credit" ? "error" : "success";
+const handleDownloadExcel = async () => {
     if (!viewingBatchId) return;
     
     try {
       showSnackBar("Downloading Excel...", "info");
-      // Use 'blob' as the response type!
-      const response = await callApi(
-        `/JS/journals/download-batch/${viewingBatchId}`, 
+      const response = await useApi(
+        `/JS/download-batch/${viewingBatchId}`, 
         null, 
         "GET", 
         "blob", 
@@ -124,17 +162,489 @@ Next, add this function to handle the API call and trigger the file download. Yo
       showSnackBar("Failed to download Excel file.", "error");
     }
   };
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Pending Requests</Typography>
+    </Stack>
+  );
+}
 
-```
-### 4. FRONTEND: Add the Export Button to the Modal
-Find the DialogTitle of your View Details Modal (around line 530). We will add a nice "Export Excel" button right next to the Close icon.
-**Replace your current <DialogTitle> with this:**
-```javascript
+export default function JournalAuthorization() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED");
+  const [executorRemarks, setExecutorRemarks] = useState("");
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
+  const [detailPage, setDetailPage] = useState(0);
+  const [detailRowsPerPage, setDetailRowsPerPage] = useState(10);
+  const [detailTotalCount, setDetailTotalCount] = useState(0);
+
+
+  useEffect(() => {
+    isMounted.current = true;
+    try {
+      const auth =
+        sessionStorage.getItem("persist:auth") ||
+        localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+      }
+    } catch (e) { }
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  const filterAndWarn = (val, type) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphanumeric and / & ( ) , . - are allowed.";
+
+    if (type === "alphanumeric_space") {
+      // 1. Strip any character that is NOT alphanumeric or in the allowed special chars list
+      filtered = val.replace(/[^a-zA-Z0-9\s/&(),.-]/g, "");
+      if (filtered !== val) {
+        hasError = true;
+      }
+
+      // 2. Strip leading space and collapse double spaces (enforces the (?!.* {2}) regex rule)
+      const beforeSpaceTrim = filtered;
+      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+      if (beforeSpaceTrim !== filtered && !hasError) {
+        hasError = true;
+        msg = "Remark should not start with space or contain consecutive spaces.";
+      }
+    }
+
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+    return filtered;
+  };
+  const handleRemarksChange = (e, setter) => {
+    const val = filterAndWarn(e.target.value, "alphanumeric_space");
+    if (val.length <= 30) {
+      setter(val);
+    }
+  };
+
+  // Validation logic: Remarks are strictly compulsory (min 2, max 30)
+  const isRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+
+  const isViewingSelfCreated =
+    currentUserId &&
+    viewingBatchCreatorId &&
+    String(currentUserId).trim().toUpperCase() ===
+    String(viewingBatchCreatorId).trim().toUpperCase();
+
+  const isLargeBatch = detailTotalCount > 2000;
+
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await callApi(
+        "/JS/journals/pending-requests-summary",
+        null,
+        "GET"
+      );
+      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
+    } catch (err) {
+      if (isMounted.current && err.name !== "CanceledError")
+        showSnackBar("Failed to load requests", "error");
+    } finally {
+      if (isMounted.current) setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchPendingBatches();
+  }, [fetchPendingBatches]);
+
+
+
+  const fetchBatchDetailsPaginated = async (batchId, page, size) => {
+    setDetailLoading(true);
+    try {
+      const res = await callApi(
+        `/JS/journals/by-batch-paginated/${batchId}?page=${page}&size=${size}`,
+        null,
+        "GET"
+      );
+
+      const contentArray = res?.content || (Array.isArray(res) ? res : []);
+
+      if (contentArray && isMounted.current) {
+        setDetailTotalCount(res?.totalElements || contentArray.length || 0);
+        const journalGroups = new Map();
+
+        contentArray.forEach((req, index) => {
+          try {
+            console.log("Backend Row Data in Authorization:", req);
+
+            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
+            const prefix = String(jId).split("-")[0]; // Extracts 0004977
+
+            // Use 'amount' or 'reqAmount' based on what Spring Boot sends
+            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
+
+            const row = {
+              ...req,
+              journalPrefix: prefix, // Save the distinct prefix
+              amount: Math.abs(amountVal),
+              transactionType: amountVal < 0 ? "Credit" : "Debit",
+              branch: req.branchCode || req.reqBranchCode || "-",
+              currency: req.currency || req.reqCurrency || "-",
+              cgl: req.cgl || req.reqCgl || "-",
+              remarks: req.narration || req.reqNarration || "-",
+              product: req.productCode || req.reqProduct || "-",
+            };
+
+            // FIX: Group explicitly by Branch!
+            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
+            journalGroups.get(prefix).push(row);
+
+          } catch (e) {
+            console.error("Failed to map row details:", req, e);
+          }
+        });
+        setBatchDetails(Array.from(journalGroups.values()));
+      }
+    } catch (e) {
+      if (isMounted.current) showSnackBar("Failed to load details", "error");
+    } finally {
+      if (isMounted.current) setDetailLoading(false);
+    }
+  };
+
+  const handleOpenViewModal = (batchId, creatorId) => {
+    setViewingBatchId(batchId);
+    setViewingBatchCreatorId(String(creatorId));
+    setDetailPage(0);
+    setDetailRowsPerPage(10);
+    setIsViewModalOpen(true);
+    fetchBatchDetailsPaginated(batchId, 0, 10);
+  };
+
+  const handleDetailPageChange = (event, newPage) => {
+    setDetailPage(newPage);
+    fetchBatchDetailsPaginated(viewingBatchId, newPage, detailRowsPerPage);
+  };
+
+  const handleDetailRowsPerPageChange = (event) => {
+    const newSize = parseInt(event.target.value, 10);
+    setDetailRowsPerPage(newSize);
+    setDetailPage(0);
+    fetchBatchDetailsPaginated(viewingBatchId, 0, newSize);
+  };
+
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setViewingBatchCreatorId(null);
+    fetchPendingBatches();
+  };
+
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleSubmitAction = async () => {
+    if (!isRemarksValid(executorRemarks)) {
+      showSnackBar("Remarks are compulsory (2-30 chars).", "warning");
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const response = await callApi(
+        "/JS/journals/process-bulk",
+        {
+          batchId: selectedBatch.batchId,
+          status: modalMode,
+          remarks: executorRemarks.trim(),
+        },
+        "POST"
+      );
+
+      // Dynamically change text based on ACCEPTED or REJECTED
+      const fallbackMsg = modalMode === "ACCEPTED"
+        ? "Approval process started in background. You will be notified upon completion."
+        : "Rejection process started in background. You will be notified upon completion.";
+
+      const displayMessage = response?.message || fallbackMsg;
+      showSnackBar(displayMessage, "info");
+
+      handleCloseModal();
+      fetchPendingBatches();
+    } catch (e) {
+      let errorMsg = "Failed to process request.";
+      if (e.response && e.response.data && e.response.data.message) {
+        errorMsg = e.response.data.message;
+      } else if (e.message) {
+        errorMsg = e.message;
+      }
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Chip label={p.value} color="warning" size="small" variant="outlined" />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Chip icon={<AccountCircleIcon />} label={p.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) =>
+        new Date(p.value).toLocaleString("en-IN", {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "requestCount",
+      headerName: "No. of Entries",
+      width: 150, // Increased width to ensure visibility
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      width: 150,
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 150,
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 1,
+      minWidth: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const isSelf =
+          currentUserId &&
+          params.row.creatorId &&
+          String(currentUserId).trim().toUpperCase() ===
+          String(params.row.creatorId).trim().toUpperCase();
+        return (
+          <Stack direction="row" spacing={1} justifyContent="center">
+            <Tooltip title="View">
+              <IconButton
+                onClick={() =>
+                  handleOpenViewModal(params.row.batchId, params.row.creatorId)
+                }
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={isSelf ? "Self-approval disabled" : "Accept"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "ACCEPTED")}
+                  color="success"
+                  disabled={isSelf}
+                >
+                  <CheckIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title={isSelf ? "Self-rejection disabled" : "Reject"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "REJECTED")}
+                  color="error"
+                  disabled={isSelf}
+                >
+                  <ClearIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Box sx={styles.mainContainer}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize
+        rowHeight={52}
+        initialState={{
+          pagination: { paginationModel: { page: 0, pageSize: 10 } },
+        }}
+        slots={{ noRowsOverlay: CustomNoRowsOverlay }}
+        sx={styles.dataGridContainer}
+      />
+
+      {/* --- Main Grid Approve/Reject Dialog --- */}
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>
+          {modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Confirm {modalMode.toLowerCase()} for batch{" "}
+            <strong>{selectedBatch?.batchId}</strong>?
+          </DialogContentText>
+          <TextField
+            autoFocus
+            required
+            margin="dense"
+            label="Remarks "
+            fullWidth
+            variant="standard"
+            value={executorRemarks}
+            onChange={(e) => handleRemarksChange(e, setExecutorRemarks)}
+            disabled={isSubmitting}
+            inputProps={{ maxLength: 30 }}
+            error={executorRemarks.length > 0 && !isRemarksValid(executorRemarks)}
+          />
+          <Typography sx={styles.helperText}>
+            Allowed 2-30 chars (alphanumeric, single spaces, / & ( ) , . -)
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={styles.dialogActions}>
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSubmitAction}
+            variant="contained"
+            color={modalMode === "ACCEPTED" ? "success" : "error"}
+            disabled={isSubmitting || !isRemarksValid(executorRemarks)}
+          >
+            {isSubmitting ? <CircularProgress size={24} /> : "Confirm"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* --- View Details Modal --- */}
+      <Dialog
+        open={isViewModalOpen}
+        onClose={handleCloseViewModal}
+        fullWidth
+        maxWidth="lg"
+      >
         <DialogTitle sx={styles.dialogTitle}>
           <Typography variant="h6">
             Batch Details: {viewingBatchId}
           </Typography>
-          <Stack direction="row" spacing={2} alignItems="center">
+          <IconButton onClick={handleCloseViewModal}>
+            <CloseIcon />
+          </IconButton>
+           <Stack direction="row" spacing={2} alignItems="center">
             <Button 
               variant="outlined" 
               size="small" 
@@ -150,5 +660,87 @@ Find the DialogTitle of your View Details Modal (around line 530). We will add a
             </IconButton>
           </Stack>
         </DialogTitle>
+        <DialogContent dividers sx={{ p: 0 }}>
+          <Box sx={styles.fixedContentBox}>
 
-```
+            <TableContainer component={Paper} sx={{ ...styles.tableContainer, position: "relative", minHeight: 350 }}>
+
+              {/* NEW: SMOOTH LOADING OVERLAY */}
+              {detailLoading && (
+                <Box
+                  sx={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: "100%",
+                    backgroundColor: "rgba(255, 255, 255, 0.6)", // Slight transparent white fade
+                    display: "flex",
+                    justifyContent: "center",
+                    alignItems: "center",
+                    zIndex: 999, // Puts spinner on top of the table
+                  }}
+                >
+                  <CircularProgress />
+                </Box>
+              )}
+
+              <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                <TableHead>
+                  <TableRow>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Branch</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
+                    <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {batchDetails.length > 0 ? (
+                    batchDetails.map((group) =>
+                      group.map((row) => (
+                        <TableRow key={row.id} hover>
+                          <TableCell align="center">{row.branch}</TableCell>
+                          <TableCell align="center">{row.currency}</TableCell>
+                          <TableCell align="center">{row.cgl}</TableCell>
+                          <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
+                          <TableCell align="center">
+                            <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" />
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    )
+                  ) : (
+                    !detailLoading && (
+                      <TableRow>
+                        <TableCell colSpan={5} align="center" sx={{ py: 5 }}>
+                          <Typography>No details found.</Typography>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+
+            {/* Pagination is now permanently anchored at the bottom */}
+            <TablePagination
+              component="div"
+              count={detailTotalCount}
+              page={detailPage}
+              onPageChange={handleDetailPageChange}
+              rowsPerPage={detailRowsPerPage}
+              onRowsPerPageChange={handleDetailRowsPerPageChange}
+              rowsPerPageOptions={[10, 25, 50]}
+            />
+          </Box>
+        </DialogContent>
+
+
+        <DialogActions sx={styles.dialogActions}>
+
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
