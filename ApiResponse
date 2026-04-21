@@ -1,29 +1,189 @@
-		0002337-1
-0002337	0002337-2
-		0002337-3
-		0002337-4
-		
-0002337 -> this is batch Id 
+To solve this completely, we need to do two things:
+ 1. **Backend:** Use your JRNL_SEQ to generate a unique journalPrefix so it is completely distinct from the BATCH_SEQ batch ID. (You can ignore or delete COMMON_REQ_SEQ as it is not needed).
+ 2. **Frontend:** Update the Authorization Modal so it physically groups the table by **Branch** (using rowSpan), making it incredibly easy for the checker to see the branches and approve/reject them individually.
+Here are the exact replacements you need to make:
+### 1. BACKEND: Separate Batch ID and Journal ID (JournalRequestServiceImpl.java)
+We need to inject the new Journal Prefix into both your bulk upload and manual entry methods.
+**A. Update createBatchFromCacheAsync**
+Find the createBatchFromCacheAsync method (around line 43).
+**Replace the sequence generation block with this:**
+```java
+        try {
+            String batchId = sequenceService.getNextBatchId();
+            String journalPrefix = sequenceService.getNextJournalIdPrefix(); // NEW: Get distinct Journal Prefix
+            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
+            
+            // Pass journalPrefix down to the async executor
+            self.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole);
+            return batchId;
+        } catch (DataAccessException e) {
 
-0002337-1 
-0002337-2 -> this is Journal Id 
+```
+**B. Update executeAsyncBatchCreation Signature**
+Find the executeAsyncBatchCreation method (around line 59).
+**Change its signature to accept the journalPrefix:**
+```java
+    @Override
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
 
-one of the most imp thing is like i dont want 0002337 batch id and 
-prefix of the Journal id to be same 0002337
+```
+*And further down inside the same method, pass it into processChunkRaw:*
+```java
+                                self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
 
-as like above in which Batch id is used to accept or reject whole batch
+```
+**C. Update processChunkRaw Signature & ID Logic**
+Find the processChunkRaw method (around line 205).
+**Update the signature and the jId string:**
+```java
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
+                                String batchId,
+                                String journalPrefix, // NEW parameter
+                                String commonRemarks,
+                                String creatorId,
+                                Integer creatorRole,
+                                int globalOffset,
+                                LongAdder globalDebit,
+                                LongAdder globalCredit) {
 
-and when we apporve reject the specific branch we are using that Journal Id 
+```
+*Inside the setValues method of that same function, change the ID generation:*
+```java
+                    int globalIdx = globalOffset + i + 1;
+                    // FIX: Use the distinct journalPrefix instead of batchId!
+                    String jId = journalPrefix + "-" + globalIdx; 
 
+```
+**D. Update createBatchRequest (Manual Upload)**
+Find the createBatchRequest method (around line 852).
+**Replace the top section to generate and use the distinct prefix:**
+```java
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = sequenceService.getNextBatchId();
+        String journalPrefix = sequenceService.getNextJournalIdPrefix(); // NEW: Get distinct prefix
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
 
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal totalDebit = BigDecimal.ZERO;
+        BigDecimal totalCredit = BigDecimal.ZERO;
+        int rowIndex = 1;
 
-This is what currently we are genrating but i dont want to be like this 
-i want like 
+        for (BatchRequestDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setRequestDate(LocalDateTime.now());
+            entity.setCreatorId(creatorId);
+            entity.setCreatorRole(creatorRole);
+            entity.setBatchId(batchId);
+            entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
 
-now to impliment this tell mi which seq should delete and which should be used 
+            // FIX: Use distinct journalPrefix
+            String journalId = journalPrefix + "-" + rowIndex;
+            entity.setJournalId(journalId);
 
-and reset the sequnces
+```
+*(Note: Don't forget to update the executeAsyncBatchCreation signature in your JournalRequestService.java interface as well so it compiles!)*
+### 2. FRONTEND: Group UI by Branch (JournalAuthorization.js)
+We will visually group the modal table by the **Branch** column instead of the Journal ID.
+**A. Update fetchBatchDetailsPaginated to group by Branch:**
+Find your fetchBatchDetailsPaginated function and replace the row mapping and grouping logic:
+```javascript
+            // Use 'amount' or 'reqAmount' based on what Spring Boot sends
+            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
+            const branchKey = req.branchCode || req.reqBranchCode || "-"; // Extract Branch
 
-and also imp thing when ever we are showing that in the Auth page show in proper way which will diff the branch and whole batch 
-so they can easly understand the Data for the branch and whole currently it i think it is there cheak once
+            const row = {
+              ...req,
+              journalId: req.journalId || req.id, // Store actual distinct Journal ID
+              amount: Math.abs(amountVal),
+              transactionType: amountVal < 0 ? "Credit" : "Debit",
+              branch: branchKey,
+              currency: req.currency || req.reqCurrency || "-",
+              cgl: req.cgl || req.reqCgl || "-",
+              remarks: req.narration || req.reqNarration || "-",
+              product: req.productCode || req.reqProduct || "-",
+            };
+            
+            // FIX: Group explicitly by Branch!
+            if (!journalGroups.has(branchKey)) journalGroups.set(branchKey, []);
+            journalGroups.get(branchKey).push(row);
 
+```
+**B. Swap the Table Headers:**
+In the <TableHead> of the View Dialog, make "Branch" the sticky column next to the Checkbox.
+```javascript
+                      <TableRow>
+                        <TableCell padding="checkbox" sx={styles.stickyHeaderColumn(0)}>
+                          <Checkbox
+                            color="primary"
+                            indeterminate={selectedJournalPrefixes.length > 0 && selectedJournalPrefixes.length < batchDetails.length}
+                            checked={batchDetails.length > 0 && selectedJournalPrefixes.length === batchDetails.length}
+                            onChange={handleSelectAllClick}
+                            disabled={isViewingSelfCreated || isLargeBatch}
+                          />
+                        </TableCell>
+                        <TableCell align="center" sx={styles.stickyHeaderColumn(48)}>
+                          Branch
+                        </TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Journal ID</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
+                        <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
+                      </TableRow>
+
+```
+**C. Update the Table Body to render the Branch groups:**
+Replace your <TableBody> mapping loop with this so the Branch name is merged across rows:
+```javascript
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => {
+                        const branchCode = group[0].branch; // The group key is now the Branch!
+                        const isSelected = selectedJournalPrefixes.includes(branchCode);
+                        
+                        return group.map((row, rowIndex) => (
+                          <TableRow
+                            key={row.id}
+                            hover={!isViewingSelfCreated && !isLargeBatch}
+                            onClick={() => !isViewingSelfCreated && !isLargeBatch && handleRowCheckboxClick(null, branchCode)}
+                            selected={isSelected}
+                            sx={{
+                              cursor: (isViewingSelfCreated || isLargeBatch) ? "not-allowed" : "pointer",
+                              ...(rowIndex === 0 && groupIndex > 0 && { borderTop: 1, borderColor: "divider" }),
+                            }}
+                          >
+                            {rowIndex === 0 && (
+                              <>
+                                <TableCell padding="checkbox" rowSpan={group.length} sx={styles.stickyBodyColumn(0)}>
+                                  <Checkbox
+                                    color="primary"
+                                    checked={isSelected}
+                                    disabled={isViewingSelfCreated || isLargeBatch}
+                                    onClick={(e) => handleRowCheckboxClick(e, branchCode)}
+                                  />
+                                </TableCell>
+                                <TableCell align="center" rowSpan={group.length} sx={styles.stickyBodyColumn(48)}>
+                                  <Typography variant="body2" fontWeight="bold" color="primary">
+                                    {branchCode}
+                                  </Typography>
+                                </TableCell>
+                              </>
+                            )}
+                            <TableCell align="center">{row.journalId}</TableCell>
+                            <TableCell align="center">{row.currency}</TableCell>
+                            <TableCell align="center">{row.cgl}</TableCell>
+                            <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
+                            <TableCell align="center">
+                              <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" />
+                            </TableCell>
+                          </TableRow>
+                        ));
+                      })}
+                    </TableBody>
+
+```
+With these changes, your Journal IDs will perfectly track using the JRNL_SEQ (e.g., 0004977-1), avoiding any overlap with the Batch ID. Furthermore, the frontend will group your rows by the Branch column visually, so the user can easily check the box next to MUMBAI_01 to accept/reject just that branch!
