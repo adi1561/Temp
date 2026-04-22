@@ -1,55 +1,38 @@
-You have identified two classic and very critical data manipulation bugs. As a financial system, absolute precision is non-negotiable, and the backend should **never** alter the user's intended scale or precision.
-I have scanned your service files and found exactly where both of these issues are occurring.
-Here is the deep dive into why this is happening and the exact code replacements needed to stop it.
-### Issue 1: Large Number Rounding (9999999999999999 becoming 10000000...)
-**Where it is happening:** JournalRequestServiceImpl.java -> generateBatchExcel()
-**Why it happens:** When generating the Excel download, the code is converting your exact BigDecimal amount into a standard Java double using .doubleValue().
-A double (64-bit floating point) has a hard mathematical limit of **15 to 16 decimal digits of precision**. When a user inputs a 16-digit amount like 9999999999999999, Java mathematically cannot store it as a double and automatically rounds it up to 10000000000000000.0.
-Furthermore, Apache POI's numeric cells also max out at double limits. To preserve 16+ digits of absolute precision in Excel, it **must** be injected as a String.
-**The Fix:**
-In generateBatchExcel, change how the amount is inserted into the cell.
-**Find this (Line 923):**
-```java
-row.createCell(3).setCellValue(amount.abs().doubleValue());
 
-```
-**Replace with:**
-```java
-// Inject as a plain string to prevent Java AND Excel from rounding the number
-row.createCell(3).setCellValue(amount.abs().stripTrailingZeros().toPlainString());
-
-```
-### Issue 2: Unwanted Decimal Padding (10.88 becoming 10.8800)
-**Where it is happening:** JournalBulkValidationService.java -> generateSuccessCsv()
-**Why it happens:** When the system writes the "Success" CSV file, there is explicit logic forcing the BigDecimal to scale to 4 decimal places and manually padding it with zeros. It actively transforms 10.88 into 10.8800 and adds up to 16 leading zeros to the integer part.
-**The Fix:**
-We need to rip out the manual scaling and zero-padding logic, instructing the CSV builder to just use the exact number as provided.
-**Find this (Lines 659-661):**
-```java
-String plainAmt = row.amount.abs().setScale(4, RoundingMode.HALF_UP).toPlainString();
-int dotIndex = plainAmt.indexOf('.');
-String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
-String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
-String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
-
-```
-**Replace with:**
-```java
-// Extracts exactly what the user entered without altering the scale or padding zeros
-String col8 = row.amount.abs().stripTrailingZeros().toPlainString();
-
-```
-### Bonus Check: Error Excel File
-**Where:** JournalBulkValidationService.java -> generateErrorExcelFast()
-You actually have a slight risk of scientific notation happening in the Error Excel file as well because it currently uses .toString(). If a user enters a very tiny fractional number, toString() might output it as 1.5E-4 instead of 0.0001.
-**Find this (Line 675):**
-```java
-r.createCell(col++).setCellValue(d.amount != null ? d.amount.toString() : "");
-
-```
-**Replace with:**
-```java
-r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
-
-```
-By making these updates, your application will act as a true "pass-through" for numeric data. 9999999999999999 will remain 9999999999999999, and 10.88 will remain 10.88.
+java.lang.NullPointerException: Cannot invoke "org.hibernate.engine.jdbc.spi.SqlExceptionHelper.convert(java.sql.SQLException, String)" because the return value of "org.hibernate.resource.transaction.backend.jdbc.internal.JdbcIsolationDelegate.sqlExceptionHelper()" is null
+	at org.hibernate.resource.transaction.backend.jdbc.internal.JdbcIsolationDelegate.delegateWork(JdbcIsolationDelegate.java:116) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.engine.jdbc.env.internal.JdbcEnvironmentInitiator.getJdbcEnvironmentUsingJdbcMetadata(JdbcEnvironmentInitiator.java:290) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.engine.jdbc.env.internal.JdbcEnvironmentInitiator.initiateService(JdbcEnvironmentInitiator.java:123) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.engine.jdbc.env.internal.JdbcEnvironmentInitiator.initiateService(JdbcEnvironmentInitiator.java:77) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.boot.registry.internal.StandardServiceRegistryImpl.initiateService(StandardServiceRegistryImpl.java:130) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.service.internal.AbstractServiceRegistryImpl.createService(AbstractServiceRegistryImpl.java:263) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.service.internal.AbstractServiceRegistryImpl.initializeService(AbstractServiceRegistryImpl.java:238) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.service.internal.AbstractServiceRegistryImpl.getService(AbstractServiceRegistryImpl.java:215) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.boot.model.relational.Database.<init>(Database.java:45) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.boot.internal.InFlightMetadataCollectorImpl.getDatabase(InFlightMetadataCollectorImpl.java:221) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.boot.internal.InFlightMetadataCollectorImpl.<init>(InFlightMetadataCollectorImpl.java:189) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.boot.model.process.spi.MetadataBuildingProcess.complete(MetadataBuildingProcess.java:171) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.jpa.boot.internal.EntityManagerFactoryBuilderImpl.metadata(EntityManagerFactoryBuilderImpl.java:1431) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.hibernate.jpa.boot.internal.EntityManagerFactoryBuilderImpl.build(EntityManagerFactoryBuilderImpl.java:1502) ~[hibernate-core-6.5.2.Final.jar:6.5.2.Final]
+	at org.springframework.orm.jpa.vendor.SpringHibernateJpaPersistenceProvider.createContainerEntityManagerFactory(SpringHibernateJpaPersistenceProvider.java:75) ~[spring-orm-6.1.8.jar:6.1.8]
+	at org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean.createNativeEntityManagerFactory(LocalContainerEntityManagerFactoryBean.java:390) ~[spring-orm-6.1.8.jar:6.1.8]
+	at org.springframework.orm.jpa.AbstractEntityManagerFactoryBean.buildNativeEntityManagerFactory(AbstractEntityManagerFactoryBean.java:409) ~[spring-orm-6.1.8.jar:6.1.8]
+	at org.springframework.orm.jpa.AbstractEntityManagerFactoryBean.afterPropertiesSet(AbstractEntityManagerFactoryBean.java:396) ~[spring-orm-6.1.8.jar:6.1.8]
+	at org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean.afterPropertiesSet(LocalContainerEntityManagerFactoryBean.java:366) ~[spring-orm-6.1.8.jar:6.1.8]
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.invokeInitMethods(AbstractAutowireCapableBeanFactory.java:1835) ~[spring-beans-6.1.8.jar:6.1.8]
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.initializeBean(AbstractAutowireCapableBeanFactory.java:1784) ~[spring-beans-6.1.8.jar:6.1.8]
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.doCreateBean(AbstractAutowireCapableBeanFactory.java:600) ~[spring-beans-6.1.8.jar:6.1.8]
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.createBean(AbstractAutowireCapableBeanFactory.java:522) ~[spring-beans-6.1.8.jar:6.1.8]
+	at org.springframework.beans.factory.support.AbstractBeanFactory.lambda$doGetBean$0(AbstractBeanFactory.java:337) ~[spring-beans-6.1.8.jar:6.1.8]
+	at org.springframework.beans.factory.support.DefaultSingletonBeanRegistry.getSingleton(DefaultSingletonBeanRegistry.java:234) ~[spring-beans-6.1.8.jar:6.1.8]
+	at org.springframework.beans.factory.support.AbstractBeanFactory.doGetBean(AbstractBeanFactory.java:335) ~[spring-beans-6.1.8.jar:6.1.8]
+	at org.springframework.beans.factory.support.AbstractBeanFactory.getBean(AbstractBeanFactory.java:205) ~[spring-beans-6.1.8.jar:6.1.8]
+	at org.springframework.context.support.AbstractApplicationContext.finishBeanFactoryInitialization(AbstractApplicationContext.java:952) ~[spring-context-6.1.8.jar:6.1.8]
+	at org.springframework.context.support.AbstractApplicationContext.refresh(AbstractApplicationContext.java:624) ~[spring-context-6.1.8.jar:6.1.8]
+	at org.springframework.boot.web.servlet.context.ServletWebServerApplicationContext.refresh(ServletWebServerApplicationContext.java:146) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.refresh(SpringApplication.java:754) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.refreshContext(SpringApplication.java:456) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:335) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:1363) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:1352) ~[spring-boot-3.3.0.jar:3.3.0]
+	at com.fincore.JournalService.JournalServiceApplication.main(JournalServiceApplication.java:13) ~[classes/:na]
