@@ -1,29 +1,128 @@
-  const handleSubmitBatchCancel = async () => {
-    setIsSubmitting(true);
-    const targetBatchId = selectedBatch.batchId; // Store it before modal closes
-    
-    try {
-      await callApi(
-        `/JS/journals/my-requests/by-batch/${targetBatchId}`,
-        null,
-        "DELETE"
-      );
-      showSnackBar(`Batch ${targetBatchId} deletion process started.`, "success");
-      
-      // 1. OPTIMISTIC UPDATE: Instantly remove the batch from the UI table
-      setRows((prevRows) => prevRows.filter((row) => row.batchId !== targetBatchId));
-      
-      handleCloseModal();
-      
-      // 2. DELAYED FETCH: Wait 1.5 seconds to give the backend Async PL/SQL 
-      // time to completely purge the records before refreshing the list.
-      setTimeout(() => {
-        fetchMyBatches();
-      }, 1500);
+Got it. As a senior engineer, standardizing error messages is a great move for user experience. The original message exposed internal backend logic ("MEMO" vs "NORMAL") which the end-user doesn't need to see.
+I have rewritten your requested message to be grammatically correct and professional. I've also reviewed your other validation methods and corrected the grammar, capitalization, and consistency across all error messages so your application feels fully polished.
+Here are the updated methods for your JournalBulkValidationService.
+### 1. Updated runBalanceCheck
+The backend grouping logic remains exactly the same to ensure accuracy, but we now hide the "MEMO/NORMAL" terminology from the user and output a clean, generic message.
+```java
+    private void runBalanceCheck(List<ExcelRowData> rows) {
+        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
 
-    } catch (error) {
-      showSnackBar("Failed to delete batch", "error");
-    } finally {
-      setIsSubmitting(false);
+        rows.parallelStream().forEach(d -> {
+            if (d.amount != null) {
+                BigDecimal val = d.amount;
+                if ("Credit".equals(d.txnType)) val = val.negate();
+                // We keep the grouping logic intact so math stays accurate
+                String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
+                
+                String key = d.branch + "_" + d.currency + "_" + type;
+                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val.multiply(new BigDecimal("10000")).longValue());
+            }
+        });
+
+        rows.parallelStream().forEach(d -> {
+            String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
+            String key = d.branch + "_" + d.currency + "_" + type;
+            LongAdder adder = balanceMap.get(key);
+            
+            if (adder != null && adder.sum() != 0) {
+                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"), 4, RoundingMode.HALF_UP);
+                synchronized (d.balErrors) {
+                    if (d.balErrors.isEmpty()) {
+                        // Clean, standard, and grammatically correct error message
+                        d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch. Difference: " + diff.toPlainString());
+                    }
+                }
+            }
+        });
     }
-  };
+
+```
+### 2. Updated runFormatCheck
+I have corrected capitalization ("Zero", "Null", "Mandatory") and improved the sentence structure for clarity.
+```java
+    private void runFormatCheck(List<ExcelRowData> rows) {
+        rows.parallelStream().forEach(d -> {
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) {
+                d.formatErrors.add("Amount cannot be zero or null.");
+            } else {
+                if (d.amount.signum() < 0) d.formatErrors.add("Amount cannot be negative.");
+                if (d.amount.precision() > 20 || d.amount.scale() > 4) d.formatErrors.add("Amount exceeds maximum allowed format (16 digits, 4 decimal places).");
+                if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) d.formatErrors.add("INR amounts cannot exceed 2 decimal places.");
+            }
+            
+            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) {
+                d.formatErrors.add("Product code must be up to 8 digits or left blank.");
+            }
+            
+            if (d.remarks == null || d.remarks.trim().isEmpty()) {
+                d.formatErrors.add("Remarks are mandatory.");
+            } else if (!d.remarks.matches("^[a-zA-Z0-9 ]{2,30}$")) {
+                d.formatErrors.add("Remarks must contain only 2-30 alphanumeric characters and spaces.");
+            }
+            
+            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency code must be exactly 3 characters.");
+            
+            if (d.cgl == null || d.cgl.isEmpty()) {
+                d.formatErrors.add("CGL is mandatory.");
+            } else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) {
+                d.formatErrors.add("CGL must be exactly 10 digits.");
+            }
+            
+            if (d.branch == null || d.branch.trim().isEmpty()) {
+                d.formatErrors.add("Branch code is mandatory.");
+            } else if (d.branch.trim().length() != 5) {
+                d.formatErrors.add("Branch code must be exactly 5 characters.");
+            }
+        });
+    }
+
+```
+### 3. Updated runDbCheck
+Standardized to clear, actionable sentences.
+```java
+    private void runDbCheck(List<ExcelRowData> rows) {
+        Set<String> validBranches = validationMasterService.getAllActiveBranches();
+        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
+        Set<String> validCgls = validationMasterService.getAllActiveCgls();
+
+        rows.parallelStream().forEach(d -> {
+            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch)) 
+                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
+            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency)) 
+                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
+            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl)) 
+                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
+        });
+    }
+
+```
+### 4. Updated validateSystemColumns
+Cleaned up the grammar and punctuation for system file validation.
+```java
+    private void validateSystemColumns(ExcelRowData d, String c0, String cDate, String cYear, String cMonth, String c11, String c12, String c13, LocalDate postingDate) {
+        if (!"01".equals(c0)) d.formatErrors.add("Site must be '01'.");
+        
+        try {
+            if (cDate == null || cDate.trim().length() != 8) {
+                d.formatErrors.add("Invalid date format. Expected: ddMMyyyy.");
+            } else {
+                LocalDate parsedDate = LocalDate.parse(cDate.trim(), SYSTEM_DATE_FMT);
+                
+                if (!parsedDate.equals(postingDate)) d.formatErrors.add("Date does not match the current posting date.");
+                
+                String expectedYear = (parsedDate.getMonthValue() >= 4) ? String.valueOf(parsedDate.getYear()) : String.valueOf(parsedDate.getYear() - 1);
+                String expectedMonth = String.format("%02d", (parsedDate.getMonthValue() >= 4) ? (parsedDate.getMonthValue() - 3) : (parsedDate.getMonthValue() + 9));
+                
+                if (cYear == null || !cYear.trim().equals(expectedYear)) d.formatErrors.add("Invalid financial year. Expected: " + expectedYear);
+                if (cMonth == null || !cMonth.trim().equals(expectedMonth)) d.formatErrors.add("Invalid financial month. Expected: " + expectedMonth);
+            }
+        } catch (DateTimeParseException e) {
+            d.formatErrors.add("Invalid calendar date.");
+        }
+        
+        if (c11 == null || !"B".equalsIgnoreCase(c11.trim())) d.formatErrors.add("Column 12 must be 'B'.");
+        if (c12 == null || !"C".equalsIgnoreCase(c12.trim())) d.formatErrors.add("Column 13 must be 'C'.");
+        if (c13 == null || !"D".equalsIgnoreCase(c13.trim())) d.formatErrors.add("Column 14 must be 'D'.");
+    }
+
+```
