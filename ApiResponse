@@ -1,128 +1,55 @@
-Got it. As a senior engineer, standardizing error messages is a great move for user experience. The original message exposed internal backend logic ("MEMO" vs "NORMAL") which the end-user doesn't need to see.
-I have rewritten your requested message to be grammatically correct and professional. I've also reviewed your other validation methods and corrected the grammar, capitalization, and consistency across all error messages so your application feels fully polished.
-Here are the updated methods for your JournalBulkValidationService.
-### 1. Updated runBalanceCheck
-The backend grouping logic remains exactly the same to ensure accuracy, but we now hide the "MEMO/NORMAL" terminology from the user and output a clean, generic message.
+You have identified two classic and very critical data manipulation bugs. As a financial system, absolute precision is non-negotiable, and the backend should **never** alter the user's intended scale or precision.
+I have scanned your service files and found exactly where both of these issues are occurring.
+Here is the deep dive into why this is happening and the exact code replacements needed to stop it.
+### Issue 1: Large Number Rounding (9999999999999999 becoming 10000000...)
+**Where it is happening:** JournalRequestServiceImpl.java -> generateBatchExcel()
+**Why it happens:** When generating the Excel download, the code is converting your exact BigDecimal amount into a standard Java double using .doubleValue().
+A double (64-bit floating point) has a hard mathematical limit of **15 to 16 decimal digits of precision**. When a user inputs a 16-digit amount like 9999999999999999, Java mathematically cannot store it as a double and automatically rounds it up to 10000000000000000.0.
+Furthermore, Apache POI's numeric cells also max out at double limits. To preserve 16+ digits of absolute precision in Excel, it **must** be injected as a String.
+**The Fix:**
+In generateBatchExcel, change how the amount is inserted into the cell.
+**Find this (Line 923):**
 ```java
-    private void runBalanceCheck(List<ExcelRowData> rows) {
-        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
-
-        rows.parallelStream().forEach(d -> {
-            if (d.amount != null) {
-                BigDecimal val = d.amount;
-                if ("Credit".equals(d.txnType)) val = val.negate();
-                // We keep the grouping logic intact so math stays accurate
-                String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
-                
-                String key = d.branch + "_" + d.currency + "_" + type;
-                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val.multiply(new BigDecimal("10000")).longValue());
-            }
-        });
-
-        rows.parallelStream().forEach(d -> {
-            String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
-            String key = d.branch + "_" + d.currency + "_" + type;
-            LongAdder adder = balanceMap.get(key);
-            
-            if (adder != null && adder.sum() != 0) {
-                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"), 4, RoundingMode.HALF_UP);
-                synchronized (d.balErrors) {
-                    if (d.balErrors.isEmpty()) {
-                        // Clean, standard, and grammatically correct error message
-                        d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch. Difference: " + diff.toPlainString());
-                    }
-                }
-            }
-        });
-    }
+row.createCell(3).setCellValue(amount.abs().doubleValue());
 
 ```
-### 2. Updated runFormatCheck
-I have corrected capitalization ("Zero", "Null", "Mandatory") and improved the sentence structure for clarity.
+**Replace with:**
 ```java
-    private void runFormatCheck(List<ExcelRowData> rows) {
-        rows.parallelStream().forEach(d -> {
-            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) {
-                d.formatErrors.add("Amount cannot be zero or null.");
-            } else {
-                if (d.amount.signum() < 0) d.formatErrors.add("Amount cannot be negative.");
-                if (d.amount.precision() > 20 || d.amount.scale() > 4) d.formatErrors.add("Amount exceeds maximum allowed format (16 digits, 4 decimal places).");
-                if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) d.formatErrors.add("INR amounts cannot exceed 2 decimal places.");
-            }
-            
-            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) {
-                d.formatErrors.add("Product code must be up to 8 digits or left blank.");
-            }
-            
-            if (d.remarks == null || d.remarks.trim().isEmpty()) {
-                d.formatErrors.add("Remarks are mandatory.");
-            } else if (!d.remarks.matches("^[a-zA-Z0-9 ]{2,30}$")) {
-                d.formatErrors.add("Remarks must contain only 2-30 alphanumeric characters and spaces.");
-            }
-            
-            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency code must be exactly 3 characters.");
-            
-            if (d.cgl == null || d.cgl.isEmpty()) {
-                d.formatErrors.add("CGL is mandatory.");
-            } else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) {
-                d.formatErrors.add("CGL must be exactly 10 digits.");
-            }
-            
-            if (d.branch == null || d.branch.trim().isEmpty()) {
-                d.formatErrors.add("Branch code is mandatory.");
-            } else if (d.branch.trim().length() != 5) {
-                d.formatErrors.add("Branch code must be exactly 5 characters.");
-            }
-        });
-    }
+// Inject as a plain string to prevent Java AND Excel from rounding the number
+row.createCell(3).setCellValue(amount.abs().stripTrailingZeros().toPlainString());
 
 ```
-### 3. Updated runDbCheck
-Standardized to clear, actionable sentences.
+### Issue 2: Unwanted Decimal Padding (10.88 becoming 10.8800)
+**Where it is happening:** JournalBulkValidationService.java -> generateSuccessCsv()
+**Why it happens:** When the system writes the "Success" CSV file, there is explicit logic forcing the BigDecimal to scale to 4 decimal places and manually padding it with zeros. It actively transforms 10.88 into 10.8800 and adds up to 16 leading zeros to the integer part.
+**The Fix:**
+We need to rip out the manual scaling and zero-padding logic, instructing the CSV builder to just use the exact number as provided.
+**Find this (Lines 659-661):**
 ```java
-    private void runDbCheck(List<ExcelRowData> rows) {
-        Set<String> validBranches = validationMasterService.getAllActiveBranches();
-        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
-        Set<String> validCgls = validationMasterService.getAllActiveCgls();
-
-        rows.parallelStream().forEach(d -> {
-            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch)) 
-                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
-            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency)) 
-                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
-            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl)) 
-                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
-        });
-    }
+String plainAmt = row.amount.abs().setScale(4, RoundingMode.HALF_UP).toPlainString();
+int dotIndex = plainAmt.indexOf('.');
+String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
+String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
+String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
 
 ```
-### 4. Updated validateSystemColumns
-Cleaned up the grammar and punctuation for system file validation.
+**Replace with:**
 ```java
-    private void validateSystemColumns(ExcelRowData d, String c0, String cDate, String cYear, String cMonth, String c11, String c12, String c13, LocalDate postingDate) {
-        if (!"01".equals(c0)) d.formatErrors.add("Site must be '01'.");
-        
-        try {
-            if (cDate == null || cDate.trim().length() != 8) {
-                d.formatErrors.add("Invalid date format. Expected: ddMMyyyy.");
-            } else {
-                LocalDate parsedDate = LocalDate.parse(cDate.trim(), SYSTEM_DATE_FMT);
-                
-                if (!parsedDate.equals(postingDate)) d.formatErrors.add("Date does not match the current posting date.");
-                
-                String expectedYear = (parsedDate.getMonthValue() >= 4) ? String.valueOf(parsedDate.getYear()) : String.valueOf(parsedDate.getYear() - 1);
-                String expectedMonth = String.format("%02d", (parsedDate.getMonthValue() >= 4) ? (parsedDate.getMonthValue() - 3) : (parsedDate.getMonthValue() + 9));
-                
-                if (cYear == null || !cYear.trim().equals(expectedYear)) d.formatErrors.add("Invalid financial year. Expected: " + expectedYear);
-                if (cMonth == null || !cMonth.trim().equals(expectedMonth)) d.formatErrors.add("Invalid financial month. Expected: " + expectedMonth);
-            }
-        } catch (DateTimeParseException e) {
-            d.formatErrors.add("Invalid calendar date.");
-        }
-        
-        if (c11 == null || !"B".equalsIgnoreCase(c11.trim())) d.formatErrors.add("Column 12 must be 'B'.");
-        if (c12 == null || !"C".equalsIgnoreCase(c12.trim())) d.formatErrors.add("Column 13 must be 'C'.");
-        if (c13 == null || !"D".equalsIgnoreCase(c13.trim())) d.formatErrors.add("Column 14 must be 'D'.");
-    }
+// Extracts exactly what the user entered without altering the scale or padding zeros
+String col8 = row.amount.abs().stripTrailingZeros().toPlainString();
 
 ```
+### Bonus Check: Error Excel File
+**Where:** JournalBulkValidationService.java -> generateErrorExcelFast()
+You actually have a slight risk of scientific notation happening in the Error Excel file as well because it currently uses .toString(). If a user enters a very tiny fractional number, toString() might output it as 1.5E-4 instead of 0.0001.
+**Find this (Line 675):**
+```java
+r.createCell(col++).setCellValue(d.amount != null ? d.amount.toString() : "");
+
+```
+**Replace with:**
+```java
+r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
+
+```
+By making these updates, your application will act as a true "pass-through" for numeric data. 9999999999999999 will remain 9999999999999999, and 10.88 will remain 10.88.
