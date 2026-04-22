@@ -1,5 +1,3 @@
-config files 
-
 package com.fincore.JournalService.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -41,6 +39,7 @@ public class AppConfig {
     }
 }
 
+
 package com.fincore.JournalService.config;
 
 import lombok.extern.slf4j.Slf4j;
@@ -49,6 +48,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.AsyncConfigurer;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
@@ -59,6 +59,7 @@ import java.util.concurrent.Executor;
  */
 @Configuration
 @EnableAsync
+@EnableScheduling
 @Slf4j
 public class AsyncConfig implements AsyncConfigurer {
 
@@ -119,13 +120,13 @@ public class AsyncConfig implements AsyncConfigurer {
                 log.error("ASYNC_DATA_FAILURE | Status: Database connectivity lost in background thread");
             } else if (ex instanceof NullPointerException) {
                 log.error("ASYNC_LOGIC_FAILURE | Status: Null pointer encountered in async task");
-            } else {
+            }
+            else {
                 log.error("ASYNC_TECHNICAL_FAULT | Status: Unexpected background error");
             }
         };
     }
 }
-
 package com.fincore.JournalService.config;
 
 import lombok.extern.slf4j.Slf4j;
@@ -158,7 +159,8 @@ public class CacheConfig {
                         config.entryTtl(java.time.Duration.ofHours(1)))
                 .build();
     }
-}  
+}
+
 package com.fincore.JournalService.config;
 
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -294,7 +296,6 @@ public class OracleDbConfig {
     }
 }
 
-
 package com.fincore.JournalService.config;
 
 import lombok.extern.slf4j.Slf4j;
@@ -336,7 +337,6 @@ public class RedisConfig {
         return template;
     }
 }
-
 
 package com.fincore.JournalService.config;
 
@@ -385,7 +385,7 @@ public class RequestStatusConverter implements AttributeConverter<RequestStatus,
                     return new IllegalArgumentException("Unknown status code found in database: " + code);
                 });
     }
-}  
+}
 
 
 
@@ -447,6 +447,8 @@ public class BranchController {
         return ResponseEntity.ok(results);
     }
 }
+
+
 package com.fincore.JournalService.Controllers;
 
 import com.fincore.JournalService.Dto.CglDto;
@@ -493,7 +495,6 @@ public class CglController {
         return ResponseEntity.ok(results);
     }
 }
-
 package com.fincore.JournalService.Controllers;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -547,21 +548,20 @@ public class JournalRequestController {
      */
     @PostMapping("/create-batch-from-cache")
     public ResponseEntity<Map<String, Object>> createBatchFromCache(
-            @RequestBody Map<String, String> payload,
+            @Valid @RequestBody CacheBatchRequestDto payload,
             @RequestHeader("Authorization") String token) throws IOException {
 
         String userId = jwtUtil.getUserIdFromToken(token);
         Integer userRole = jwtUtil.getUserRoleFromToken(token);
 
-        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.get("requestId"));
-
+        // Using getter methods from the new DTO instead of .get() from a Map
+        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
         String batchId = journalRequestService.createBatchFromCacheAsync(
-                payload.get("requestId"),
-                payload.get("commonBatchRemarks"),
+                payload.getRequestId(),
+                payload.getCommonBatchRemarks(),
                 userId,
                 userRole
         );
-
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
                 "status", "PROCESSING",
                 "message", "Batch creation initiated in background.",
@@ -751,7 +751,6 @@ public class JournalRequestController {
             );
             return ResponseEntity.status(HttpStatus.CREATED).body(created);
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
-            // Rule 2: Masking JSON structure details in logs
             log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
             throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
         }
@@ -768,10 +767,11 @@ public class JournalRequestController {
     }
 
     @PatchMapping("/update-request")
-    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token, @RequestBody ProcessJournalRequestDto dto) throws JsonProcessingException {
+    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token, @Valid @RequestBody ProcessJournalRequestDto dto) throws JsonProcessingException {
         return journalRequestService.updateRequestStatus(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token))
                 .orElseThrow(() -> new CustomExceptions.FileProcessingException("Request Update Failed"));
     }
+
 
     @DeleteMapping("/my-request/{requestId}")
     public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
@@ -779,19 +779,24 @@ public class JournalRequestController {
         return ResponseEntity.noContent().build();
     }
 
-    @DeleteMapping("/my-requests/by-journal-list")
-    public ResponseEntity<Map<String, String>> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @RequestBody List<String> list) {
-        journalRequestService.cancelMyRequestsByJournalPrefixes(list, jwtUtil.getUserIdFromToken(token));
-        return ResponseEntity.ok(Map.of("status", "SUCCESS"));
-    }
 
     @GetMapping("/status")
     public ResponseEntity<List<JournalRequestStatusDto>> getJournalStatusList() {
         return ResponseEntity.ok(journalRequestService.getJournalRequestStatusList());
     }
+    @GetMapping("/download-batch/{batchId}")
+    public org.springframework.http.ResponseEntity<byte[]> downloadBatchExcel(@PathVariable String batchId) {
+        byte[] excelData = journalRequestService.generateBatchExcel(batchId);
+
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
+        headers.setContentDispositionFormData("attachment", "Batch_" + batchId + ".xlsx");
+        headers.setCacheControl("must-revalidate, post-check=0, pre-check=0");
+
+        return new org.springframework.http.ResponseEntity<>(excelData, headers, org.springframework.http.HttpStatus.OK);
+    }
+
 }
-
-
 package com.fincore.JournalService.Dto;
 
 
@@ -816,7 +821,7 @@ public class ApiErrorResponseDto {
         private String field;
         private String message;
     }
-} 
+}
 
 package com.fincore.JournalService.Dto;
 
@@ -841,22 +846,27 @@ public class BatchRequestDto {
 
         private LocalDate csvDate;
 
-        @NotNull @Size(min = 1, max = 50)
+        @jakarta.validation.constraints.NotBlank(message = "Branch is required")
+        @jakarta.validation.constraints.Size(min = 5, max = 5, message = "Branch code must be exactly 5 characters")
         private String branch;
 
-        @NotNull @Size(min = 3, max = 3)
+        @jakarta.validation.constraints.NotBlank(message = "Currency is required")
+        @jakarta.validation.constraints.Size(min = 3, max = 3, message = "Currency must be exactly 3 characters")
         private String currency;
 
-        @NotNull @Size(min = 1, max = 50)
+        @jakarta.validation.constraints.NotBlank(message = "CGL is required")
+        @jakarta.validation.constraints.Pattern(regexp = "^\\d{10}$", message = "CGL must be exactly 10 digits")
         private String cgl;
 
-        @NotNull
+        @jakarta.validation.constraints.NotNull(message = "Amount is required")
+        @jakarta.validation.constraints.Digits(integer = 16, fraction = 4, message = "Amount cannot exceed 16 integer digits and 4 fractional digits")
         private BigDecimal amount;
 
-        @Size(max = 20)
+        @jakarta.validation.constraints.Pattern(regexp = "^\\d{0,8}$", message = "Product Type must be numeric and up to 8 digits")
         private String productType;
 
-        @Size(max = 200)
+        @jakarta.validation.constraints.NotBlank(message = "Remarks are required")
+        @jakarta.validation.constraints.Pattern(regexp = "^[a-zA-Z0-9 ]{2,30}$", message = "Remarks must be 2-30 alphanumeric characters and spaces only")
         private String remarks;
 
         @Size(min = 1, max = 1)
@@ -866,15 +876,13 @@ public class BatchRequestDto {
         private String acClassification;
     }
 
-    @Size(max = 200)
+    @jakarta.validation.constraints.Pattern(regexp = "^([a-zA-Z0-9 ]{2,30})?$", message = "Common remarks must be 2-30 alphanumeric characters and spaces only, if provided")
     private String commonBatchRemarks;
 
     @Valid
-    @NotNull
+    @jakarta.validation.constraints.NotEmpty(message = "Batch must contain at least one row")
     private List<JournalRequestRow> rows;
 }
-
-
 
 package com.fincore.JournalService.Dto;
 
@@ -891,32 +899,30 @@ public class BranchDto {
     private String name;
     
 }
+
+
 package com.fincore.JournalService.Dto;
 
-import java.util.List;
 
 import com.fincore.JournalService.Models.enums.RequestStatus;
 
 import jakarta.validation.constraints.NotNull;
-import jakarta.validation.constraints.Size;
 import lombok.Data;
 
 @Data
 public class BulkProcessJournalRequestDto {
-     
+
+    @jakarta.validation.constraints.NotBlank(message = "Batch ID is required")
     private String batchId;
-    
-    private List<String> journalIdPrefixes;
+
 
     @NotNull
-    private RequestStatus status; 
-    
-    @Size(max = 50)
+    private RequestStatus status;
+
+    @jakarta.validation.constraints.NotBlank(message = "Remarks are required")
+    @jakarta.validation.constraints.Pattern(regexp = "^[a-zA-Z0-9 ]{2,30}$", message = "Remarks must be 2-30 alphanumeric characters and spaces only")
     private String remarks;
 }
-
-
-
 package com.fincore.JournalService.Dto;
 
 import lombok.Data;
@@ -938,8 +944,28 @@ public class BulkUploadStateDto implements Serializable {
     private transient String errorFilePath;
     private transient String successFilePath;
 }
-
 package com.fincore.JournalService.Dto;
+
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class CacheBatchRequestDto {
+
+    @NotBlank(message = "Request ID is required")
+    private String requestId;
+
+    @Pattern(regexp = "^([a-zA-Z0-9 ]{2,30})?$", message = "Common batch remarks must be 2-30 alphanumeric characters and spaces only, if provided")
+    private String commonBatchRemarks;
+
+}package com.fincore.JournalService.Dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -1020,8 +1046,6 @@ public class CreateJournalRequestDto {
 
     private String transactionType;
 }
-
-
 package com.fincore.JournalService.Dto;
 
 import lombok.AllArgsConstructor;
@@ -1075,8 +1099,6 @@ public class HdfsSyncDto {
     private BigDecimal newBalance;
     private BigDecimal newInrBalance;
 }
-
-
 package com.fincore.JournalService.Dto;
 
 import jakarta.validation.Valid;
@@ -1089,8 +1111,32 @@ import lombok.NoArgsConstructor;
 import java.util.List;
 
 
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class JournalBatchRequestDto {
+    @Pattern(regexp = "^$|^[a-zA-Z0-9]{2,30}$", message = "Common Batch Remarks must be empty or between 2 and 30 alphanumeric characters")
+    private String commonBatchRemarks;
 
+    @NotEmpty(message = "Batch must contain at least one journal row")
+    @Valid
+    private List<JournalRowDto> rows;
+}
 
+package com.fincore.JournalService.Dto;
+
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+import java.util.List;
+
+@Data
+public class JournalListRequestDto {
+
+    @NotEmpty(message = "You must select at least one entry")
+    private List<@NotNull(message = "Journal ID cannot be null") String> journalIds;
+}
 package com.fincore.JournalService.Dto;
 
 import lombok.Data;
@@ -1124,6 +1170,63 @@ public class JournalRequestStatusDto {
 
 package com.fincore.JournalService.Dto;
 
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.AssertTrue;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class JournalRowDto {
+
+    @NotBlank(message = "Branch is mandatory")
+    private String branch;
+
+    @NotBlank(message = "Currency is mandatory")
+    private String currency;
+
+    @NotBlank(message = "CGL is mandatory")
+    private String cgl;
+
+    // Allows optional '-', up to 16 digits, and optional decimal up to 4 places
+    @NotBlank(message = "Amount is mandatory")
+    @Pattern(regexp = "^-?\\d{1,16}(\\.\\d{1,4})?$", message = "Amount must be a valid number with up to 16 digits and a maximum of 4 decimal places")
+    private String amount;
+
+    // Optional field, so we just restrict it to 0-8 digits
+    @Pattern(regexp = "^\\d{0,8}$", message = "Product Code must be a maximum of 8 digits")
+    private String productCode;
+
+    @NotBlank(message = "Remarks are mandatory")
+    @Pattern(regexp = "^[a-zA-Z0-9]{2,30}$", message = "Remarks must be between 2 and 30 alphanumeric characters")
+    private String remarks;
+
+    @NotBlank(message = "AR Flag is mandatory")
+    private String arFlag;
+
+    // --- CROSS-FIELD VALIDATION (The Currency/Decimal Rule) ---
+    // Spring Boot will automatically run any method annotated with @AssertTrue during validation
+    @AssertTrue(message = "INR currency allows a maximum of 2 decimal places. Other currencies allow up to 4.")
+    public boolean isAmountDecimalValid() {
+        if (amount == null || currency == null) return true; // Skip if null, let @NotBlank handle the error
+
+        String[] parts = amount.replace("-", "").split("\\.");
+        int fractionLength = parts.length > 1 ? parts[1].length() : 0;
+
+        if ("INR".equalsIgnoreCase(currency)) {
+            return fractionLength <= 2;
+        } else {
+            return fractionLength <= 4;
+        }
+    }
+
+    // Getters and Setters...
+}
+package com.fincore.JournalService.Dto;
+
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -1135,11 +1238,6 @@ public class NotificationConfigDto {
     private String targetUrl;
     private String targetRoles; // Comma separated string: "51,52,55"
 }
-
-
-
-
-
 package com.fincore.JournalService.Dto;
 
 import com.fincore.JournalService.Models.enums.RequestStatus;
@@ -1161,11 +1259,10 @@ public class ProcessJournalRequestDto {
     @NotNull(message = "Status is required")
     private RequestStatus status;
 
-    @Size(max = 50)
+    @jakarta.validation.constraints.NotBlank(message = "Remarks are required")
+    @jakarta.validation.constraints.Pattern(regexp = "^[a-zA-Z0-9 ]{2,30}$", message = "Remarks must be 2-30 alphanumeric characters and spaces only")
     private String remarks;
-}
-
-  package com.fincore.JournalService.Dto;
+}package com.fincore.JournalService.Dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -1246,10 +1343,7 @@ public class CustomExceptions {
             super(message);
         }
     }
-}
-
-
-package com.fincore.JournalService.Exception;
+}package com.fincore.JournalService.Exception;
 
 import com.fincore.JournalService.Dto.ApiErrorResponseDto;
 import jakarta.servlet.http.HttpServletRequest;
@@ -1258,14 +1352,18 @@ import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 
 import java.io.IOException;
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -1284,8 +1382,15 @@ public class GlobalExceptionHandler {
                         .build())
                 .collect(Collectors.toList());
 
+        // Join the custom messages for the React frontend Snackbar
+        String joinedMessage = ex.getBindingResult().getFieldErrors().stream()
+                .map(org.springframework.validation.FieldError::getDefaultMessage)
+                .collect(Collectors.joining(" | "));
+
         log.warn("VALIDATION_FAILED | Path: {} | Errors: {}", request.getRequestURI(), errors.size());
-        return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed", "Input validation error", request.getRequestURI(), errors);
+
+        // Feed the joinedMessage into the response instead of the generic string
+        return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed", joinedMessage, request.getRequestURI(), errors);
     }
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)
@@ -1386,12 +1491,13 @@ public class GlobalExceptionHandler {
     }
 
 
+    @ExceptionHandler(CustomExceptions.InvalidDataException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleInvalidData(CustomExceptions.InvalidDataException ex, HttpServletRequest request) {
+        log.warn("INVALID_DATA | Path: {} | Msg: {}", request.getRequestURI(), ex.getMessage());
+        return buildResponse(HttpStatus.BAD_REQUEST, "Invalid Data", ex.getMessage(), request.getRequestURI(), null);
+    }
 
-}
-
-
-
-package com.fincore.JournalService.Exception;
+}package com.fincore.JournalService.Exception;
 
 
 import org.springframework.http.HttpStatus;
@@ -1403,7 +1509,6 @@ public class ResourceNotFoundException extends RuntimeException {
         super(message);
     }
 }
-
 
 package com.fincore.JournalService.Models.enums;
 
@@ -1438,8 +1543,6 @@ public enum AcClassification {
 	                ));
 	    }
 }
-
-
 package com.fincore.JournalService.Models.enums;
 
 import lombok.Getter;
@@ -1473,8 +1576,6 @@ public enum RequestStatus {
         this.code = code;
     }
 }
-
-
 package com.fincore.JournalService.Models;
 
 import jakarta.persistence.Column;
@@ -1551,7 +1652,6 @@ public class BranchMaster {
     @Column(name = "BRANCH_TYPE")
     private String branchType;
 }
-
 package com.fincore.JournalService.Models;
 
 import jakarta.persistence.Column;
@@ -1607,8 +1707,6 @@ public class CglMaster {
     @Column(name = "MANUAL_POSTING", nullable = false)
     private Boolean manualPosting = true;
 }
-
-
 package com.fincore.JournalService.Models;
 
 import jakarta.persistence.Column;
@@ -1637,7 +1735,6 @@ public class CurrencyMaster {
     @Column(name = "CURRENCY_RATE", precision = 18, scale = 6)
     private BigDecimal currencyRate;
 }
-
 package com.fincore.JournalService.Models;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -1693,10 +1790,7 @@ public class GlBalance {
 
     @Column(name = "INR_BALANCE", precision = 25, scale = 4)
     private BigDecimal inrBalance;
-}
-
-
-package com.fincore.JournalService.Models;
+}package com.fincore.JournalService.Models;
 
 import jakarta.persistence.*;
 import lombok.Data;
@@ -1857,7 +1951,6 @@ public class JournalRequest {
     @Column(name = "COMMON_BATCH_REMARKS" , length = 50)
     private String commonBatchRemarks;
 
-    // --- NEW OPTIMIZED COLUMNS ---
     @Column(name = "REQ_BRANCH_CODE", length = 50)
     private String branchCode;
 
@@ -1879,6 +1972,7 @@ public class JournalRequest {
     @Column(name = "REQ_PRODUCT", length = 50)
     private String productCode;
 }
+
 package com.fincore.JournalService.Models;
 
 import java.math.BigDecimal;
@@ -2031,10 +2125,7 @@ public class Permissions {
     // This is the key field used for Journal Authorization logic
     @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
     private String mappedRequestType; 
-}
-
-
-package com.fincore.JournalService.Repository;
+}package com.fincore.JournalService.Repository;
 
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -2048,10 +2139,7 @@ import java.util.List;
 public interface BranchMasterRepository extends JpaRepository<BranchMaster, String> {
 
     List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(String name, String code, Pageable pageable);
-}
-
-
-package com.fincore.JournalService.Repository;
+}package com.fincore.JournalService.Repository;
 
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -2092,7 +2180,6 @@ public interface FincoreDateRepository extends JpaRepository<FincoreDate, LocalD
     LocalDate findCurrentPostingDate();
 }
 
-
 package com.fincore.JournalService.Repository;
 
 import com.fincore.JournalService.Models.GlBalance;
@@ -2102,8 +2189,6 @@ import org.springframework.stereotype.Repository;
 @Repository
 public interface GlBalanceRepository extends JpaRepository<GlBalance, Long> {
 }
-
-
 package com.fincore.JournalService.Repository;
 
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -2113,9 +2198,7 @@ import com.fincore.JournalService.Models.GlTransaction;
 
 @Repository
 public interface GlTransactionRepository extends JpaRepository<GlTransaction, Long> {
-}
-
-package com.fincore.JournalService.Repository;
+}package com.fincore.JournalService.Repository;
 
 import com.fincore.JournalService.Models.JournalLog;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -2125,7 +2208,6 @@ import org.springframework.stereotype.Repository;
 @Repository
 public interface JournalLogRepository extends JpaRepository<JournalLog, Long> {
 }
-
 
 
 
@@ -2215,34 +2297,16 @@ public interface JournalRequestRepository extends JpaRepository<JournalRequest, 
     @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(:userId)) AND TRIM(REQ_STATUS) IN ('P', 'PENDING')", nativeQuery = true)
     void deleteBatchNative(@Param("batchId") String batchId, @Param("userId") String userId);
 
-    /**
-     * MULTI-ROW SPECIFIC DELETE
-     * Purges specific journal IDs from a batch.
-     */
-    @Modifying
-    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE JOURNAL_ID IN (:journalIds) AND CREATOR_ID = :userId", nativeQuery = true)
-    void deleteJournalsNative(@Param("journalIds") List<String> journalIds, @Param("userId") String userId);
 
     // Standard Finder Methods
     List<JournalRequest> findByBatchId(String batchId);
     List<JournalRequest> findByCreatorId(String creatorId);
     List<JournalRequest> findByRequestStatus(RequestStatus status);
 
-    /**
-     * Use 'branchCode' because that is the field name in your JournalRequest entity.
-     */
-    Page<JournalRequest> findByBranchCodeStartingWithAndRequestStatus(String branchCode, RequestStatus status, Pageable pageable);
 
-    /**
-     * Use 'cgl' because that is the field name in your JournalRequest entity.
-     */
-    Page<JournalRequest> findByCglStartingWithAndRequestStatus(String cgl, RequestStatus status, Pageable pageable);
 
-    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
+
 }
-
-
-
 
 package com.fincore.JournalService.Repository;
 
@@ -2254,10 +2318,7 @@ import com.fincore.JournalService.Models.MasterJournal;
 @Repository
 public interface MasterJournalRepository extends JpaRepository<MasterJournal, Long>{
 
-}
-
-
-package com.fincore.JournalService.Repository;
+}package com.fincore.JournalService.Repository;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
@@ -2266,10 +2327,7 @@ import java.util.UUID;
 
 @Repository
 public interface NotificationRepository extends JpaRepository<Notifications, UUID> {
-}
-
-
-package com.fincore.JournalService.Repository;
+}package com.fincore.JournalService.Repository;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -2297,9 +2355,7 @@ public interface PermissionRepository extends JpaRepository<Permissions, Integer
 }
 
 
-services
---------
-
+Service
 
 package com.fincore.JournalService.Service;
 
@@ -2454,6 +2510,7 @@ public class CglService {
         }
     }
 }
+
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Dto.HdfsSyncDto;
@@ -2602,6 +2659,7 @@ import java.util.List;
 
 /**
  * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
+ * Implements native Delta Lake MERGE INTO logic for atomic, duplicate-free Upserts.
  */
 @Service
 @RequiredArgsConstructor
@@ -2622,25 +2680,32 @@ public class HdfsSyncService {
             for (HdfsSyncDto dto : data) {
 
                 String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+                String balanceDateStr = dto.getBalanceDate().toString();
+                String newBalance = dto.getNewBalance().toPlainString();
+                String newInrBalance = dto.getNewInrBalance().toPlainString();
 
-                // Construct literal SQL strings. Added explicit cast() for the date to be safe with Spark SQL.
-                String sql = String.format(
-                        "UPDATE fincoredatalakejournal.gl_balance SET closing_balance = %s, INR_BALANCE = %s WHERE glcc = '%s' AND BALANCE_DATE = cast('%s' as date)",
-                        dto.getNewBalance().toPlainString(),
-                        dto.getNewInrBalance().toPlainString(),
-                        glccKey,
-                        dto.getBalanceDate().toString()
+                // Native Delta Lake UPSERT syntax.
+                // This prevents the "duplicate rows" bug by handling the update/insert atomically inside Spark.
+                String mergeSql = String.format(
+                        "MERGE INTO fincoredatalakejournal.gl_balance AS target " +
+                                "USING (SELECT '%s' AS glcc, cast('%s' AS date) AS balance_date, %s AS closing_balance, %s AS inr_balance) AS source " +
+                                "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.balance_date " +
+                                "WHEN MATCHED THEN " +
+                                "  UPDATE SET target.closing_balance = source.closing_balance, target.INR_BALANCE = source.inr_balance " +
+                                "WHEN NOT MATCHED THEN " +
+                                "  INSERT (glcc, BALANCE_DATE, closing_balance, INR_BALANCE) " +
+                                "  VALUES (source.glcc, source.balance_date, source.closing_balance, source.inr_balance)",
+                        glccKey, balanceDateStr, newBalance, newInrBalance
                 );
 
-                // FIX 1: Use .update() instead of .execute() for UPDATE statements
-                hiveJdbcTemplate.update(sql);
+                hiveJdbcTemplate.update(mergeSql);
             }
 
             log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
                     (System.currentTimeMillis() - startTime), data.size());
 
         } catch (DataAccessException e) {
-            // FIX 2: Extract the exact Spark Thrift Server error message
+            // Extract the exact Spark Thrift Server error message for cleaner debugging
             Throwable rootCause = e.getRootCause();
             String exactSparkError = (rootCause != null) ? rootCause.getMessage() : e.getMessage();
 
@@ -2649,7 +2714,6 @@ public class HdfsSyncService {
         }
     }
 }
-
 
 package com.fincore.JournalService.Service;
 
@@ -2704,8 +2768,10 @@ import java.util.zip.GZIPOutputStream;
 public class JournalBulkValidationService {
 
     private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
-    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
+    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{1,8}$");
     private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
+
+
     private static final DateTimeFormatter SYSTEM_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
 
     private final ValidationMasterService validationMasterService;
@@ -3130,13 +3196,18 @@ public class JournalBulkValidationService {
                 if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) d.formatErrors.add("INR Amount > 2 decimal places");
             }
             if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches())
-                d.formatErrors.add("Product Code must be 8 digits or Blank");
+                d.formatErrors.add("Product Code must be up to 8 digits or Blank");
+
             if (d.remarks == null || d.remarks.trim().isEmpty()) d.formatErrors.add("Remarks is Mandatory");
-            else if (d.remarks.length() > 30) d.formatErrors.add("Remarks length must be <= 30 chars");
+            else if (!d.remarks.matches("^[a-zA-Z0-9 ]{2,30}$")) d.formatErrors.add("Remarks must be 2-30 alphanumeric characters and spaces only");
+
             if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency must be exactly 3 characters");
+
             if (d.cgl == null || d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
             else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("CGL must be 10 digits");
+
             if (d.branch == null || d.branch.trim().isEmpty()) d.formatErrors.add("Branch is Mandatory");
+            else if (d.branch.trim().length() != 5) d.formatErrors.add("Branch code must be exactly 5 characters");
         });
     }
 
@@ -3488,6 +3559,7 @@ public class JournalBulkValidationService {
         }
     }
 }
+
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -3525,10 +3597,7 @@ public interface JournalRequestService {
      */
     void cancelMyRequestsByBatchIdAsync(String batchId, String userId);
 
-    /**
-     * Internal method: Deletes one chunk (10k rows) in a new transaction.
-     */
-//    int deleteBatchChunk(String batchId, String userId);
+
 
     /**
      * Fast count using Summary Table or Index.
@@ -3536,7 +3605,7 @@ public interface JournalRequestService {
     long getRequestCountByBatchId(String batchId);
 
     // --- 2. INTERNAL ASYNC EXECUTORS (Public for Spring Proxy) ---
-    void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole);
+    void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole);
     void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId);
     void executeAsyncBatchCancellation(String batchId, String userId);
 
@@ -3547,10 +3616,7 @@ public interface JournalRequestService {
 
     // Manual Creation (Sync)
     List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
-    String createBulkBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
-    String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException; // Deprecated by Async version
 
-    List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole);
     Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException;
 
     List<JournalRequest> getMyRequests(String userId);
@@ -3560,12 +3626,9 @@ public interface JournalRequestService {
     List<JournalRequestStatusDto> getJournalRequestStatusList();
 
     void cancelMyRequest(Long requestId, String userId);
-    void cancelMyRequestsByBatchId(String batchId, String userId); // Deprecated by Async version
-    void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId);
-    void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId);
+    byte[] generateBatchExcel(String batchId);
 
-    Page<JournalRequest> searchPendingByBranchPrefix(String branchPrefix, Pageable pageable);
-    Page<JournalRequest> searchPendingByCglPrefix(String cglPrefix, Pageable pageable);
+
 
 }
 package com.fincore.JournalService.Service;
@@ -3682,11 +3745,16 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
 
         try {
-            String batchId = sequenceService.getNextBatchId();
+            String batchId = sequenceService.getNextBatchId(); // e.g., 0002356
+            String journalPrefix = sequenceService.getNextJournalIdPrefix(); // e.g., 0004977
+
             progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
-            self.executeAsyncBatchCreation(batchId, requestId, commonRemarks, creatorId, creatorRole);
+
+            // Pass BOTH down!
+            self.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole);
             return batchId;
-        } catch (DataAccessException e) {
+        }
+        catch (DataAccessException e) {
             redisTemplate.delete(lockKey);
             log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
             throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
@@ -3695,7 +3763,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
     @Override
     @Async("bulkExecutor")
-    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
         String lockKey = "LOCK_REQ_" + requestId;
         MDC.put("batchId", batchId);
         MDC.put("user", creatorId);
@@ -3743,7 +3811,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                             if (contextMap != null) MDC.setContextMap(contextMap);
                             try {
-                                self.processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+                                self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
                                 // Increment successfully committed row count
                                 successfulRowsCount.addAndGet(chunk.size());
                             } finally {
@@ -3773,8 +3841,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             String finalRemarks = commonRemarks;
 
             if (actualCommittedRows != totalRows) {
-                batchStatus = "ERROR";
-                finalRemarks = String.format("INTEGRITY_FAILURE: Expected %d rows but only %d were saved.", totalRows, actualCommittedRows);
                 log.error("BATCH_INTEGRITY_FAILED | Batch: {} | Expected: {} | Actual: {}", batchId, totalRows, actualCommittedRows);
             }
 
@@ -3782,13 +3848,14 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
             String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
+
             jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, actualCommittedRows,
-                    finalDebit, finalCredit, batchStatus, (actualCommittedRows != totalRows ? finalRemarks : ""));
+                    finalDebit, finalCredit, batchStatus, null);
 
             // Audit and Notification Logic (Preserved Business Logic)
-            if ("ERROR".equals(batchStatus)) {
-                progressService.sendProgress(batchId, creatorId, 0, "FAILED", finalRemarks);
-            } else {
+            if (actualCommittedRows != totalRows) {
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Integrity Failure: Row count mismatch.");
+            } else  {
                 logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Successfully created batch " + batchId);
                 progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
                 sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
@@ -3830,14 +3897,14 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
             // 2. Then: UPSERT the master record with error status (don't delete it!)
             int updated = jdbcTemplate.update(
-                    "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
-                    message, batchId);
+                    "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?",
+                    batchId);
 
-            // If master record doesn't exist yet, insert it so there's a permanent audit trace
+            // If master record doesn't exist yet, insert it clean
             if (updated == 0) {
                 jdbcTemplate.update(
-                        "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, BATCH_STATUS, EXECUTOR_REMARKS, REQ_DATE) VALUES (?, 'ERROR', ?, SYSTIMESTAMP)",
-                        batchId, message);
+                        "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, BATCH_STATUS, EXECUTOR_REMARKS, REQ_DATE) VALUES (?, 'PENDING', NULL, SYSTIMESTAMP)",
+                        batchId);
             }
         } catch (DataAccessException e) {
             log.error("CLEANUP_CRITICAL_FAIL | Batch: {} | Cannot record failure state", batchId);
@@ -3853,6 +3920,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
                                 String batchId,
+                                String journalPrefix,
                                 String commonRemarks,
                                 String creatorId,
                                 Integer creatorRole,
@@ -3872,7 +3940,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                     JournalBulkValidationService.ExcelRowData r = chunk.get(i);
 
                     int globalIdx = globalOffset + i + 1;
-                    String jId = batchId + "-" + globalIdx;
+                    // FIX: Use distinct prefix! Result: 0004977-1
+                    String jId = journalPrefix + "-" + globalIdx;
 
                     BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
                     boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
@@ -3927,14 +3996,14 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     }
 
 
-    private void cleanupFailedBatch(String batchId) {
-        try {
-            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-            jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
-        } catch (DataAccessException e) {
-            log.warn("CLEANUP_WARN | Batch: {} | Status: Partial data purge failed", batchId);
-        }
-    }
+//    private void cleanupFailedBatch(String batchId) {
+//        try {
+//            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
+//            jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+//        } catch (DataAccessException e) {
+//            log.warn("CLEANUP_WARN | Batch: {} | Status: Partial data purge failed", batchId);
+//        }
+//    }
 
     // ==================================================================================
     // 2. ASYNC APPROVAL (Oracle Procedure & HDFS SYNC)
@@ -3943,6 +4012,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Override
     @Transactional
     public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+
+        // 1. Lock the target batch
         String lockSql = "UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS = 'PENDING'";
         int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
 
@@ -3951,11 +4022,10 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             throw new IllegalStateException("Batch is already being processed or is not in PENDING status.");
         }
 
+        // 2. Send progress and execute in background
         progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
         self.executeAsyncBatchProcessing(dto, executorId);
     }
-
-
 
     @Override
     @Async("bulkExecutor")
@@ -3966,21 +4036,17 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         long start = System.currentTimeMillis();
 
         try {
-            // Note: If 'self' is not yet defined in your class, you must inject it at the top of your service:
-            // @Autowired @Lazy private JournalRequestServiceImpl self;
             self.executeApprovalInTransaction(dto, executorId);
-
             log.info("BATCH_PROCESSING_DONE | Batch: {} | Status: {} | Duration: {}ms", batchId, dto.getStatus(), System.currentTimeMillis() - start);
-
-        } catch (org.springframework.dao.PessimisticLockingFailureException e) {
+        }  catch (org.springframework.dao.PessimisticLockingFailureException e) {
             log.error("DATABASE_LOCK_TIMEOUT | Batch: {} | Status: GL_BALANCE row locked", batchId);
-            handleAsyncFailure(batchId, executorId, null, "System is busy. Please retry in 1 minute.");
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "System is busy. Please retry in 1 minute.");
         } catch (DataAccessException e) {
             log.error("PROCEDURE_EXEC_FAIL | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-            handleAsyncFailure(batchId, executorId, null, "Database execution error during approval.");
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "Database execution error during approval.");
         } catch (Exception e) {
             log.error("INTERNAL_PROCESSING_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
-            handleAsyncFailure(batchId, executorId, null, "An internal logic error occurred.");
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "An internal logic error occurred.");
         } finally {
             MDC.clear();
         }
@@ -3992,9 +4058,17 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         String creatorId = jdbcTemplate.queryForObject(
                 "SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
 
+        if (creatorId != null && creatorId.equalsIgnoreCase(executorId)) {
+            log.error("SECURITY_VIOLATION | Self-approval attempt blocked | Batch: {} | User: {}", batchId, executorId);
+            // FIX: Added dto.getStatus() as the 3rd argument
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "Security Violation: You cannot approve or reject your own batch.");
+            return;
+        }
+
         progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Executing Oracle Core Business Logic...");
 
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+
             List<HdfsSyncDto> syncData = jdbcTemplate.execute(
                     "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
                     (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
@@ -4025,11 +4099,13 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             try {
                 hdfsSyncService.syncToDataLake(syncData);
             } catch (Exception hdfsEx) {
-                // FIX: Catch ALL exceptions (including Hikari PoolInitializationException)
+                // Silently catch the HDFS error. DO NOT roll back Oracle.
                 log.error("HDFS_SYNC_FAIL | Batch: {} | Error: {} | Status: Background recovery queued", batchId, hdfsEx.getClass().getSimpleName());
+                // Put it in the retry queue so the HdfsRecoveryService picks it up later
                 jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
             }
 
+            // Oracle succeeded! The user will see 100% success even if HDFS failed.
             progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
             notificationWriterService.createBatchApprovedNotification(batchId, creatorId, executorId);
 
@@ -4046,9 +4122,20 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
     }
 
-    private void handleAsyncApprovalError(String batchId, String executorId, String msg) {
-        jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", msg, batchId);
+    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String msg) {
+        // Revert to PENDING and wipe the error message from remarks
+        jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?", batchId);
         progressService.sendProgress(batchId, executorId, 0, "FAILED", msg);
+
+        // Send specific notification based on what Oracle failed to do
+        String actionName = (actionStatus == RequestStatus.ACCEPTED) ? "approve" : "reject";
+        String notifMsg = String.format("Failed to %s Journal Batch '%s'. It has been returned to PENDING.", actionName, batchId);
+
+        try {
+            notificationWriterService.createNotification(executorId, null, notifMsg, "/journal-view/" + batchId, batchId, "JournalService");
+        } catch (Exception e) {
+            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notification", batchId);
+        }
     }
 
     // ==================================================================================
@@ -4058,10 +4145,12 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Override
     @Transactional
     public void cancelMyRequestsByBatchIdAsync(String batchId, String userId) {
-        int updated = jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS IN ('PENDING', 'ERROR')", batchId);
+        // Added CREATOR_ID check to prevent unauthorized users from locking other users' batches
+        int updated = jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND CREATOR_ID = ? AND BATCH_STATUS IN ('PENDING', 'ERROR')", batchId, userId);
+
         if (updated == 0) {
-            log.warn("DELETE_LOCK_FAIL | Batch: {} | Status: Deletion already queued", batchId);
-            throw new IllegalStateException("Batch is already being processed or deleted.");
+            log.warn("DELETE_LOCK_FAIL_OR_UNAUTHORIZED | Batch: {} | User: {}", batchId, userId);
+            throw new IllegalStateException("Batch not found, unauthorized, or already being processed.");
         }
         progressService.sendProgress(batchId, userId, 0, "PROCESSING", "Purging Batch Data...");
         self.executeAsyncBatchCancellation(batchId, userId);
@@ -4090,7 +4179,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
         } catch (DataAccessException e) {
             log.error("PURGE_DB_ERROR | Batch: {} | Status: SQL operation failed", batchId);
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", "Deletion Failed on Database", batchId);
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?", batchId);
             progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: System error");
         } finally {
             MDC.clear();
@@ -4115,8 +4204,13 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             map.put("requestCount", rs.getLong("TOTAL_ROWS"));
             map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
             map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
-            map.put("requestStatus", rs.getString("BATCH_STATUS"));
-            if ("ERROR".equals(rs.getString("BATCH_STATUS"))) map.put("errorMessage", rs.getString("EXECUTOR_REMARKS"));
+
+            // Strictly force the frontend to only see "PENDING"
+            map.put("requestStatus", "PENDING");
+
+            // Completely hide any error messages from the frontend UI
+            map.put("errorMessage", null);
+
             return map;
         });
     }
@@ -4127,9 +4221,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 "FROM JOURNAL_BATCH_MASTER ORDER BY REQ_DATE DESC FETCH FIRST 100 ROWS ONLY";
 
         return jdbcTemplate.query(sql, (rs, rowNum) -> {
-
             Map<String, Object> map = new HashMap<>();
-
             map.put("batchId", rs.getString("BATCH_ID"));
             map.put("creatorId", rs.getString("CREATOR_ID"));
             map.put("requestDate", rs.getTimestamp("REQ_DATE"));
@@ -4137,13 +4229,19 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             map.put("requestCount", rs.getLong("TOTAL_ROWS"));
             map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
             map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
-            map.put("requestStatus", rs.getString("BATCH_STATUS"));
+
+            // Map QUEUED and legacy ERROR rows back to PENDING for the UI
+            String dbStatus = rs.getString("BATCH_STATUS");
+            if ("QUEUED".equals(dbStatus) || "ERROR".equals(dbStatus)) {
+                map.put("requestStatus", "PENDING");
+                map.put("executorRemarks", null); // Wipe error remarks so they don't show in the grid
+            } else {
+                map.put("requestStatus", dbStatus);
+                map.put("executorRemarks", rs.getString("EXECUTOR_REMARKS"));
+            }
+
             map.put("executorId", rs.getString("EXECUTOR_ID"));
-            map.put("executorRemarks", rs.getString("EXECUTOR_REMARKS"));
-
-
             return map;
-
         });
     }
 
@@ -4211,8 +4309,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
     @Override
     @Transactional
-    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
-        String batchId = sequenceService.getNextBatchId();
+    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole)  {
+        String batchId = sequenceService.getNextBatchId(); // e.g., 0002356
+        String journalPrefix = sequenceService.getNextJournalIdPrefix(); // e.g., 0004977
         Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
 
         List<JournalRequest> entities = new ArrayList<>();
@@ -4229,13 +4328,26 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             entity.setBatchId(batchId);
             entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
 
-            String journalId = batchId + "-" + rowIndex;
+            // FIX: Use distinct journalPrefix
+            String journalId = journalPrefix + "-" + rowIndex;
             entity.setJournalId(journalId);
             entity.setBranchCode(row.getBranch());
             entity.setCurrency(row.getCurrency());
             entity.setCgl(row.getCgl());
-
             BigDecimal amount = row.getAmount();
+            // 1. Strict Cross-Field Validation for INR
+            if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
+                throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
+            }
+
+            // 2. ADD THIS NEW CONDITION TO BLOCK ZERO
+            if (amount.compareTo(BigDecimal.ZERO) == 0) {
+                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
+            }
+
+            entity.setAmount(amount);
+
+
             entity.setAmount(amount);
             entity.setCsvDate(row.getCsvDate() != null ? row.getCsvDate() : LocalDate.now());
             entity.setNarration(row.getRemarks());
@@ -4266,11 +4378,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     }
 
 
-    // --- Overrides ---
     @Override public Page<JournalRequest> getRequestsByBatchIdPaginated(String b, Pageable p) { return journalRequestRepository.findByBatchIdPaginated(b, p); }
     @Override public List<JournalRequest> getRequestsByBatchId(String b) { return journalRequestRepository.findByBatchId(b); }
     @Override public List<JournalRequest> getMyRequests(String u) { return new ArrayList<>(); }
-//    @Override public List<JournalRequest> getPendingRequests(String u, Integer r) { return new ArrayList<>(); }
     /**
      * FETCH ALL PENDING REQUESTS
      * Replaces the empty placeholder to provide a default view for the search screen.
@@ -4286,7 +4396,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         JournalRequest request = journalRequestRepository.findById(requestId)
                 .orElseThrow(() -> new RuntimeException("Request not found: " + requestId)); // Replace RuntimeException with your custom ResourceNotFoundException if you have one
 
-        // CRITICAL FIX: Security Ownership Check
         if (!request.getCreatorId().equalsIgnoreCase(userId)) {
             log.warn("UNAUTHORIZED_DELETE | User: {} | RequestOwner: {} | ReqID: {}", userId, request.getCreatorId(), requestId);
             throw new IllegalStateException("You can only cancel your own requests.");
@@ -4301,43 +4410,68 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     }
 
 
-    @Override @Transactional public void cancelMyRequestsByBatchId(String b, String u) { cancelMyRequestsByBatchIdAsync(b, u); }
-    @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> l, String u) { journalRequestRepository.deleteJournalsNative(l, u); }
-    @Override @Transactional public void cancelMyRequestsByJournalPrefix(String p, String u) {}
     @Override public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String u, Integer r) { return Optional.empty(); }
-    @Override public String createBulkBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException { return ""; }
-    @Override public String createBatchFromCache(String r, String m, String u, Integer o) throws IOException { return createBatchFromCacheAsync(r, m, u, o); }
-    @Override public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto d, String u, Integer r) { processBulkRequestsAsync(d, u, r); return Collections.emptyList(); }
-    /**
-     * SEARCH BY BRANCH (STARTS WITH)
-     * Rule: Specifically filters by PENDING status for the Authorization screen.
-     * Logic: Passes the prefix to the repository which uses 'LIKE branch%'
-     */
+
+
     @Override
-    public Page<JournalRequest> searchPendingByBranchPrefix(String branchPrefix, Pageable pageable) {
-        log.info("SEARCH_BRANCH_STARTING_WITH | Prefix: {}", branchPrefix);
-        return journalRequestRepository.findByBranchCodeStartingWithAndRequestStatus(
-                branchPrefix,
-                RequestStatus.PENDING,
-                pageable
-        );
-    }
-    /**
-     * SEARCH BY CGL (STARTS WITH)
-     * Rule: Strictly matches the beginning of the CGL string.
-     * Optimization: Allows Oracle to perform an Index Range Scan.
-     */
-    @Override
-    public Page<JournalRequest> searchPendingByCglPrefix(String cglPrefix, Pageable pageable) {
-        log.info("SEARCH_CGL_STARTING_WITH | Prefix: {}", cglPrefix);
-        return journalRequestRepository.findByCglStartingWithAndRequestStatus(
-                cglPrefix,
-                RequestStatus.PENDING,
-                pageable
-        );
+    public byte[] generateBatchExcel(String batchId) {
+        // Fetch all rows belonging to this batch
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+
+        if (requests == null || requests.isEmpty()) {
+            throw new CustomExceptions.InvalidDataException("No records found for batch: " + batchId);
+        }
+
+        // Use Apache POI to create the Excel file
+        try (org.apache.poi.xssf.usermodel.XSSFWorkbook workbook = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
+             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+
+            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
+
+            // 1. Create Header Row (Journal ID removed)
+            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
+            String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product", "Date"};
+
+            for (int i = 0; i < headers.length; i++) {
+                org.apache.poi.ss.usermodel.Cell cell = headerRow.createCell(i);
+                cell.setCellValue(headers[i]);
+            }
+
+            // 2. Populate Data Rows
+            int rowIdx = 1;
+            for (JournalRequest req : requests) {
+                org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx++);
+
+                // Shifted all indexes down by 1 since Journal ID is gone
+                row.createCell(0).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
+                row.createCell(1).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
+                row.createCell(2).setCellValue(req.getCgl() != null ? req.getCgl() : "");
+
+                BigDecimal amount = req.getAmount();
+                if (amount != null) {
+                    row.createCell(3).setCellValue(amount.abs().doubleValue());
+                    row.createCell(4).setCellValue(amount.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
+                } else {
+                    row.createCell(3).setCellValue(0);
+                    row.createCell(4).setCellValue("");
+                }
+
+                row.createCell(5).setCellValue(req.getNarration() != null ? req.getNarration() : "");
+                row.createCell(6).setCellValue(req.getProductCode() != null ? req.getProductCode() : "");
+                row.createCell(7).setCellValue(req.getCsvDate() != null ? req.getCsvDate().toString() : "");
+            }
+
+            workbook.write(out);
+            return out.toByteArray();
+
+        } catch (java.io.IOException e) {
+            log.error("EXCEL_GEN_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e);
+        }
     }
 
 }
+
 
 package com.fincore.JournalService.Service;
 
@@ -4500,7 +4634,6 @@ public class PermissionConfigService {
         }
     }
 }
-
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -4581,8 +4714,6 @@ public class ProgressService {
         }
     }
 }
-
-
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Exception.CustomExceptions;
@@ -4759,22 +4890,7 @@ public class ValidationMasterService {
     }
 }
 
-
-spring.application.name=JournalService
-spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
-spring.profiles.active=dev
-server.port=9999
-
-#todo Expose all actuator endpoints over HTTP.
-management.endpoints.web.exposure.include=*
-
-# Always show full details on the health endpoint (e.g., database connection status)
-management.endpoint.health.show-details=always
-
-# Add some custom info to the /info endpoint
-info.app.name=JournalService
-info.app.description=Service for managing journals.
-info.app.version=1.0.0
+application.proerty
 
 # notification topic name
 notification.progress.topic:notifications:progress
@@ -4782,7 +4898,7 @@ notification.progress.topic:notifications:progress
 # --- Redis Configuration ---
 # Ensure timeouts are set so a Redis glitch doesn't hang the app
 
-spring.data.redis.host=10.0.17.242
+spring.data.redis.host=10.0.19.101
 spring.data.redis.port=6379
 spring.data.redis.timeout=2000
 spring.data.redis.jedis.pool.max-active=50
@@ -4800,38 +4916,11 @@ app.async.core-pool-size=5
 app.async.max-pool-size=20
 app.async.queue-capacity=500
 # ----------------------------------
-
-
-# LOGIN SERVICE KEY
-jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
-
-spring.datasource.oracle.jdbc-url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
-spring.datasource.oracle.username=fincore
-spring.datasource.oracle.password=Password#1234
-spring.datasource.oracle.driver-class-name=oracle.jdbc.OracleDriver
-# --- 1. ORACLE CONNECTION POOL (HikariCP) ---
-# Critical: We are doing parallel inserts (8 threads).
-# If pool is too small, threads will wait.
-
-#Connection Pool Settings for High-Volume Uploads
-
 spring.datasource.hikari.maximum-pool-size=65
 spring.datasource.hikari.minimum-idle=10
 spring.datasource.hikari.idle-timeout=300000
 spring.datasource.hikari.connection-timeout=60000
 spring.datasource.hikari.max-lifetime=1800000
-
-# Hibernate specific config for Oracle
-
-spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.OracleDialect
-spring.jpa.show-sql=false
-
-
-
-
-# --- 2. Secondary DataSource ( Delta Lake) ---
-# Used for Data Lake connectivity
-#spring.datasource.hive.jdbc-url=jdbc:hive2://spark-thrift:10000/cbops
 
 spring.datasource.hive.jdbc-url=jdbc:hive2://localhost:10000/fincoredatalakejournal
 spring.datasource.hive.driver-class-name=org.apache.hive.jdbc.HiveDriver
@@ -4840,223 +4929,10 @@ spring.datasource.hive.test-on-borrow=true
 spring.datasource.hive.validation-query=SELECT 1
 
 
-spring.datasource.hive.username=spark
-
-
-pom
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.3.0</version>
-        <relativePath/> </parent>
-
-    <groupId>com.fincore</groupId>
-    <artifactId>JournalService</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-    <name>journal-service</name>
-    <description>Creating and posting Journals</description>
-
-    <properties>
-        <java.version>22</java.version>
-    </properties>
-
-    <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-jpa</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-cache</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>net.logstash.logback</groupId>
-            <artifactId>logstash-logback-encoder</artifactId>
-            <version>7.4</version>
-        </dependency>
-
-        <dependency>
-            <groupId>com.oracle.database.jdbc</groupId>
-            <artifactId>ojdbc11</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>com.fincore</groupId>
-            <artifactId>common-utilities</artifactId>
-            <version>0.0.1-SNAPSHOT</version>
-        </dependency>
-        <dependency>
-            <groupId>jakarta.validation</groupId>
-            <artifactId>jakarta.validation-api</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.apache.poi</groupId>
-            <artifactId>poi-ooxml</artifactId>
-            <version>5.2.5</version>
-        </dependency>
-        <dependency>
-            <groupId>com.monitorjbl</groupId>
-            <artifactId>xlsx-streamer</artifactId>
-            <version>2.2.0</version>
-        </dependency>
-        <dependency>
-            <groupId>com.github.pjfanning</groupId>
-            <artifactId>excel-streaming-reader</artifactId>
-            <version>4.0.5</version>
-        </dependency>
-        <dependency>
-            <groupId>com.github.pjfanning</groupId>
-            <artifactId>poi-shared-strings</artifactId>
-            <version>2.7.1</version>
-        </dependency>
-
-        <dependency>
-            <groupId>org.apache.hive</groupId>
-            <artifactId>hive-jdbc</artifactId>
-            <version>3.1.3</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.slf4j</groupId>
-                    <artifactId>slf4j-log4j12</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.slf4j</groupId>
-                    <artifactId>slf4j-reload4j</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>log4j</groupId>
-                    <artifactId>log4j</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>ch.qos.reload4j</groupId>
-                    <artifactId>reload4j</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>javax.servlet</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.eclipse.jetty.aggregate</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-
-        <dependency>
-            <groupId>net.logstash.logback</groupId>
-            <artifactId>logstash-logback-encoder</artifactId>
-            <version>7.4</version>
-        </dependency>
-
-        <dependency>
-            <groupId>org.apache.hadoop</groupId>
-            <artifactId>hadoop-common</artifactId>
-            <version>3.3.4</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.slf4j</groupId>
-                    <artifactId>slf4j-log4j12</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.slf4j</groupId>
-                    <artifactId>slf4j-reload4j</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>log4j</groupId>
-                    <artifactId>log4j</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>ch.qos.reload4j</groupId>
-                    <artifactId>reload4j</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>javax.servlet</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.eclipse.jetty</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <configuration>
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </path>
-                    </annotationProcessorPaths>
-                </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration>
-                    <excludes>
-                        <exclude>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </exclude>
-                    </excludes>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
-</project>
-
-
 DB tables
 
-JOURNAL_REQUEST
+JOURNAL_BATCH_MASTER
 
-
-REQ_ID	NUMBER	No		1	
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	3	
-CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
-EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
-EXECUTION_DATE	DATE	Yes		6	Timestamp when this specific row was processed.
-EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
-PAYLOAD	CLOB	Yes		8	
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		9	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		10	Unique identifier for the individual request.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		11	Remarks inherited from the batch creation process.
-CREATOR_ROLE	NUMBER(10,0)	Yes		12	
-REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		13	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		14	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 BYTE)	Yes		15	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		16	Raw requested amount 
-REQ_CSV_DATE	DATE	Yes		17	The transaction date provided in the uploaded file.
-REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		18	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		19	The product  code requested.
-CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		20	
-
-
-
-JOURNAL BATCH MASTER
 
 BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
 CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
@@ -5071,7 +4947,29 @@ EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rej
 EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
 
 
-MASTER JOURNAL 
+JOURNAL_REQUEST
+
+REQ_ID	NUMBER	No		1	
+REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
+REQ_DATE	DATE	No	SYSDATE 	3	
+CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
+EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
+EXECUTION_DATE	DATE	Yes		6	Timestamp when this specific row was processed.
+EXECUTOR_REMARKS	VARCHAR2(32 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		8	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		9	Unique identifier for the individual request.
+COMMON_BATCH_REMARKS	VARCHAR2(32 CHAR)	Yes		10	Remarks inherited from the batch creation process.
+REQ_BRANCH_CODE	VARCHAR2(50 BYTE)	Yes		11	The branch code requested for the transaction.
+REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		12	The 3-character currency code requested.
+REQ_CGL	VARCHAR2(50 BYTE)	Yes		13	The 10-digit CGL account code requested.
+REQ_AMOUNT	NUMBER(25,4)	Yes		14	Raw requested amount 
+REQ_CSV_DATE	DATE	Yes		15	The transaction date provided in the uploaded file.
+REQ_NARRATION	VARCHAR2(200 BYTE)	Yes		16	remarks from the uploaded file.
+REQ_PRODUCT	VARCHAR2(50 BYTE)	Yes		17	The product  code requested.
+CREATOR_ROLE	NUMBER(10,0)	Yes		18	
+
+
+MASTER_JOURNAL
 
 JOURNAL_ID	NUMBER(19,0)	No		1	Unique sequential identifier for the master journal entry.
 JOURNAL_AMT	NUMBER(38,2)	Yes		2	Absolute transaction amount. Always positive; Txn Type determines debit/credit.
@@ -5086,10 +4984,8 @@ JOURNAL_PDATE	DATE	Yes		10	CSV date of the journal entry.
 PRODUCT_TYPE	VARCHAR2(20 CHAR)	Yes		11	The 8-digit product code
 REMARKS	VARCHAR2(50 CHAR)	Yes		12	specific remarks for this individual entry.
 TXN_TYPE	VARCHAR2(20 CHAR)	Yes		13	Specifies if the entry is a Debit or Credit.
-AC_CLASSIFICATION	VARCHAR2(255 CHAR)	Yes		14	
 
-
-HDFS_DATA_SYNC
+HDFS RETRY QUEUE
 
 BATCH_ID	VARCHAR2(50 BYTE)	No		1	
 CREATED_AT	TIMESTAMP(6)	Yes	SYSTIMESTAMP	2	
@@ -5099,229 +4995,160 @@ STATUS	VARCHAR2(20 BYTE)	Yes	"'PENDING' -- PENDING, FAILED, COMPLETED
 
 
 
-
-sequences
-
-
-   CREATE SEQUENCE  "FINCORE"."BATCH_SEQ"  MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 2288 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL ;
-
-   
-   CREATE SEQUENCE  "FINCORE"."JOURNAL_REQUEST_SEQ"  MINVALUE 1 MAXVALUE 999999999999999999999999999 INCREMENT BY 1 START WITH 8050524 CACHE 1000 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL ;
-
-   CREATE SEQUENCE  "FINCORE"."JRNL_SEQ"  MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 4977 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL ;
-
-   CREATE SEQUENCE  "FINCORE"."MASTER_JOURNAL_SEQ"  MINVALUE 1 MAXVALUE 999999999999999999999999999 INCREMENT BY 1 START WITH 31 NOCACHE  NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL ;
-
-
-
-   
-   procedures
-   
-   PROCESS_JOURNAL_BATCH
-   
-   
-   create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+procedures
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
     p_batch_id      IN VARCHAR2,
     p_executor_id   IN VARCHAR2,
     p_remarks       IN VARCHAR2,
-    p_status        IN VARCHAR2, 
+    p_status        IN VARCHAR2,
     o_cursor        OUT SYS_REFCURSOR
 ) AS
     v_missing_rates NUMBER;
 BEGIN
-
-    -- ==========================================================
     -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
-    -- ==========================================================
-    -- Rule 3: Validates that every non-INR currency in the batch has an active rate.
-    -- This prevents corrupted balances in the GL_BALANCE table.
-    SELECT COUNT(*)
-    INTO v_missing_rates
+    SELECT COUNT(*) INTO v_missing_rates
     FROM (
-        SELECT DISTINCT REQ_CURRENCY 
-        FROM JOURNAL_REQUEST 
+        SELECT DISTINCT REQ_CURRENCY FROM JOURNAL_REQUEST
         WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
     ) req
-    LEFT JOIN CURRENCY_MASTER cm 
+    LEFT JOIN CURRENCY_MASTER cm
         ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
     WHERE req.REQ_CURRENCY <> 'INR'
       AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
     IF v_missing_rates > 0 THEN
-        -- Rule 1 & 2: Specific error code for Java to catch without leaking schema details.
         RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
     END IF;
 
-    -- START ATOMIC TRANSACTION
-    BEGIN
-        -- ==========================================================
-        -- 1. Insert into GL_TRANSACTIONS
-        -- ==========================================================
-        -- Safe for Parallelism: New row inserts do not lock existing data rows.
-        INSERT /*+ APPEND PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
-            TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
-            BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
-        )
-        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-            GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID, NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
-            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
-            CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, 
-            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, 
-            'J'
-        FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    -- 1. Insert GL_TRANSACTIONS (REMOVED APPEND hint — prevents DML conflict)
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
+    )
+    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+        
+--        Debit negative
+        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
+        'J'
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        -- ==========================================================
-        -- 2. Insert into MASTER_JOURNAL 
-        -- ==========================================================
-        INSERT /*+ APPEND PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
-            JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH, 
-            JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF, 
-            JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
-        )
-        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-            MASTER_JOURNAL_SEQ.nextval, 
-            ABS(REQ_AMOUNT), 
-            'A', 
-            BATCH_ID, 
-            REQ_BRANCH_CODE, 
-            REQ_CGL, 
-            p_remarks, 
-            REQ_CURRENCY, 
-            JOURNAL_ID, 
-            NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), 
-            REQ_PRODUCT, 
-            REQ_NARRATION, 
-            CASE WHEN REQ_AMOUNT > 0 THEN 'Debit' ELSE 'Credit' END
-        FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    -- 2. Insert MASTER_JOURNAL (REMOVED APPEND hint)
+    INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
+        JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
+        JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF,
+        JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
+    )
+    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+        MASTER_JOURNAL_SEQ.nextval, ABS(REQ_AMOUNT), 'A', BATCH_ID,
+        REQ_BRANCH_CODE, REQ_CGL, p_remarks, REQ_CURRENCY, JOURNAL_ID,
+        NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), REQ_PRODUCT, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN 'Debit'
+             WHEN REQ_AMOUNT < 0 THEN 'Credit'
+             ELSE 'Zero' END
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        -- ==========================================================
-        -- 3. Merge Balances (CONCURRENCY FIX)
-        -- ==========================================================
+    -- 3. Merge GL Balances
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM JOURNAL_REQUEST j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
 
-        MERGE INTO GL_BALANCE target
-        USING (
-            SELECT 
-                j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
-                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
-                CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE 
-            FROM JOURNAL_REQUEST j
-            LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1 
-            WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
-            GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
-        ) source
-        ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE 
-            AND target.CURRENCY = source.REQ_CURRENCY 
-            AND target.CGL = source.REQ_CGL 
-            AND target.BALANCE_DATE = source.BAL_DATE)
-        WHEN MATCHED THEN
-            UPDATE SET 
-                target.BALANCE = target.BALANCE + source.TXN_AMOUNT, 
-                target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
-        WHEN NOT MATCHED THEN
-            INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
-            VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE, 
-                    source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT, 
-                    (source.TXN_AMOUNT * source.EXCH_RATE));
+    -- 4. Capture sync data BEFORE status update (fixes cursor-after-commit race)
+    -- Use cursor directly — no explicit COMMIT (let Spring manage tx)
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE
+        FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE));
 
-        -- ==========================================================
-        -- 4. Final Status Update
-        -- ==========================================================
-        UPDATE JOURNAL_REQUEST
-        SET REQ_STATUS = p_status, 
-            EXECUTOR_ID = p_executor_id, 
-            EXECUTION_DATE = SYSTIMESTAMP, 
-            EXECUTOR_REMARKS = p_remarks
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    -- 5. Update status AFTER cursor capture
+    UPDATE JOURNAL_REQUEST
+    SET REQ_STATUS = p_status,
+        EXECUTOR_ID = p_executor_id,
+        EXECUTION_DATE = SYSTIMESTAMP,
+        EXECUTOR_REMARKS = p_remarks
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        COMMIT; 
+    -- NO EXPLICIT COMMIT — Spring @Transactional manages this
 
-        -- ==========================================================
-        -- 5. Return Sync Cursor to Java
-        -- ==========================================================
-        OPEN o_cursor FOR
-        SELECT 
-            j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL, 
-            j.REQ_CSV_DATE AS BAL_DATE, g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
-        FROM (SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
-              FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id) j
-        JOIN GL_BALANCE g 
-            ON g.BRANCH_CODE = j.REQ_BRANCH_CODE 
-            AND g.CURRENCY = j.REQ_CURRENCY 
-            AND g.CGL = j.REQ_CGL 
-            AND g.BALANCE_DATE = j.REQ_CSV_DATE;
-
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-            -- Rule 2: Re-raising for Java, but Java must be configured to log only the Code, not the Message.
-            RAISE; 
-    END;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
 END;
 
 
 
-PURGE JOURNAL BATCH 
+2nd one 
+PURGE_JOURNAL_BATCH
 create or replace PROCEDURE PURGE_JOURNAL_BATCH(
     p_batch_id IN VARCHAR2,
-    p_user_id IN VARCHAR2
+    p_user_id  IN VARCHAR2
 ) AS
     v_status VARCHAR2(20);
+    v_deleted NUMBER;
 BEGIN
-    -- 1. Security Check
-    SELECT BATCH_STATUS INTO v_status
-    FROM JOURNAL_BATCH_MASTER
-    WHERE BATCH_ID = p_batch_id AND CREATOR_ID = p_user_id;
+    -- 1. Security + Ownership Check
+    BEGIN
+        SELECT BATCH_STATUS INTO v_status
+        FROM JOURNAL_BATCH_MASTER
+        WHERE BATCH_ID = p_batch_id AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(p_user_id));
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+    END;
 
-    -- ALLOW 'PENDING' OR 'QUEUED' (Locked by Java)
     IF v_status NOT IN ('PENDING', 'QUEUED', 'ERROR') THEN
         RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
     END IF;
 
-    -- 2. Fast Chunked Delete
-    LOOP
-        DELETE FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id
-          AND REQ_STATUS IN ('P', 'R') -- Clean PENDING or REJECTED
-          AND ROWNUM <= 50000;
-
-        EXIT WHEN SQL%ROWCOUNT = 0;
-        COMMIT; 
-    END LOOP;
+    -- 2. Delete all rows (no chunked commits — let Spring manage tx)
+    DELETE FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id
+      AND REQ_STATUS IN ('P', 'R');
 
     -- 3. Delete Master
     DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
-    COMMIT;
+
+    -- NO EXPLICIT COMMIT — Spring @Transactional handles it
 
 EXCEPTION
-    WHEN NO_DATA_FOUND THEN
-        RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
 END;
-
-
-
-
-
-
-
- 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
