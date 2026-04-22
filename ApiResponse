@@ -1,4 +1,4 @@
-create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+CREATE OR REPLACE PROCEDURE PROCESS_JOURNAL_BATCH (
     p_batch_id      IN VARCHAR2,
     p_executor_id   IN VARCHAR2,
     p_remarks       IN VARCHAR2,
@@ -7,7 +7,11 @@ create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
 ) AS
     v_missing_rates NUMBER;
 BEGIN
+    -- ==============================================================================
     -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- Verifies that all non-INR currencies in the batch have a valid, active 
+    -- exchange rate setup in CURRENCY_MASTER before processing begins.
+    -- ==============================================================================
     SELECT COUNT(*) INTO v_missing_rates
     FROM (
         SELECT DISTINCT REQ_CURRENCY FROM JOURNAL_REQUEST
@@ -22,25 +26,35 @@ BEGIN
         RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
     END IF;
 
-    -- 1. Insert GL_TRANSACTIONS 
+    -- ==============================================================================
+    -- 1. Insert GL_TRANSACTIONS
+    -- Moves the pending requests into the live transaction ledger.
+    -- * FIX APPLIED: Replaced REQ_CSV_DATE with POSTING_DATE.
+    -- * OPTIMIZATION: Uses COUNT(*) OVER () to seamlessly inject the total 
+    --   transaction count across all rows in the batch.
+    -- ==============================================================================
     INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
         TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
-        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG,TRANSACTION_COUNT
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
     )
     SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
         GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
-        NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+        NVL(POSTING_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
         REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
         
---        Debit negative
+        -- Debit amount logic (negative for debits)
         CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
         CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
         'J' ,
-         COUNT(*) OVER ()
+        COUNT(*) OVER ()
     FROM JOURNAL_REQUEST
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-    -- 2. Insert MASTER_JOURNAL (REMOVED APPEND hint)
+    -- ==============================================================================
+    -- 2. Insert MASTER_JOURNAL
+    -- Archives the specific journal details into the master reporting table.
+    -- * FIX APPLIED: Replaced REQ_CSV_DATE with POSTING_DATE.
+    -- ==============================================================================
     INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
         JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
         JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF,
@@ -49,24 +63,30 @@ BEGIN
     SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
         MASTER_JOURNAL_SEQ.nextval, ABS(REQ_AMOUNT), 'A', BATCH_ID,
         REQ_BRANCH_CODE, REQ_CGL, p_remarks, REQ_CURRENCY, JOURNAL_ID,
-        NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), REQ_PRODUCT, REQ_NARRATION,
+        NVL(POSTING_DATE, TRUNC(SYSDATE)), REQ_PRODUCT, REQ_NARRATION,
         CASE WHEN REQ_AMOUNT > 0 THEN 'Debit'
              WHEN REQ_AMOUNT < 0 THEN 'Credit'
              ELSE 'Zero' END
     FROM JOURNAL_REQUEST
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
+    -- ==============================================================================
     -- 3. Merge GL Balances
+    -- Aggregates the net changes from the batch and atomically updates/inserts 
+    -- the final end-of-day balances.
+    -- * FIX APPLIED: Replaced REQ_CSV_DATE with POSTING_DATE in the SELECT, 
+    --   NVL, and GROUP BY clauses.
+    -- ==============================================================================
     MERGE INTO GL_BALANCE target
     USING (
         SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
-               NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+               NVL(j.POSTING_DATE, TRUNC(SYSDATE)) as BAL_DATE,
                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
                CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
         FROM JOURNAL_REQUEST j
         LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
         WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
-        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.POSTING_DATE
     ) source
     ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
         AND target.CURRENCY = source.REQ_CURRENCY
@@ -82,12 +102,16 @@ BEGIN
                 source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
                 (source.TXN_AMOUNT * source.EXCH_RATE));
 
-    -- 4. Capture sync data BEFORE status update (fixes cursor-after-commit race)
-    -- Use cursor directly — no explicit COMMIT (let Spring manage tx)
+    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- Opens a cursor to return the freshly calculated GL balances back to the Java 
+    -- application so it can sync them to the Hadoop Data Lake.
+    -- * FIX APPLIED: Replaced REQ_CSV_DATE with POSTING_DATE.
+    -- ==============================================================================
     OPEN o_cursor FOR
     SELECT
         j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
-        NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) AS BAL_DATE,
+        NVL(j.POSTING_DATE, TRUNC(SYSDATE)) AS BAL_DATE,
         g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
     FROM (
         SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, POSTING_DATE
@@ -97,9 +121,12 @@ BEGIN
         ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
         AND g.CURRENCY = j.REQ_CURRENCY
         AND g.CGL = j.REQ_CGL
-        AND g.BALANCE_DATE = NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE));
+        AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(SYSDATE));
 
-    -- 5. Update status AFTER cursor capture
+    -- ==============================================================================
+    -- 5. Finalize Batch Status
+    -- Marks the staged request rows as 'A' (Approved) and logs who executed it.
+    -- ==============================================================================
     UPDATE JOURNAL_REQUEST
     SET REQ_STATUS = p_status,
         EXECUTOR_ID = p_executor_id,
@@ -107,89 +134,10 @@ BEGIN
         EXECUTOR_REMARKS = p_remarks
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-    -- NO EXPLICIT COMMIT — Spring @Transactional manages this
+    -- NO EXPLICIT COMMIT — Spring @Transactional manages this to prevent partial data writes.
 
 EXCEPTION
     WHEN OTHERS THEN
         ROLLBACK;
         RAISE;
 END;
-package com.fincore.JournalService.Models;
-
-import jakarta.persistence.*;
-import lombok.Data;
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-
-import com.fincore.JournalService.Models.enums.ChangeType;
-import com.fincore.JournalService.Models.enums.RequestStatus;
-import com.fincore.JournalService.config.RequestStatusConverter;
-
-@Entity
-@Table(name = "JOURNAL_REQUEST")
-@Data
-public class JournalRequest {
-    @Id
-    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "JOURNAL_REQUEST_SEQ")
-    @SequenceGenerator(name = "JOURNAL_REQUEST_SEQ", sequenceName = "JOURNAL_REQUEST_SEQ", allocationSize = 1)
-    @Column(name = "REQ_ID")
-    private Long id;
-
-    @Convert(converter = RequestStatusConverter.class)
-    @Column(name = "REQ_STATUS", length = 10)
-    private RequestStatus requestStatus;
-
-
-
-    @Column(name = "REQ_DATE", updatable = false)
-    private LocalDateTime requestDate = LocalDateTime.now();
-
-    @Column(name = "CREATOR_ID", length = 12, updatable = false)
-    private String creatorId;
-
-    @Column(name = "CREATOR_ROLE", updatable = false)
-    private Integer creatorRole;
-
-    @Column(name = "EXECUTOR_ID", length = 12)
-    private String executorId;
-
-    @Column(name = "EXECUTION_DATE")
-    private LocalDateTime executionDate;
-
-    @Column(name = "EXECUTOR_REMARKS", length = 50)
-    private String executorRemarks;
-
-
-
-    @Column(name = "BATCH_ID", length = 50)
-    private String batchId;
-
-    @Column(name = "JOURNAL_ID", length = 50)
-    private String journalId;
-
-    @Column(name = "COMMON_BATCH_REMARKS" , length = 50)
-    private String commonBatchRemarks;
-
-    @Column(name = "REQ_BRANCH_CODE", length = 50)
-    private String branchCode;
-
-    @Column(name = "REQ_CURRENCY", length = 3)
-    private String currency;
-
-    @Column(name = "REQ_CGL", length = 50)
-    private String cgl;
-
-    @Column(name = "REQ_AMOUNT", precision = 25, scale = 4)
-    private BigDecimal amount;
-
-    @Column(name = "POSTING_DATE")
-    private LocalDate posting_date;
-
-    @Column(name = "REQ_NARRATION", length = 200)
-    private String narration;
-
-    @Column(name = "REQ_PRODUCT", length = 50)
-    private String productCode;
-}
-
