@@ -1,61 +1,140 @@
-This is the final boss of working with massive financial data in full-stack applications. You are witnessing **JavaScript's IEEE 754 Double-Precision Float limit**.
-In JavaScript, all numbers are 64-bit floats. The maximum safe integer in JS is 9,007,199,254,740,991.
-Your number (2,469,135,780,242,468) is pushing right up against that limit. As soon as you add decimal places (.6912), JavaScript runs out of memory bits to store the precision and silently rounds the trailing decimals to .5000.
-Worse, this corruption happens in two places:
- 1. When Axios/JSON.parse() reads the incoming API response.
- 2. When your formatCurrency function calls Number(num).
-To fix this, we must completely bypass JavaScript's math engine and treat these massive totals strictly as **Strings** across the entire pipeline.
-### 1. The Backend Fix (Prevent JSON Parsing Corruption)
-Right now, Jackson is sending the BigDecimal as a raw number in the JSON payload. We must force Spring Boot to send these specific totals wrapped in quotes so the frontend browser receives them as strings, not numbers.
-Find the DTO/Response class that your /pending-requests-summary endpoint returns (e.g., JournalBatchSummaryDto.java) and add the @JsonFormat annotation to force string serialization.
-```java
-import com.fasterxml.jackson.annotation.JsonFormat;
-import java.math.BigDecimal;
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2,
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+    v_txn_count     NUMBER; 
+BEGIN
+    -- ==============================================================================
+    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
-public class JournalBatchSummaryDto {
-    // ... other fields ...
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
 
-    // Forces the API to send "2469135780242468.6912" instead of 2469135780242468.6912
-    @JsonFormat(shape = JsonFormat.Shape.STRING)
-    private BigDecimal totalDebit;
+    -- ==============================================================================
+    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_txn_count
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-    @JsonFormat(shape = JsonFormat.Shape.STRING)
-    private BigDecimal totalCredit;
-}
+    -- ==============================================================================
+    -- 1. Insert GL_TRANSACTIONS
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        NVL(POSTING_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
+        'J' ,
+        v_txn_count 
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-```
-### 2. The Frontend Fix (Prevent Formatting Corruption)
-Now that the frontend is safely receiving the exact string "2469135780242468.6912", we need to update your formatCurrency function so it doesn't convert it back into a Number. We will use pure string manipulation to add the commas and pad the 4 decimal places.
-At the top of your React file, replace your existing formatCurrency function with this string-safe version:
-**Existing Code:**
-```javascript
-const formatCurrency = (num) => Number(num).toFixed(4);
+    -- ==============================================================================
+    -- 2. Insert MASTER_JOURNAL
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
+        JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
+        JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF,
+        JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
+    )
+    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+        MASTER_JOURNAL_SEQ.nextval, ABS(REQ_AMOUNT), 'A', BATCH_ID,
+        REQ_BRANCH_CODE, REQ_CGL, 
+        SUBSTR(p_remarks, 1, 30), -- Defensive substring to prevent ORA-12899
+        REQ_CURRENCY, JOURNAL_ID,
+        NVL(POSTING_DATE, TRUNC(SYSDATE)), REQ_PRODUCT, REQ_NARRATION,
+        
+        -- FIX: Adjusted to perfectly fit the VARCHAR2(3) schema limit
+        CASE WHEN REQ_AMOUNT > 0 THEN 'DR'
+             WHEN REQ_AMOUNT < 0 THEN 'CR'
+             ELSE 'NIL' END
+             
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-```
-**Replace with:**
-```javascript
-// Pure string manipulation to completely bypass JavaScript's 64-bit float limit
-const formatCurrency = (val) => {
-  if (val === null || val === undefined || val === "") return "0.0000";
-  
-  // Ensure it's a string without using Number()
-  const strVal = String(val).trim();
-  
-  // Split into integer and decimal parts
-  const parts = strVal.split(".");
-  let intPart = parts[0];
-  let decPart = parts[1] || "";
+    -- ==============================================================================
+    -- 3. Merge GL Balances
+    -- ==============================================================================
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               NVL(j.POSTING_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM JOURNAL_REQUEST j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.POSTING_DATE
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
 
-  // Pad or truncate to exactly 4 decimal places
-  decPart = decPart.padEnd(4, "0").substring(0, 4);
+    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- ==============================================================================
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        NVL(j.POSTING_DATE, TRUNC(SYSDATE)) AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, POSTING_DATE
+        FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(SYSDATE));
 
-  // Safely add commas to the integer part (e.g. 1000000 -> 1,000,000)
-  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    -- ==============================================================================
+    -- 5. Finalize Batch Status
+    -- ==============================================================================
+    UPDATE JOURNAL_REQUEST
+    SET REQ_STATUS = p_status,
+        EXECUTOR_ID = p_executor_id,
+        EXECUTION_DATE = SYSTIMESTAMP,
+        EXECUTOR_REMARKS = p_remarks
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-  return `${intPart}.${decPart}`;
-};
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
 
-```
-### Why this is the ultimate fix:
-Because the backend now shields the number in quotes, Axios won't accidentally truncate it. Because the frontend now formats it using string splitting and Regex, JavaScript never attempts to load 2.469 Quintillion into its math memory.
-Your UI will now perfectly mirror the database, showing 2,469,135,780,242,468.6912!
+dont change anything extra just give add in this with what u added 
+and dont remove the existing logic 
+from here and and dont give mi updated  
