@@ -1,246 +1,85 @@
-Here are the exact replacements to bring your **JournalPostingStatus.js** file up to the exact same standard as the Authorization screen.
-### 1. Update Helper Functions (String Math & "CR" Type)
-At the top of your file, replace the old numeric formatter and the color function.
-**Existing Code:**
-```javascript
-const formatCurrency = (num) => Number(num).toFixed(4);
-const getStatusChipColor = (status) => {
-// ...
-};
-const getTxnTypeColor = (txnType) =>
-  txnType === "Credit" ? "error" : "success";
+Locking down data at the entry point is excellent practice. By enforcing strict case sensitivity ("DR" and "CR") at the upload level, you prevent dirty data from ever hitting your processing logic.
+To implement this, we need to add a strict .equals() check to your format validation, and then we can safely simplify your balance validation since we no longer need to check for variations like "Credit" or "Cr".
+Here are the exact updates to make in **JournalBulkValidationService.java**:
+### 1. Update runFormatCheck
+Add this new validation block inside your runFormatCheck loop. You can place it right after your Branch check.
+**Add this code:**
+```java
+            // Transaction Type (Strictly "DR" or "CR" uppercase)
+            if (d.txnType == null || (!d.txnType.equals("DR") && !d.txnType.equals("CR"))) {
+                synchronized(d.formatErrors) { 
+                    d.formatErrors.add("Transaction type must be strictly 'DR' or 'CR'."); 
+                }
+            }
 
 ```
-**Replace with:**
-```javascript
-// Pure string manipulation to completely bypass JavaScript's 64-bit float limit
-const formatCurrency = (val) => {
-  if (val === null || val === undefined || val === "") return "0.0000";
-  const strVal = String(val).trim();
-  const parts = strVal.split(".");
-  let intPart = parts[0];
-  let decPart = (parts[1] || "").padEnd(4, "0").substring(0, 4);
-  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return `${intPart}.${decPart}`;
-};
+### 2. Update runBalanceCheck
+Because runFormatCheck will now aggressively reject anything that isn't exactly "DR" or "CR", we can strip out the .equalsIgnoreCase() and the checks for the full words ("Debit"/"Credit") from the balance logic. This actually makes the backend slightly faster.
+Replace your entire runBalanceCheck method with this streamlined version:
+```java
+    private void runBalanceCheck(List<ExcelRowData> rows) {
+        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
+        Set<String> seenCgls = ConcurrentHashMap.newKeySet();
+        Set<String> duplicateCgls = ConcurrentHashMap.newKeySet();
+        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
 
-const getStatusChipColor = (status) => {
-// ... (keep this exactly as is)
-};
+        // Pass 1: Aggregate totals and check for duplicates & presence
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
 
-// Use CR instead of Credit
-const getTxnTypeColor = (txnType) =>
-  txnType === "CR" ? "error" : "success";
+            // Track Duplicate CGLs (Branch + Currency + CGL)
+            String uniqueCglKey = d.branch + "_" + d.currency + "_" + d.cgl;
+            if (!seenCgls.add(uniqueCglKey)) {
+                duplicateCgls.add(uniqueCglKey);
+            }
 
-```
-### 2. Update Data Mapping
-Inside fetchDetailRows, update the ternary operator to map to "CR" and "DR".
-**Existing Code:**
-```javascript
-            const row = {
-              ...req,
-              journalPrefix: prefix,
-              amount: Math.abs(amountVal),
-              transactionType: amountVal < 0 ? "Credit" : "Debit",
+            // Track Debit/Credit Presence per Branch (Now strictly "DR" / "CR")
+            if ("DR".equals(d.txnType)) branchHasDebit.put(d.branch, true);
+            if ("CR".equals(d.txnType)) branchHasCredit.put(d.branch, true);
 
-              // Bullet-proof catch-all mapping to handle any Java Entity naming convention
+            // Calculate Balance Groupings
+            boolean isCredit = "CR".equals(d.txnType);
+            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
 
-```
-**Replace with:**
-```javascript
-            const row = {
-              ...req,
-              journalPrefix: prefix,
-              amount: Math.abs(amountVal),
-              transactionType: amountVal < 0 ? "CR" : "DR",
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
 
-              // Bullet-proof catch-all mapping to handle any Java Entity naming convention
+            // Thread-safe BigDecimal addition without scaling or overflow risks
+            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
+                    .updateAndGet(curr -> curr.add(finalVal)); 
+        });
 
-```
-### 3. Remove Creator Remarks & Expand Totals (DataGrid Columns)
-Find your columns array. Remove the commonBatchRemarks column completely, and update the widths and Tooltips for totalDebit and totalCredit.
-**Existing Code:**
-```javascript
-    {
-      field: "commonBatchRemarks",
-      headerName: "Creator Remarks",
-      width: 200,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-    },
-    {
-      field: "requestCount",
-      headerName: "No. of Entries",
-      width: 150,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-    },
-    {
-      field: "totalDebit",
-      headerName: "Total Debit",
-      width: 150,
-      align: "right",
-      headerAlign: "right",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => (
-        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
-          {formatCurrency(p.value)}
-        </Typography>
-      ),
-    },
-    {
-      field: "totalCredit",
-      headerName: "Total Credit",
-      width: 150,
-      align: "right",
-      headerAlign: "right",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => (
-        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
-          {formatCurrency(p.value)}
-        </Typography>
-      ),
-    },
+        // Pass 2: Apply the simple, generic error messages to the rows
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            String uniqueCglKey = d.branch + "_" + d.currency + "_" + d.cgl;
+            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
+            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
+
+            synchronized (d.balErrors) {
+                // 1. Duplicate CGL Check
+                if (duplicateCgls.contains(uniqueCglKey) && !d.balErrors.contains("Duplicate CGL entry found for the same Branch and Currency.")) {
+                    d.balErrors.add("Duplicate CGL entry found for the same Branch and Currency.");
+                }
+
+                // 2. Debit/Credit Presence Check
+                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
+                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
+                }
+
+                // 3. Balance Math Check (Using BigDecimal's compareTo)
+                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
+                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
+                }
+            }
+        });
+    }
 
 ```
-**Replace with:**
-```javascript
-    {
-      field: "requestCount",
-      headerName: "No. of Entries",
-      width: 150,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-    },
-    {
-      field: "totalDebit",
-      headerName: "Total Debit",
-      width: 220, // Expanded width
-      align: "right",
-      headerAlign: "right",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => (
-        <Tooltip title={p.value ? p.value.toString() : "0"} placement="top">
-          <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {formatCurrency(p.value)}
-          </Typography>
-        </Tooltip>
-      ),
-    },
-    {
-      field: "totalCredit",
-      headerName: "Total Credit",
-      width: 220, // Expanded width
-      align: "right",
-      headerAlign: "right",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => (
-        <Tooltip title={p.value ? p.value.toString() : "0"} placement="top">
-          <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {formatCurrency(p.value)}
-          </Typography>
-        </Tooltip>
-      ),
-    },
-
-```
-### 4. Detail Table Headers (Inside <DialogContent>)
-Update your TableHead to include the specific width percentages and the new Remarks column.
-**Existing Code:**
-```javascript
-                <TableHead>
-                  <TableRow>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>Branch</TableCell>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>Currency</TableCell>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>CGL</TableCell>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>Amount</TableCell>
-                    <TableCell align="center" sx={styles.tableHeaderCell}>Type</TableCell>
-                  </TableRow>
-                </TableHead>
-
-```
-**Replace with:**
-```javascript
-                <TableHead>
-                  <TableRow>
-                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "10%" }}>Branch</TableCell>
-                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "10%" }}>Currency</TableCell>
-                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "15%" }}>CGL</TableCell>
-                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "20%" }}>Amount</TableCell>
-                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "10%" }}>Type</TableCell>
-                    <TableCell align="left" sx={{ ...styles.tableHeaderCell, width: "35%" }}>Remarks</TableCell>
-                  </TableRow>
-                </TableHead>
-
-```
-### 5. Detail Table Body (Inside <DialogContent>)
-Add the Remarks cell, make the type Chip bold, and fix the colSpan for the empty state.
-**Existing Code:**
-```javascript
-                <TableBody>
-                  {batchDetails.length > 0 ? (
-                    batchDetails.map((group) =>
-                      group.map((row) => (
-                        <TableRow key={row.id} hover>
-                          <TableCell align="center">{row.branch}</TableCell>
-                          <TableCell align="center">{row.currency}</TableCell>
-                          <TableCell align="center">{row.cgl}</TableCell>
-                          <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
-                          <TableCell align="center">
-                            <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" />
-                          </TableCell>
-                        </TableRow>
-                      ))
-                    )
-                  ) : (
-                    !detailLoading && (
-                      <TableRow>
-                        <TableCell colSpan={5} align="center" sx={{ py: 5 }}>
-                          <Typography>No details found.</Typography>
-                        </TableCell>
-                      </TableRow>
-                    )
-                  )}
-                </TableBody>
-
-```
-**Replace with:**
-```javascript
-                <TableBody>
-                  {batchDetails.length > 0 ? (
-                    batchDetails.map((group) =>
-                      group.map((row) => (
-                        <TableRow key={row.id} hover>
-                          <TableCell align="center">{row.branch}</TableCell>
-                          <TableCell align="center">{row.currency}</TableCell>
-                          <TableCell align="center">{row.cgl}</TableCell>
-                          <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
-                          <TableCell align="center">
-                            <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" sx={{ fontWeight: 'bold' }} />
-                          </TableCell>
-                          <TableCell align="left">{row.remarks}</TableCell>
-                        </TableRow>
-                      ))
-                    )
-                  ) : (
-                    !detailLoading && (
-                      <TableRow>
-                        <TableCell colSpan={6} align="center" sx={{ py: 5 }}>
-                          <Typography>No details found.</Typography>
-                        </TableCell>
-                      </TableRow>
-                    )
-                  )}
-                </TableBody>
-
-```
+Now, if a user uploads a file with Dr, cr, Debit, or Credit, the file will be immediately rejected with the clear message: "Transaction type must be strictly 'DR' or 'CR'."
