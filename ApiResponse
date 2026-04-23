@@ -1,65 +1,86 @@
-REQ_DATE why this date come 1 day before the todays Date 
-today is 23-04-2026 but 22-04-26 this is in DB why correct this 
-This is a classic architectural issue known as **Timezone Drift**.
-In distributed systems, your database server, your application server (JVM), and your local timezone are often out of sync. If your JVM or Oracle database is running on a cloud server configured to UTC (or a US timezone like PST/EST), it will inherently log the "wrong" date.
-For example, when it is 10:00 AM IST on the 23rd, it is still late at night on the 22nd in Western timezones. If your system relies on the server's default clock, it will record yesterday's date.
-To fix this permanently across your entire service, we need to explicitly lock the timezone at the application level.
-### 1. The JVM Application-Level Fix (Primary Fix)
-Your JournalRequest entity uses LocalDateTime.now() to populate the requestDate. By default, this uses the JVM's underlying operating system timezone.
-We need to force the Spring Boot application to boot up exclusively in the Asia/Kolkata (IST) timezone.
-Open your main application class (e.g., JournalServiceApplication.java) and add a @PostConstruct block:
-```java
-import jakarta.annotation.PostConstruct;
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import java.util.TimeZone;
+2026-04-23T10:56:33.794+05:30  INFO 31948 --- [JournalService] [nio-9999-exec-3] c.f.J.Service.SequenceService            : SEQUENCE_GENERATED | Type: JRNL_ID | Value: 0004991
+2026-04-23T10:56:33.798+05:30  INFO 31948 --- [JournalService] [    BulkCoord-2] c.f.J.Service.JournalRequestServiceImpl  : ASYNC_BATCH_START | Batch: 0002371 | Source: c0e4e22d-a061-40f8-a486-4ce172083277
+2026-04-23T10:56:33.869+05:30  INFO 31948 --- [JournalService] [    BulkCoord-2] c.f.J.S.JournalBulkValidationService     : CACHE_RETRIEVAL_SUCCESS | ReqID: c0e4e22d-a061-40f8-a486-4ce172083277 | Rows: 2 | Duration: 14ms
+2026-04-23T10:56:33.895+05:30 ERROR 31948 --- [JournalService] [   BulkWriter-1] c.f.J.Service.JournalRequestServiceImpl  : JDBC_BATCH_FAIL | Batch: 0002371 | Offset: 0 | Error: PreparedStatementCallback; uncategorized SQLException for SQL [INSERT INTO JOURNAL_REQUEST (BATCH_ID, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_DATE, REQ_NARRATION, POSTING_DATE, REQ_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'P')]; SQL state [99999]; error code [17003]; Invalid column index
+2026-04-23T10:56:33.913+05:30 ERROR 31948 --- [JournalService] [    BulkCoord-2] c.f.J.Service.JournalRequestServiceImpl  : BATCH_FATAL_ERROR | Batch: 0002371 | Error: com.fincore.JournalService.Exception.CustomExceptions$DatabaseOperationException: Database integrity error during chunk insert
 
-@SpringBootApplication
-public class JournalServiceApplication {
+  @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
+                                String batchId,
+                                String journalPrefix,
+                                String commonRemarks,
+                                String creatorId,
+                                Integer creatorRole,
+                                int globalOffset,
+                                LongAdder globalDebit,
+                                LongAdder globalCredit) {
 
-    public static void main(String[] args) {
-        SpringApplication.run(JournalServiceApplication.class, args);
+        // 1. PAYLOAD removed from INSERT statement
+        String sql = "INSERT INTO JOURNAL_REQUEST (BATCH_ID, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_DATE, REQ_NARRATION, POSTING_DATE, REQ_STATUS) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'P')";
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
+
+        try {
+            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                    JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+
+                    int globalIdx = globalOffset + i + 1;
+                    // FIX: Use distinct prefix! Result: 0004977-1
+                    String jId = journalPrefix + "-" + globalIdx;
+
+                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                    boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
+                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+
+                    LocalDate rDate = LocalDate.now();
+                    if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                        try {
+                            rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
+                        } catch (DateTimeParseException ignored) {}
+                    }
+
+                    ps.setString(1, "P");
+                    ps.setTimestamp(2, ts);
+                    ps.setString(3, creatorId);
+                    ps.setInt(4, creatorRole != null ? creatorRole : 0);
+                    ps.setString(5, batchId);
+                    ps.setString(6, jId);
+                    ps.setString(7, commonRemarks);
+
+                    ps.setTimestamp(5, java.sql.Timestamp.valueOf(LocalDateTime.now()));
+
+                    // 2. Indexes shifted up since Payload is gone
+                    ps.setString(8, r.branch);
+                    ps.setString(9, r.currency);
+                    ps.setString(10, r.cgl);
+                    ps.setBigDecimal(11, signedAmt);
+                    ps.setDate(12, java.sql.Date.valueOf(rDate));
+                    ps.setString(13, r.remarks);
+                    ps.setString(14, r.productCode);
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return chunk.size();
+                }
+            });
+
+            for (JournalBulkValidationService.ExcelRowData r : chunk) {
+                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                long scaledValue = absAmt.multiply(SCALE_FACTOR).longValue();
+
+                if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
+                    globalCredit.add(scaledValue);
+                } else {
+                    globalDebit.add(scaledValue);
+                }
+            }
+
+        } catch (org.springframework.dao.DataAccessException e) {
+            log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+        }
     }
-
-    // This forces the entire Spring Boot JVM to run in IST
-    // Any call to LocalDateTime.now() will now perfectly match your local date.
-    @PostConstruct
-    public void init() {
-        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Kolkata"));
-    }
-}
-
-```
-### 2. The Bulk Upload / Raw SQL Fix (Secondary Fix)
-If you are bypassing JPA for your bulk uploads and using JdbcTemplate to insert rows, you might be letting Oracle use its SYSDATE default for the REQ_DATE column. If the Oracle server is hosted in UTC, SYSDATE will be wrong.
-**Instead of letting the database decide the time, pass the JVM's strictly controlled time to the database.**
-If you have an INSERT statement in your batchUpdate logic, update it to explicitly set the REQ_DATE using the Java time:
-```java
-// Inside your bulk insert logic:
-String sql = "INSERT INTO JOURNAL_REQUEST (BATCH_ID, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_AMOUNT, REQ_DATE, ...) " +
-             "VALUES (?, ?, ?, ?, ?, ...)";
-
-jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-    @Override
-    public void setValues(PreparedStatement ps, int i) throws SQLException {
-        // ... set other values ...
-        
-        // Pass the strictly locked IST time from Java, bypassing Oracle's SYSDATE
-        ps.setTimestamp(5, java.sql.Timestamp.valueOf(LocalDateTime.now())); 
-    }
-    // ...
-});
-
-```
-### 3. Oracle PL/SQL Procedure Fix
-If you look back at the PROCESS_JOURNAL_BATCH procedure we worked on earlier, we used SYSTIMESTAMP and TRUNC(SYSDATE) in several places (like for EXECUTION_DATE and POST_DATE).
-If your Oracle DB is returning the 22nd instead of the 23rd, you can explicitly force Oracle to cast the system time to your timezone inside your procedures.
-Replace SYSDATE or SYSTIMESTAMP with:
-CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'
-**Example inside your procedure:**
-```sql
-    -- Instead of SYSTIMESTAMP:
-    EXECUTION_DATE = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
-
-```
-Implementing Step 1 will fix all JPA saves (@Entity), and Steps 2/3 will seal the gaps in your high-performance JDBC/PLSQL layers.
