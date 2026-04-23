@@ -1,2 +1,65 @@
 REQ_DATE why this date come 1 day before the todays Date 
 today is 23-04-2026 but 22-04-26 this is in DB why correct this 
+This is a classic architectural issue known as **Timezone Drift**.
+In distributed systems, your database server, your application server (JVM), and your local timezone are often out of sync. If your JVM or Oracle database is running on a cloud server configured to UTC (or a US timezone like PST/EST), it will inherently log the "wrong" date.
+For example, when it is 10:00 AM IST on the 23rd, it is still late at night on the 22nd in Western timezones. If your system relies on the server's default clock, it will record yesterday's date.
+To fix this permanently across your entire service, we need to explicitly lock the timezone at the application level.
+### 1. The JVM Application-Level Fix (Primary Fix)
+Your JournalRequest entity uses LocalDateTime.now() to populate the requestDate. By default, this uses the JVM's underlying operating system timezone.
+We need to force the Spring Boot application to boot up exclusively in the Asia/Kolkata (IST) timezone.
+Open your main application class (e.g., JournalServiceApplication.java) and add a @PostConstruct block:
+```java
+import jakarta.annotation.PostConstruct;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import java.util.TimeZone;
+
+@SpringBootApplication
+public class JournalServiceApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(JournalServiceApplication.class, args);
+    }
+
+    // This forces the entire Spring Boot JVM to run in IST
+    // Any call to LocalDateTime.now() will now perfectly match your local date.
+    @PostConstruct
+    public void init() {
+        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Kolkata"));
+    }
+}
+
+```
+### 2. The Bulk Upload / Raw SQL Fix (Secondary Fix)
+If you are bypassing JPA for your bulk uploads and using JdbcTemplate to insert rows, you might be letting Oracle use its SYSDATE default for the REQ_DATE column. If the Oracle server is hosted in UTC, SYSDATE will be wrong.
+**Instead of letting the database decide the time, pass the JVM's strictly controlled time to the database.**
+If you have an INSERT statement in your batchUpdate logic, update it to explicitly set the REQ_DATE using the Java time:
+```java
+// Inside your bulk insert logic:
+String sql = "INSERT INTO JOURNAL_REQUEST (BATCH_ID, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_AMOUNT, REQ_DATE, ...) " +
+             "VALUES (?, ?, ?, ?, ?, ...)";
+
+jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+    @Override
+    public void setValues(PreparedStatement ps, int i) throws SQLException {
+        // ... set other values ...
+        
+        // Pass the strictly locked IST time from Java, bypassing Oracle's SYSDATE
+        ps.setTimestamp(5, java.sql.Timestamp.valueOf(LocalDateTime.now())); 
+    }
+    // ...
+});
+
+```
+### 3. Oracle PL/SQL Procedure Fix
+If you look back at the PROCESS_JOURNAL_BATCH procedure we worked on earlier, we used SYSTIMESTAMP and TRUNC(SYSDATE) in several places (like for EXECUTION_DATE and POST_DATE).
+If your Oracle DB is returning the 22nd instead of the 23rd, you can explicitly force Oracle to cast the system time to your timezone inside your procedures.
+Replace SYSDATE or SYSTIMESTAMP with:
+CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'
+**Example inside your procedure:**
+```sql
+    -- Instead of SYSTIMESTAMP:
+    EXECUTION_DATE = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
+
+```
+Implementing Step 1 will fix all JPA saves (@Entity), and Steps 2/3 will seal the gaps in your high-performance JDBC/PLSQL layers.
