@@ -1,4 +1,4 @@
- @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
                                 String batchId,
                                 String journalPrefix,
@@ -9,15 +9,11 @@
                                 AtomicReference<BigDecimal> globalDebit,
                                 AtomicReference<BigDecimal> globalCredit) {
 
-
-
         String sql = "INSERT INTO JOURNAL_REQUEST (" +
                 "REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, " +
                 "JOURNAL_ID, COMMON_BATCH_REMARKS, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, " +
                 "REQ_AMOUNT, POSTING_DATE, REQ_NARRATION, REQ_PRODUCT) " +
                 "VALUES (JOURNAL_REQUEST_SEQ.NEXTVAL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-
-        final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
 
         try {
             jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
@@ -28,8 +24,9 @@
                     int globalIdx = globalOffset + i + 1;
                     String jId = journalPrefix + "-" + globalIdx;
 
+                    // 1. Convert CR to negative amount so Oracle recognizes it as Credit
                     BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                    boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
+                    boolean isCredit = "CR".equals(r.txnType);
                     BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
 
                     LocalDate rDate = LocalDate.now();
@@ -41,7 +38,7 @@
 
                     // 2. PERFECTLY MAPPED SETTERS (1 through 14 sequentially)
                     ps.setString(1, "P");                                                           // REQ_STATUS
-                    ps.setTimestamp(2, java.sql.Timestamp.valueOf(LocalDateTime.now()));            // REQ_DATE (Timezone fix applied here)
+                    ps.setTimestamp(2, java.sql.Timestamp.valueOf(LocalDateTime.now()));            // REQ_DATE
                     ps.setString(3, creatorId);                                                     // CREATOR_ID
                     ps.setInt(4, creatorRole != null ? creatorRole : 0);                            // CREATOR_ROLE
                     ps.setString(5, batchId);                                                       // BATCH_ID
@@ -62,11 +59,11 @@
                 }
             });
 
+            // 3. Update Thread-Safe Aggregates 
             for (JournalBulkValidationService.ExcelRowData r : chunk) {
                 BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                long scaledValue = absAmt.multiply(SCALE_FACTOR).longValue();
 
-                if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
+                if ("CR".equals(r.txnType)) {
                     globalCredit.updateAndGet(curr -> curr.add(absAmt));
                 } else {
                     globalDebit.updateAndGet(curr -> curr.add(absAmt));
