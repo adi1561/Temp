@@ -1,13 +1,61 @@
-0002384
-PENDING
-1021256
-23 Apr 2026, 2:03 pm
-4
-2469135780242468.5000
+This is the final boss of working with massive financial data in full-stack applications. You are witnessing **JavaScript's IEEE 754 Double-Precision Float limit**.
+In JavaScript, all numbers are 64-bit floats. The maximum safe integer in JS is 9,007,199,254,740,991.
+Your number (2,469,135,780,242,468) is pushing right up against that limit. As soon as you add decimal places (.6912), JavaScript runs out of memory bits to store the precision and silently rounds the trailing decimals to .5000.
+Worse, this corruption happens in two places:
+ 1. When Axios/JSON.parse() reads the incoming API response.
+ 2. When your formatCurrency function calls Number(num).
+To fix this, we must completely bypass JavaScript's math engine and treat these massive totals strictly as **Strings** across the entire pipeline.
+### 1. The Backend Fix (Prevent JSON Parsing Corruption)
+Right now, Jackson is sending the BigDecimal as a raw number in the JSON payload. We must force Spring Boot to send these specific totals wrapped in quotes so the frontend browser receives them as strings, not numbers.
+Find the DTO/Response class that your /pending-requests-summary endpoint returns (e.g., JournalBatchSummaryDto.java) and add the @JsonFormat annotation to force string serialization.
+```java
+import com.fasterxml.jackson.annotation.JsonFormat;
+import java.math.BigDecimal;
 
-2469135780242468.5000
+public class JournalBatchSummaryDto {
+    // ... other fields ...
 
+    // Forces the API to send "2469135780242468.6912" instead of 2469135780242468.6912
+    @JsonFormat(shape = JsonFormat.Shape.STRING)
+    private BigDecimal totalDebit;
 
-this is what i am getting in this frontend 
+    @JsonFormat(shape = JsonFormat.Shape.STRING)
+    private BigDecimal totalCredit;
+}
 
-Bulk Upload - 2025-12-02	4	2469135780242468.6912	2469135780242468.6912	PENDING			in DB
+```
+### 2. The Frontend Fix (Prevent Formatting Corruption)
+Now that the frontend is safely receiving the exact string "2469135780242468.6912", we need to update your formatCurrency function so it doesn't convert it back into a Number. We will use pure string manipulation to add the commas and pad the 4 decimal places.
+At the top of your React file, replace your existing formatCurrency function with this string-safe version:
+**Existing Code:**
+```javascript
+const formatCurrency = (num) => Number(num).toFixed(4);
+
+```
+**Replace with:**
+```javascript
+// Pure string manipulation to completely bypass JavaScript's 64-bit float limit
+const formatCurrency = (val) => {
+  if (val === null || val === undefined || val === "") return "0.0000";
+  
+  // Ensure it's a string without using Number()
+  const strVal = String(val).trim();
+  
+  // Split into integer and decimal parts
+  const parts = strVal.split(".");
+  let intPart = parts[0];
+  let decPart = parts[1] || "";
+
+  // Pad or truncate to exactly 4 decimal places
+  decPart = decPart.padEnd(4, "0").substring(0, 4);
+
+  // Safely add commas to the integer part (e.g. 1000000 -> 1,000,000)
+  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+  return `${intPart}.${decPart}`;
+};
+
+```
+### Why this is the ultimate fix:
+Because the backend now shields the number in quotes, Axios won't accidentally truncate it. Because the frontend now formats it using string splitting and Regex, JavaScript never attempts to load 2.469 Quintillion into its math memory.
+Your UI will now perfectly mirror the database, showing 2,469,135,780,242,468.6912!
