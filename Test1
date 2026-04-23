@@ -1,85 +1,15 @@
-Locking down data at the entry point is excellent practice. By enforcing strict case sensitivity ("DR" and "CR") at the upload level, you prevent dirty data from ever hitting your processing logic.
-To implement this, we need to add a strict .equals() check to your format validation, and then we can safely simplify your balance validation since we no longer need to check for variations like "Credit" or "Cr".
-Here are the exact updates to make in **JournalBulkValidationService.java**:
-### 1. Update runFormatCheck
-Add this new validation block inside your runFormatCheck loop. You can place it right after your Branch check.
-**Add this code:**
-```java
-            // Transaction Type (Strictly "DR" or "CR" uppercase)
-            if (d.txnType == null || (!d.txnType.equals("DR") && !d.txnType.equals("CR"))) {
-                synchronized(d.formatErrors) { 
-                    d.formatErrors.add("Transaction type must be strictly 'DR' or 'CR'."); 
-                }
-            }
+branch 	currency 	cgl 	amount 	txntype 	remarks 	product
+00050	ACE	5051030601	1000.01	CR	Adesh	12346578
+00050	ACE	5051240801	1000.01	DR	Adesh	13246795
 
-```
-### 2. Update runBalanceCheck
-Because runFormatCheck will now aggressively reject anything that isn't exactly "DR" or "CR", we can strip out the .equalsIgnoreCase() and the checks for the full words ("Debit"/"Credit") from the balance logic. This actually makes the backend slightly faster.
-Replace your entire runBalanceCheck method with this streamlined version:
-```java
-    private void runBalanceCheck(List<ExcelRowData> rows) {
-        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
-        Set<String> seenCgls = ConcurrentHashMap.newKeySet();
-        Set<String> duplicateCgls = ConcurrentHashMap.newKeySet();
-        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
+this what i uploaded in that i am getting like 
+0002387
+PENDING
+1015698
+23 Apr 2026, 2:37 pm
+2
+1,000.0100
 
-        // Pass 1: Aggregate totals and check for duplicates & presence
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+1,000.0100
 
-            // Track Duplicate CGLs (Branch + Currency + CGL)
-            String uniqueCglKey = d.branch + "_" + d.currency + "_" + d.cgl;
-            if (!seenCgls.add(uniqueCglKey)) {
-                duplicateCgls.add(uniqueCglKey);
-            }
-
-            // Track Debit/Credit Presence per Branch (Now strictly "DR" / "CR")
-            if ("DR".equals(d.txnType)) branchHasDebit.put(d.branch, true);
-            if ("CR".equals(d.txnType)) branchHasCredit.put(d.branch, true);
-
-            // Calculate Balance Groupings
-            boolean isCredit = "CR".equals(d.txnType);
-            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-
-            // Thread-safe BigDecimal addition without scaling or overflow risks
-            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
-                    .updateAndGet(curr -> curr.add(finalVal)); 
-        });
-
-        // Pass 2: Apply the simple, generic error messages to the rows
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            String uniqueCglKey = d.branch + "_" + d.currency + "_" + d.cgl;
-            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
-            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
-
-            synchronized (d.balErrors) {
-                // 1. Duplicate CGL Check
-                if (duplicateCgls.contains(uniqueCglKey) && !d.balErrors.contains("Duplicate CGL entry found for the same Branch and Currency.")) {
-                    d.balErrors.add("Duplicate CGL entry found for the same Branch and Currency.");
-                }
-
-                // 2. Debit/Credit Presence Check
-                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
-                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
-                }
-
-                // 3. Balance Math Check (Using BigDecimal's compareTo)
-                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
-                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
-                }
-            }
-        });
-    }
-
-```
-Now, if a user uploads a file with Dr, cr, Debit, or Credit, the file will be immediately rejected with the clear message: "Transaction type must be strictly 'DR' or 'CR'."
+in both auth and status screen why this is wrong na 
