@@ -1,4 +1,4 @@
-create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+CREATE OR REPLACE PROCEDURE PROCESS_JOURNAL_BATCH (
     p_batch_id      IN VARCHAR2,
     p_executor_id   IN VARCHAR2,
     p_remarks       IN VARCHAR2,
@@ -6,11 +6,10 @@ create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
     o_cursor        OUT SYS_REFCURSOR
 ) AS
     v_missing_rates NUMBER;
+    v_txn_count     NUMBER; -- Added variable to hold the total count
 BEGIN
     -- ==============================================================================
     -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
-    -- Verifies that all non-INR currencies in the batch have a valid, active 
-    -- exchange rate setup in CURRENCY_MASTER before processing begins.
     -- ==============================================================================
     SELECT COUNT(*) INTO v_missing_rates
     FROM (
@@ -27,11 +26,15 @@ BEGIN
     END IF;
 
     -- ==============================================================================
+    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
+    -- Calculate the count once into a local variable to avoid ORA-02287
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_txn_count
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+    -- ==============================================================================
     -- 1. Insert GL_TRANSACTIONS
-    -- Moves the pending requests into the live transaction ledger.
-    -- * FIX APPLIED: Replaced REQ_CSV_DATE with POSTING_DATE.
-    -- * OPTIMIZATION: Uses COUNT(*) OVER () to seamlessly inject the total 
-    --   transaction count across all rows in the batch.
     -- ==============================================================================
     INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
         TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
@@ -46,14 +49,12 @@ BEGIN
         CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
         CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
         'J' ,
-        COUNT(*) OVER ()
+        v_txn_count -- Replaced analytic function with the pre-calculated static variable
     FROM JOURNAL_REQUEST
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
     -- ==============================================================================
     -- 2. Insert MASTER_JOURNAL
-    -- Archives the specific journal details into the master reporting table.
-    -- * FIX APPLIED: Replaced REQ_CSV_DATE with POSTING_DATE.
     -- ==============================================================================
     INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
         JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
@@ -72,10 +73,6 @@ BEGIN
 
     -- ==============================================================================
     -- 3. Merge GL Balances
-    -- Aggregates the net changes from the batch and atomically updates/inserts 
-    -- the final end-of-day balances.
-    -- * FIX APPLIED: Replaced REQ_CSV_DATE with POSTING_DATE in the SELECT, 
-    --   NVL, and GROUP BY clauses.
     -- ==============================================================================
     MERGE INTO GL_BALANCE target
     USING (
@@ -104,9 +101,6 @@ BEGIN
 
     -- ==============================================================================
     -- 4. Capture Sync Data for HDFS (Data Lake)
-    -- Opens a cursor to return the freshly calculated GL balances back to the Java 
-    -- application so it can sync them to the Hadoop Data Lake.
-    -- * FIX APPLIED: Replaced REQ_CSV_DATE with POSTING_DATE.
     -- ==============================================================================
     OPEN o_cursor FOR
     SELECT
@@ -125,7 +119,6 @@ BEGIN
 
     -- ==============================================================================
     -- 5. Finalize Batch Status
-    -- Marks the staged request rows as 'A' (Approved) and logs who executed it.
     -- ==============================================================================
     UPDATE JOURNAL_REQUEST
     SET REQ_STATUS = p_status,
@@ -134,19 +127,8 @@ BEGIN
         EXECUTOR_REMARKS = p_remarks
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-    -- NO EXPLICIT COMMIT — Spring @Transactional manages this to prevent partial data writes.
-
 EXCEPTION
     WHEN OTHERS THEN
         ROLLBACK;
         RAISE;
 END;
-it saying 
-
-2026-04-23T11:15:07.377+05:30  INFO 10704 --- [JournalService] [    BulkCoord-2] c.f.J.Service.JournalRequestServiceImpl  : BATCH_CREATION_FINISHED | Batch: 0002374 | Status: PENDING | Rows: 2 | Duration: 376ms
-2026-04-23T11:16:26.002+05:30  INFO 10704 --- [JournalService] [nio-9999-exec-8] c.f.J.C.JournalRequestController         : BULK_PROCESS_START | User: 1021256 | Batch: 0002374 | Action: ACCEPTED
-2026-04-23T11:16:26.188+05:30 ERROR 10704 --- [JournalService] [    BulkCoord-3] c.f.J.Service.JournalRequestServiceImpl  : PROCEDURE_EXEC_FAIL | Batch: 0002374 | Type: UncategorizedSQLException
-2026-04-23T11:16:26.211+05:30  INFO 10704 --- [JournalService] [    BulkCoord-3] c.f.J.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 1021256 | Ref: 0002374
-
-
-after accepting
