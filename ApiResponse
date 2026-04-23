@@ -1,79 +1,88 @@
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
-                                String batchId,
-                                String journalPrefix,
-                                String commonRemarks,
-                                String creatorId,
-                                Integer creatorRole,
-                                int globalOffset,
-                                LongAdder globalDebit,
-                                LongAdder globalCredit) {
+2026-04-23T11:03:28.526+05:30  INFO 32352 --- [JournalService] [nio-9999-exec-3] c.f.J.C.JournalRequestController         : CACHE_BATCH_INIT | User: 1021256 | ReqID: 18e69fc1-685f-4eb2-9f03-857cfb6c23e9
+2026-04-23T11:03:28.616+05:30  INFO 32352 --- [JournalService] [nio-9999-exec-3] c.f.J.Service.SequenceService            : SEQUENCE_GENERATED | Type: BATCH_ID | Value: 0002372
+2026-04-23T11:03:28.634+05:30  INFO 32352 --- [JournalService] [nio-9999-exec-3] c.f.J.Service.SequenceService            : SEQUENCE_GENERATED | Type: JRNL_ID | Value: 0004992
+2026-04-23T11:03:28.639+05:30  INFO 32352 --- [JournalService] [    BulkCoord-2] c.f.J.Service.JournalRequestServiceImpl  : ASYNC_BATCH_START | Batch: 0002372 | Source: 18e69fc1-685f-4eb2-9f03-857cfb6c23e9
+2026-04-23T11:03:28.719+05:30  INFO 32352 --- [JournalService] [    BulkCoord-2] c.f.J.S.JournalBulkValidationService     : CACHE_RETRIEVAL_SUCCESS | ReqID: 18e69fc1-685f-4eb2-9f03-857cfb6c23e9 | Rows: 2 | Duration: 10ms
+2026-04-23T11:03:28.779+05:30 ERROR 32352 --- [JournalService] [   BulkWriter-1] c.f.J.Service.JournalRequestServiceImpl  : JDBC_BATCH_FAIL | Batch: 0002372 | Offset: 0 | Error: PreparedStatementCallback; SQL [INSERT INTO JOURNAL_REQUEST (REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, POSTING_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)]; ORA-01400: cannot insert NULL into ("FINCORE"."JOURNAL_REQUEST"."REQ_ID")
 
-        // 1. PERFECTLY MAPPED SQL: 14 Columns = 14 Question Marks
-        String sql = "INSERT INTO JOURNAL_REQUEST (" +
-                "REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, " +
-                "JOURNAL_ID, COMMON_BATCH_REMARKS, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, " +
-                "REQ_AMOUNT, POSTING_DATE, REQ_NARRATION, REQ_PRODUCT) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                
-        final BigDecimal SCALE_FACTOR = new BigDecimal("10000");
+2026-04-23T11:03:28.797+05:30 ERROR 32352 --- [JournalService] [    BulkCoord-2] c.f.J.Service.JournalRequestServiceImpl  : BATCH_FATAL_ERROR | Batch: 0002372 | Error: com.fincore.JournalService.Exception.CustomExceptions$DatabaseOperationException: Database integrity error during chunk insert
 
-        try {
-            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
-                    JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+package com.fincore.JournalService.Models;
 
-                    int globalIdx = globalOffset + i + 1;
-                    String jId = journalPrefix + "-" + globalIdx;
+import jakarta.persistence.*;
+import lombok.Data;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 
-                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                    boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.config.RequestStatusConverter;
 
-                    LocalDate rDate = LocalDate.now();
-                    if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                        try {
-                            rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
-                        } catch (DateTimeParseException ignored) {}
-                    }
+@Entity
+@Table(name = "JOURNAL_REQUEST")
+@Data
+public class JournalRequest {
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "JOURNAL_REQUEST_SEQ")
+    @SequenceGenerator(name = "JOURNAL_REQUEST_SEQ", sequenceName = "JOURNAL_REQUEST_SEQ", allocationSize = 1)
+    @Column(name = "REQ_ID")
+    private Long id;
 
-                    // 2. PERFECTLY MAPPED SETTERS (1 through 14 sequentially)
-                    ps.setString(1, "P");                                                           // REQ_STATUS
-                    ps.setTimestamp(2, java.sql.Timestamp.valueOf(LocalDateTime.now()));            // REQ_DATE (Timezone fix applied here)
-                    ps.setString(3, creatorId);                                                     // CREATOR_ID
-                    ps.setInt(4, creatorRole != null ? creatorRole : 0);                            // CREATOR_ROLE
-                    ps.setString(5, batchId);                                                       // BATCH_ID
-                    ps.setString(6, jId);                                                           // JOURNAL_ID
-                    ps.setString(7, commonRemarks);                                                 // COMMON_BATCH_REMARKS
-                    ps.setString(8, r.branch);                                                      // REQ_BRANCH_CODE
-                    ps.setString(9, r.currency);                                                    // REQ_CURRENCY
-                    ps.setString(10, r.cgl);                                                        // REQ_CGL
-                    ps.setBigDecimal(11, signedAmt);                                                // REQ_AMOUNT
-                    ps.setDate(12, java.sql.Date.valueOf(rDate));                                   // POSTING_DATE
-                    ps.setString(13, r.remarks);                                                    // REQ_NARRATION
-                    ps.setString(14, r.productCode);                                                // REQ_PRODUCT
-                }
+    @Convert(converter = RequestStatusConverter.class)
+    @Column(name = "REQ_STATUS", length = 10)
+    private RequestStatus requestStatus;
 
-                @Override
-                public int getBatchSize() {
-                    return chunk.size();
-                }
-            });
 
-            for (JournalBulkValidationService.ExcelRowData r : chunk) {
-                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                long scaledValue = absAmt.multiply(SCALE_FACTOR).longValue();
 
-                if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
-                    globalCredit.add(scaledValue);
-                } else {
-                    globalDebit.add(scaledValue);
-                }
-            }
+    @Column(name = "REQ_DATE", updatable = false)
+    private LocalDateTime requestDate = LocalDateTime.now();
 
-        } catch (org.springframework.dao.DataAccessException e) {
-            log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
-        }
-    }
+    @Column(name = "CREATOR_ID", length = 12, updatable = false)
+    private String creatorId;
+
+    @Column(name = "CREATOR_ROLE", updatable = false)
+    private Integer creatorRole;
+
+    @Column(name = "EXECUTOR_ID", length = 12)
+    private String executorId;
+
+    @Column(name = "EXECUTION_DATE")
+    private LocalDateTime executionDate;
+
+    @Column(name = "EXECUTOR_REMARKS", length = 50)
+    private String executorRemarks;
+
+
+
+    @Column(name = "BATCH_ID", length = 50)
+    private String batchId;
+
+    @Column(name = "JOURNAL_ID", length = 50)
+    private String journalId;
+
+    @Column(name = "COMMON_BATCH_REMARKS" , length = 50)
+    private String commonBatchRemarks;
+
+    @Column(name = "REQ_BRANCH_CODE", length = 50)
+    private String branchCode;
+
+    @Column(name = "REQ_CURRENCY", length = 3)
+    private String currency;
+
+    @Column(name = "REQ_CGL", length = 50)
+    private String cgl;
+
+    @Column(name = "REQ_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal amount;
+
+    @Column(name = "POSTING_DATE")
+    private LocalDate posting_date;
+
+    @Column(name = "REQ_NARRATION", length = 200)
+    private String narration;
+
+    @Column(name = "REQ_PRODUCT", length = 50)
+    private String productCode;
+}
+
