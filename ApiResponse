@@ -1,136 +1,125 @@
-CREATE OR REPLACE PROCEDURE PROCESS_JOURNAL_BATCH (
-    p_batch_id      IN VARCHAR2,
-    p_executor_id   IN VARCHAR2,
-    p_remarks       IN VARCHAR2,
-    p_status        IN VARCHAR2,
-    o_cursor        OUT SYS_REFCURSOR
-) AS
-    v_missing_rates NUMBER;
-    v_txn_count     NUMBER; 
-BEGIN
-    -- ==============================================================================
-    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
-    -- ==============================================================================
-    SELECT COUNT(*) INTO v_missing_rates
-    FROM (
-        SELECT DISTINCT REQ_CURRENCY FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
-    ) req
-    LEFT JOIN CURRENCY_MASTER cm
-        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
-    WHERE req.REQ_CURRENCY <> 'INR'
-      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
+As a Technical Lead, I completely agree with these UX and security improvements. Centralizing your regular expressions (regex) makes the code much easier to maintain, and standardizing the frontend error messages to perfectly mirror the backend ensures a consistent user experience without leaking internal data (like specific branch codes or totals) to the screen.
+Here are the exact, targeted changes you need to make to your React frontend file.
+### 1. Centralize the Regex Patterns
+Add these regex constants at the top of your file (just below your imports). By doing this, if business requirements change in the future, you only have to change the regex string here.
+```javascript
+// --- CENTRALIZED REGEX PATTERNS ---
+// Replaces anything that is NOT an alphabet, number, or space
+const REMARKS_REPLACE_REGEX = /[^a-zA-Z0-9 ]/g; 
 
-    IF v_missing_rates > 0 THEN
-        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
-    END IF;
+// Replaces anything that is NOT a digit (CGL is strictly digits)
+const CGL_REPLACE_REGEX = /[^0-9]/g;
 
-    -- ==============================================================================
-    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
-    -- ==============================================================================
-    SELECT COUNT(*) INTO v_txn_count
-    FROM JOURNAL_REQUEST
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+// Replaces anything that is NOT alphanumeric (Branch is strictly alphanumeric)
+const BRANCH_REPLACE_REGEX = /[^a-zA-Z0-9]/g;
 
-    -- ==============================================================================
-    -- 1. Insert GL_TRANSACTIONS
-    -- ==============================================================================
-    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
-        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
-        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
-    )
-    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
-        NVL(POSTING_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
-        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
-        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
-        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
-        'J' ,
-        v_txn_count 
-    FROM JOURNAL_REQUEST
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+```
+### 2. Update filterAndWarn for Remarks
+Update your filterAndWarn function to use the new centralized regex. It will now aggressively strip out dashes, slashes, and brackets, leaving only pure alphabets and numbers (and spaces).
+```javascript
+  const filterAndWarn = (val, type) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphabets and numbers are allowed.";
 
-    -- ==============================================================================
-    -- 2. Insert MASTER_JOURNAL
-    -- ==============================================================================
-    INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
-        JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
-        JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF,
-        JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
-    )
-    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-        MASTER_JOURNAL_SEQ.nextval, ABS(REQ_AMOUNT), 'A', BATCH_ID,
-        REQ_BRANCH_CODE, REQ_CGL, 
-        SUBSTR(p_remarks, 1, 30), -- Defensive substring to prevent ORA-12899
-        REQ_CURRENCY, JOURNAL_ID,
-        NVL(POSTING_DATE, TRUNC(SYSDATE)), REQ_PRODUCT, REQ_NARRATION,
-        
-        -- FIX: Adjusted to perfectly fit the VARCHAR2(3) schema limit
-        CASE WHEN REQ_AMOUNT > 0 THEN 'DR'
-             WHEN REQ_AMOUNT < 0 THEN 'CR'
-             ELSE 'NIL' END
-             
-    FROM JOURNAL_REQUEST
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    if (type === "alphanumeric_space") {
+      // 1. Strip any character using the centralized regex
+      filtered = val.replace(REMARKS_REPLACE_REGEX, ""); 
+      
+      if (filtered !== val) {
+        hasError = true;
+      }
+      
+      // 2. Strip leading space and collapse double spaces
+      const beforeSpaceTrim = filtered;
+      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+      if (beforeSpaceTrim !== filtered && !hasError) {
+        hasError = true;
+        msg = "Remark should not start with space or contain consecutive spaces.";
+      }
+    }
 
-    -- ==============================================================================
-    -- 3. Merge GL Balances
-    -- ==============================================================================
-    MERGE INTO GL_BALANCE target
-    USING (
-        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
-               NVL(j.POSTING_DATE, TRUNC(SYSDATE)) as BAL_DATE,
-               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
-               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
-        FROM JOURNAL_REQUEST j
-        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
-        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
-        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.POSTING_DATE
-    ) source
-    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
-        AND target.CURRENCY = source.REQ_CURRENCY
-        AND target.CGL = source.REQ_CGL
-        AND target.BALANCE_DATE = source.BAL_DATE)
-    WHEN MATCHED THEN
-        UPDATE SET
-            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
-            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
-    WHEN NOT MATCHED THEN
-        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
-        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
-                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
-                (source.TXN_AMOUNT * source.EXCH_RATE));
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+    return filtered;
+  };
 
-    -- ==============================================================================
-    -- 4. Capture Sync Data for HDFS (Data Lake)
-    -- ==============================================================================
-    OPEN o_cursor FOR
-    SELECT
-        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
-        NVL(j.POSTING_DATE, TRUNC(SYSDATE)) AS BAL_DATE,
-        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
-    FROM (
-        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, POSTING_DATE
-        FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
-    ) j
-    JOIN GL_BALANCE g
-        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
-        AND g.CURRENCY = j.REQ_CURRENCY
-        AND g.CGL = j.REQ_CGL
-        AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(SYSDATE));
+```
+### 3. Restrict Branch (Max 5 chars) & CGL (Max 10 digits)
+Update the onInputChange block inside the <Autocomplete> component for both Branch and CGL to enforce the strict length limits and character types.
+**For Branch (Inside the Branch Autocomplete):**
+```javascript
+                    onInputChange={(event, newInputValue, reason) => {
+                      if (reason === 'input') {
+                        // Apply Regex and restrict to exactly 5 characters
+                        const cleanInput = newInputValue
+                          .replace(BRANCH_REPLACE_REGEX, "")
+                          .substring(0, 5);
+                          
+                        setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+                        searchBranches(cleanInput, row.id);
+                      } else {
+                        setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
+                      }
+                    }}
 
-    -- ==============================================================================
-    -- 5. Finalize Batch Status
-    -- ==============================================================================
-    UPDATE JOURNAL_REQUEST
-    SET REQ_STATUS = p_status,
-        EXECUTOR_ID = p_executor_id,
-        EXECUTION_DATE = SYSTIMESTAMP,
-        EXECUTOR_REMARKS = p_remarks
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+```
+**For CGL (Inside the CGL Autocomplete):**
+```javascript
+                    onInputChange={(event, newInputValue, reason) => {
+                      if (reason === 'input') {
+                        // Apply Regex and restrict to exactly 10 digits
+                        const cleanInput = newInputValue
+                          .replace(CGL_REPLACE_REGEX, "")
+                          .substring(0, 10);
+                          
+                        setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+                        searchCgls(cleanInput, row.id);
+                      } else {
+                        setCglInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
+                      }
+                    }}
 
-EXCEPTION
-    WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
-END;
+```
+### 4. Standardize the Error Messages
+Update the handleSubmit function. We will rip out the dynamic variables (like ${branchName} or totals) and replace them with the exact, clean, generic messages you established in the backend.
+Find these blocks inside handleSubmit and replace them:
+**A. Duplicate CGL Check:**
+```javascript
+      if (cglSet.has(cgl)) {
+        // CHANGED: Simple generic message
+        showSnackBar("Duplicate CGL entry found for the same Branch and Currency.", "error");
+        setIsSubmitting(false);
+        return;
+      }
+
+```
+**B. Debit/Credit Presence Check:**
+```javascript
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit } = totals;
+      if (!hasDebit || !hasCredit) {
+        // CHANGED: Simple generic message
+        showSnackBar("Branch must have at least one Debit and one Credit entry.", "error");
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+```
+**C. Balance Mismatch Check:**
+```javascript
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit } = totals;
+
+      if (totalDebit !== totalCredit) {
+        // CHANGED: Matches backend exactly! No totals, no branch names.
+        showSnackBar("Branch, Currency, and CGL-wise balance mismatch.", "error");
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+```
+These updates seamlessly lock down the user input using centralized regex rules and provide a highly professional, secure error-handling experience that perfectly matches your backend Java layer!
