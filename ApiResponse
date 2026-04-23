@@ -1,125 +1,52 @@
-As a Technical Lead, I completely agree with these UX and security improvements. Centralizing your regular expressions (regex) makes the code much easier to maintain, and standardizing the frontend error messages to perfectly mirror the backend ensures a consistent user experience without leaking internal data (like specific branch codes or totals) to the screen.
-Here are the exact, targeted changes you need to make to your React frontend file.
-### 1. Centralize the Regex Patterns
-Add these regex constants at the top of your file (just below your imports). By doing this, if business requirements change in the future, you only have to change the regex string here.
-```javascript
-// --- CENTRALIZED REGEX PATTERNS ---
-// Replaces anything that is NOT an alphabet, number, or space
-const REMARKS_REPLACE_REGEX = /[^a-zA-Z0-9 ]/g; 
+    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
+        StringBuilder csv = new StringBuilder(rows.size() * 100);
+        
+        // 1. Date Format: Set to dd/MM/yyyy (e.g., 25/03/2026)
+        DateTimeFormatter slashDateFmt = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+        DateTimeFormatter noSlashDateFmt = DateTimeFormatter.ofPattern("ddMMyyyy");
+        
+        String defaultDateStr = postingDate.format(slashDateFmt);
+        String year = (postingDate.getMonthValue() >= 4) ? String.valueOf(postingDate.getYear()) : String.valueOf(postingDate.getYear() - 1);
+        String month = String.format("%02d", (postingDate.getMonthValue() >= 4) ? (postingDate.getMonthValue() - 3) : (postingDate.getMonthValue() + 9));
 
-// Replaces anything that is NOT a digit (CGL is strictly digits)
-const CGL_REPLACE_REGEX = /[^0-9]/g;
+        for (ExcelRowData row : rows) {
+            
+            // Format system dates or fallback to default date with slashes
+            String cDate = defaultDateStr;
+            if (row.isSystemFormat && row.sysDate != null && row.sysDate.length() == 8) {
+                try {
+                    cDate = LocalDate.parse(row.sysDate, noSlashDateFmt).format(slashDateFmt);
+                } catch (Exception e) {
+                    cDate = defaultDateStr;
+                }
+            }
+            
+            String cYear = row.isSystemFormat ? row.sysYear : year;
+            String cMonth = row.isSystemFormat ? row.sysPeriod : month;
+            
+            // 2. Branch Padding: Exactly 5 digits with leading zeros (e.g., "56" -> "00056")
+            String col5 = String.format("%5s", row.branch).replace(' ', '0');
+            String col6 = (row.currency == null || row.currency.isEmpty()) ? "INR" : row.currency;
+            
+            // 3. Amount 16.4 Padding: 16 integer digits, 4 decimal digits
+            // setScale(4) ensures 1100.34 mathematically becomes 1100.3400
+            String plainAmt = row.amount.abs().setScale(4, RoundingMode.HALF_UP).toPlainString();
+            int dotIndex = plainAmt.indexOf('.');
+            String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
+            String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
+            
+            // Padds the integer part to exactly 16 zeroes
+            String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
 
-// Replaces anything that is NOT alphanumeric (Branch is strictly alphanumeric)
-const BRANCH_REPLACE_REGEX = /[^a-zA-Z0-9]/g;
-
-```
-### 2. Update filterAndWarn for Remarks
-Update your filterAndWarn function to use the new centralized regex. It will now aggressively strip out dashes, slashes, and brackets, leaving only pure alphabets and numbers (and spaces).
-```javascript
-  const filterAndWarn = (val, type) => {
-    let filtered = val;
-    let hasError = false;
-    let msg = "Only alphabets and numbers are allowed.";
-
-    if (type === "alphanumeric_space") {
-      // 1. Strip any character using the centralized regex
-      filtered = val.replace(REMARKS_REPLACE_REGEX, ""); 
-      
-      if (filtered !== val) {
-        hasError = true;
-      }
-      
-      // 2. Strip leading space and collapse double spaces
-      const beforeSpaceTrim = filtered;
-      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
-      if (beforeSpaceTrim !== filtered && !hasError) {
-        hasError = true;
-        msg = "Remark should not start with space or contain consecutive spaces.";
-      }
+            // 4. TXN Type: Strictly Uppercase DR / CR
+            String col9 = "Credit".equalsIgnoreCase(row.txnType) ? "CR" : "DR";
+            
+            String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
+            String col11 = (row.productCode == null || row.productCode.trim().isEmpty()) ? "A" : row.productCode.trim();
+            
+            csv.append("01,").append(cDate).append(",").append(cYear).append(",").append(cMonth).append(",")
+                    .append(col5).append(",").append(col6).append(",").append(row.cgl).append(",").append(col8).append(",")
+                    .append(col9).append(",").append(col10).append(",").append(col11).append(",B,C,D\n");
+        }
+        return csv.toString().getBytes(StandardCharsets.UTF_8);
     }
-
-    if (hasError) {
-      showSnackBar(msg, "warning");
-    }
-    return filtered;
-  };
-
-```
-### 3. Restrict Branch (Max 5 chars) & CGL (Max 10 digits)
-Update the onInputChange block inside the <Autocomplete> component for both Branch and CGL to enforce the strict length limits and character types.
-**For Branch (Inside the Branch Autocomplete):**
-```javascript
-                    onInputChange={(event, newInputValue, reason) => {
-                      if (reason === 'input') {
-                        // Apply Regex and restrict to exactly 5 characters
-                        const cleanInput = newInputValue
-                          .replace(BRANCH_REPLACE_REGEX, "")
-                          .substring(0, 5);
-                          
-                        setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                        searchBranches(cleanInput, row.id);
-                      } else {
-                        setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                      }
-                    }}
-
-```
-**For CGL (Inside the CGL Autocomplete):**
-```javascript
-                    onInputChange={(event, newInputValue, reason) => {
-                      if (reason === 'input') {
-                        // Apply Regex and restrict to exactly 10 digits
-                        const cleanInput = newInputValue
-                          .replace(CGL_REPLACE_REGEX, "")
-                          .substring(0, 10);
-                          
-                        setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                        searchCgls(cleanInput, row.id);
-                      } else {
-                        setCglInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                      }
-                    }}
-
-```
-### 4. Standardize the Error Messages
-Update the handleSubmit function. We will rip out the dynamic variables (like ${branchName} or totals) and replace them with the exact, clean, generic messages you established in the backend.
-Find these blocks inside handleSubmit and replace them:
-**A. Duplicate CGL Check:**
-```javascript
-      if (cglSet.has(cgl)) {
-        // CHANGED: Simple generic message
-        showSnackBar("Duplicate CGL entry found for the same Branch and Currency.", "error");
-        setIsSubmitting(false);
-        return;
-      }
-
-```
-**B. Debit/Credit Presence Check:**
-```javascript
-    for (const [branchCode, totals] of branchEntryCheck.entries()) {
-      const { hasDebit, hasCredit } = totals;
-      if (!hasDebit || !hasCredit) {
-        // CHANGED: Simple generic message
-        showSnackBar("Branch must have at least one Debit and one Credit entry.", "error");
-        setIsSubmitting(false);
-        return;
-      }
-    }
-
-```
-**C. Balance Mismatch Check:**
-```javascript
-    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
-      const { totalDebit, totalCredit } = totals;
-
-      if (totalDebit !== totalCredit) {
-        // CHANGED: Matches backend exactly! No totals, no branch names.
-        showSnackBar("Branch, Currency, and CGL-wise balance mismatch.", "error");
-        setIsSubmitting(false);
-        return;
-      }
-    }
-
-```
-These updates seamlessly lock down the user input using centralized regex rules and provide a highly professional, secure error-handling experience that perfectly matches your backend Java layer!
