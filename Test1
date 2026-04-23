@@ -1,20 +1,122 @@
+This is a classic and spectacular **64-bit Integer Overflow** (also known as "Long Wrap-Around").
+As a Technical Lead, I can tell you exactly why this happened. We successfully prevented *floating-point drift* by scaling the decimal out, but we hit the absolute mathematical ceiling of Java's primitive data types!
+### The Mathematics of the Crash
+In our Java backend, we were scaling the BigDecimal by 10,000 and converting it to a long to use the high-speed LongAdder for parallel threading.
+ 1. Your amount: 1234567890121234.3456
+ 2. Multiply by 10,000: **12,345,678,901,212,343,456** (12.3 Quintillion)
+ 3. The absolute maximum value a Java long (64-bit integer) can hold is: **9,223,372,036,854,775,807** (9.2 Quintillion).
+Because 12.3 Quintillion is mathematically larger than 9.2 Quintillion, the 64-bit memory register overflows. Instead of crashing the JVM, Java silently "wraps around" into negative numbers.
+When it wrote the total back to the database, it divided that wrapped negative number by 10,000, leaving you with -610106517249720.816!
+### The Architectural Fix
+We must completely rip out LongAdder from the aggregation logic. To support numbers up to the absolute 38-digit Oracle database limit, we must use BigDecimal wrapped inside an AtomicReference for thread safety.
+Here are the three places you need to update your backend code to fix this permanently.
+### 1. Update the Caller Method (Where the batch starts)
+Wherever you are initializing globalDebit and globalCredit before passing them to processChunkRaw, change them from LongAdder to AtomicReference<BigDecimal>.
+**Change this:**
+```java
+LongAdder globalDebit = new LongAdder();
+LongAdder globalCredit = new LongAdder();
 
-01,02122025,2025,09,32121,USD,1122505001,1234567890121234.3456,Cr,Normal,12345679,B,C,D
-01,02122025,2025,09,32121,USD,1208505003,1234567890121234.3456,Dr,ewreew,12345678,B,C,D
+```
+**To this:**
+```java
+import java.util.concurrent.atomic.AtomicReference;
 
-1234567890121234.3456
-1234567890121234.3456
-after this i entered as credit and debit 
+AtomicReference<BigDecimal> globalDebit = new AtomicReference<>(BigDecimal.ZERO);
+AtomicReference<BigDecimal> globalCredit = new AtomicReference<>(BigDecimal.ZERO);
 
-1234567890121234.3456 + 1234567890121234.3456 = 2469135780242468.6912
+```
+### 2. Update processChunkRaw (JournalRequestServiceImpl)
+Update the method signature to accept the new types, and remove the SCALE_FACTOR and .longValue() conversion entirely.
+```java
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
+                                String batchId,
+                                String journalPrefix,
+                                String commonRemarks,
+                                String creatorId,
+                                Integer creatorRole,
+                                int globalOffset,
+                                AtomicReference<BigDecimal> globalDebit,   // <--- UPDATED
+                                AtomicReference<BigDecimal> globalCredit) { // <--- UPDATED
 
-in the journal batch master 
+        String sql = "INSERT INTO JOURNAL_REQUEST (" +
+                "REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, " +
+                "JOURNAL_ID, COMMON_BATCH_REMARKS, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, " +
+                "REQ_AMOUNT, POSTING_DATE, REQ_NARRATION, REQ_PRODUCT) " +
+                "VALUES (JOURNAL_REQUEST_SEQ.NEXTVAL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-0002382	1021256	23-04-26 01:22:08.503059000 PM	Bulk Upload - 2025-12-02	2	-610106517249720.816	-610106517249720.816	PENDING			
+        try {
+            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                // ... (Keep your exact existing setValues logic inside here) ...
+            });
 
+            // FIX: Use AtomicReference with BigDecimal to prevent Long Overflow
+            for (JournalBulkValidationService.ExcelRowData r : chunk) {
+                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
 
-i am getting this why what about sign why there are sign
+                if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
+                    globalCredit.updateAndGet(curr -> curr.add(absAmt));
+                } else {
+                    globalDebit.updateAndGet(curr -> curr.add(absAmt));
+                }
+            }
 
+        } catch (org.springframework.dao.DataAccessException e) {
+            log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+        }
+    }
 
+```
+### 3. Prevent Overflow in Validation (JournalBulkValidationService)
+Because we used LongAdder to check for balance mismatches during the initial file upload, large mismatched batches would also slip through. Update runBalanceCheck to use AtomicReference.
+**Find this inside runBalanceCheck:**
+```java
+ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
 
+```
+**Replace the aggregation logic with this:**
+```java
+        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
+        // ... (Keep your Sets for seenCgls and duplicateCgls)
 
+        // Pass 1
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+            
+            // ... (Keep duplicate/presence tracking)
+
+            BigDecimal val = d.amount;
+            if ("Credit".equalsIgnoreCase(d.txnType) || "Cr".equalsIgnoreCase(d.txnType)) val = val.negate();
+            
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+            
+            // Thread-safe BigDecimal addition without scaling or overflow risks
+            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
+                      .updateAndGet(curr -> curr.add(val));
+        });
+
+        // Pass 2
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+            
+            // ... (Keep Duplicate and Debit/Credit Presence Checks)
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
+
+            synchronized (d.balErrors) {
+                // ... (Keep Duplicate & Presence error adders)
+                
+                // Compare to exactly zero
+                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
+                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
+                }
+            }
+        });
+
+```
+With BigDecimal handling the math, the system can now perfectly aggregate numbers up to thousands of digits long without ever showing a negative sign or overflowing!
