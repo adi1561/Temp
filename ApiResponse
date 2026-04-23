@@ -1,75 +1,31 @@
-You are 100% correct, and I completely agree with your architectural assessment.
-Calling it csvDate in the backend was a legacy naming convention left over from when the system only processed CSVs. Since it conceptually represents the POSTING_DATE in the database for both Excel and CSV files, **we should standardize the name to postingDate across the entire stack (Frontend -> Backend DTO -> Database).**
-Instead of forcing your React frontend to use the old csvDate name, we will fix the Spring Boot backend to accept postingDate.
-Here are the exact changes you need to make to fully standardize this.
-### 1. Frontend (React): Keep using postingDate
-Revert my previous advice. Keep your React code clean and logically named.
-**For Manual Entry (handleSubmit):**
-```javascript
-rowPayloads.push({
-    branch: row.branch.code,
-    // ... other fields
-    postingDate: formattedBackendDate // Keep this as postingDate!
-});
+ @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> initiateValidation(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("postingDate") LocalDate postingDate,
+            HttpServletRequest request) {
 
-```
-**For Bulk Upload (handleStartValidation):**
-```javascript
-formData.append("file", file);
-formData.append("postingDate", selectedDate.format("YYYY-MM-DD")); // Keep as postingDate!
+        if (file == null || file.isEmpty()) {
+            throw new CustomExceptions.FileProcessingException("File is missing or empty");
+        }
 
-```
-### 2. Backend DTO (Fixing the 500 Error Root Cause)
-The UnrecognizedPropertyException happened because Jackson was looking for csvDate. Update your Request DTO to expect postingDate.
-Open **BatchRequestDto.java** (or whichever class handles your JSON row requests) and change the field:
-```java
-// Remove this:
-// private LocalDate csvDate;
+        try {
+            LocalDate parsedDate = LocalDate.parse(postingDate);
 
-// Replace with this:
-private LocalDate postingDate;
+            log.info("VALIDATION_INIT | File: {} | Date: {}", file.getOriginalFilename(), parsedDate);
 
-// Make sure your getters and setters are updated (if not using Lombok @Data)
-// public LocalDate getPostingDate() { return postingDate; }
-// public void setPostingDate(LocalDate postingDate) { this.postingDate = postingDate; }
+            String reqId = journalBulkValidationService.initiateValidation(
+                    file.getInputStream(),
+                    file.getOriginalFilename(),
+                    parsedDate
+            );
+            return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
+        } catch (java.time.format.DateTimeParseException e) {
+            log.error("VALIDATION_DATE_FAIL | RawDate: {}", postingDate);
+            throw new CustomExceptions.InvalidDataException("Invalid date format. Use YYYY-MM-DD.");
+        } catch (IOException e) {
+            log.error("VALIDATION_IO_FAIL | File: {}", file.getOriginalFilename());
+            throw new CustomExceptions.FileProcessingException("Failed to read uploaded file.");
+        }
+    }
 
-```
-### 3. Backend Controller
-Ensure your bulk upload initialization endpoint expects the postingDate string from the FormData.
-Open **JournalRequestController.java**:
-```java
-@PostMapping("/bulk-validate-init")
-public ResponseEntity<?> initBulkUpload(
-    @RequestParam("file") MultipartFile file, 
-    @RequestParam("postingDate") LocalDate postingDate // <--- Update the parameter name here
-) {
-    // Pass postingDate down to your validation service
-}
-
-```
-### 4. Backend Service (JDBC / JPA Inserts)
-Wherever you are translating the DTO into the Database Entity or JDBC template, make sure it pulls the newly named postingDate.
-**If using JdbcTemplate (batchUpdate):**
-```java
-String sql = "INSERT INTO JOURNAL_REQUEST (BATCH_ID, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, POSTING_DATE, REQ_STATUS, ...) " +
-             "VALUES (?, ?, ?, ?, ?, ?, ?, 'P', ...)";
-
-// In your ps.setDate or object array mapping:
-// Change row.getCsvDate() to row.getPostingDate()
-
-```
-**If mapping to the JournalRequest Entity:**
-```java
-JournalRequest entity = new JournalRequest();
-// ... mapping other fields ...
-entity.setPosting_date(dtoRow.getPostingDate()); // Map the DTO postingDate to Entity posting_date
-
-```
-### Summary of Why This is Better
-By making these changes in the Java backend, you achieve complete **Domain Language Consistency**.
- * The User Interface says "Posting Date"
- * The React state is postingDate
- * The JSON Payload is {"postingDate": "2026-02-28"}
- * The Java DTO is postingDate
- * The Database is POSTING_DATE
-This eliminates confusion permanently and prevents the exact mapping mismatch that caused your 500 error earlier. Excellent catch on realizing the naming was logically flawed!
+'parse(java.lang.CharSequence)' in 'java.time.LocalDate' cannot be applied to '(java.time.LocalDate)'
