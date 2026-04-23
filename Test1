@@ -1,15 +1,35 @@
-branch 	currency 	cgl 	amount 	txntype 	remarks 	product
-00050	ACE	5051030601	1000.01	CR	Adesh	12346578
-00050	ACE	5051240801	1000.01	DR	Adesh	13246795
+I know exactly what you are looking at. There are actually two different things happening here—one is mathematically correct, but the other is a hidden bug in how we save the data to Oracle.
+As a Senior Developer, here is the breakdown of what is correct and what we need to fix.
+### 1. The Totals Are 100% Correct
+If you are looking at the main grid and seeing **Total Debit: 1,000.0100** and **Total Credit: 1,000.0100**, this is **not wrong**.
+In double-entry financial systems, your totals represent the *absolute sum* of all debits and the *absolute sum* of all credits. Since you uploaded one Debit of 1000.01 and one Credit of 1000.01, your batch is perfectly balanced. Total Debit **must** equal Total Credit. We do not display the net balance (which would be 0.00) in those columns.
+### 2. The Hidden Bug: Both rows will show as "DR" in the Eye View
+If you click the "Eye" icon to view the row details, you will notice that *both* rows are showing up as **DR (Debit)** with a green chip, even though your CSV explicitly said one was **CR**.
+**Why is this happening?**
+Look at your database schema: The JOURNAL_REQUEST table **does not have a TXN_TYPE column**.
+Instead, your Oracle PROCESS_JOURNAL_BATCH procedure determines if a row is a Credit or Debit entirely based on whether the amount is positive or negative:
+ * Positive REQ_AMOUNT = DR
+ * Negative REQ_AMOUNT = CR
+Right now, when your Java code reads the CSV, both amounts are positive 1000.01. Your JDBC insert logic is inserting both of them as positive numbers into Oracle. Therefore, the database (and the UI) assumes they are both Debits!
+### The Fix: Negate the CR Amount Before Inserting
+We need to tell the JdbcTemplate to convert the amount to a negative number if the CSV txnType is "CR".
+Go to your **JournalRequestServiceImpl.java**, find the processChunkRaw method, and look inside the jdbcTemplate.batchUpdate block where you map the values to the PreparedStatement.
+Update the line where you set the REQ_AMOUNT (usually around parameter index 12):
+**Existing Logic (Inside setValues):**
+```java
+// Right now you are probably just inserting the raw positive amount
+ps.setBigDecimal(12, row.amount); 
 
-this what i uploaded in that i am getting like 
-0002387
-PENDING
-1015698
-23 Apr 2026, 2:37 pm
-2
-1,000.0100
+```
+**Replace with:**
+```java
+// FIX: Convert CR amounts to negative so Oracle recognizes them as Credits
+BigDecimal amountToInsert = row.amount;
+if ("CR".equals(row.txnType)) {
+    amountToInsert = amountToInsert.negate();
+}
+ps.setBigDecimal(12, amountToInsert);
 
-1,000.0100
-
-in both auth and status screen why this is wrong na 
+```
+Once you add that if ("CR") { negate() } check to your Java insert logic, Oracle will safely store the Credit as -1000.01.
+Your frontend Eye View will then automatically detect amountVal < 0, and the UI will accurately display one green **DR** and one red **CR**!
