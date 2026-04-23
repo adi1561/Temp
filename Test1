@@ -1,65 +1,20 @@
-I found exactly where the phantom mapping is hiding! It is inside your **parseAmount** method, and there is one tiny side-effect hidden inside your **generateSuccessCsv** method.
-Because we locked down the system to accept *only* "CR" and "DR", we have to stop parseAmount from translating them, and we have to update the CSV generator so it knows how to read the new format.
-Here are the exactly two changes you need to make in your JournalBulkValidationService.java file.
-### 1. Update the parseAmount Method
-Scroll down to line ~295 where parseAmount is located. Notice how the old code checks for "C" or "CR" and then forces the string to become "Credit" or "Debit".
-**Find this existing code:**
+Got it. If you want to be completely strict and force the user to type exactly **"CR"** and **"DR"** in capital letters (and reject "Cr", "dr", "cr", etc.), we need to remove the .toUpperCase() function that is "helpfully" fixing their bad casing behind the scenes.
+Since our runFormatCheck is already using the strict, case-sensitive .equals("CR") and .equals("DR"), the only thing we need to change is how we extract the text from the file.
+Here is the final update for your **parseAmount** method.
+**Find this line in parseAmount:**
 ```java
-    private void parseAmount(ExcelRowData d, String amountRaw, String typeRaw) {
-        try {
-            String amtClean = (amountRaw == null) ? "" : amountRaw.trim();
-            if (amtClean.contains("-") || amtClean.contains("(") || amtClean.contains(")"))
-                d.formatErrors.add("Amount cannot be negative");
-            String clean = CLEAN_AMOUNT_REGEX.matcher(amtClean).replaceAll("");
-            if (clean.isEmpty()) { d.amount = BigDecimal.ZERO; return; }
-            BigDecimal v = new BigDecimal(clean);
-            if (v.signum() < 0) d.formatErrors.add("Amount cannot be negative");
-            boolean isCredit = typeRaw != null && (typeRaw.toUpperCase().contains("C") || typeRaw.toUpperCase().contains("CR"));
-            d.txnType = isCredit ? "Credit" : "Debit"; // <--- HERE IS THE BUG
-            d.amount = v;
-        } catch (NumberFormatException | ArithmeticException e) {
-            d.amount = BigDecimal.ZERO;
-            d.formatErrors.add("Invalid numeric format");
-        }
-    }
-
-```
-**Replace it entirely with this:**
-```java
-    private void parseAmount(ExcelRowData d, String amountRaw, String typeRaw) {
-        try {
-            String amtClean = (amountRaw == null) ? "" : amountRaw.trim();
-            if (amtClean.contains("-") || amtClean.contains("(") || amtClean.contains(")"))
-                d.formatErrors.add("Amount cannot be negative");
-            String clean = CLEAN_AMOUNT_REGEX.matcher(amtClean).replaceAll("");
-            if (clean.isEmpty()) { d.amount = BigDecimal.ZERO; return; }
-            BigDecimal v = new BigDecimal(clean);
-            if (v.signum() < 0) d.formatErrors.add("Amount cannot be negative");
-            
-            // FIX: Stop translating! Just capture the raw input, trim it, and uppercase it.
-            // Our runFormatCheck method will strictly validate if it is exactly "CR" or "DR".
-            d.txnType = (typeRaw != null) ? typeRaw.trim().toUpperCase() : "";
-            
-            d.amount = v;
-        } catch (NumberFormatException | ArithmeticException e) {
-            d.amount = BigDecimal.ZERO;
-            d.formatErrors.add("Invalid numeric format");
-        }
-    }
-
-```
-### 2. Update the generateSuccessCsv Method
-Now that txnType is strictly "CR" instead of "Credit", your success file generator will break if we don't update it.
-Scroll down to line ~480 inside generateSuccessCsv.
-**Find this existing line:**
-```java
-            String col9 = "Credit".equalsIgnoreCase(row.txnType) ? "Cr" : "Dr";
+d.txnType = (typeRaw != null) ? typeRaw.trim().toUpperCase() : "";
 
 ```
 **Replace it with this:**
 ```java
-            // FIX: Look for strict "CR" instead of "Credit"
-            String col9 = "CR".equals(row.txnType) ? "Cr" : "Dr";
+// FIX: Removed .toUpperCase(). 
+// Now it captures the exact casing the user typed in the file.
+d.txnType = (typeRaw != null) ? typeRaw.trim() : "";
 
 ```
-That's it! Save and re-run. Your system will now pull the raw "CR" and "DR" from your file, instantly pass your new strict validation rules, and successfully balance the totals.
+### Why this works:
+ 1. If the user uploads **CR**: txnType becomes "CR". The validation .equals("CR") passes.
+ 2. If the user uploads **Cr**: txnType becomes "Cr". The validation .equals("CR") **fails**, and the row is rejected with the message: *"Transaction type must be strictly 'DR' or 'CR'."*
+ 3. If the user uploads **dr**: txnType becomes "dr". The validation .equals("DR") **fails**.
+*(Note: In your prompt you typed "capital CR and Dr". I assumed you meant capital "DR". If you strictly want "Dr" instead of "DR", just change the validation in runFormatCheck to d.txnType.equals("Dr")!)*
