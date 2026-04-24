@@ -1,33 +1,33 @@
-Your backend code looks excellent! You have successfully implemented all the requested changes.
-I reviewed the file and confirmed:
- 1. **Success Notifications** for both Async and Manual creation now correctly read: "Batch created Successfully with Batch ID : " + batchId
- 2. **Failure Notification** for Async creation now correctly reads: "Batch creation Failed for Batch ID : " + batchId
- 3. **Excel Generation** has the correct sequence ("Product Code" then "Remarks") and strictly outputs "Credit" and "Debit".
-### One Tiny Cleanup to Make:
-While reviewing, I noticed a minor copy-paste duplication in your createBatchRequest method (around line 457). You are setting the amount twice in a row.
-**Find this snippet in createBatchRequest:**
+Yes, we **are** sending the exact same notifications for Bulk Upload as we are for Manual Posting! We just updated both of them to use the exact same grammar: "Batch created Successfully with Batch ID : " + batchId.
+However, looking closely at your code, there is actually one notification missing in the **Manual Posting** method that the Bulk Upload already has!
+In Bulk Upload, after it notifies the creator that the batch was successful, it also looks up the Approvers (JOURNAL_AUTH role) and **sends a notification to the Approvers** telling them a new batch is ready for authorization. Manual Posting forgot to do this!
+To make them 100% identical, we should add the Approver notification to your Manual Posting method too.
+Here is the quick fix for your **JournalRequestServiceImpl.java**:
+Find your createBatchRequest (Manual Posting) method, right at the bottom before return savedEntities; (around line 469).
+**Find this exact block:**
 ```java
-            // 2. ADD THIS NEW CONDITION TO BLOCK ZERO
-            if (amount.compareTo(BigDecimal.ZERO) == 0) {
-                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
-            }
+        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Manual Batch " + batchId + " Created");
+        sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
 
-            entity.setAmount(amount);
-
-
-            entity.setAmount(amount); // <-- Duplicate line here
-            entity.setPosting_date(row.getPostingDate() != null ? row.getPostingDate() : LocalDate.now());
+        return savedEntities;
 
 ```
-**Just delete the duplicate line so it looks like this:**
+**Replace it with this:**
 ```java
-            // 2. ADD THIS NEW CONDITION TO BLOCK ZERO
-            if (amount.compareTo(BigDecimal.ZERO) == 0) {
-                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
-            }
+        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Manual Batch " + batchId + " Created");
+        sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
 
-            entity.setAmount(amount);
-            entity.setPosting_date(row.getPostingDate() != null ? row.getPostingDate() : LocalDate.now());
+        // --- NEW: Notify the Approvers/Checkers (Identical to Bulk Upload) ---
+        NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+        if (config != null) {
+            String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
+            sendNotification(null, config.getTargetRoles(), msg, batchId);
+        }
+
+        return savedEntities;
 
 ```
-Everything else is perfectly configured and ready to go!
+Now, both screens (Manual and Bulk) have the exact same notification flow:
+ 1. They tell the **Creator** they were successful.
+ 2. They tell the **Approvers** there is a new pending batch waiting for them.
+*(And Bulk Upload correctly notifies the creator of a Failure if the background thread crashes).*
