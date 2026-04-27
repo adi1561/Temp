@@ -1,39 +1,134 @@
-CREATE OR REPLACE TRIGGER TRG_SYNC_JS_EOD_COUNTER
-AFTER INSERT OR UPDATE OR DELETE ON JOURNAL_BATCH_MASTER
-FOR EACH ROW
-DECLARE
-    v_diff NUMBER := 0;
-BEGIN
-    -- 1. Determine if the pending count goes UP or DOWN
-    IF INSERTING THEN
-        IF :NEW.BATCH_STATUS = 'PENDING' THEN
-            v_diff := 1;
-        END IF;
-        
-    ELSIF UPDATING THEN
-        -- It was Pending, but now it is something else (e.g. Accepted, Rejected, Queued)
-        IF :OLD.BATCH_STATUS = 'PENDING' AND :NEW.BATCH_STATUS != 'PENDING' THEN
-            v_diff := -1;
-        -- It was something else, but returned to Pending (e.g. Async failure)
-        ELSIF :OLD.BATCH_STATUS != 'PENDING' AND :NEW.BATCH_STATUS = 'PENDING' THEN
-            v_diff := 1;
-        END IF;
-        
-    ELSIF DELETING THEN
-        IF :OLD.BATCH_STATUS = 'PENDING' THEN
-            v_diff := -1;
-        END IF;
-    END IF;
+### 1. Branch Padding Confirmation
+Yes, the 5-digit padding condition is fully active. Because we added the padBranch() helper method to your JournalBulkValidationService.java parser in our very first step, the "56" is instantly converted to "00056" the millisecond the file is read.
+This means that when your DB validation runs, it is already checking against "00056".
+### 2. CR/DR Case Insensitivity (Java Backend)
+To ensure the database safely processes "cr", "Cr", or "CR" without failing, we must update the processChunkRaw method to be completely case-insensitive using .equalsIgnoreCase().
+As requested, here is the complete, updated processChunkRaw method for your **JournalRequestServiceImpl.java**. Replace your existing method entirely:
+```java
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processChunkRaw(List<JournalBulkValidationService.ExcelRowData> chunk,
+                                String batchId,
+                                String journalPrefix,
+                                String commonRemarks,
+                                String creatorId,
+                                Integer creatorRole,
+                                int globalOffset,
+                                AtomicReference<BigDecimal> globalDebit,
+                                AtomicReference<BigDecimal> globalCredit) {
 
-    -- 2. If a change happened, update the master table and the JS boolean flag
-    IF v_diff != 0 THEN
-        UPDATE JS_EOD_MASTER
-        SET 
-            JS_PENDING_COUNTER = JS_PENDING_COUNTER + v_diff,
-            -- If Counter becomes 0, set JS_STATUS to 1 (True), otherwise 0 (False)
-            JS_STATUS = CASE WHEN (JS_PENDING_COUNTER + v_diff) = 0 THEN 1 ELSE 0 END,
-            JS_UPDATED_AT = SYSTIMESTAMP
-        WHERE ID = 1;
-    END IF;
-END;
-/
+        String sql = "INSERT INTO JOURNAL_REQUEST (" +
+                "REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, " +
+                "JOURNAL_ID, COMMON_BATCH_REMARKS, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, " +
+                "REQ_AMOUNT, POSTING_DATE, REQ_NARRATION, REQ_PRODUCT) " +
+                "VALUES (JOURNAL_REQUEST_SEQ.NEXTVAL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+        try {
+            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                    JournalBulkValidationService.ExcelRowData r = chunk.get(i);
+
+                    int globalIdx = globalOffset + i + 1;
+                    String jId = journalPrefix + "-" + globalIdx;
+
+                    // 1. Case-Insensitive Check for Credit
+                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                    String safeTxnType = r.txnType != null ? r.txnType.trim() : "";
+                    boolean isCredit = "CR".equalsIgnoreCase(safeTxnType) || "CREDIT".equalsIgnoreCase(safeTxnType);
+                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+
+                    LocalDate rDate = LocalDate.now();
+                    if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                        try {
+                            rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"));
+                        } catch (DateTimeParseException ignored) {}
+                    }
+
+                    // 2. PERFECTLY MAPPED SETTERS (1 through 14 sequentially)
+                    ps.setString(1, "P");                                                           // REQ_STATUS
+                    ps.setTimestamp(2, java.sql.Timestamp.valueOf(LocalDateTime.now()));            // REQ_DATE
+                    ps.setString(3, creatorId);                                                     // CREATOR_ID
+                    ps.setInt(4, creatorRole != null ? creatorRole : 0);                            // CREATOR_ROLE
+                    ps.setString(5, batchId);                                                       // BATCH_ID
+                    ps.setString(6, jId);                                                           // JOURNAL_ID
+                    ps.setString(7, commonRemarks);                                                 // COMMON_BATCH_REMARKS
+                    ps.setString(8, r.branch);                                                      // REQ_BRANCH_CODE
+                    ps.setString(9, r.currency);                                                    // REQ_CURRENCY
+                    ps.setString(10, r.cgl);                                                        // REQ_CGL
+                    ps.setBigDecimal(11, signedAmt);                                                // REQ_AMOUNT
+                    ps.setDate(12, java.sql.Date.valueOf(rDate));                                   // POSTING_DATE
+                    ps.setString(13, r.remarks);                                                    // REQ_NARRATION
+                    ps.setString(14, r.productCode);                                                // REQ_PRODUCT
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return chunk.size();
+                }
+            });
+
+            // 3. Update Thread-Safe Aggregates Case-Insensitively
+            for (JournalBulkValidationService.ExcelRowData r : chunk) {
+                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                String safeTxnType = r.txnType != null ? r.txnType.trim() : "";
+
+                if ("CR".equalsIgnoreCase(safeTxnType) || "CREDIT".equalsIgnoreCase(safeTxnType)) {
+                    globalCredit.updateAndGet(curr -> curr.add(absAmt));
+                } else {
+                    globalDebit.updateAndGet(curr -> curr.add(absAmt));
+                }
+            }
+
+        } catch (org.springframework.dao.DataAccessException e) {
+            log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+        }
+    }
+
+```
+### 3. Restoring the Download CSV Button (React Frontend)
+To bring back the "Download CSV" button exactly where it belongs (next to Submit Batch), update the activeStep === 1 block in **JournalBulkUpload.js**.
+Replace your entire {activeStep === 1 && (...)} block with this complete section:
+```javascript
+        {activeStep === 1 && (
+          <Box sx={{ textAlign: "center", py: 6 }}>
+            <TaskAltIcon sx={{ fontSize: "6rem", color: "success.main", mb: 2 }} />
+            <Typography variant="h4" sx={{ fontWeight: "bold", mb: 1 }}>
+              Validation Successful!
+            </Typography>
+            <Typography variant="body1" sx={{ color: "text.secondary", mb: 4 }}>
+              Your file has been successfully validated. Total valid records ready for submission: <strong>{totalRows.toLocaleString()}</strong>.
+            </Typography>
+
+            <Stack direction="row" sx={actionButtonsContainer}>
+              <Button variant="outlined" onClick={handleBack} startIcon={<ArrowBackIcon />}>Back</Button>
+              <Button variant="text" onClick={resetAll} startIcon={<RestartAltIcon />}>Cancel</Button>
+              
+              {/* RESTORED: Download CSV Button */}
+              {!isCsvFile && (
+                <Button 
+                  variant="outlined" 
+                  color="primary"
+                  startIcon={<FileDownloadIcon />} 
+                  onClick={() => handleDownloadFile("SUCCESS")}
+                >
+                  Download CSV
+                </Button>
+              )}
+
+              <Button
+                variant="contained"
+                color="success"
+                size="large"
+                onClick={handleCreateBatch}
+                disabled={isCreatingBatch || isDebouncing}
+                startIcon={isCreatingBatch ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
+              >
+                {isCreatingBatch ? "Creating batch..." : "Submit Batch"}
+              </Button>
+            </Stack>
+          </Box>
+        )}
+
+```
+Are there any specific edge-case scenarios or error validations you want to implement for the CSV generation if a row happens to fail mid-parsing?
