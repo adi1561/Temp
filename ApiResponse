@@ -1,2 +1,154 @@
-as u Download the error excel u should disable the start Validation button 
-remove the Duplicate CGL condtion from the backend and as well as from the frontend
+Here are the exact step-by-step changes to remove the Duplicate CGL condition across your entire application and disable the validation button once the user downloads the error file.
+### 1. Disable "Start Validation" after Error Download (Frontend: JournalBulkUpload.js)
+We need to add a new state to track if the error file was downloaded, and then hook that state up to the button.
+**Step 1A: Add the state and reset it**
+Find your state variables (around line 110) and add this new one:
+```javascript
+  const [downloadMsg, setDownloadMsg] = useState("Downloading error report...");
+  const [isErrorDownloaded, setIsErrorDownloaded] = useState(false); // <-- NEW STATE
+
+```
+Now, make sure it resets when the user clears or uploads a new file.
+In validateAndSetFile (around line 160), add:
+```javascript
+    setAutoDlTriggered(false);
+    setIsProcessing(false);
+    setIsErrorDownloaded(false); // <-- ADD HERE
+    setDownloadMsg("Downloading error report...");
+
+```
+In handleClearFile (around line 192), add:
+```javascript
+    setValidationStage(0);
+    setIsProcessing(false);
+    setIsErrorDownloaded(false); // <-- ADD HERE
+
+```
+In resetAll (around line 204), add:
+```javascript
+    setAutoDlTriggered(false);
+    setIsCsvFile(false);
+    setIsErrorDownloaded(false); // <-- ADD HERE
+
+```
+**Step 1B: Set it to true when downloaded**
+Find handleDownloadFile (around line 236):
+```javascript
+    if (success && type === "SUCCESS") showSnackBar("Downloaded successfully.", "success");
+    if (success && type === "ERROR") {
+      setDownloadMsg("Error report downloaded.");
+      setIsErrorDownloaded(true); // <-- ADD THIS LINE
+    }
+
+```
+**Step 1C: Disable the button**
+Scroll down to the "Start Validation" button (around line 454):
+```javascript
+            <Stack direction="row" sx={actionButtonsContainer}>
+              <Button
+                variant="contained"
+                size="large"
+                onClick={handleStartValidation}
+                // ADD isErrorDownloaded to the disabled logic
+                disabled={!file || !selectedDate || isDebouncing || isProcessing || isErrorDownloaded}
+                startIcon={isProcessing ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
+              >
+
+```
+### 2. Remove Duplicate CGL from Manual Posting (Frontend: JournalPosting.js)
+Open JournalPosting.js and find your handleSubmit function (around line 210). We are completely deleting the cglCheck loop.
+**Delete this entire block:**
+```javascript
+    const [day, month, year] = postingDate.split("-");
+    const formattedBackendDate = `${year}-${month}-${day}`;
+
+    // --- DELETE FROM HERE ---
+    const cglCheck = new Map();
+    for (const row of rows) {
+      if (!row.branch || !row.currency || !row.cgl) {
+        continue;
+      }
+      const key = `${row.branch.code}-${row.currency}`;
+      const cgl = row.cgl.cglNumber;
+
+      if (!cglCheck.has(key)) {
+        cglCheck.set(key, new Set());
+      }
+
+      const cglSet = cglCheck.get(key);
+      if (cglSet.has(cgl)) {
+      if (cglSet.has(cgl)) {
+        showSnackBar("Duplicate CGL entry found for the same Branch and Currency.", "error");
+        setIsSubmitting(false);
+        return;
+      }
+        setIsSubmitting(false);
+        return;
+      }
+      cglSet.add(cgl);
+    }
+    // --- TO HERE ---
+
+    const branchCurrencyTotals = new Map();
+
+```
+### 3. Remove Duplicate CGL from Bulk Validation (Backend: JournalBulkValidationService.java)
+Open JournalBulkValidationService.java and completely replace the runBalanceCheck method to remove the duplicate CGL tracking arrays and checks.
+**Replace your runBalanceCheck method with this clean version:**
+```java
+    /**
+     * Rule 5: Balance Integrity Logic.
+     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
+     * on parallel streams, preventing floating-point drift in large batches.
+     */
+    private void runBalanceCheck(List<ExcelRowData> rows) {
+        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
+
+        // Pass 1: Aggregate totals and check for presence
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            // Track Debit/Credit Presence per Branch
+            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
+            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
+
+            // Calculate Balance Groupings
+            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
+            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+
+            // Thread-safe BigDecimal addition without scaling or overflow risks
+            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
+                    .updateAndGet(curr -> curr.add(finalVal));
+        });
+
+        // Pass 2: Apply the simple, generic error messages to the rows
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
+            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
+
+            synchronized (d.balErrors) {
+                // 1. Debit/Credit Presence Check
+                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
+                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
+                }
+
+                // 2. Balance Math Check (Using BigDecimal's compareTo)
+                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
+                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
+                }
+            }
+        });
+    }
+
+```
