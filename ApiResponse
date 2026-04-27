@@ -1,3 +1,34 @@
-Branch	Currency	CGL	Amount	TxnType	Remarks	Product	ERRORS
-10400	ACE	5051030601	1000	CR	Remark	12346578	Transaction type must be 'DR/Dr' or 'CR/Cr'.
-10400	ACE	5051240801	1000	DR	Remark	13246795	Transaction type must be 'DR/Dr' or 'CR/Cr'.
+I know exactly what is happening here!
+When you see a validation error failing on perfectly good data like CR or DR, it is almost always caused by **invisible trailing spaces** (like "CR " or " CR") inside the Excel cell, or because the Java backend is using a strict case-sensitive check that doesn't account for whitespace.
+Since you want to allow small/capital letters (cr, CR, dr, DR) in the uploaded Excel file, but you want the system and the downloaded files to strictly format them as **"Credit"** and **"Debit"**, we need to intercept that value in your validation service, clean it up, and standardize it.
+Here is how to fix this permanently in your Java backend.
+### The Fix (Backend: JournalBulkValidationService.java)
+Open your JournalBulkValidationService.java and find the exact spot where that error message ("Transaction type must be 'DR/Dr' or 'CR/Cr'.") is written. It will likely be inside a validation method checking the row data.
+**Find your existing validation logic that looks something like this:**
+```java
+        if (!"DR".equals(d.txnType) && !"Dr".equals(d.txnType) && !"CR".equals(d.txnType) && !"Cr".equals(d.txnType)) {
+            d.formatErrors.add("Transaction type must be 'DR/Dr' or 'CR/Cr'.");
+        }
+
+```
+**Replace it with this robust, case-insensitive block:**
+```java
+        // 1. Safely grab the value, remove all spaces, and make it uppercase
+        String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
+
+        // 2. Check the cleaned value and instantly standardize it to full words
+        if (rawType.equals("CR") || rawType.equals("CREDIT")) {
+            d.txnType = "Credit"; // Overwrites the raw 'cr' with 'Credit' for all downstream logic and CSVs
+        } 
+        else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
+            d.txnType = "Debit";  // Overwrites the raw 'dr' with 'Debit'
+        } 
+        else {
+            // 3. Throw the error only if it's completely invalid
+            d.formatErrors.add("Transaction type must be 'CR' or 'DR' (Case insensitive).");
+        }
+
+```
+### Why this solves all your conditions:
+ 1. **.trim().toUpperCase()**: This instantly fixes the false-error bug. If a user types " cr " (with spaces) or "cR", Java instantly strips the spaces and converts it to exactly "CR".
+ 2. **d.txnType = "Credit"**: By overwriting the variable right here during validation, you guarantee that by the time your code generates the **Success CSV** or the **Error Excel file**, the column will perfectly print out "Credit" or "Debit", exactly as you requested!
