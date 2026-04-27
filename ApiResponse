@@ -1,5 +1,47 @@
-SYS_C0012085	Check	CHANGE_TYPE in ('ADD','UPDATE','DELETE')					ENABLED	NOT DEFERRABLE	VALIDATED	GENERATED NAME			24-04-26				
-SYS_C008712	Check	"REQ_ID" IS NOT NULL					ENABLED	NOT DEFERRABLE	VALIDATED	GENERATED NAME			20-11-25				
-SYS_C008713	Check	"REQ_STATUS" IS NOT NULL					ENABLED	NOT DEFERRABLE	VALIDATED	GENERATED NAME			20-11-25				
-SYS_C008715	Check	"REQ_DATE" IS NOT NULL					ENABLED	NOT DEFERRABLE	VALIDATED	GENERATED NAME			20-11-25				
-SYS_C008716	Check	"CREATOR_ID" IS NOT NULL					ENABLED	NOT DEFERRABLE	VALIDATED	GENERATED NAME			20-11-25				
+**I see exactly what is causing the crash! You provided the perfect clue.**
+Look closely at the very first constraint in the list you just shared:
+SYS_C0012085 Check CHANGE_TYPE in ('ADD','UPDATE','DELETE')
+This is a strict rule on your **JOURNAL_LOG** table. It says that the database will instantly reject any insert if the CHANGE_TYPE column is not exactly "ADD", "UPDATE", or "DELETE".
+Now, look at how we are calling the logAudit method in your Java backend (JournalRequestServiceImpl.java):
+logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Manual Batch " + batchId + " Created");
+We are passing **"BATCH_MANUAL"** and **"BATCH_ASYNC"** as the changeType! The database sees "BATCH_MANUAL", realizes it isn't "ADD", "UPDATE", or "DELETE", and immediately throws the 409 Constraint Violation error, rolling back your entire transaction!
+Here is the exact fix. We just need to update the logAudit calls in your backend to pass "ADD" or "DELETE" to satisfy the database constraint.
+### The Fix (Backend: JournalRequestServiceImpl.java)
+Open **JournalRequestServiceImpl.java** and replace these three logAudit lines.
+**1. Fix Manual Posting Audit Log**
+Find createBatchRequest (around line 468).
+**Find this:**
+```java
+        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Manual Batch " + batchId + " Created");
+
+```
+**Replace it with:**
+```java
+        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created");
+
+```
+**2. Fix Async Bulk Upload Audit Log**
+Find executeAsyncBatchCreation (around line 169).
+**Find this:**
+```java
+                logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Successfully created batch " + batchId);
+
+```
+**Replace it with:**
+```java
+                logAudit(creatorId, "BATCH_ASYNC", "ADD", "Successfully created batch " + batchId);
+
+```
+**3. Fix Async Deletion Audit Log**
+Find executeAsyncBatchCancellation (around line 290).
+**Find this:**
+```java
+            logAudit(userId, "CANCEL_SUCCESS", "BATCH_ASYNC", "Purged Batch " + batchId);
+
+```
+**Replace it with:**
+```java
+            logAudit(userId, "CANCEL_SUCCESS", "DELETE", "Purged Batch " + batchId);
+
+```
+By changing that third parameter to strictly "ADD" or "DELETE", you perfectly satisfy the SYS_C0012085 check constraint. Your database will now happily accept the records, and your 409 Error will vanish!
