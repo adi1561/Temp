@@ -1,33 +1,3 @@
-As a Technical Lead, I strongly recommend using an **Oracle Database Trigger** for this requirement rather than writing Java code or Spring Boot logic to update the counter.
-Here is why: You are updating BATCH_STATUS from many different places (Async creation, UI Approval, PL/SQL Purge scripts, Error handling). If you try to manage a counter in Java, you risk race conditions and the counter falling out of sync. A Database Trigger watches the table at the lowest level—meaning no matter how the status changes, the counter is mathematically guaranteed to be 100% accurate.
-Here is the complete Oracle SQL implementation to fulfill your requirement.
-### Step 1: Create the Configuration Table
-Since Oracle does not have a native BOOLEAN data type for tables, the industry standard is to use NUMBER(1) where 1 = True and 0 = False. We also add a constraint so only exactly one row can ever exist in this table.
-Run this script in your database:
-```sql
-CREATE TABLE JS_EOD_MASTER (
-    ID NUMBER DEFAULT 1 PRIMARY KEY,
-    JS_STATUS NUMBER(1) DEFAULT 1,     -- 1 means True (Ready), 0 means False (Pending items exist)
-    EOD_STATUS NUMBER(1) DEFAULT 0,    -- 0 means False
-    JS_UPDATED_AT TIMESTAMP,
-    EOD_UPDATED_AT TIMESTAMP,
-    JS_PENDING_COUNTER NUMBER DEFAULT 0,
-    
-    -- This constraint guarantees you never accidentally insert a second row
-    CONSTRAINT CHK_JS_EOD_SINGLE_ROW CHECK (ID = 1) 
-);
-
--- Insert the single master row that the system will update
-INSERT INTO JS_EOD_MASTER (ID, JS_STATUS, EOD_STATUS, JS_UPDATED_AT, EOD_UPDATED_AT, JS_PENDING_COUNTER)
-VALUES (1, 1, 0, SYSTIMESTAMP, SYSTIMESTAMP, 0);
-
-COMMIT;
-
-```
-### Step 2: Create the Smart Trigger
-This trigger listens to the JOURNAL_BATCH_MASTER table. If a row is inserted as 'PENDING', it adds +1. If a row changes from 'PENDING' to 'ACCEPTED' or 'REJECTED', it subtracts -1. It then dynamically flips your boolean JS_STATUS depending on if the counter is exactly 0.
-Run this trigger in your database:
-```sql
 CREATE OR REPLACE TRIGGER TRG_SYNC_JS_EOD_COUNTER
 AFTER INSERT OR UPDATE OR DELETE ON JOURNAL_BATCH_MASTER
 FOR EACH ROW
@@ -55,7 +25,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- 2. If a change happened, update the master table and the boolean flag
+    -- 2. If a change happened, update the master table and the JS boolean flag
     IF v_diff != 0 THEN
         UPDATE JS_EOD_MASTER
         SET 
@@ -67,9 +37,3 @@ BEGIN
     END IF;
 END;
 /
-
-```
-### Why this is the perfect architecture:
- 1. **Zero Java Code Changes:** You do not need to touch a single line of your Spring Boot application! The database handles it invisibly.
- 2. **Instant Sync:** The millisecond a batch is approved by a checker or uploaded via the UI, the counter adjusts.
- 3. **Bulletproof:** Even if a DBA logs into the database and manually deletes a 'PENDING' batch row using SQL Developer, the trigger will fire, decrement the counter, and flip the boolean back to True safely.
