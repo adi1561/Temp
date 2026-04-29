@@ -1,9 +1,147 @@
-branch 	currency 	cgl 	amount 	txntype 	remarks 	product
-00050	ACE	     5051030601	1000.01	  CR	     Adesh	   12346578
-00050	ACE	     5051240801	1000.01	  DR	     Adesh	   13246795
+I see exactly what happened!
+In our previous update, we moved **Product Code** to be before **Remarks** (Column 5 vs Column 6) based on the sequence requested. However, the file you are uploading actually has **Remarks** before **Product Code** (remarks at index 5, product at index 6).
+Because of this mismatch, the system read your remarks (Adesh) as the Product Code, and the product code (12346578) as the Remarks. That is why it threw the validation error!
+Here are the exact fixes for **JournalBulkValidationService.java** to perfectly align everything to the sequence: **Branch -> Currency -> CGL -> Amount -> Type -> Remarks -> Product Code**.
+### 1. Update parseCsvStream
+Find the parseCsvStream method (around line 228).
+**Replace the else block for the Standard Format with this:**
+```java
+                // Logic for Standard Format (Remarks at index 5, Product Code at index 6)
+                else {
+                    if (c.length > 0) d.branch = padBranch(c[0]);
+                    if (c.length > 1) d.currency = c[1].trim().toUpperCase();
+                    if (c.length > 2) d.cgl = c[2].trim();
+                    parseAmount(d, (c.length > 3) ? c[3].trim() : "", (c.length > 4) ? c[4].trim() : "");
+                    
+                    // Index 5 is now Remarks
+                    if (c.length > 5) d.remarks = c[5].trim();
+                    
+                    // Index 6 is now Product Code
+                    if (c.length > 6) {
+                        String rawProd = c[6].trim();
+                        d.productCode = rawProd;
+                        if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+                            hasProductCol = true;
+                        }
+                    } else {
+                        d.productCode = "";
+                    }
+                }
 
-there is bug in code like above is the file which i upload and below is the file which i am getting i think there is problem with the sequnce or something like that 
-cheak that and fix that 
-Branch*	Currency*	CGL*	Amount*	Type*	Product Code	Remarks*	ERRORS
-00050	ACE	5051030601	1000.01	Credit	Adesh	12346578	Product code must be up to 8 digits or left blank.
-00050	ACE	5051240801	1000.01	Debit	Adesh	13246795	Product code must be up to 8 digits or left blank.
+```
+### 2. Update parseExcelStream
+Find the parseExcelStream method (around line 273).
+**Replace the else block for the Standard Format with this:**
+```java
+                // --- START PRESERVED BUSINESS LOGIC (Standard Format) ---
+                else {
+                    d.branch = padBranch(col0);
+                    d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
+                    d.cgl = parseCode(r.getCell(2), fmt);
+                    parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
+                    
+                    // Index 5 is now Remarks
+                    d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
+                    
+                    // Index 6 is now Product Code
+                    Cell prodCell = r.getCell(6);
+                    String rawProd = (prodCell != null) ? parseCode(prodCell, fmt).trim() : "";
+                    d.productCode = rawProd;
+                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
+                        hasProductCol = true;
+                    }
+                }
+
+```
+### 3. Update generateErrorExcelFast
+We need the Error generator to match this exact sequence so the error files align perfectly with your uploads.
+**Replace your entire generateErrorExcelFast method with this:**
+```java
+    private byte[] generateErrorExcelFast(List<ExcelRowData> rows, boolean includeProduct) throws IOException {
+        SXSSFWorkbook workbook = new SXSSFWorkbook(100);
+
+        try {
+            Sheet sheet = workbook.createSheet("Error Report");
+            CellStyle errStyle = workbook.createCellStyle();
+            Font f = workbook.createFont(); f.setColor(IndexedColors.RED.getIndex()); errStyle.setFont(f);
+
+            boolean isSystem = rows.stream().anyMatch(r -> r.isSystemFormat);
+            
+            Row h = sheet.createRow(0);
+            List<String> headerList = new ArrayList<>();
+            
+            if (isSystem) {
+                headerList.addAll(Arrays.asList("Site", "Date", "Year", "Month", "Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks"));
+                if (includeProduct) headerList.add("Product Code");
+            } else {
+                // Remarks comes BEFORE Product Code
+                headerList.addAll(Arrays.asList("Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*"));
+                if (includeProduct) headerList.add("Product Code");
+            }
+            headerList.add("ERRORS");
+            
+            for (int i = 0; i < headerList.size(); i++) h.createCell(i).setCellValue(headerList.get(i));
+
+            int idx = 1;
+            for (ExcelRowData d : rows) {
+                Row r = sheet.createRow(idx++);
+                int col = 0;
+                if (isSystem) {
+                    r.createCell(col++).setCellValue(sanitize(d.sysSite));
+                    r.createCell(col++).setCellValue(sanitize(d.sysDate));
+                    r.createCell(col++).setCellValue(sanitize(d.sysYear));
+                    r.createCell(col++).setCellValue(sanitize(d.sysPeriod));
+                    r.createCell(col++).setCellValue(sanitize(d.branch));
+                    r.createCell(col++).setCellValue(sanitize(d.currency));
+                    r.createCell(col++).setCellValue(sanitize(d.cgl));
+                    r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
+                    r.createCell(col++).setCellValue(sanitize(d.txnType));
+                    r.createCell(col++).setCellValue(sanitize(d.remarks));
+                    if (includeProduct) r.createCell(col++).setCellValue(sanitize(d.productCode));
+                } else {
+                    r.createCell(col++).setCellValue(sanitize(d.branch));
+                    r.createCell(col++).setCellValue(sanitize(d.currency));
+                    r.createCell(col++).setCellValue(sanitize(d.cgl));
+                    r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
+                    r.createCell(col++).setCellValue(sanitize(d.txnType));
+                    r.createCell(col++).setCellValue(sanitize(d.remarks)); // Remarks BEFORE Product
+                    if (includeProduct) r.createCell(col++).setCellValue(sanitize(d.productCode)); 
+                }
+                
+                Cell c = r.createCell(col);
+                if (d.hasErrors()) { c.setCellValue(d.getAllErrors()); c.setCellStyle(errStyle); }
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            workbook.write(out);
+            return out.toByteArray();
+        } finally {
+            workbook.dispose();
+            workbook.close();
+        }
+    }
+
+```
+### 4. Update the Template Generator
+Finally, set the downloaded template to match this sequence.
+**Replace your entire generateTemplateBytes method with this:**
+```java
+    public byte[] generateTemplateBytes() throws IOException {
+        try (SXSSFWorkbook wb = new SXSSFWorkbook()) {
+            Sheet sheet = wb.createSheet("Journal Template");
+            Row row = sheet.createRow(0);
+            
+            // Updated sequence: Remarks before Product Code
+            String[] headers = {"Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*", "Product Code"};
+            
+            for (int i = 0; i < headers.length; i++) {
+                Cell cell = row.createCell(i); 
+                cell.setCellValue(headers[i]); 
+                sheet.setColumnWidth(i, 4000);
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            wb.write(out);
+            return out.toByteArray();
+        }
+    }
+
+```
