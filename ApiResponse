@@ -1,409 +1,66 @@
-Here are the exact replacements for JournalPosting.js to implement all three of your new requirements perfectly.
-### 1. Add EOD Block & API Integration
-First, we will add the EOD states and update your useEffect to check the API (/JS/journals/eod_status) before anything else loads.
-**Find your useEffect block (around line 68) and replace the entire useEffect and state declarations above it with this:**
+You are doing a great job catching these final UI details!
+Here are the fixes to ensure the **Branch Search strictly only looks at the Branch Code**, and the **Helper Texts perfectly disappear** as soon as the user enters data.
+### 1. Restrict Branch Search to Code Only
+Since the backend API might be returning matches for both the name and the code, we can add a strict filter on the frontend to instantly drop any results that don't match the Branch Code.
+**Find your searchBranches function (around line 185) and update it to this:**
 ```javascript
-  const [checked, setChecked] = useState(false);
-
-  // --- NEW: EOD Tracking States ---
-  const [isPageLoading, setIsPageLoading] = useState(true);
-  const [isEodRunning, setIsEodRunning] = useState(false);
-
-  // Replaces anything that is NOT an alphabet, number, or space
-  const REMARKS_REPLACE_REGEX = /[^a-zA-Z0-9 ]/g; 
-
-  // Replaces anything that is NOT a digit (CGL is strictly digits)
-  const CGL_REPLACE_REGEX = /[^0-9]/g;
-
-  // Replaces anything that is NOT alphanumeric (Branch is strictly alphanumeric)
-  const BRANCH_REPLACE_REGEX = /[^a-zA-Z0-9]/g;
-
-  // Track input values to prevent empty dropdown tray on focus
-  const [branchInputValues, setBranchInputValues] = useState({});
-  const [cglInputValues, setCglInputValues] = useState({});
-
-  const [branchSearch, setBranchSearch] = useState({ loadingId: null, options: [] });
-  const [cglSearch, setCglSearch] = useState({ loadingId: null, options: [] });
-
-  useEffect(() => {
-    const fetchInitialData = async () => {
-      try {
-        setIsPageLoading(true);
-
-        // 1. FIRST: Check the EOD Status from your new API
-        const eodResponse = await callApi("/JS/journals/eod_status", null, "GET");
-        
-        // The API returns an array: [{ "eodStatus": 0 }]
-        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
-          if (eodResponse[0].eodStatus === 1) {
-            setIsEodRunning(true);
-            setIsPageLoading(false);
-            return; // STOP loading everything else, block the screen
-          }
-        }
-
-        // 2. IF EOD IS NOT RUNNING: Continue loading the normal page data
-        const dateResponse = await callApi("/JS/journals/current-posting-date", null, "GET");
-
-        if (dateResponse) {
-          try {
-            const [year, month, day] = dateResponse.split("-");
-            const formattedDate = `${day}-${month}-${year}`;
-            setPostingDate(formattedDate);
-          } catch (e) {
-            console.error("Could not parse date:", dateResponse, e);
-            setPostingDate(dateResponse);
-          }
-        } else {
-          showSnackBar("Failed to load official posting date.", "error");
-          setPostingDate("Error");
-        }
-
-        const currencyResponse = await callApi("/CM/common-master/currency", null, "GET");
-        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
-          const uniqueCurrencies = [...new Set(currencyResponse.data)];
-          setCurrencyOptions(uniqueCurrencies);
-        } else {
-          showSnackBar("Failed to load currencies.", "error");
-        }
-      } catch (error) {
-        console.error("Error fetching initial data:", error);
-        showSnackBar("An error occurred while loading page data.", "error");
-      } finally {
-        setIsPageLoading(false);
+  const searchBranches = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query || query.trim().length < 3) {
+        setBranchSearch({ loadingId: null, options: [] });
+        return;
       }
-    };
+      setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
+      try {
+        const response = await callApi(
+          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
 
-    fetchInitialData();
-  }, [callApi, showSnackBar]);
+        // --- NEW: Strictly filter out any results where the CODE doesn't match the query ---
+        // This completely prevents searching by branch name!
+        const filteredOptions = (response || []).filter((opt) => 
+          opt.code && opt.code.toLowerCase().includes(query.toLowerCase())
+        );
 
-```
-### 2. Make Remarks Compulsory Before Adding a New Row
-**Find your handleAddRow function (around line 147) and replace it with this:**
-```javascript
-  const handleAddRow = () => {
-    const lastRow = rows[rows.length - 1];
-
-    if (
-      !lastRow.branch ||
-      !lastRow.currency ||
-      !lastRow.cgl ||
-      !lastRow.amount ||
-      !lastRow.txnType ||
-      !isRowRemarksValid(lastRow.remarks) // <-- NEW: Validates remarks!
-    ) {
-      showSnackBar(
-        "Please fill all required fields (*) and ensure remarks are valid (2-30 chars) before adding a new row.",
-        "warning"
-      );
-      return;
-    }
-
-    const newRow = {
-      ...initialRowState,
-      id: Date.now(),
-      remarks: checked ? commonBatchRemarks : "",
-    };
-    setRows([...rows, newRow]);
-  };
-
-```
-### 3. Hide Helper Text Dynamically & Show Loading/Blocked Screens
-We will wrap the Typography helper texts so they disappear when data is entered. We'll also inject the Blocked EOD UI at the bottom.
-**Scroll all the way down to where isFormReadyToSubmit is declared (around line 380), and replace EVERYTHING from that point to the end of the file with this:**
-```javascript
-  const isFormReadyToSubmit = rows.every(
-    (row) =>
-      row.branch &&
-      row.currency &&
-      row.cgl &&
-      row.amount &&
-      parseFloat(row.amount) > 0 &&
-      row.txnType &&
-      isRowRemarksValid(row.remarks)
+        setBranchSearch({ loadingId: null, options: filteredOptions });
+      } catch (error) {
+        showSnackBar("Branch search failed.", "error");
+        setBranchSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
   );
 
-  // --- NEW: Show a Loading Spinner while checking EOD status ---
-  if (isPageLoading) {
-    return (
-      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '80vh' }}>
-        <CircularProgress size={60} />
-      </Box>
-    );
-  }
-
-  // --- NEW: The "Blocked" Screen when EOD is Running ---
-  if (isEodRunning) {
-    return (
-      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '80vh', p: 3 }}>
-        <Paper elevation={4} sx={{ p: 6, textAlign: 'center', borderRadius: 4, bgcolor: '#ffebee', border: '1px solid #ffcdd2' }}>
-          <Typography variant="h4" color="error" fontWeight="bold" gutterBottom>
-            EOD is Currently Running
-          </Typography>
-          <Typography variant="h6" color="text.secondary" sx={{ mt: 2 }}>
-            Journal Posting is temporarily disabled.
-          </Typography>
-          <Typography variant="body1" color="text.secondary" sx={{ mt: 1 }}>
-            Please wait until the End of Day process completes to post new transactions.
-          </Typography>
-        </Paper>
-      </Box>
-    );
-  }
-
-  // --- ORIGINAL UI RENDER ---
-  return (
-    <Box sx={{ p: 3, maxWidth: "98%" }}>
-      <Paper elevation={3} sx={{ p: 3 }}>
-        <Box>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-            <Typography variant="body1" fontWeight="bold" component="span">
-              Posting Date:
-            </Typography>
-            <Typography variant="body1" fontWeight="bold" component="span">
-              {postingDate}
-            </Typography>
-          </Box>
-          <Box sx={{ marginTop: 0.5 }}>
-            <Typography
-              variant="body2"
-              component="span"
-              sx={{ color: "#ec0101ff" }}
-            >
-              Note: All Journals will be Posted on this Date
-            </Typography>
-          </Box>
-        </Box>
-
-        <Grid item xs={12} md={12} sx={{ margin: "1% 0%", width: "95%" }}>
-          <TextField
-            label="Common Batch Remarks"
-            value={commonBatchRemarks}
-            onChange={(e) => {
-              const newValue = filterAndWarn(e.target.value, "alphanumeric_space");
-              if (newValue.length <= 30) {
-                setCommonBatchRemarks(newValue);
-                if (checked) {
-                  setRows(rows.map((row) => ({ ...row, remarks: newValue })));
-                }
-              }
-            }}
-            fullWidth
-            required
-            multiline
-            rows={1}
-            inputProps={{
-              maxLength: 30,
-            }}
-            error={commonBatchRemarks.length > 0 && !isCommonRemarksValid(commonBatchRemarks)}
-          />
-          {commonBatchRemarks.length === 0 && (
-             <FormHelperText sx={{ color: "text.secondary", textAlign: "left", ml: 1.5 }}>
-               Allowed 2-30 chars (alphabets, numbers)
-             </FormHelperText>
-          )}
-          <Box sx={{ display: "flex", alignItems: "center", mt: 1 }}>
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={checked}
-                  onChange={handleRemarksSync}
-                  color="primary"
-                  disabled={commonBatchRemarks.length > 0 && !isRemarksValid(commonBatchRemarks)}
-                />
-              }
-              label="Apply This Remark To All Below Transaction"
-            />
-          </Box>
-        </Grid>
-
-        <Box>
-          {rows.map((row, index) => {
-            const isINR = row.currency === "INR";
-            const amountRegex = isINR ? /^\d{0,16}(\.\d{0,2})?$/ : /^\d{0,16}(\.\d{0,4})?$/;
-
-            return (
-              <React.Fragment key={row.id}>
-                <Grid container spacing={2} alignItems="flex-start" sx={{ mt: 1 }}>
-                  {/* Branch */}
-                  <Grid item xs={12} md={3} size={1.8}>
-                    <Autocomplete
-                      popupIcon={null}
-                      autoHighlight
-                      options={branchSearch.options}
-                      getOptionLabel={(option) => option && option.code ? `${option.code} - ${option.name}` : ""}
-                      value={row.branch || null}
-                      onChange={(event, newValue) => handleRowChange(row.id, "branch", newValue)}
-                      inputValue={branchInputValues[row.id] || ""}
-                      onInputChange={(event, newInputValue, reason) => {
-                        if (reason === 'input') {
-                          const cleanInput = newInputValue
-                            .replace(BRANCH_REPLACE_REGEX, "")
-                            .substring(0, 5);
-                          setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                          searchBranches(cleanInput, row.id);
-                        } else {
-                          setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                        }
-                      }}
-                      loading={branchSearch.loadingId === row.id}
-                      filterOptions={(x) => x}
-                      isOptionEqualToValue={(option, value) => option?.code === value?.code}
-                      noOptionsText={
-                        (branchInputValues[row.id] || "").length < 3
-                          ? "Type at least 3 characters of Branch Code..."
-                          : "Branch not found"
-                      }
-                      renderInput={(params) => (
-                        <Tooltip title="Search by Branch Code" placement="top-start">
-                          <TextField
-                            {...params}
-                            label="Branch *"
-                            placeholder="Type to search..."
-                            InputLabelProps={{ shrink: true }}
-                            InputProps={{
-                              ...params.InputProps,
-                              endAdornment: (
-                                <Box>
-                                  {branchSearch.loadingId === row.id ? (
-                                    <CircularProgress color="inherit" size={20} />
-                                  ) : null}
-                                  {params.InputProps.endAdornment}
-                                </Box>
-                              ),
-                            }}
-                          />
-                        </Tooltip>
-                      )}
-                    />
-                    {!row.branch && (
+```
+### 2. Make Helper Texts Hide When Typing
+Right now, the Autocomplete helper texts wait until a full option is *selected* to hide. We will update the logic so they hide the millisecond the user starts typing valid data, and reappear if they clear the box.
+**Scroll down to your rows.map inside the return statement (around line 470). Replace your existing Typography tags for each column with these updated ones:**
+**For Branch:**
+Find {!row.branch && ( under the Branch Autocomplete and replace it with:
+```javascript
+                    {(!row.branch && (branchInputValues[row.id] || "").length < 3) && (
                       <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2, display: "block", textAlign: "left" }}>
                         Min 3 characters required (Branch Code)
                       </Typography>
                     )}
-                  </Grid>
 
-                  {/* Currency */}
-                  <Grid item xs={12} md={1.5} size={1.5}>
-                    <TextField
-                      select
-                      label="Currency *"
-                      value={row.currency}
-                      onChange={(e) => {
-                        handleRowChange(row.id, "currency", e.target.value);
-                        handleRowChange(row.id, "amount", "");
-                      }}
-                      fullWidth
-                      InputLabelProps={{ shrink: true }}
-                      SelectProps={{
-                        displayEmpty: true,
-                        renderValue: (selected) => {
-                          if (!selected) {
-                            return <span style={{ color: 'gray', opacity: 0.8 }}>Select Currency</span>;
-                          }
-                          return selected;
-                        },
-                        MenuProps: {
-                          anchorOrigin: { vertical: "bottom", horizontal: "left" },
-                          transformOrigin: { vertical: "top", horizontal: "left" },
-                          PaperProps: { style: { maxHeight: 250 } }
-                        }
-                      }}
-                    >
-                      {currencyOptions.map((c) => (
-                        <MenuItem key={c} value={c}>
-                          {c}
-                        </MenuItem>
-                      ))}
-                    </TextField>
-                  </Grid>
-
-                  {/* CGL */}
-                  <Grid item xs={12} md={2} size={1.8}>
-                    <Autocomplete
-                      popupIcon={null}
-                      autoHighlight
-                      options={cglSearch.options}
-                      getOptionLabel={(option) => option && option.cglNumber ? `${option.cglNumber} - ${option.description}` : ""}
-                      value={row.cgl || null}
-                      onChange={(event, newValue) => handleRowChange(row.id, "cgl", newValue)}
-                      inputValue={cglInputValues[row.id] || ""}
-                      onInputChange={(event, newInputValue, reason) => {
-                        if (reason === 'input') {
-                          const cleanInput = newInputValue
-                            .replace(CGL_REPLACE_REGEX, "")
-                            .substring(0, 10);
-                          setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                          searchCgls(cleanInput, row.id);
-                        } else {
-                          setCglInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                        }
-                      }}
-                      loading={cglSearch.loadingId === row.id}
-                      filterOptions={(x) => x}
-                      isOptionEqualToValue={(option, value) => option?.cglNumber === value?.cglNumber}
-                      noOptionsText={
-                        (cglInputValues[row.id] || "").length < 3
-                          ? "Type at least 3 digits of CGL Number..."
-                          : "CGL not found"
-                      }
-                      renderInput={(params) => (
-                        <Tooltip title="Search by CGL Number" placement="top-start">
-                          <TextField
-                            {...params}
-                            label="CGL *"
-                            placeholder="Type to search..."
-                            InputLabelProps={{ shrink: true }}
-                            InputProps={{
-                              ...params.InputProps,
-                              endAdornment: (
-                                <Box sx={{ marginLeft: "2%", display: "flex", alignItems: "center" }}>
-                                  {row.cgl && String(row.cgl.cglNumber).startsWith("5") && (
-                                    <Chip label="MEMO" size="small" color="warning" sx={{ height: 20, fontSize: "0.7rem", mr: 1 }} />
-                                  )}
-                                  {cglSearch.loadingId === row.id ? <CircularProgress color="inherit" size={20} /> : null}
-                                  {params.InputProps.endAdornment}
-                                </Box>
-                              ),
-                            }}
-                          />
-                        </Tooltip>
-                      )}
-                    />
-                    {!row.cgl && (
+```
+**For CGL:**
+Find {!row.cgl && ( under the CGL Autocomplete and replace it with:
+```javascript
+                    {(!row.cgl && (cglInputValues[row.id] || "").length < 3) && (
                       <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2, display: "block", textAlign: "left" }}>
                         Min 3 digits required (CGL Number)
                       </Typography>
                     )}
-                  </Grid>
 
-                  {/* Amount */}
-                  <Grid item xs={12} md={2} size={1.5}>
-                    <TextField
-                      label="Amount *"
-                      type="text"
-                      value={row.amount}
-                      InputLabelProps={{ shrink: true }}
-                      onChange={(e) => {
-                        const rawVal = e.target.value;
-                        if (/[^0-9.]/.test(rawVal)) {
-                          showSnackBar("Only numbers and decimal point are allowed.", "warning");
-                          return; 
-                        }
-                        if (rawVal === "" || amountRegex.test(rawVal)) {
-                          handleRowChange(row.id, "amount", rawVal);
-                        } else {
-                          showSnackBar("Exceeded maximum digits or decimal places.", "warning");
-                        }
-                      }}
-                      disabled={!row.currency}
-                      fullWidth
-                      placeholder={isINR ? "0.00" : "0.0000"}
-                      inputProps={{
-                        style: { textAlign: "right" }
-                      }}
-                    />
-                    {!row.amount && (
+```
+**For Amount:**
+Find {!row.amount && ( under the Amount TextField and replace it with:
+```javascript
+                    {(!row.amount || row.amount.length === 0) && (
                       <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2, display: "block", textAlign: "left" }}>
                         {!row.currency
                           ? "Select Currency first"
@@ -412,139 +69,26 @@ We will wrap the Typography helper texts so they disappear when data is entered.
                             : "Max 16 digits, 4 decimals (numbers)"}
                       </Typography>
                     )}
-                  </Grid>
 
-                  {/* Txn Type */}
-                  <Grid item xs={12} md={1} size={1.3}>
-                    <TextField
-                      select
-                      label="Type *"
-                      value={row.txnType}
-                      onChange={(e) =>
-                        handleRowChange(row.id, "txnType", e.target.value)
-                      }
-                      fullWidth
-                      InputLabelProps={{ shrink: true }}
-                      SelectProps={{
-                        displayEmpty: true,
-                        renderValue: (selected) => {
-                          if (!selected) {
-                            return <span style={{ color: 'gray', opacity: 0.8 }}>Type</span>;
-                          }
-                          return selected;
-                        }
-                      }}
-                    >
-                      <MenuItem value="Debit">Debit</MenuItem>
-                      <MenuItem value="Credit">Credit</MenuItem>
-                    </TextField>
-                  </Grid>
-
-                  {/* Product Code */}
-                  <Grid item xs={12} md={2} size={1.5}>
-                    <TextField
-                      label="Product Code"
-                      value={row.productCode}
-                      InputLabelProps={{ shrink: true }}
-                      placeholder="Enter Product Code.."
-                      onChange={(e) => {
-                        const rawVal = e.target.value;
-                        const cleanVal = rawVal.replace(/[^0-9]/g, "");
-                        if (rawVal !== cleanVal) {
-                          showSnackBar("Only digits are allowed.", "warning");
-                        }
-                        if (cleanVal.length <= 8) {
-                          handleRowChange(row.id, "productCode", cleanVal);
-                        }
-                      }}
-                      fullWidth
-                      inputProps={{
-                        maxLength: 8,
-                      }}
-                    />
-                    {!row.productCode && (
+```
+**For Product Code:**
+Find {!row.productCode && ( under the Product Code TextField and replace it with:
+```javascript
+                    {(!row.productCode || row.productCode.length === 0) && (
                       <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2, display: "block", textAlign: "left" }}>
                         Max 8 digits (numbers)
                       </Typography>
                     )}
-                  </Grid>
 
-                  {/* Remarks (Individual) */}
-                  <Grid item xs={12} md={2} size={2}>
-                    <TextField
-                      label="Remarks *"
-                      value={row.remarks}
-                      InputLabelProps={{ shrink: true }}
-                      placeholder="Enter remarks..."
-                      onChange={(e) => {
-                        const val = filterAndWarn(e.target.value, "alphanumeric_space");
-                        if (val.length <= 30) {
-                          handleRowChange(row.id, "remarks", val);
-                        }
-                      }}
-                      fullWidth
-                      inputProps={{
-                        maxLength: 30,
-                      }}
-                      disabled={checked}
-                      error={row.remarks.length > 0 && !isRowRemarksValid(row.remarks)}
-                    />
-                    {!(row.remarks && row.remarks.length >= 2) && (
+```
+**For Row Remarks:**
+Find {!(row.remarks && row.remarks.length >= 2) && ( under the Remarks TextField and replace it with:
+```javascript
+                    {(!row.remarks || row.remarks.length === 0) && (
                       <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", ml: 1.2, display: "block", textAlign: "left" }}>
                         Allowed 2-30 chars (alphabets, numbers)
                       </Typography>
                     )}
-                  </Grid>
-
-                  {/* Actions */}
-                  <Grid item xs={12} md={0.5} sx={{ textAlign: "center" }}>
-                    <IconButton
-                      onClick={() => handleDeleteRow(row.id)}
-                      aria-label="delete row"
-                    >
-                      <DeleteIcon />
-                    </IconButton>
-                  </Grid>
-                </Grid>
-
-                {index < rows.length - 1 && (
-                  <Box
-                    sx={{
-                      borderBottom: 1,
-                      borderColor: "divider",
-                      my: 2,
-                    }}
-                  />
-                )}
-              </React.Fragment>
-            );
-          })}
-
-          <Box sx={{ mt: 3, display: "flex", gap: 2, justifyContent: "right" }}>
-            <Button
-              variant="contained"
-              startIcon={<AddIcon />}
-              onClick={handleAddRow}
-            >
-              Add Row
-            </Button>
-            <Button
-              variant="contained"
-              color="success"
-              onClick={handleSubmit}
-              disabled={
-                isSubmitting ||
-                !isCommonRemarksValid(commonBatchRemarks) ||
-                !isFormReadyToSubmit
-              }
-            >
-              {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
-            </Button>
-          </Box>
-        </Box>
-      </Paper>
-    </Box>
-  );
-}
 
 ```
+Now, the UI will be perfectly clean as the user types, and it strictly enforces searching by Branch Code only!
