@@ -1,95 +1,90 @@
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
-public class BankSynchronizationDemo {
+public class ThreadVisibilityDemo {
 
-    // Our shared data
     private int unsafeBalance = 0;
     private int safeBalance = 0;
-
-    // The physical padlock object for our synchronized block
     private final Object lock = new Object();
 
     // ---------------------------------------------------------
-    // SCENARIO 1: NO SYNCHRONIZATION (The Danger Zone)
+    // SCENARIO 1: THE CHAOS (No Lock)
     // ---------------------------------------------------------
     public void depositUnsafe() {
-        // Read the current balance
+        String threadName = Thread.currentThread().getName();
+        System.out.println(threadName + " [UNSAFE] Entering method.");
+
+        // 1. Read the state
         int currentBalance = unsafeBalance;
+        System.out.println(threadName + " [UNSAFE] Read balance as: $" + currentBalance);
 
-        // Force the OS to time-slice/pause this thread for 1 millisecond!
-        // This guarantees a massive race condition because other threads 
-        // will rush in while this thread is asleep.
-        try {
-            Thread.sleep(1);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
+        // 2. The OS pauses the thread! 
+        System.out.println(threadName + " [UNSAFE] 💤 Going to sleep (OS Time-Slice)...");
+        try { Thread.sleep(100); } catch (InterruptedException e) {}
 
-        // Write the new balance
+        // 3. The thread wakes up and writes the state based on old data
         unsafeBalance = currentBalance + 1;
+        System.out.println(threadName + " [UNSAFE] ⏰ Woke up! Wrote balance as: $" + unsafeBalance);
     }
 
     // ---------------------------------------------------------
-    // SCENARIO 2: WITH SYNCHRONIZED BLOCK (The Vault)
+    // SCENARIO 2: THE VAULT (Synchronized Block)
     // ---------------------------------------------------------
     public void depositSafe() {
-        // Only one thread at a time can grab this lock and enter the block
+        String threadName = Thread.currentThread().getName();
+        System.out.println(threadName + " [SAFE] Arrived at the block. Waiting for key...");
+
+        // Only one thread gets past this line at a time
         synchronized (lock) {
+            System.out.println(threadName + " [SAFE] 🔐 GRABBED THE KEY! Current balance: $" + safeBalance);
+            
+            // 1. Read the state
             int currentBalance = safeBalance;
 
-            // The OS STILL pauses the thread here for 1 millisecond!
-            // BUT, because it holds the 'lock' key in its pocket while it sleeps,
-            // no other thread can enter this block to mess up the data.
-            try {
-                Thread.sleep(1);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
+            // 2. The OS pauses the thread! BUT it takes the key with it.
+            System.out.println(threadName + " [SAFE] 💤 Sleeping with key in pocket...");
+            try { Thread.sleep(100); } catch (InterruptedException e) {}
 
+            // 3. The thread wakes up and writes the state
             safeBalance = currentBalance + 1;
-        } // The thread drops the key here so the next thread can enter
+            System.out.println(threadName + " [SAFE] ⏰ Woke up! Wrote balance as: $" + safeBalance + ". 🔓 DROPPING KEY.");
+        } 
     }
 
     // ---------------------------------------------------------
-    // MAIN METHOD (Let's run 1,000 threads!)
+    // MAIN METHOD
     // ---------------------------------------------------------
     public static void main(String[] args) throws InterruptedException {
-        BankSynchronizationDemo bank = new BankSynchronizationDemo();
-        int totalDeposits = 1000;
+        ThreadVisibilityDemo demo = new ThreadVisibilityDemo();
 
-        // We create a Thread Pool with 100 active workers
-        ExecutorService threadPool = Executors.newFixedThreadPool(100);
-        
-        // This is just a countdown timer so the main thread waits for all workers to finish
-        CountDownLatch latch = new CountDownLatch(totalDeposits * 2);
+        // Create a pool of 3 workers and give them custom nametags
+        ExecutorService threadPool = Executors.newFixedThreadPool(3, runnable -> {
+            Thread t = new Thread(runnable);
+            // We give them distinct names to track them easily
+            t.setName("Worker-" + t.getId()); 
+            return t;
+        });
 
-        System.out.println("Starting the test. Firing 1,000 threads...");
-
-        for (int i = 0; i < totalDeposits; i++) {
-            // Tell the workers to run the unsafe method
-            threadPool.submit(() -> {
-                bank.depositUnsafe();
-                latch.countDown();
-            });
-
-            // Tell the workers to run the safe method
-            threadPool.submit(() -> {
-                bank.depositSafe();
-                latch.countDown();
-            });
+        System.out.println("========== STARTING UNSAFE TEST ==========");
+        for (int i = 0; i < 3; i++) {
+            threadPool.submit(demo::depositUnsafe);
         }
 
-        // Wait here until all 2,000 tasks are done
-        latch.await();
-        threadPool.shutdown();
+        // Wait a moment for the unsafe test to finish before starting the safe one
+        Thread.sleep(1000); 
 
-        // Print the results
-        System.out.println("\n--- FINAL RESULTS ---");
-        System.out.println("Expected Balance : 1000");
-        System.out.println("Unsafe Balance   : " + bank.unsafeBalance + "  <-- MASSIVE DATA LOSS!");
-        System.out.println("Safe Balance     : " + bank.safeBalance + "  <-- PERFECTLY ACCURATE!");
-        System.out.println("---------------------");
+        System.out.println("\n========== STARTING SAFE TEST ==========");
+        for (int i = 0; i < 3; i++) {
+            threadPool.submit(demo::depositSafe);
+        }
+
+        threadPool.shutdown();
+        threadPool.awaitTermination(5, TimeUnit.SECONDS);
+        
+        System.out.println("\n========== FINAL RESULTS ==========");
+        System.out.println("Expected Balance : $3");
+        System.out.println("Unsafe Balance   : $" + demo.unsafeBalance + " (Data corrupted by Race Condition)");
+        System.out.println("Safe Balance     : $" + demo.safeBalance + " (Data perfectly protected)");
     }
 }
