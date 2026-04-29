@@ -1,256 +1,86 @@
-Here are the **4 complete methods** you need to replace in your **JournalBulkValidationService.java**.
-I have standardized them so that **Product Code is always at Index 6** and the **ERRORS column is always pushed to Index 7**.
-### How this solves the Error File Re-upload Bug:
-Because your Java parser is strictly programmed to only read from Index 0 to Index 6, it will **completely ignore the ERRORS column** sitting at Index 7 when a user re-uploads an error file. The old errors vanish automatically, and if there are still mistakes, fresh errors get printed perfectly in a new error file!
-Furthermore, the * characters in the headers are safely ignored because the parser drops the first row completely as long as it contains the word "branch".
-Replace these four methods entirely in your Java backend:
-### 1. parseCsvStream
-```java
-    private ParsingResult parseCsvStream(InputStream is, LocalDate postingDate) throws IOException {
-        List<ExcelRowData> list = new ArrayList<>();
-        boolean hasProductCol = false;
-
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-            String line;
-            int i = 0;
-            while ((line = br.readLine()) != null) {
-                if (line.trim().isEmpty()) continue;
-                String[] c = line.split(",", -1);
-
-                // Header skipping logic (Safely ignores the '*' characters)
-                if (i == 0) {
-                    String h = c.length > 0 ? c[0].trim().toLowerCase() : "";
-                    if (h.contains("branch") || h.contains("batch")) {
-                        i++; continue;
-                    }
-                }
-
-                ExcelRowData d = new ExcelRowData();
-                d.rowIndex = i++;
-                String col0Clean = c.length > 0 ? c[0].replace("\uFEFF", "").trim() : "";
-                d.sysSite = col0Clean;
-
-                // Logic for System Format (01)
-                if ("01".equals(col0Clean) && c.length > 8) {
-                    d.isSystemFormat = true;
-                    if (c.length > 1) d.sysDate = c[1].trim();
-                    if (c.length > 2) d.sysYear = c[2].trim();
-                    if (c.length > 3) d.sysPeriod = c[3].trim();
-                    if (c.length > 4) d.branch = padBranch(c[4]);
-                    if (c.length > 5) d.currency = c[5].trim().toUpperCase();
-                    if (c.length > 6) d.cgl = c[6].trim();
-                    parseAmount(d, (c.length > 7) ? c[7].trim() : "", (c.length > 8) ? c[8].trim() : "");
-                    if (c.length > 9) d.remarks = c[9].trim();
-
-                    if (c.length > 10) {
-                        String rawProd = c[10].trim();
-                        d.productCode = rawProd;
-                        if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                            hasProductCol = true;
-                        }
-                    } else {
-                        d.productCode = "";
-                    }
-
-                    if (c.length < 14) {
-                        d.formatErrors.add("Invalid CSV columns");
-                    } else {
-                        validateSystemColumns(d, d.sysSite, d.sysDate, d.sysYear, d.sysPeriod, c[11].trim(), c[12].trim(), c[13].trim(), postingDate);
-                    }
-                }
-                // Logic for Standard Format
-                // The ERRORS column is at index 7, which means it is safely ignored!
-                else {
-                    if (c.length > 0) d.branch = padBranch(c[0]);
-                    if (c.length > 1) d.currency = c[1].trim().toUpperCase();
-                    if (c.length > 2) d.cgl = c[2].trim();
-                    parseAmount(d, (c.length > 3) ? c[3].trim() : "", (c.length > 4) ? c[4].trim() : "");
-                    
-                    // Index 5 is strictly Remarks
-                    if (c.length > 5) d.remarks = c[5].trim();
-                    
-                    // Index 6 is strictly Product Code
-                    if (c.length > 6) {
-                        String rawProd = c[6].trim();
-                        d.productCode = rawProd;
-                        if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                            hasProductCol = true;
-                        }
-                    } else {
-                        d.productCode = "";
-                    }
-                }
-                list.add(d);
-            }
-        }
-        return new ParsingResult(list, hasProductCol);
-    }
-
-```
-### 2. parseExcelStream
-```java
-    private ParsingResult parseExcelStream(InputStream is, LocalDate postingDate) throws IOException {
-        List<ExcelRowData> list = new ArrayList<>();
-        boolean hasProductCol = false;
-        DataFormatter fmt = new DataFormatter();
-
-        try (Workbook wb = com.github.pjfanning.xlsx.StreamingReader.builder()
-                .rowCacheSize(100)
-                .bufferSize(4096)
-                .open(is)) {
-
-            Sheet sheet = wb.getSheetAt(0);
-            for (Row r : sheet) {
-                if (isRowEmpty(r)) continue;
-
-                // Header skipping logic (Safely ignores the '*' characters)
-                if (r.getRowNum() == 0) {
-                    String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
-                    if (h.contains("branch") || h.contains("batch")) continue;
-                }
-
-                ExcelRowData d = new ExcelRowData();
-                d.rowIndex = r.getRowNum();
-                String col0 = parseCode(r.getCell(0), fmt);
-
-                if (("01".equals(col0) || "1".equals(col0)) && r.getLastCellNum() > 8) {
-                    d.isSystemFormat = true;
-                    d.sysSite = col0;
-                    d.sysDate = parseCode(r.getCell(1), fmt);
-                    d.sysYear = parseCode(r.getCell(2), fmt);
-                    d.sysPeriod = parseCode(r.getCell(3), fmt);
-                    d.branch = padBranch(parseCode(r.getCell(4), fmt));
-                    d.currency = fmt.formatCellValue(r.getCell(5)).trim().toUpperCase();
-                    d.cgl = parseCode(r.getCell(6), fmt);
-                    parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
-                    d.remarks = fmt.formatCellValue(r.getCell(9)).trim();
-
-                    Cell prodCell = r.getCell(10);
-                    String rawProd = (prodCell != null) ? parseCode(prodCell, fmt).trim() : "";
-                    d.productCode = rawProd;
-                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                        hasProductCol = true;
-                    }
-
-                    validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod,
-                            parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
-                }
-                // Logic for Standard Format
-                // The ERRORS column is at index 7, which means it is safely ignored!
-                else {
-                    d.branch = padBranch(col0);
-                    d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
-                    d.cgl = parseCode(r.getCell(2), fmt);
-                    parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
-                    
-                    // Index 5 is strictly Remarks
-                    d.remarks = fmt.formatCellValue(r.getCell(5)).trim();
-                    
-                    // Index 6 is strictly Product Code
-                    Cell prodCell = r.getCell(6);
-                    String rawProd = (prodCell != null) ? parseCode(prodCell, fmt).trim() : "";
-                    d.productCode = rawProd;
-                    if (!rawProd.isEmpty() && !"A".equalsIgnoreCase(rawProd)) {
-                        hasProductCol = true;
-                    }
-                }
-                list.add(d);
-            }
-        } catch (Exception e) {
-            log.error("EXCEL_STREAM_PARSE_FAIL | Reason: {}", e.getMessage());
-            throw new IOException("Failed to stream Excel content: " + e.getMessage());
-        }
-
-        return new ParsingResult(list, hasProductCol);
-    }
-
-```
-### 3. generateErrorExcelFast
-```java
-    private byte[] generateErrorExcelFast(List<ExcelRowData> rows, boolean includeProduct) throws IOException {
-        SXSSFWorkbook workbook = new SXSSFWorkbook(100);
-
-        try {
-            Sheet sheet = workbook.createSheet("Error Report");
-            CellStyle errStyle = workbook.createCellStyle();
-            Font f = workbook.createFont(); f.setColor(IndexedColors.RED.getIndex()); errStyle.setFont(f);
-
-            boolean isSystem = rows.stream().anyMatch(r -> r.isSystemFormat);
-            
-            Row h = sheet.createRow(0);
-            List<String> headerList = new ArrayList<>();
-            
-            if (isSystem) {
-                headerList.addAll(Arrays.asList("Site", "Date", "Year", "Month", "Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks"));
-                headerList.add("Product Code"); // Always render to lock column indices
-            } else {
-                // Sequence matching parser perfectly. Asterisks included.
-                headerList.addAll(Arrays.asList("Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*", "Product Code")); 
-            }
-            
-            // ERRORS is always safely pushed to the end (Index 7)
-            headerList.add("ERRORS");
-            
-            for (int i = 0; i < headerList.size(); i++) h.createCell(i).setCellValue(headerList.get(i));
-
-            int idx = 1;
-            for (ExcelRowData d : rows) {
-                Row r = sheet.createRow(idx++);
-                int col = 0;
-                if (isSystem) {
-                    r.createCell(col++).setCellValue(sanitize(d.sysSite));
-                    r.createCell(col++).setCellValue(sanitize(d.sysDate));
-                    r.createCell(col++).setCellValue(sanitize(d.sysYear));
-                    r.createCell(col++).setCellValue(sanitize(d.sysPeriod));
-                    r.createCell(col++).setCellValue(sanitize(d.branch));
-                    r.createCell(col++).setCellValue(sanitize(d.currency));
-                    r.createCell(col++).setCellValue(sanitize(d.cgl));
-                    r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
-                    r.createCell(col++).setCellValue(sanitize(d.txnType));
-                    r.createCell(col++).setCellValue(sanitize(d.remarks));
-                    r.createCell(col++).setCellValue(sanitize(d.productCode));
-                } else {
-                    r.createCell(col++).setCellValue(sanitize(d.branch));
-                    r.createCell(col++).setCellValue(sanitize(d.currency));
-                    r.createCell(col++).setCellValue(sanitize(d.cgl));
-                    r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
-                    r.createCell(col++).setCellValue(sanitize(d.txnType));
-                    r.createCell(col++).setCellValue(sanitize(d.remarks)); 
-                    r.createCell(col++).setCellValue(sanitize(d.productCode)); 
-                }
+Got it! That makes sense—forcing them to intentionally click the red "X" to remove the file before they can browse for a new one prevents accidental overwrites.
+Here is the exact block to replace in **JournalBulkUpload.js** to **restore** the "Remove File" (X) button, while keeping the "Change File" button hidden.
+**Find this entire section (around line 430) and replace it with this:**
+```javascript
+            <Box sx={boxCenterStyle}>
+              <Box sx={{ position: "relative", textAlign: "center" }}>
+                 <CloudUploadIcon sx={{ fontSize: "6rem", color: "primary.main", mb: 1 }} />
+                <Typography sx={headerTextStyle}>
+                  {file ? file.name : (isDragging ? "Drop file now" : "Drag or Browse the File")}
+                </Typography>
+                {!file && (
+                  <Typography sx={subTextStyle}>
+                    Supported file formats: {ALLOWED_FILE_TYPES.join(", ")} (Maximum Size: 50MB)
+                  </Typography>
+                )}
                 
-                Cell c = r.createCell(col);
-                if (d.hasErrors()) { c.setCellValue(d.getAllErrors()); c.setCellStyle(errStyle); }
-            }
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            workbook.write(out);
-            return out.toByteArray();
-        } finally {
-            workbook.dispose();
-            workbook.close();
-        }
-    }
+                {/* 1. RESTORED: The "Remove File" (X) button is back! */}
+                {file && (
+                  <Tooltip title="Remove File">
+                    <IconButton
+                      size="small"
+                      onClick={handleClearFile}
+                      sx={{
+                        position: "absolute",
+                        top: -10,
+                        right: -40,
+                        bgcolor: "background.paper",
+                        "&:hover": { bgcolor: "error.light", color: "white" },
+                      }}
+                    >
+                      <CloseIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                )}
+              </Box>
+            </Box>
+
+            <Box sx={{ ...boxCenterStyle, flexDirection: "row", alignItems: "flex-start", mt: 2 }} onClick={(e) => e.stopPropagation()}>
+              <Box sx={dateinputfield}>
+                <LocalizationProvider dateAdapter={AdapterDayjs}>
+                  <DatePicker
+                    label="Posting Date"
+                    value={selectedDate}
+                    onChange={(newValue) => setSelectedDate(newValue)}
+                    disabled={isProcessing || isCreatingBatch}
+                    minDate={dayjs().subtract(1, 'year')}
+                    maxDate={dayjs()}
+                    slotProps={{
+                      textField: {
+                        size: "small",
+                        onKeyDown: (e) => e.preventDefault(),
+                        helperText: file && !selectedDate ? "Please select a posting date" : "",
+                        FormHelperTextProps: { sx: { color: "primary.main", fontWeight: 500 } },
+                        sx: file && !selectedDate ? { "& .MuiOutlinedInput-root": { "& fieldset": { borderColor: "primary.main", borderWidth: "2px" } } } : {},
+                        inputProps: { readOnly: true, sx: { cursor: 'pointer' } }
+                      },
+                    }}
+                  />
+                </LocalizationProvider>
+              </Box>
+              
+              {/* 2. HIDDEN: The "Browse/Change File" button disappears once a file is selected */}
+              {!file && (
+                <Box>
+                  <input
+                    type="file"
+                    hidden
+                    ref={fileInputRef}
+                    onChange={handleFileSelect}
+                    onClick={(e) => (e.target.value = null)}
+                    accept={ALLOWED_FILE_TYPES.join(",")}
+                  />
+                  <Button
+                    sx={customButtonStyle}
+                    variant="contained"
+                    onClick={() => fileInputRef.current.click()}
+                    disabled={isProcessing || isCreatingBatch}
+                  >
+                    Browse File
+                  </Button>
+                </Box>
+              )}
+            </Box>
 
 ```
-### 4. generateTemplateBytes
-```java
-    public byte[] generateTemplateBytes() throws IOException {
-        try (SXSSFWorkbook wb = new SXSSFWorkbook()) {
-            Sheet sheet = wb.createSheet("Journal Template");
-            Row row = sheet.createRow(0);
-            
-            // Updated exact names, sequence, and mandatory asterisks
-            String[] headers = {"Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*", "Product Code"};
-            
-            for (int i = 0; i < headers.length; i++) {
-                Cell cell = row.createCell(i); 
-                cell.setCellValue(headers[i]); 
-                sheet.setColumnWidth(i, 4000);
-            }
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            wb.write(out);
-            return out.toByteArray();
-        }
-    }
-
-```
+Now, when they select a file, the "Browse" button vanishes, but the little "X" icon appears perfectly in the corner so they can clear it out if they made a mistake!
