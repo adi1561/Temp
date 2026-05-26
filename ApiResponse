@@ -1,4 +1,12 @@
-  @Override
+The compilation errors you are seeing are caused by two things:
+ 1. **Duplicate Code:** You accidentally pasted the workflow initialization block twice inside the same method.
+ 2. **Type Mismatch:** Your dto.getScheduledTime() is already a LocalDateTime object (because Spring Boot automatically converts it from the frontend JSON), so you cannot use String methods like .isEmpty() or .replace() on it.
+Lastly, the executeOraclePostingProcedure error is from the processWorkflowAction method (not this one), because it was a placeholder I put for your existing execution logic.
+Here is exactly how to fix all of these issues.
+### 1. Fix the createBatchRequest Method
+Replace your entire createBatchRequest method with this cleaned-up version. I have removed the duplicate variables and fixed the LocalDateTime logic.
+```java
+    @Override
     @Transactional
     public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole)  {
         String batchId = sequenceService.getNextBatchId();
@@ -54,7 +62,8 @@
         jdbcTemplate.update(sumSql, batchId, creatorId, ts, dto.getCommonBatchRemarks(), entities.size(), totalDebit, totalCredit, "PENDING");
 
         // 2. Initialize New Workflow Engine
-        String roleName = getRoleName(creatorRole);
+        String roleName = (creatorRole == 51) ? "TCSGLIF" : (creatorRole == 52 ? "SBIGLIF" : "OTHER");
+        
         VoucherPosting posting = new VoucherPosting();
         posting.setBatchId(batchId);
         posting.setVidFk(dto.getVid()); // From DTO
@@ -64,17 +73,17 @@
 
         // Determine Workflow Route
         if ("TCSGLIF".equalsIgnoreCase(roleName)) {
-            posting.setApprovalWorkflow("W1_3_APPROVERS"); // 1 TCS, 2 SBI
+            posting.setApprovalWorkflow("W1_3_APPROVERS"); // Route 1: 1 TCS, 2 SBI
             posting.setNextApproval("TCSGLIF"); // First step is TCSGLIF
         } else {
-            posting.setApprovalWorkflow("W2_4_APPROVERS"); // 2 TCS, 2 SBI
+            posting.setApprovalWorkflow("W2_4_APPROVERS"); // Route 2: 2 TCS, 2 SBI
             posting.setNextApproval("TCSGLIF"); // First step is TCSGLIF
         }
 
-        // Handle Maker Scheduling
+        // Handle Maker Scheduling (Fixed LocalDateTime check)
         if (dto.getScheduledTime() != null) {
             posting.setExecutionScheduled("YES");
-            posting.setScheduledTime(dto.getScheduledTime());
+            posting.setScheduledTime(dto.getScheduledTime()); // It is already a LocalDateTime object
             posting.setIsScheduleOverride("NO");
         } else {
             posting.setExecutionScheduled("NO");
@@ -83,6 +92,8 @@
         voucherPostingRepository.save(posting);
 
         // 3. Notifications & Audits
+        // If logAudit and sendNotification are missing, make sure they exist in your service, 
+        // or comment them out if you handle notifications differently.
         logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under workflow " + posting.getApprovalWorkflow());
         sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
 
@@ -93,44 +104,41 @@
             sendNotification(null, config.getTargetRoles(), msg, batchId);
         }
 
-        // 1. Map the Creator's Role ID to the Role Name (Adjust IDs based on your DB)
-        String roleName = (creatorRole == 51) ? "TCSGLIF" : (creatorRole == 52 ? "SBIGLIF" : "OTHER");
-
-        // 2. Initialize the Multi-Level Workflow State
-        VoucherPosting posting = new VoucherPosting();
-        posting.setBatchId(batchId);
-        posting.setVidFk(dto.getVid()); // Received from your new frontend payload
-        posting.setCreatorsRole(roleName);
-        posting.setCreatedBy(creatorId);
-        posting.setCurrentStatus("PENDING_L1");
-
-        // 3. Determine the specific Approval Route
-        if ("TCSGLIF".equalsIgnoreCase(roleName)) {
-            posting.setApprovalWorkflow("W1_3_APPROVERS"); // Route 1: TCS -> SBI -> SBI
-            posting.setNextApproval("TCSGLIF");
-        } else {
-            posting.setApprovalWorkflow("W2_4_APPROVERS"); // Route 2: TCS -> TCS -> SBI -> SBI
-            posting.setNextApproval("TCSGLIF");
-        }
-
-        // 4. Handle the Optional Scheduling from the frontend
-        if (dto.getScheduledTime() != null && !dto.getScheduledTime().isEmpty()) {
-            posting.setExecutionScheduled("YES");
-            posting.setScheduledTime(LocalDateTime.parse(dto.getScheduledTime().replace(" ", "T")));
-            posting.setIsScheduleOverride("NO");
-        } else {
-            posting.setExecutionScheduled("NO");
-        }
-
-        // Save to the database
-        voucherPostingRepository.save(posting);
-
-
         return savedEntities;
     }
-	
-	Variable 'roleName' is already defined in the scope
-	Variable 'posting' is already defined in the scope
-	Cannot resolve method 'isEmpty' in 'LocalDateTime'
-	Cannot resolve method 'replace' in 'LocalDateTime'
-	Cannot resolve method 'executeOraclePostingProcedure' in 'VoucherRequestServiceImpl'
+
+```
+### 2. Fix the executeOraclePostingProcedure Error
+This error is in your **processWorkflowAction** method (the Checker approval logic). I used executeOraclePostingProcedure as a generic placeholder for whatever method you normally use to execute the batch.
+Find this section in your processWorkflowAction method:
+**FIND THIS:**
+```java
+            } else {
+                posting.setCurrentStatus("POSTED");
+                posting.setExecutedAt(LocalDateTime.now());
+                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks());
+                
+                // TRIGGER YOUR ORACLE DB PROCEDURE HERE (e.g., PROCESS_JOURNAL_BATCH)
+                executeOraclePostingProcedure(batchId, executorId, dto.getRemarks());
+            }
+
+```
+**REPLACE WITH THIS (Using your actual execution method):**
+```java
+            } else {
+                posting.setCurrentStatus("POSTED");
+                posting.setExecutedAt(LocalDateTime.now());
+                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks());
+                
+                // Call your actual async bulk process method
+                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                execDto.setBatchId(batchId);
+                execDto.setStatus(RequestStatus.ACCEPTED);
+                execDto.setRemarks(dto.getRemarks());
+                
+                // Assuming processBulkRequestsAsync exists in this service to trigger the DB Procedure
+                this.processBulkRequestsAsync(execDto, executorId, executorRole); 
+            }
+
+```
+*(Note: If your existing method for executing batches is named something else, like executeAsyncBatchCreation, replace this.processBulkRequestsAsync with that exact method name).*
