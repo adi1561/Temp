@@ -1,201 +1,136 @@
-To build the backend workflow for the Manual Entry, we need to implement the core state machine. This involves three distinct phases: **Initialization** (when the Maker submits the manual grid), **Routing** (fetching the correct batches for the logged-in Checker), and **Progression** (the Checkers approving/rejecting the batch).
-Here is the exact step-by-step implementation guide to wire this up in your Spring Boot backend.
-### Step 1: Initialize the Workflow (The Maker Submission)
-When the user submits the Manual Entry grid from the frontend, it hits your createBatchRequest method. We need to update this method to register the batch in the new VOUCHER_POSTING table and set its initial state.
-**File to Update:** VoucherRequestServiceImpl.java (or your equivalent service class)
-Find your createBatchRequest method and add the workflow initialization logic right after you save the initial batch details.
-**ADD THIS CODE BLOCK:**
-```java
-    // ... inside createBatchRequest, after saving to JOURNAL_BATCH_MASTER ...
-
-    // 1. Map the Creator's Role ID to the Role Name (Adjust IDs based on your DB)
-    String roleName = (creatorRole == 51) ? "TCSGLIF" : (creatorRole == 52 ? "SBIGLIF" : "OTHER");
-
-    // 2. Initialize the Multi-Level Workflow State
-    VoucherPosting posting = new VoucherPosting();
-    posting.setBatchId(batchId);
-    posting.setVidFk(dto.getVid()); // Received from your new frontend payload
-    posting.setCreatorsRole(roleName);
-    posting.setCreatedBy(creatorId);
-    posting.setCurrentStatus("PENDING_L1"); 
-    
-    // 3. Determine the specific Approval Route
-    if ("TCSGLIF".equalsIgnoreCase(roleName)) {
-        posting.setApprovalWorkflow("W1_3_APPROVERS"); // Route 1: TCS -> SBI -> SBI
-        posting.setNextApproval("TCSGLIF"); 
-    } else {
-        posting.setApprovalWorkflow("W2_4_APPROVERS"); // Route 2: TCS -> TCS -> SBI -> SBI
-        posting.setNextApproval("TCSGLIF"); 
-    }
-
-    // 4. Handle the Optional Scheduling from the frontend
-    if (dto.getScheduledTime() != null && !dto.getScheduledTime().isEmpty()) {
-        posting.setExecutionScheduled("YES");
-        posting.setScheduledTime(LocalDateTime.parse(dto.getScheduledTime().replace(" ", "T")));
-        posting.setIsScheduleOverride("NO");
-    } else {
-        posting.setExecutionScheduled("NO");
-    }
-    
-    // Save to the database
-    voucherPostingRepository.save(posting);
-
-```
-### Step 2: The Checker Dashboard API (Role-Based Routing)
-When a Checker logs in, they should *only* see batches that are currently waiting for their specific role's approval. We need to create a fetch method that joins JOURNAL_BATCH_MASTER with our VOUCHER_POSTING table.
-**File to Update:** VoucherRequestServiceImpl.java
-**ADD THIS METHOD:**
-```java
-    @Override
-    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole) {
-        // Map the logged-in user's role
-        String roleName = (userRole == 51) ? "TCSGLIF" : (userRole == 52 ? "SBIGLIF" : "OTHER");
-
-        // Fetch only batches where NEXT_APPROVAL matches the current user's role
-        String sql = """
-            SELECT 
-                b.BATCH_ID, p.VID_FK, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
-                b.TOTAL_ROWS, b.TOTAL_DEBIT, b.TOTAL_CREDIT, 
-                p.CURRENT_STATUS, p.NEXT_APPROVAL, p.SCHEDULED_TIME
-            FROM JOURNAL_BATCH_MASTER b
-            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
-            WHERE p.NEXT_APPROVAL = ? 
-              AND p.CURRENT_STATUS LIKE 'PENDING_%'
-            ORDER BY b.REQ_DATE DESC
-        """;
-
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID_FK"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("remarks", rs.getString("BATCH_REMARKS"));
-            map.put("totalRows", rs.getLong("TOTAL_ROWS"));
-            map.put("totalAmount", rs.getBigDecimal("TOTAL_DEBIT"));
-            map.put("workflowState", rs.getString("CURRENT_STATUS"));
-            
-            Timestamp scheduled = rs.getTimestamp("SCHEDULED_TIME");
-            map.put("scheduledTime", scheduled != null ? scheduled.toLocalDateTime().toString() : null);
-
-            return map;
-        }, roleName); 
-    }
-
-```
-### Step 3: The State Machine Engine (Approval/Rejection)
-This is the most critical part of the backend. It enforces the business rules (no self-approval, no duplicate approvals) and moves the state from L1 to L2 to L3.
-**File to Update:** VoucherRequestServiceImpl.java
-**ADD THIS METHOD:**
-```java
+  @Override
     @Transactional
-    public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
-        String batchId = dto.getBatchId();
-        
-        VoucherPosting posting = voucherPostingRepository.findById(batchId)
-                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch ID not found."));
+    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole)  {
+        String batchId = sequenceService.getNextBatchId();
+        String journalPrefix = sequenceService.getNextJournalIdPrefix();
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
 
-        // 1. Business Rule: Prevent Self-Approval
-        if (executorId.equalsIgnoreCase(posting.getCreatedBy())) {
-            throw new CustomExceptions.InvalidDataException("Security Violation: You cannot approve a batch you created.");
-        }
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal totalDebit = BigDecimal.ZERO;
+        BigDecimal totalCredit = BigDecimal.ZERO;
+        int rowIndex = 1;
 
-        // 2. Business Rule: Prevent Duplicate Approvals
-        boolean hasAlreadyApproved = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId)
-                .stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
-        if (hasAlreadyApproved) {
-            throw new CustomExceptions.InvalidDataException("Security Violation: You have already approved this batch at a previous level.");
-        }
+        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setRequestDate(LocalDateTime.now());
+            entity.setCreatorId(creatorId);
+            entity.setCreatorRole(creatorRole);
+            entity.setBatchId(batchId);
+            entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
 
-        // 3. Process Rejection
-        if (dto.getStatus() == RequestStatus.REJECTED) {
-            posting.setCurrentStatus("REJECTED");
-            posting.setNextApproval(null);
-            voucherPostingRepository.save(posting);
-            
-            logWorkflowAction(batchId, posting.getVidFk(), "REJECTED", executorId, dto.getRemarks());
-            
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED' WHERE BATCH_ID = ?", batchId);
-            return;
-        }
+            String journalId = journalPrefix + "-" + rowIndex;
+            entity.setJournalId(journalId);
+            entity.setBranchCode(row.getBranch());
+            entity.setCurrency(row.getCurrency());
+            entity.setCgl(row.getCgl());
 
-        // 4. State Machine Progression (Approval)
-        boolean isFinalApproval = false;
-        String nextState = "";
-        String nextRoleRequired = "";
-
-        if ("W1_3_APPROVERS".equals(posting.getApprovalWorkflow())) {
-            switch (posting.getCurrentStatus()) {
-                case "PENDING_L1": nextState = "PENDING_L2"; nextRoleRequired = "SBIGLIF"; break; 
-                case "PENDING_L2": nextState = "PENDING_L3"; nextRoleRequired = "SBIGLIF"; break; 
-                case "PENDING_L3": isFinalApproval = true; break; 
+            BigDecimal amount = row.getAmount();
+            if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
+                throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
             }
-        } else if ("W2_4_APPROVERS".equals(posting.getApprovalWorkflow())) {
-            switch (posting.getCurrentStatus()) {
-                case "PENDING_L1": nextState = "PENDING_L2"; nextRoleRequired = "TCSGLIF"; break; 
-                case "PENDING_L2": nextState = "PENDING_L3"; nextRoleRequired = "SBIGLIF"; break; 
-                case "PENDING_L3": nextState = "PENDING_L4"; nextRoleRequired = "SBIGLIF"; break; 
-                case "PENDING_L4": isFinalApproval = true; break; 
+            if (amount.compareTo(BigDecimal.ZERO) == 0) {
+                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
             }
-        }
+            entity.setAmount(amount);
+            entity.setPosting_date(row.getPostingDate() != null ? row.getPostingDate() : LocalDate.now());
+            entity.setNarration(row.getRemarks());
+            entity.setProductCode(row.getProductType());
 
-        if (isFinalApproval) {
-            // Check Schedule Logic
-            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
-                posting.setCurrentStatus("SCHEDULED");
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_SCHEDULED", executorId, dto.getRemarks());
+            if (amount.compareTo(BigDecimal.ZERO) < 0) {
+                totalCredit = totalCredit.add(amount.abs());
             } else {
-                posting.setCurrentStatus("POSTED");
-                posting.setExecutedAt(LocalDateTime.now());
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks());
-                
-                // TRIGGER YOUR ORACLE DB PROCEDURE HERE (e.g., PROCESS_JOURNAL_BATCH)
-                executeOraclePostingProcedure(batchId, executorId, dto.getRemarks());
+                totalDebit = totalDebit.add(amount.abs());
             }
-            posting.setNextApproval(null);
+
+            entities.add(entity);
+            rowIndex++;
+        }
+
+        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+
+        // 1. Insert into Legacy Master Table
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        jdbcTemplate.update(sumSql, batchId, creatorId, ts, dto.getCommonBatchRemarks(), entities.size(), totalDebit, totalCredit, "PENDING");
+
+        // 2. Initialize New Workflow Engine
+        String roleName = getRoleName(creatorRole);
+        VoucherPosting posting = new VoucherPosting();
+        posting.setBatchId(batchId);
+        posting.setVidFk(dto.getVid()); // From DTO
+        posting.setCreatorsRole(roleName);
+        posting.setCreatedBy(creatorId);
+        posting.setCurrentStatus("PENDING_L1");
+
+        // Determine Workflow Route
+        if ("TCSGLIF".equalsIgnoreCase(roleName)) {
+            posting.setApprovalWorkflow("W1_3_APPROVERS"); // 1 TCS, 2 SBI
+            posting.setNextApproval("TCSGLIF"); // First step is TCSGLIF
         } else {
-            posting.setCurrentStatus(nextState);
-            posting.setNextApproval(nextRoleRequired);
-            logWorkflowAction(batchId, posting.getVidFk(), "APPROVED_" + posting.getCurrentStatus(), executorId, dto.getRemarks());
+            posting.setApprovalWorkflow("W2_4_APPROVERS"); // 2 TCS, 2 SBI
+            posting.setNextApproval("TCSGLIF"); // First step is TCSGLIF
+        }
+
+        // Handle Maker Scheduling
+        if (dto.getScheduledTime() != null) {
+            posting.setExecutionScheduled("YES");
+            posting.setScheduledTime(dto.getScheduledTime());
+            posting.setIsScheduleOverride("NO");
+        } else {
+            posting.setExecutionScheduled("NO");
         }
 
         voucherPostingRepository.save(posting);
+
+        // 3. Notifications & Audits
+        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under workflow " + posting.getApprovalWorkflow());
+        sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
+
+        // Alert the Next Approver (TCSGLIF in both scenarios)
+        NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+        if (config != null) {
+            String msg = String.format("New Batch %s by %s requires Level 1 approval.", batchId, creatorId);
+            sendNotification(null, config.getTargetRoles(), msg, batchId);
+        }
+
+        // 1. Map the Creator's Role ID to the Role Name (Adjust IDs based on your DB)
+        String roleName = (creatorRole == 51) ? "TCSGLIF" : (creatorRole == 52 ? "SBIGLIF" : "OTHER");
+
+        // 2. Initialize the Multi-Level Workflow State
+        VoucherPosting posting = new VoucherPosting();
+        posting.setBatchId(batchId);
+        posting.setVidFk(dto.getVid()); // Received from your new frontend payload
+        posting.setCreatorsRole(roleName);
+        posting.setCreatedBy(creatorId);
+        posting.setCurrentStatus("PENDING_L1");
+
+        // 3. Determine the specific Approval Route
+        if ("TCSGLIF".equalsIgnoreCase(roleName)) {
+            posting.setApprovalWorkflow("W1_3_APPROVERS"); // Route 1: TCS -> SBI -> SBI
+            posting.setNextApproval("TCSGLIF");
+        } else {
+            posting.setApprovalWorkflow("W2_4_APPROVERS"); // Route 2: TCS -> TCS -> SBI -> SBI
+            posting.setNextApproval("TCSGLIF");
+        }
+
+        // 4. Handle the Optional Scheduling from the frontend
+        if (dto.getScheduledTime() != null && !dto.getScheduledTime().isEmpty()) {
+            posting.setExecutionScheduled("YES");
+            posting.setScheduledTime(LocalDateTime.parse(dto.getScheduledTime().replace(" ", "T")));
+            posting.setIsScheduleOverride("NO");
+        } else {
+            posting.setExecutionScheduled("NO");
+        }
+
+        // Save to the database
+        voucherPostingRepository.save(posting);
+
+
+        return savedEntities;
     }
-
-    private void logWorkflowAction(String batchId, String vid, String action, String executorId, String remarks) {
-        VoucherWorkflow wf = new VoucherWorkflow();
-        wf.setBatchIdFk(batchId);
-        wf.setVidFk(vid);
-        wf.setLastAction(action);
-        wf.setLastActionBy(executorId);
-        wf.setRemarks(remarks);
-        voucherWorkflowRepository.save(wf);
-    }
-
-```
-### Step 4: Expose the Controller Endpoints
-Finally, map these new services to REST endpoints so your frontend Checker screen can call them.
-**File to Update:** VoucherPostingController.java
-**ADD THESE ENDPOINTS:**
-```java
-    @GetMapping("/checker/pending-approvals")
-    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
-        Integer userRole = jwtUtil.getUserRoleFromToken(token); // Extract role from JWT
-        return ResponseEntity.ok(voucherRequestService.getPendingBatchesForChecker(userRole));
-    }
-
-    @PostMapping("/workflow/action")
-    public ResponseEntity<Map<String, String>> processCheckerAction(
-            @RequestHeader("Authorization") String token, 
-            @Valid @RequestBody ProcessVoucherRequestDto dto) {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-        voucherRequestService.processWorkflowAction(dto, userId, userRole);
-
-        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Workflow action processed successfully."));
-    }
-
-```
-Once you plug these backend blocks in, the Manual Entry grid you just built will automatically route into this robust, role-based state machine. Should we look at building the frontend Checker UI to consume these APIs next?
+	
+	Variable 'roleName' is already defined in the scope
+	Variable 'posting' is already defined in the scope
+	Cannot resolve method 'isEmpty' in 'LocalDateTime'
+	Cannot resolve method 'replace' in 'LocalDateTime'
+	Cannot resolve method 'executeOraclePostingProcedure' in 'VoucherRequestServiceImpl'
