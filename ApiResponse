@@ -1,144 +1,771 @@
-The compilation errors you are seeing are caused by two things:
- 1. **Duplicate Code:** You accidentally pasted the workflow initialization block twice inside the same method.
- 2. **Type Mismatch:** Your dto.getScheduledTime() is already a LocalDateTime object (because Spring Boot automatically converts it from the frontend JSON), so you cannot use String methods like .isEmpty() or .replace() on it.
-Lastly, the executeOraclePostingProcedure error is from the processWorkflowAction method (not this one), because it was a placeholder I put for your existing execution logic.
-Here is exactly how to fix all of these issues.
-### 1. Fix the createBatchRequest Method
-Replace your entire createBatchRequest method with this cleaned-up version. I have removed the duplicate variables and fixed the LocalDateTime logic.
-```java
-    @Override
-    @Transactional
-    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole)  {
-        String batchId = sequenceService.getNextBatchId();
-        String journalPrefix = sequenceService.getNextJournalIdPrefix();
-        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+  TablePagination,
+  Alert,
+  FormHelperText,
+} from "@mui/material";
 
-        List<JournalRequest> entities = new ArrayList<>();
-        BigDecimal totalDebit = BigDecimal.ZERO;
-        BigDecimal totalCredit = BigDecimal.ZERO;
-        int rowIndex = 1;
 
-        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
-            JournalRequest entity = new JournalRequest();
-            entity.setRequestStatus(RequestStatus.PENDING);
-            entity.setRequestDate(LocalDateTime.now());
-            entity.setCreatorId(creatorId);
-            entity.setCreatorRole(creatorRole);
-            entity.setBatchId(batchId);
-            entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
 
-            String journalId = journalPrefix + "-" + rowIndex;
-            entity.setJournalId(journalId);
-            entity.setBranchCode(row.getBranch());
-            entity.setCurrency(row.getCurrency());
-            entity.setCgl(row.getCgl());
 
-            BigDecimal amount = row.getAmount();
-            if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
-                throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
-            }
-            if (amount.compareTo(BigDecimal.ZERO) == 0) {
-                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
-            }
-            entity.setAmount(amount);
-            entity.setPosting_date(row.getPostingDate() != null ? row.getPostingDate() : LocalDate.now());
-            entity.setNarration(row.getRemarks());
-            entity.setProductCode(row.getProductType());
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Check as CheckIcon,
+  Clear as ClearIcon,
+  Visibility as VisibilityIcon,
+  FileDownload as FileDownloadIcon,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import { alpha } from "@mui/material/styles";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-            if (amount.compareTo(BigDecimal.ZERO) < 0) {
-                totalCredit = totalCredit.add(amount.abs());
-            } else {
-                totalDebit = totalDebit.add(amount.abs());
-            }
+const styles = {
+  mainContainer: {
+    padding: 3,
+    height: "100%",
+    width: "100%",
+  },
+  dataGridContainer: {
+    height: 600,
+    width: "100%",
+    backgroundColor: "background.paper",
+    boxShadow: 2,
+    borderRadius: 2,
+    border: 1,
+    borderColor: "divider",
+    "& .MuiDataGrid-columnHeaders": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+      fontWeight: "bold",
+      fontSize: "0.95rem",
+    },
+    "& .MuiDataGrid-row:hover": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
+    },
+  },
+  tableContainer: {
+    maxHeight: 450,
+    overflowY: "auto",
+    border: 1,
+    borderColor: "divider",
+    mt: 1
+  },
+  fixedContentBox: {
+    minHeight: 400,
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+  },
+  tableHeaderCell: {
+    fontWeight: "bold",
+    backgroundColor: "#f5f6f8",
+    color: "text.primary",
+    whiteSpace: "nowrap",
+    zIndex: 10,
+  },
+  stickyHeaderColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    top: 0,
+    zIndex: 20,
+    backgroundColor: "background.paper",
+    borderBottom: 1,
+    borderRight: 1,
+    borderColor: "divider",
+    fontWeight: "bold",
+  }),
+  stickyBodyColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    zIndex: 5,
+    backgroundColor: "background.paper",
+    borderRight: 1,
+    borderColor: "divider",
+  }),
+  dialogTitle: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    pb: 1,
+  },
+  dialogActions: { p: 2, borderTop: 1, borderColor: "divider" },
+  loadingContainer: {
+    height: "100%",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  helperText: {
+    fontSize: "0.75rem",
+    color: "text.secondary",
+    marginTop: "4px",
+  }
+};
 
-            entities.add(entity);
-            rowIndex++;
-        }
+const formatCurrency = (val) => {
+  if (val === null || val === undefined || val === "") return "0.0000";
+  
+  // Ensure it's a string without using Number()
+  const strVal = String(val).trim();
+  
+  // Split into integer and decimal parts
+  const parts = strVal.split(".");
+  let intPart = parts[0];
+  let decPart = parts[1] || "";
 
-        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+  // Pad or truncate to exactly 4 decimal places
+  decPart = decPart.padEnd(4, "0").substring(0, 4);
 
-        // 1. Insert into Legacy Master Table
-        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-        jdbcTemplate.update(sumSql, batchId, creatorId, ts, dto.getCommonBatchRemarks(), entities.size(), totalDebit, totalCredit, "PENDING");
+  // Safely add commas to the integer part (e.g. 1000000 -> 1,000,000)
+  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 
-        // 2. Initialize New Workflow Engine
-        String roleName = (creatorRole == 51) ? "TCSGLIF" : (creatorRole == 52 ? "SBIGLIF" : "OTHER");
-        
-        VoucherPosting posting = new VoucherPosting();
-        posting.setBatchId(batchId);
-        posting.setVidFk(dto.getVid()); // From DTO
-        posting.setCreatorsRole(roleName);
-        posting.setCreatedBy(creatorId);
-        posting.setCurrentStatus("PENDING_L1");
+  return `${intPart}.${decPart}`;
+};
 
-        // Determine Workflow Route
-        if ("TCSGLIF".equalsIgnoreCase(roleName)) {
-            posting.setApprovalWorkflow("W1_3_APPROVERS"); // Route 1: 1 TCS, 2 SBI
-            posting.setNextApproval("TCSGLIF"); // First step is TCSGLIF
-        } else {
-            posting.setApprovalWorkflow("W2_4_APPROVERS"); // Route 2: 2 TCS, 2 SBI
-            posting.setNextApproval("TCSGLIF"); // First step is TCSGLIF
-        }
+const getTxnTypeColor = (txnType) =>
+  txnType === "Credit" ? "error" : "success";
 
-        // Handle Maker Scheduling (Fixed LocalDateTime check)
-        if (dto.getScheduledTime() != null) {
-            posting.setExecutionScheduled("YES");
-            posting.setScheduledTime(dto.getScheduledTime()); // It is already a LocalDateTime object
-            posting.setIsScheduleOverride("NO");
-        } else {
-            posting.setExecutionScheduled("NO");
-        }
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Pending Requests</Typography>
+    </Stack>
+  );
+}
 
-        voucherPostingRepository.save(posting);
+export default function JournalAuthorization() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
 
-        // 3. Notifications & Audits
-        // If logAudit and sendNotification are missing, make sure they exist in your service, 
-        // or comment them out if you handle notifications differently.
-        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under workflow " + posting.getApprovalWorkflow());
-        sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED");
+  const [executorRemarks, setExecutorRemarks] = useState("");
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
+  const [detailPage, setDetailPage] = useState(0);
+  const [detailRowsPerPage, setDetailRowsPerPage] = useState(10);
+  const [detailTotalCount, setDetailTotalCount] = useState(0);
+  const handleDownloadExcel = async () => {
 
-        // Alert the Next Approver (TCSGLIF in both scenarios)
-        NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-        if (config != null) {
-            String msg = String.format("New Batch %s by %s requires Level 1 approval.", batchId, creatorId);
-            sendNotification(null, config.getTargetRoles(), msg, batchId);
-        }
-
-        return savedEntities;
+    if (!viewingBatchId) {
+      showSnackBar("Error: Batch ID is missing!", "error");
+      return;
     }
 
-```
-### 2. Fix the executeOraclePostingProcedure Error
-This error is in your **processWorkflowAction** method (the Checker approval logic). I used executeOraclePostingProcedure as a generic placeholder for whatever method you normally use to execute the batch.
-Find this section in your processWorkflowAction method:
-**FIND THIS:**
-```java
-            } else {
-                posting.setCurrentStatus("POSTED");
-                posting.setExecutedAt(LocalDateTime.now());
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks());
-                
-                // TRIGGER YOUR ORACLE DB PROCEDURE HERE (e.g., PROCESS_JOURNAL_BATCH)
-                executeOraclePostingProcedure(batchId, executorId, dto.getRemarks());
-            }
+    try {
+      showSnackBar("Downloading Excel...", "info");
 
-```
-**REPLACE WITH THIS (Using your actual execution method):**
-```java
-            } else {
-                posting.setCurrentStatus("POSTED");
-                posting.setExecutedAt(LocalDateTime.now());
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks());
-                
-                // Call your actual async bulk process method
-                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-                execDto.setBatchId(batchId);
-                execDto.setStatus(RequestStatus.ACCEPTED);
-                execDto.setRemarks(dto.getRemarks());
-                
-                // Assuming processBulkRequestsAsync exists in this service to trigger the DB Procedure
-                this.processBulkRequestsAsync(execDto, executorId, executorRole); 
-            }
+      const response = await callApi(
+        `/JS/voucher/download-batch/${viewingBatchId}`,
+        null,
+        "GET",
+        "blob",
+        null,
+        {},
+        false
+      );
 
-```
-*(Note: If your existing method for executing batches is named something else, like executeAsyncBatchCreation, replace this.processBulkRequestsAsync with that exact method name).*
+      const blobData = response.data || response;
+      if (!blobData) {
+        throw new Error("No data received from backend");
+      }
+
+      const blob = new Blob([blobData], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = window.URL.createObjectURL(blob);
+
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", `Batch_${viewingBatchId}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      showSnackBar("Download complete.", "success");
+    } catch (e) {
+      console.error("Download failed:", e);
+      let errorMsg = "Failed to download Excel file.";
+      if (e.response && e.status === 404) {
+        errorMsg = "API endpoint not found (404).";
+      }
+      showSnackBar(errorMsg, "error");
+    }
+  };
+
+  useEffect(() => {
+    isMounted.current = true;
+    try {
+      const auth =
+        sessionStorage.getItem("persist:auth") ||
+        localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+      }
+    } catch (e) { }
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  const filterAndWarn = (val, type) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphanumeric and / & ( ) , . - are allowed.";
+
+    if (type === "alphanumeric_space") {
+      // 1. Strip any character that is NOT alphanumeric or in the allowed special chars list
+      filtered = val.replace(/[^a-zA-Z0-9 ]/g, "");
+      if (filtered !== val) {
+        hasError = true;
+      }
+
+      // 2. Strip leading space and collapse double spaces (enforces the (?!.* {2}) regex rule)
+      const beforeSpaceTrim = filtered;
+      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+      if (beforeSpaceTrim !== filtered && !hasError) {
+        hasError = true;
+        msg = "Remark should not start with space or contain consecutive spaces.";
+      }
+    }
+
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+    return filtered;
+  };
+  const handleRemarksChange = (e, setter) => {
+    const val = filterAndWarn(e.target.value, "alphanumeric_space");
+    if (val.length <= 30) {
+      setter(val);
+    }
+  };
+
+  // Validation logic: Remarks are strictly compulsory (min 2, max 30)
+  const isRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+
+  const isViewingSelfCreated =
+    currentUserId &&
+    viewingBatchCreatorId &&
+    String(currentUserId).trim().toUpperCase() ===
+    String(viewingBatchCreatorId).trim().toUpperCase();
+
+  const isLargeBatch = detailTotalCount > 2000;
+
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await callApi(
+        "/JS/voucher/pending-requests-summary",
+        null,
+        "GET"
+      );
+      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
+    } catch (err) {
+      if (isMounted.current && err.name !== "CanceledError")
+        showSnackBar("Failed to load requests", "error");
+    } finally {
+      if (isMounted.current) setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchPendingBatches();
+  }, [fetchPendingBatches]);
+
+
+
+  const fetchBatchDetailsPaginated = async (batchId, page, size) => {
+    setDetailLoading(true);
+    try {
+      const res = await callApi(
+        `/JS/voucher/by-batch-paginated/${batchId}?page=${page}&size=${size}`,
+        null,
+        "GET"
+      );
+
+      const contentArray = res?.content || (Array.isArray(res) ? res : []);
+
+      if (contentArray && isMounted.current) {
+        setDetailTotalCount(res?.totalElements || contentArray.length || 0);
+        const journalGroups = new Map();
+
+        contentArray.forEach((req, index) => {
+          try {
+            console.log("Backend Row Data in Authorization:", req);
+
+            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
+            const prefix = String(jId).split("-")[0];
+
+            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
+
+            const row = {
+              ...req,
+              journalPrefix: prefix, // Save the distinct prefix
+              amount: Math.abs(amountVal),
+      transactionType: amountVal < 0 ? "Credit" : "Debit",
+              branch: req.branchCode || req.reqBranchCode || "-",
+              currency: req.currency || req.reqCurrency || "-",
+              cgl: req.cgl || req.reqCgl || "-",
+              remarks: req.narration || req.reqNarration || "-",
+              product: req.productCode || req.reqProduct || "-",
+            };
+
+            // FIX: Group explicitly by Branch!
+            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
+            journalGroups.get(prefix).push(row);
+
+          } catch (e) {
+            console.error("Failed to map row details:", req, e);
+          }
+        });
+        setBatchDetails(Array.from(journalGroups.values()));
+      }
+    } catch (e) {
+      if (isMounted.current) showSnackBar("Failed to load details", "error");
+    } finally {
+      if (isMounted.current) setDetailLoading(false);
+    }
+  };
+
+  const handleOpenViewModal = (batchId, creatorId) => {
+    setViewingBatchId(batchId);
+    setViewingBatchCreatorId(String(creatorId));
+    setDetailPage(0);
+    setDetailRowsPerPage(10);
+    setIsViewModalOpen(true);
+    fetchBatchDetailsPaginated(batchId, 0, 10);
+  };
+
+  const handleDetailPageChange = (event, newPage) => {
+    setDetailPage(newPage);
+    fetchBatchDetailsPaginated(viewingBatchId, newPage, detailRowsPerPage);
+  };
+
+  const handleDetailRowsPerPageChange = (event) => {
+    const newSize = parseInt(event.target.value, 10);
+    setDetailRowsPerPage(newSize);
+    setDetailPage(0);
+    fetchBatchDetailsPaginated(viewingBatchId, 0, newSize);
+  };
+
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setViewingBatchCreatorId(null);
+    fetchPendingBatches();
+  };
+
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleSubmitAction = async () => {
+    if (!isRemarksValid(executorRemarks)) {
+      showSnackBar("Remarks are compulsory (2-30 chars).", "warning");
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const response = await callApi(
+        "/JS/voucher/process-bulk",
+        {
+          batchId: selectedBatch.batchId,
+          status: modalMode,
+          remarks: executorRemarks.trim(),
+        },
+        "POST"
+      );
+
+      // Dynamically change text based on ACCEPTED or REJECTED
+      const fallbackMsg = modalMode === "ACCEPTED"
+        ? "Approval process started in background. You will be notified upon completion."
+        : "Rejection process started in background. You will be notified upon completion.";
+
+      const displayMessage = response?.message || fallbackMsg;
+      showSnackBar(displayMessage, "info");
+
+      handleCloseModal();
+      fetchPendingBatches();
+    } catch (e) {
+      let errorMsg = "Failed to process request.";
+      if (e.response && e.response.data && e.response.data.message) {
+        errorMsg = e.response.data.message;
+      } else if (e.message) {
+        errorMsg = e.message;
+      }
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Chip label={p.value} color="warning" size="small" variant="outlined" />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Chip icon={<AccountCircleIcon />} label={p.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) =>
+        new Date(p.value).toLocaleString("en-IN", {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }),
+    },
+
+    {
+      field: "requestCount",
+      headerName: "No. of Entries",
+      width: 220,  // Increased width to ensure visibility
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+       width: 220, 
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 150,
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 1,
+      minWidth: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const isSelf =
+          currentUserId &&
+          params.row.creatorId &&
+          String(currentUserId).trim().toUpperCase() ===
+          String(params.row.creatorId).trim().toUpperCase();
+        return (
+          <Stack direction="row" spacing={1} justifyContent="center">
+            <Tooltip title="View">
+              <IconButton
+                onClick={() =>
+                  handleOpenViewModal(params.row.batchId, params.row.creatorId)
+                }
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={isSelf ? "Self-approval disabled" : "Accept"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "ACCEPTED")}
+                  color="success"
+                  disabled={isSelf}
+                >
+                  <CheckIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title={isSelf ? "Self-rejection disabled" : "Reject"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "REJECTED")}
+                  color="error"
+                  disabled={isSelf}
+                >
+                  <ClearIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Box sx={styles.mainContainer}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize
+        rowHeight={52}
+        initialState={{
+          pagination: { paginationModel: { page: 0, pageSize: 10 } },
+        }}
+        slots={{ noRowsOverlay: CustomNoRowsOverlay }}
+        sx={styles.dataGridContainer}
+      />
+
+      {/* --- Main Grid Approve/Reject Dialog --- */}
+
+      <Dialog 
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+   <DialogTitle>
+          {modalMode === "ACCEPTED" ? "Accept" : "Reject"} Batch ID
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Please provide the remarks to {modalMode === "ACCEPTED" ? "Accept" : "Reject"} Batch ID{" "}
+            <strong>{selectedBatch?.batchId}</strong>
+          </DialogContentText>
+          <TextField
+            autoFocus
+            required
+            margin="dense"
+            label="Remarks "
+            fullWidth
+            variant="standard"
+            value={executorRemarks}
+            onChange={(e) => handleRemarksChange(e, setExecutorRemarks)}
+            disabled={isSubmitting}
+            inputProps={{ maxLength: 30 }}
+            error={executorRemarks.length > 0 && !isRemarksValid(executorRemarks)}
+          />
+ <Typography sx={styles.helperText}>
+            Allowed 2-30 chars (alphabets, numbers)
+          </Typography>
+
+        </DialogContent>
+        <DialogActions sx={styles.dialogActions}>
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
+            Cancel
+          </Button>
+ <Button
+            onClick={handleSubmitAction}
+            variant="contained"
+            color={modalMode === "ACCEPTED" ? "success" : "error"}
+            disabled={isSubmitting || !isRemarksValid(executorRemarks)}
+          >
+            {isSubmitting ? <CircularProgress size={24} /> : (modalMode === "ACCEPTED" ? "Accept" : "Reject")}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* --- View Details Modal --- */}
+      <Dialog
+        open={isViewModalOpen}
+        onClose={handleCloseViewModal}
+        fullWidth
+        maxWidth="lg"
+      >
+        <DialogTitle sx={styles.dialogTitle}>
+          <Typography variant="h6">
+            Batch Details: {viewingBatchId}
+          </Typography>
+          <Stack direction="row" spacing={2} alignItems="center">
+            <Button
+              variant="outlined"
+              size="small"
+              startIcon={<FileDownloadIcon />}
+              onClick={handleDownloadExcel}
+              disabled={!viewingBatchId}
+              sx={{ textTransform: "none", borderRadius: 1.5 }}
+            >
+              Export Excel
+            </Button>
+            <IconButton onClick={handleCloseViewModal}>
+              <CloseIcon />
+            </IconButton>
+          </Stack>
+        </DialogTitle>
+        <DialogContent dividers sx={{ p: 0 }}>
+          <Box sx={styles.fixedContentBox}>
+
+            <TableContainer component={Paper} sx={{ ...styles.tableContainer, position: "relative", minHeight: 350 }}>
+
+              {/* NEW: SMOOTH LOADING OVERLAY */}
+              {detailLoading && (
+                <Box
+                  sx={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: "100%",
+                    backgroundColor: "rgba(255, 255, 255, 0.6)", // Slight transparent white fade
+                    display: "flex",
+                    justifyContent: "center",
+                    alignItems: "center",
+                    zIndex: 999, // Puts spinner on top of the table
+                  }}
+                >
+                  <CircularProgress />
+                </Box>
+              )}
+
+              <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                <TableHead>
+                  <TableRow>
+                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "10%" }}>Branch</TableCell>
+                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "10%" }}>Currency</TableCell>
+                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "15%" }}>CGL</TableCell>
+                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "20%" }}>Amount</TableCell>
+                    <TableCell align="center" sx={{ ...styles.tableHeaderCell, width: "10%" }}>Type</TableCell>
+                    <TableCell align="left" sx={{ ...styles.tableHeaderCell, width: "35%" }}>Remarks</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {batchDetails.length > 0 ? (
+                    batchDetails.map((group) =>
+                      group.map((row) => (
+                        <TableRow key={row.id} hover>
+                          <TableCell align="center">{row.branch}</TableCell>
+                          <TableCell align="center">{row.currency}</TableCell>
+                          <TableCell align="center">{row.cgl}</TableCell>
+                          <TableCell align="center">{formatCurrency(row.amount)}</TableCell>
+                          <TableCell align="center">
+                            <Chip label={row.transactionType} color={getTxnTypeColor(row.transactionType)} size="small" sx={{ fontWeight: 'bold' }} />
+                          </TableCell>
+                          <TableCell align="left">{row.remarks}</TableCell>
+                        </TableRow>
+                      ))
+                    )
+                  ) : (
+                    !detailLoading && (
+                      <TableRow>
+                        <TableCell colSpan={6} align="center" sx={{ py: 5 }}>
+                          <Typography>No details found.</Typography>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+
+            {/* Pagination is now permanently anchored at the bottom */}
+            <TablePagination
+              component="div"
+              count={detailTotalCount}
+              page={detailPage}
+              onPageChange={handleDetailPageChange}
+              rowsPerPage={detailRowsPerPage}
+              onRowsPerPageChange={handleDetailRowsPerPageChange}
+              rowsPerPageOptions={[10, 25, 50]}
+            />
+          </Box>
+        </DialogContent>
+
+
+        <DialogActions sx={styles.dialogActions}>
+
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+now i want to do the changes in the frontend auth screen 
