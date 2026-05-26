@@ -1,19 +1,180 @@
-there is one change in the flow like i also want the flow to be little change like 
-i want to get all the date from this table with catagory  , role and date (created at )
+To handle a requirement where filters are **optional** (meaning if you pass nothing, it returns everything; if you pass one filter, it filters by that one; if you pass all, it filters by all), the best and most professional way to do this in Spring Boot is using **JPA Specifications**.
+Here are the step-by-step code files to create this dynamic filtering flow for the REQUEST_VOUCHER table.
+### Step 1: Create the Entity Model
+If you haven't mapped this table to a Java object yet, create this in your Models folder.
+**File:** RequestVoucher.java (in com.fincore.VoucherService.Models)
+```java
+package com.fincore.VoucherService.Models;
 
-Request_voucher 
-ID	NUMBER	No	"FINCORE"."ISEQ$$_81233".nextval	1	
-VID	VARCHAR2(20 BYTE)	No		2	
-CATEGORY	VARCHAR2(20 BYTE)	No		3	
-DESCRIPTION	VARCHAR2(500 BYTE)	No		4	
-ALLOWED_ROLE	VARCHAR2(100 BYTE)	No		5	
-SD_REQ_NO	VARCHAR2(100 BYTE)	Yes		6	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		7	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	8	
-TERMINATED_BY	VARCHAR2(100 BYTE)	Yes		9	
-TERMINATED_AT	TIMESTAMP(6)	Yes		10	
-STATUS	VARCHAR2(30 BYTE)	No		11	
-REMARKS	VARCHAR2(50 BYTE)	Yes		12	
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
 
+@Entity
+@Table(name = "REQUEST_VOUCHER")
+@Data
+public class RequestVoucher {
 
-suppose i dont pass any filter then it should get all the data 
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "ID")
+    private Long id;
+
+    @Column(name = "VID", length = 20, nullable = false)
+    private String vid;
+
+    @Column(name = "CATEGORY", length = 20, nullable = false)
+    private String category;
+
+    @Column(name = "DESCRIPTION", length = 500, nullable = false)
+    private String description;
+
+    @Column(name = "ALLOWED_ROLE", length = 100, nullable = false)
+    private String allowedRole;
+
+    @Column(name = "SD_REQ_NO", length = 100)
+    private String sdReqNo;
+
+    @Column(name = "CREATED_BY", length = 100)
+    private String createdBy;
+
+    @Column(name = "CREATED_AT", updatable = false)
+    private LocalDateTime createdAt = LocalDateTime.now();
+
+    @Column(name = "TERMINATED_BY", length = 100)
+    private String terminatedBy;
+
+    @Column(name = "TERMINATED_AT")
+    private LocalDateTime terminatedAt;
+
+    @Column(name = "STATUS", length = 30, nullable = false)
+    private String status;
+
+    @Column(name = "REMARKS", length = 50)
+    private String remarks;
+}
+
+```
+### Step 2: Create the Repository
+To support dynamic filtering, the repository must extend JpaSpecificationExecutor.
+**File:** RequestVoucherRepository.java (in com.fincore.VoucherService.Repository)
+```java
+package com.fincore.VoucherService.Repository;
+
+import com.fincore.VoucherService.Models.RequestVoucher;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface RequestVoucherRepository extends JpaRepository<RequestVoucher, Long>, JpaSpecificationExecutor<RequestVoucher> {
+}
+
+```
+### Step 3: Create the Service Logic
+This is where the magic happens. We build a query dynamically based on what the user passes.
+**File:** RequestVoucherService.java (in com.fincore.VoucherService.Service)
+```java
+package com.fincore.VoucherService.Service;
+
+import com.fincore.VoucherService.Models.RequestVoucher;
+import com.fincore.VoucherService.Repository.RequestVoucherRepository;
+import jakarta.persistence.criteria.Predicate;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestVoucherService {
+
+    private final RequestVoucherRepository requestVoucherRepository;
+
+    public List<RequestVoucher> getFilteredVouchers(String category, String role, LocalDate date) {
+        log.info("Fetching Request Vouchers | Category: {}, Role: {}, Date: {}", category, role, date);
+
+        Specification<RequestVoucher> spec = (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+
+            // 1. Add Category Filter if provided
+            if (category != null && !category.trim().isEmpty()) {
+                predicates.add(cb.equal(root.get("category"), category.trim()));
+            }
+
+            // 2. Add Role Filter if provided
+            if (role != null && !role.trim().isEmpty()) {
+                predicates.add(cb.equal(root.get("allowedRole"), role.trim()));
+            }
+
+            // 3. Add Date Filter if provided (Matches from 00:00:00 to 23:59:59 of that day)
+            if (date != null) {
+                LocalDateTime startOfDay = date.atStartOfDay();
+                LocalDateTime endOfDay = date.atTime(23, 59, 59, 999999999);
+                predicates.add(cb.between(root.get("createdAt"), startOfDay, endOfDay));
+            }
+
+            // If no filters were added, this returns all records.
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+
+        // Sort by ID or CreatedAt descending so newest records appear first
+        return requestVoucherRepository.findAll(spec, org.springframework.data.domain.Sort.by(org.springframework.data.domain.Sort.Direction.DESC, "createdAt"));
+    }
+}
+
+```
+### Step 4: Create the Controller Endpoint
+Expose this via a REST API where all parameters are marked as required = false.
+**File:** RequestVoucherController.java (in com.fincore.VoucherService.Controllers)
+```java
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Models.RequestVoucher;
+import com.fincore.VoucherService.Service.RequestVoucherService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/request-vouchers")
+@RequiredArgsConstructor
+public class RequestVoucherController {
+
+    private final RequestVoucherService requestVoucherService;
+
+    @GetMapping("/filter")
+    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(
+            @RequestParam(required = false) String category,
+            @RequestParam(required = false) String role,
+            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
+
+        List<RequestVoucher> results = requestVoucherService.getFilteredVouchers(category, role, date);
+        return ResponseEntity.ok(results);
+    }
+}
+
+```
+### How to Test This in Postman
+Because we used @RequestParam(required = false), Spring Boot will handle all combinations automatically:
+ 1. **Get ALL Data (No Filters passed):**
+   GET http://localhost:8080/api/request-vouchers/filter
+ 2. **Filter strictly by Category:**
+   GET http://localhost:8080/api/request-vouchers/filter?category=TRAVEL
+ 3. **Filter by Role and Date:**
+   GET http://localhost:8080/api/request-vouchers/filter?role=TCSGLIF&date=2026-05-26
+ 4. **Filter by ALL conditions:**
+   GET http://localhost:8080/api/request-vouchers/filter?category=TRAVEL&role=TCSGLIF&date=2026-05-26
