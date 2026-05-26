@@ -1,251 +1,264 @@
-there is biggest change in the code like i have to change the workflow like for the accept reject 
+This is a significant and exciting architectural shift. Moving from a simple Maker-Checker to a multi-level state machine requires careful orchestration, especially with dynamic scheduling and role-based routing.
+Since you want to tackle **Manual Entry** first, we will lay the foundation by creating the new Entities, Repositories, updating the DTOs to accept scheduling, and finally modifying your createBatchRequest method to initialize this new workflow.
+Here is the step-by-step guide to wire up the creation phase of the new workflow.
+### Step 1: Create the New Models
+Create two new Entity classes in your com.fincore.VoucherService.Models package to map to the tables you just created.
+**File:** VoucherPosting.java
+```java
+package com.fincore.VoucherService.Models;
 
-currently we just have the one maker and one cheker
-but need to change this workflow
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
 
-i tell u flow 
-now we need to move this to advance part like 
-multi leval approver
-Approval Workflow 
+@Entity
+@Table(name = "VOUCHER_POSTING")
+@Data
+public class VoucherPosting {
 
-All voucher postings created by TCSGLIF to be approved by 3 approvers (1 TCSGLIF and 2 SBIGLIF). 
+    @Id
+    @Column(name = "BATCH_ID", length = 50)
+    private String batchId;
 
-In case vouchers created by any other role, to be approved by 4 approvers (2 TCSGLIF and 2 SBIGLIF). 
+    @Column(name = "VID_FK", length = 20, nullable = false)
+    private String vidFk;
 
-Once approved by Last approver, the voucher will get posted. If execution schedule time is provided it will be executed on or after the scheduled time, else immediately. In case if the scheduled time is passed at the time of Final approval, it will be posted immediately. 
+    @Column(name = "CREATORS_ROLE", length = 100)
+    private String creatorsRole;
 
-The voucher’s life cycle will end when a voucher posting is rejected by any approver. 
+    @Column(name = "CREATED_BY", length = 100)
+    private String createdBy;
 
-The users involved in workflow will get the notification of the voucher approval, rejection and schedule change. 
+    @Column(name = "CREATED_AT", updatable = false)
+    private LocalDateTime createdAt = LocalDateTime.now();
 
-Comments are mandatory while approving or rejecting the request. 
+    @Column(name = "CURRENT_STATUS", length = 30)
+    private String currentStatus;
 
-The Maker and Last approver will have option to schedule the time of voucher posting. In case when Last approver schedules the execution time, it will override the scheduled time in case if it was provided by the Maker of the request. 
+    @Column(name = "NEXT_APPROVAL", length = 100)
+    private String nextApproval;
 
-Maker will have an option to cancel the vouchers created by him, before Approver accepts/rejects. Upon cancelling the vouchers, RVID can be used again. 
+    @Column(name = "EXECUTION_SCHEDULED", length = 3)
+    private String executionScheduled; // "YES" or "NO"
 
-No individual can approve the same voucher twice. 
-No individual can approve the vouchers created by himself. 
+    @Column(name = "SCHEDULED_TIME")
+    private LocalDateTime scheduledTime;
 
-EXISTING  TABLES
+    @Column(name = "APPROVAL_WORKFLOW", length = 100)
+    private String approvalWorkflow;
 
-JOURNAL REQUEST(in past the name of this is Journal so that in the DB still is journal)
+    @Column(name = "IS_SCHEDULE_OVERRIDE", length = 3)
+    private String isScheduleOverride; // "YES" or "NO"
 
-REQ_ID	NUMBER	No		1	
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	3	The date when maker created the journal
-CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
-EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
-EXECUTION_DATE	DATE	Yes		6	Timestamp when this checker acted upon the journal
-EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		8	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		9	Unique identifier for the individual request.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		10	Remarks inherited from the batch creation process.
-REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		11	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		12	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 CHAR)	Yes		13	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		14	Raw requested amount 
-POSTING_DATE	DATE	Yes		15	The transaction date for which txn to be posted
-REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		16	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		17	The product  code requested.
-CREATOR_ROLE	NUMBER(10,0)	Yes		18	
-CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		19	
-PAYLOAD	CLOB	Yes		20	
-REQ_CSV_DATE	DATE	Yes		21	
+    @Column(name = "EXECUTED_AT")
+    private LocalDateTime executedAt;
+}
 
-journal Batch master
+```
+**File:** VoucherWorkflow.java
+```java
+package com.fincore.VoucherService.Models;
 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
-CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
-REQ_DATE	TIMESTAMP(6)	Yes		3	Timestamp when the batch was originally created.
-BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	Initial remarks provided by the creator upon create.
-TOTAL_ROWS	NUMBER	Yes	0	5	Total number of valid transaction rows contained in this batch.
-TOTAL_DEBIT	NUMBER(38,4)	Yes	0	6	Sum of all debit transaction amounts in the batch.
-TOTAL_CREDIT	NUMBER(38,4)	Yes	0	7	Sum of all credit transaction amounts in the batch.
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	Current workflow state (e.g., PENDING, ACCEPTED, REJECTED, ERROR).
-EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	User ID of the person who approved or rejected the batch.
-EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rejected.
-EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
 
+@Entity
+@Table(name = "VOUCHER_WORKFLOW")
+@Data
+public class VoucherWorkflow {
 
-one of the most imp part is this procedures in the DB 
-create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
-    p_batch_id      IN VARCHAR2,
-    p_executor_id   IN VARCHAR2,
-    p_remarks       IN VARCHAR2,
-    p_status        IN VARCHAR2,
-    o_cursor        OUT SYS_REFCURSOR
-) AS
-    v_missing_rates NUMBER;
-    v_txn_count     NUMBER; 
-BEGIN
-    -- ==============================================================================
-    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
-    -- ==============================================================================
-    SELECT COUNT(*) INTO v_missing_rates
-    FROM (
-        SELECT DISTINCT REQ_CURRENCY FROM JOURNAL_REQUEST
-        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
-    ) req
-    LEFT JOIN CURRENCY_MASTER cm
-        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
-    WHERE req.REQ_CURRENCY <> 'INR'
-      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "WORKFLOW_ID")
+    private Long workflowId;
 
-    IF v_missing_rates > 0 THEN
-        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
-    END IF;
+    @Column(name = "BATCH_ID_FK", length = 50, nullable = false)
+    private String batchIdFk;
 
-    -- ==============================================================================
-    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
-    -- ==============================================================================
-    SELECT COUNT(*) INTO v_txn_count
-    FROM JOURNAL_REQUEST
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    @Column(name = "VID_FK", length = 20, nullable = false)
+    private String vidFk;
 
-    -- ==============================================================================
-    -- 1. Insert GL_TRANSACTIONS
-    -- ==============================================================================
-    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
-        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
-        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
-    )
-    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
-        NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
-        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
-        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
-        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
-        'J' ,
-        '1' 
-    FROM JOURNAL_REQUEST
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    @Column(name = "LAST_ACTION", length = 30)
+    private String lastAction;
 
-    -- ==============================================================================
-    -- 2. Insert MASTER_JOURNAL
-    -- ==============================================================================
-    INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
-        JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
-        JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF,
-        JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
-    )
-    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
-        MASTER_JOURNAL_SEQ.nextval, ABS(REQ_AMOUNT), 'A', BATCH_ID,
-        REQ_BRANCH_CODE, REQ_CGL, 
-        SUBSTR(p_remarks, 1, 30), -- Defensive substring to prevent ORA-12899
-        REQ_CURRENCY, JOURNAL_ID,
-        NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), REQ_PRODUCT, REQ_NARRATION,
+    @Column(name = "LAST_ACTION_BY", length = 100)
+    private String lastActionBy;
+
+    @Column(name = "LAST_ACTION_AT")
+    private LocalDateTime lastActionAt = LocalDateTime.now();
+
+    @Column(name = "REMARKS", length = 500)
+    private String remarks;
+
+    @Column(name = "SCHEDULED_TIME")
+    private LocalDateTime scheduledTime;
+}
+
+```
+### Step 2: Create the Repositories
+Create standard Spring Data JPA repositories in your com.fincore.VoucherService.Repository package.
+**File:** VoucherPostingRepository.java
+```java
+package com.fincore.VoucherService.Repository;
+
+import com.fincore.VoucherService.Models.VoucherPosting;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface VoucherPostingRepository extends JpaRepository<VoucherPosting, String> {
+}
+
+```
+**File:** VoucherWorkflowRepository.java
+```java
+package com.fincore.VoucherService.Repository;
+
+import com.fincore.VoucherService.Models.VoucherWorkflow;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface VoucherWorkflowRepository extends JpaRepository<VoucherWorkflow, Long> {
+    List<VoucherWorkflow> findByBatchIdFkOrderByLastActionAtAsc(String batchIdFk);
+}
+
+```
+### Step 3: Update the DTOs for Scheduling
+We need to capture the Maker's optional scheduled time. Open BatchPostingDto.java and add the scheduledTime field.
+**File:** BatchPostingDto.java
+```java
+// ADD this inside the BatchPostingDto class, below commonBatchRemarks:
+
+    @com.fasterxml.jackson.annotation.JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    private LocalDateTime scheduledTime;
+    
+    // Assuming VID is passed from frontend to identify the voucher type
+    @jakarta.validation.constraints.NotBlank(message = "VID is required")
+    private String vid; 
+
+```
+### Step 4: Update the Creation Service
+Now we inject the new repository and modify the manual batch creation logic to initialize the workflow state machine.
+**File:** VoucherRequestServiceImpl.java
+**1. Inject the new Repository at the top:**
+```java
+    // Add this to your injected dependencies at the top of the class
+    private final VoucherPostingRepository voucherPostingRepository;
+    
+    // Example Helper method to convert your Integer Role to a String name. 
+    // You will need to map your actual DB role IDs here.
+    private String getRoleName(Integer roleId) {
+        if (roleId == 51) return "TCSGLIF"; // Replace 51 with your actual ID
+        if (roleId == 52) return "SBIGLIF"; // Replace 52 with your actual ID
+        return "OTHER";
+    }
+
+```
+**2. Replace the createBatchRequest method:**
+Find your existing createBatchRequest method and replace it with this updated version. This initializes the VOUCHER_POSTING table with the correct workflow route based on the Maker's role.
+```java
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole)  {
+        String batchId = sequenceService.getNextBatchId();
+        String journalPrefix = sequenceService.getNextJournalIdPrefix();
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal totalDebit = BigDecimal.ZERO;
+        BigDecimal totalCredit = BigDecimal.ZERO;
+        int rowIndex = 1;
         
-        -- FIX: Adjusted to perfectly fit the VARCHAR2(3) schema limit
-        CASE WHEN REQ_AMOUNT > 0 THEN 'DR'
-             WHEN REQ_AMOUNT < 0 THEN 'CR'
-             ELSE 'NIL' END
-             
-    FROM JOURNAL_REQUEST
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setRequestDate(LocalDateTime.now());
+            entity.setCreatorId(creatorId);
+            entity.setCreatorRole(creatorRole);
+            entity.setBatchId(batchId);
+            entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
 
-    -- ==============================================================================
-    -- 3. Merge GL Balances
-    -- ==============================================================================
-    MERGE INTO GL_BALANCE target
-    USING (
-        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
-               NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) as BAL_DATE,
-               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
-               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
-        FROM JOURNAL_REQUEST j
-        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
-        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
-        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.POSTING_DATE
-    ) source
-    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
-        AND target.CURRENCY = source.REQ_CURRENCY
-        AND target.CGL = source.REQ_CGL
-        AND target.BALANCE_DATE = source.BAL_DATE)
-    WHEN MATCHED THEN
-        UPDATE SET
-            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
-            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
-    WHEN NOT MATCHED THEN
-        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
-        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
-                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
-                (source.TXN_AMOUNT * source.EXCH_RATE));
+            String journalId = journalPrefix + "-" + rowIndex;
+            entity.setJournalId(journalId);
+            entity.setBranchCode(row.getBranch());
+            entity.setCurrency(row.getCurrency());
+            entity.setCgl(row.getCgl());
+            
+            BigDecimal amount = row.getAmount();
+            if ("INR".equalsIgnoreCase(row.getCurrency()) && amount.stripTrailingZeros().scale() > 2) {
+                throw new CustomExceptions.InvalidDataException("INR amounts cannot have more than 2 decimal places.");
+            }
+            if (amount.compareTo(BigDecimal.ZERO) == 0) {
+                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
+            }
+            entity.setAmount(amount);
+            entity.setPosting_date(row.getPostingDate() != null ? row.getPostingDate() : LocalDate.now());
+            entity.setNarration(row.getRemarks());
+            entity.setProductCode(row.getProductType());
 
-    -- ==============================================================================
-    -- 4. Capture Sync Data for HDFS (Data Lake)
-    -- ==============================================================================
-    OPEN o_cursor FOR
-    SELECT
-        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
-        NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) AS BAL_DATE,
-        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
-    FROM (
-        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, POSTING_DATE
-        FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
-    ) j
-    JOIN GL_BALANCE g
-        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
-        AND g.CURRENCY = j.REQ_CURRENCY
-        AND g.CGL = j.REQ_CGL
-        AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
+            if (amount.compareTo(BigDecimal.ZERO) < 0) {
+                totalCredit = totalCredit.add(amount.abs());
+            } else {
+                totalDebit = totalDebit.add(amount.abs());
+            }
 
-    -- ==============================================================================
-    -- 5. Finalize Batch Status
-    -- ==============================================================================
-    UPDATE JOURNAL_REQUEST
-    SET REQ_STATUS = p_status,
-        EXECUTOR_ID = p_executor_id,
-        EXECUTION_DATE = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
-        EXECUTOR_REMARKS = p_remarks
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+            entities.add(entity);
+            rowIndex++;
+        }
 
-EXCEPTION
-    WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
-END;
+        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+        
+        // 1. Insert into Legacy Master Table
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        jdbcTemplate.update(sumSql, batchId, creatorId, ts, dto.getCommonBatchRemarks(), entities.size(), totalDebit, totalCredit, "PENDING");
 
-2nd one 
-create or replace PROCEDURE PURGE_JOURNAL_BATCH(
-    p_batch_id IN VARCHAR2,
-    p_user_id  IN VARCHAR2
-) AS
-    v_status VARCHAR2(20);
-    v_deleted NUMBER;
-BEGIN
-    -- 1. Security + Ownership Check
-    BEGIN
-        SELECT BATCH_STATUS INTO v_status
-        FROM JOURNAL_BATCH_MASTER
-        WHERE BATCH_ID = p_batch_id AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(p_user_id));
-    EXCEPTION
-        WHEN NO_DATA_FOUND THEN
-            RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
-    END;
+        // 2. Initialize New Workflow Engine
+        String roleName = getRoleName(creatorRole);
+        VoucherPosting posting = new VoucherPosting();
+        posting.setBatchId(batchId);
+        posting.setVidFk(dto.getVid()); // From DTO
+        posting.setCreatorsRole(roleName);
+        posting.setCreatedBy(creatorId);
+        posting.setCurrentStatus("PENDING_L1"); 
+        
+        // Determine Workflow Route
+        if ("TCSGLIF".equalsIgnoreCase(roleName)) {
+            posting.setApprovalWorkflow("W1_3_APPROVERS"); // 1 TCS, 2 SBI
+            posting.setNextApproval("TCSGLIF"); // First step is TCSGLIF
+        } else {
+            posting.setApprovalWorkflow("W2_4_APPROVERS"); // 2 TCS, 2 SBI
+            posting.setNextApproval("TCSGLIF"); // First step is TCSGLIF
+        }
 
-    IF v_status NOT IN ('PENDING', 'QUEUED', 'ERROR') THEN
-        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
-    END IF;
+        // Handle Maker Scheduling
+        if (dto.getScheduledTime() != null) {
+            posting.setExecutionScheduled("YES");
+            posting.setScheduledTime(dto.getScheduledTime());
+            posting.setIsScheduleOverride("NO");
+        } else {
+            posting.setExecutionScheduled("NO");
+        }
+        
+        voucherPostingRepository.save(posting);
 
-    -- 2. Delete all rows (no chunked commits — let Spring manage tx)
-    DELETE FROM JOURNAL_REQUEST
-    WHERE BATCH_ID = p_batch_id
-      AND REQ_STATUS IN ('P', 'R');
+        // 3. Notifications & Audits
+        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under workflow " + posting.getApprovalWorkflow());
+        sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
+        
+        // Alert the Next Approver (TCSGLIF in both scenarios)
+        NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+        if (config != null) {
+            String msg = String.format("New Batch %s by %s requires Level 1 approval.", batchId, creatorId);
+            sendNotification(null, config.getTargetRoles(), msg, batchId);
+        }
 
-    -- 3. Delete Master
-    DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
+        return savedEntities;
+    }
 
-    -- NO EXPLICIT COMMIT — Spring @Transactional handles it
-
-EXCEPTION
-    WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
-END;
-
-i hope now u understand that how this table is working toghther can create backend for this 
-now lets start with manual entry then we will go for the bulk one 
-in the manual entry tell mi file name method name and code which need to be replce give mi this details i will make changes accordingly 
-and alsop tell mi  what models  , dto , new serivce or existing service methods change tell mi step byu step
-
+```
+Once you have these parts wired up and compiling, the backend will successfully route the initial state of the workflow into your new VOUCHER_POSTING table.
+After this is verified, we can move on to the complex part: the **Checker Execution Logic** (where we update the status, log to VOUCHER_WORKFLOW, validate against previous approvers, and eventually trigger PROCESS_JOURNAL_BATCH).
