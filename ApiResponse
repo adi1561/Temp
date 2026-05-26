@@ -1,169 +1,201 @@
-This is a great set of UI refinements. Combining the row selection with the expand action makes the table much cleaner, and assigning fixed widths to the method cards will ensure they look perfectly symmetrical on all screen sizes.
-Here are the exact blocks to replace to implement these changes while keeping the animation buttery smooth.
-### Step 1: Add the Excel Icon to Imports
-Find your icon imports near the top of the file and add TableChartIcon (which looks like a spreadsheet).
-**FIND THIS:**
-```javascript
-import EditNoteIcon from '@mui/icons-material/EditNote';
-import UploadFileIcon from '@mui/icons-material/UploadFile';
-import { debounce } from "lodash";
+To build the backend workflow for the Manual Entry, we need to implement the core state machine. This involves three distinct phases: **Initialization** (when the Maker submits the manual grid), **Routing** (fetching the correct batches for the logged-in Checker), and **Progression** (the Checkers approving/rejecting the batch).
+Here is the exact step-by-step implementation guide to wire this up in your Spring Boot backend.
+### Step 1: Initialize the Workflow (The Maker Submission)
+When the user submits the Manual Entry grid from the frontend, it hits your createBatchRequest method. We need to update this method to register the batch in the new VOUCHER_POSTING table and set its initial state.
+**File to Update:** VoucherRequestServiceImpl.java (or your equivalent service class)
+Find your createBatchRequest method and add the workflow initialization logic right after you save the initial batch details.
+**ADD THIS CODE BLOCK:**
+```java
+    // ... inside createBatchRequest, after saving to JOURNAL_BATCH_MASTER ...
+
+    // 1. Map the Creator's Role ID to the Role Name (Adjust IDs based on your DB)
+    String roleName = (creatorRole == 51) ? "TCSGLIF" : (creatorRole == 52 ? "SBIGLIF" : "OTHER");
+
+    // 2. Initialize the Multi-Level Workflow State
+    VoucherPosting posting = new VoucherPosting();
+    posting.setBatchId(batchId);
+    posting.setVidFk(dto.getVid()); // Received from your new frontend payload
+    posting.setCreatorsRole(roleName);
+    posting.setCreatedBy(creatorId);
+    posting.setCurrentStatus("PENDING_L1"); 
+    
+    // 3. Determine the specific Approval Route
+    if ("TCSGLIF".equalsIgnoreCase(roleName)) {
+        posting.setApprovalWorkflow("W1_3_APPROVERS"); // Route 1: TCS -> SBI -> SBI
+        posting.setNextApproval("TCSGLIF"); 
+    } else {
+        posting.setApprovalWorkflow("W2_4_APPROVERS"); // Route 2: TCS -> TCS -> SBI -> SBI
+        posting.setNextApproval("TCSGLIF"); 
+    }
+
+    // 4. Handle the Optional Scheduling from the frontend
+    if (dto.getScheduledTime() != null && !dto.getScheduledTime().isEmpty()) {
+        posting.setExecutionScheduled("YES");
+        posting.setScheduledTime(LocalDateTime.parse(dto.getScheduledTime().replace(" ", "T")));
+        posting.setIsScheduleOverride("NO");
+    } else {
+        posting.setExecutionScheduled("NO");
+    }
+    
+    // Save to the database
+    voucherPostingRepository.save(posting);
 
 ```
-**REPLACE WITH THIS:**
-```javascript
-import EditNoteIcon from '@mui/icons-material/EditNote';
-import UploadFileIcon from '@mui/icons-material/UploadFile';
-import TableChartIcon from '@mui/icons-material/TableChart';
-import { debounce } from "lodash";
+### Step 2: The Checker Dashboard API (Role-Based Routing)
+When a Checker logs in, they should *only* see batches that are currently waiting for their specific role's approval. We need to create a fetch method that joins JOURNAL_BATCH_MASTER with our VOUCHER_POSTING table.
+**File to Update:** VoucherRequestServiceImpl.java
+**ADD THIS METHOD:**
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole) {
+        // Map the logged-in user's role
+        String roleName = (userRole == 51) ? "TCSGLIF" : (userRole == 52 ? "SBIGLIF" : "OTHER");
 
-```
-### Step 2: Replace the Table UI (Step 0)
-This will remove the Status and Details columns, replace them with Category, trigger the collapse when clicking anywhere on the row, and only show the Description inside.
-**FIND THIS ENTIRE BLOCK (Inside Step 0):**
-```javascript
-          <Paper elevation={2} sx={{ width: '100%', mb: 2, borderRadius: 2, overflow: 'hidden' }}>
-            <TableContainer sx={{ overflowX: "hidden" }}>
+        // Fetch only batches where NEXT_APPROVAL matches the current user's role
+        String sql = """
+            SELECT 
+                b.BATCH_ID, p.VID_FK, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
+                b.TOTAL_ROWS, b.TOTAL_DEBIT, b.TOTAL_CREDIT, 
+                p.CURRENT_STATUS, p.NEXT_APPROVAL, p.SCHEDULED_TIME
+            FROM JOURNAL_BATCH_MASTER b
+            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
+            WHERE p.NEXT_APPROVAL = ? 
+              AND p.CURRENT_STATUS LIKE 'PENDING_%'
+            ORDER BY b.REQ_DATE DESC
+        """;
 
-```
-*(Highlight from there all the way down to </Paper> for Step 0)*
-**REPLACE WITH THIS:**
-```javascript
-          <Paper elevation={2} sx={{ width: '100%', mb: 2, borderRadius: 2, overflow: 'hidden' }}>
-            <TableContainer sx={{ overflowX: "hidden" }}>
-              <Table size="medium" sx={{ tableLayout: "fixed" }}>
-                <TableHead sx={{ backgroundColor: "action.hover" }}>
-                  <TableRow>
-                    <TableCell padding="checkbox" sx={{ width: '5%' }}></TableCell>
-                    <TableCell sx={{ fontWeight: 'bold', width: '25%' }}>VID</TableCell>
-                    <TableCell sx={{ fontWeight: 'bold', width: '35%' }}>Category</TableCell>
-                    <TableCell sx={{ fontWeight: 'bold', width: '35%' }}>Created By</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {voucherList
-                    .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
-                    .map((row) => {
-                      const isSelected = selectedVoucher?.id === row.id;
-                      const isExpanded = expandedRow === row.id;
-
-                      return (
-                        <React.Fragment key={row.id}>
-                          {/* MAIN ROW */}
-                          <TableRow 
-                            hover 
-                            onClick={() => {
-                              setSelectedVoucher(row);
-                              handleRowExpand(row.id); // Triggers the smooth collapse
-                            }}
-                            sx={{ 
-                              cursor: 'pointer',
-                              backgroundColor: isSelected ? "action.selected" : "inherit",
-                              '& > *': { borderBottom: isExpanded ? 'none' : '1px solid rgba(224, 224, 224, 1)' } 
-                            }}
-                          >
-                            <TableCell padding="checkbox">
-                              <Radio checked={isSelected} color="primary" />
-                            </TableCell>
-                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              {row.vid}
-                            </TableCell>
-                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              {row.category || "General"}
-                            </TableCell>
-                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              {row.createdBy || "System"}
-                            </TableCell>
-                          </TableRow>
-                          
-                          {/* EXPANDABLE ROW CONTENT (Description Only) */}
-                          <TableRow sx={{ backgroundColor: "background.default" }}>
-                            {/* Notice colSpan is now 4 to match the new column count */}
-                            <TableCell style={{ paddingBottom: 0, paddingTop: 0, borderBottom: isExpanded ? '1px solid rgba(224, 224, 224, 1)' : 'none' }} colSpan={4}>
-                              <Collapse in={isExpanded} timeout="auto" unmountOnExit>
-                                <Box sx={{ margin: 2, p: 2, backgroundColor: "#f8f9fa", borderRadius: 2, border: "1px solid #e0e0e0" }}>
-                                  <Typography variant="body2" color="text.secondary">
-                                    <strong style={{ color: "black" }}>Description:</strong> {row.description || "No description provided for this voucher configuration."}
-                                  </Typography>
-                                </Box>
-                              </Collapse>
-                            </TableCell>
-                          </TableRow>
-                        </React.Fragment>
-                      );
-                    })}
-                  {voucherList.length === 0 && (
-                     <TableRow>
-                       <TableCell colSpan={4} align="center" sx={{ py: 3 }}>
-                         No configurations found.
-                       </TableCell>
-                     </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </TableContainer>
-            <TablePagination
-              rowsPerPageOptions={[5, 10, 25]}
-              component="div"
-              count={voucherList.length}
-              rowsPerPage={rowsPerPage}
-              page={page}
-              onPageChange={handleChangePage}
-              onRowsPerPageChange={handleChangeRowsPerPage}
-            />
-          </Paper>
-
-```
-### Step 3: Update the Entry Method Cards (Step 1)
-This applies fixed dimensions (width: 320, height: 260) to the boxes, perfectly centers them, adds the Excel icon in standard Excel Green, and clarifies that it's strictly for Excel files.
-**FIND THIS ENTIRE BLOCK (Inside Step 1):**
-```javascript
-          <Grid container spacing={4} justifyContent="center" alignItems="stretch">
-            <Grid item xs={12} sm={5} md={4}>
-              <Card elevation={2} sx={{ height: "100%", borderRadius: 3, transition: "0.3s", "&:hover": { transform: "translateY(-5px)", boxShadow: 6 } }}>
-                <CardActionArea onClick={() => handleMethodSelection("MANUAL")} sx={{ height: "100%", p: 4, textAlign: "center", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-                   {/* ... manual card code ... */}
-                </CardActionArea>
-              </Card>
-            </Grid>
-
-            <Grid item xs={12} sm={5} md={4}>
-              <Card elevation={2} sx={{ height: "100%", borderRadius: 3, transition: "0.3s", "&:hover": { transform: "translateY(-5px)", boxShadow: 6 } }}>
-                <CardActionArea onClick={() => handleMethodSelection("BULK")} sx={{ height: "100%", p: 4, textAlign: "center", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-                   {/* ... bulk card code ... */}
-                </CardActionArea>
-              </Card>
-            </Grid>
-          </Grid>
-
-```
-**REPLACE WITH THIS:**
-```javascript
-          {/* Using Flexbox with fixed widths instead of dynamic Grids for perfect symmetry */}
-          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 4, justifyContent: "center", alignItems: "center" }}>
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID_FK"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("remarks", rs.getString("BATCH_REMARKS"));
+            map.put("totalRows", rs.getLong("TOTAL_ROWS"));
+            map.put("totalAmount", rs.getBigDecimal("TOTAL_DEBIT"));
+            map.put("workflowState", rs.getString("CURRENT_STATUS"));
             
-            {/* MANUAL ENTRY CARD */}
-            <Card elevation={2} sx={{ width: 320, height: 260, borderRadius: 3, transition: "0.3s", "&:hover": { transform: "translateY(-5px)", boxShadow: 6 } }}>
-              <CardActionArea onClick={() => handleMethodSelection("MANUAL")} sx={{ height: "100%", p: 4, textAlign: "center", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-                <EditNoteIcon color="primary" sx={{ fontSize: 60, mb: 2 }} />
-                <Typography variant="h6" fontWeight="bold" gutterBottom>Manual Entry</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Use an interactive grid interface to enter branch, CGL, and amount details row by row.
-                </Typography>
-              </CardActionArea>
-            </Card>
+            Timestamp scheduled = rs.getTimestamp("SCHEDULED_TIME");
+            map.put("scheduledTime", scheduled != null ? scheduled.toLocalDateTime().toString() : null);
 
-            {/* EXCEL UPLOAD CARD */}
-            <Card elevation={2} sx={{ width: 320, height: 260, borderRadius: 3, transition: "0.3s", "&:hover": { transform: "translateY(-5px)", boxShadow: 6 } }}>
-              <CardActionArea onClick={() => handleMethodSelection("BULK")} sx={{ height: "100%", p: 4, textAlign: "center", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-                {/* Standard Excel Green Hex Code */}
-                <TableChartIcon sx={{ fontSize: 60, mb: 2, color: "#217346" }} /> 
-                <Typography variant="h6" fontWeight="bold" gutterBottom>Excel Upload</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Upload an Excel file (.xlsx or .xls) to process hundreds of voucher entries instantly.
-                </Typography>
-              </CardActionArea>
-            </Card>
-            
-          </Box>
+            return map;
+        }, roleName); 
+    }
 
 ```
+### Step 3: The State Machine Engine (Approval/Rejection)
+This is the most critical part of the backend. It enforces the business rules (no self-approval, no duplicate approvals) and moves the state from L1 to L2 to L3.
+**File to Update:** VoucherRequestServiceImpl.java
+**ADD THIS METHOD:**
+```java
+    @Transactional
+    public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
+        String batchId = dto.getBatchId();
+        
+        VoucherPosting posting = voucherPostingRepository.findById(batchId)
+                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch ID not found."));
+
+        // 1. Business Rule: Prevent Self-Approval
+        if (executorId.equalsIgnoreCase(posting.getCreatedBy())) {
+            throw new CustomExceptions.InvalidDataException("Security Violation: You cannot approve a batch you created.");
+        }
+
+        // 2. Business Rule: Prevent Duplicate Approvals
+        boolean hasAlreadyApproved = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId)
+                .stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
+        if (hasAlreadyApproved) {
+            throw new CustomExceptions.InvalidDataException("Security Violation: You have already approved this batch at a previous level.");
+        }
+
+        // 3. Process Rejection
+        if (dto.getStatus() == RequestStatus.REJECTED) {
+            posting.setCurrentStatus("REJECTED");
+            posting.setNextApproval(null);
+            voucherPostingRepository.save(posting);
+            
+            logWorkflowAction(batchId, posting.getVidFk(), "REJECTED", executorId, dto.getRemarks());
+            
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED' WHERE BATCH_ID = ?", batchId);
+            return;
+        }
+
+        // 4. State Machine Progression (Approval)
+        boolean isFinalApproval = false;
+        String nextState = "";
+        String nextRoleRequired = "";
+
+        if ("W1_3_APPROVERS".equals(posting.getApprovalWorkflow())) {
+            switch (posting.getCurrentStatus()) {
+                case "PENDING_L1": nextState = "PENDING_L2"; nextRoleRequired = "SBIGLIF"; break; 
+                case "PENDING_L2": nextState = "PENDING_L3"; nextRoleRequired = "SBIGLIF"; break; 
+                case "PENDING_L3": isFinalApproval = true; break; 
+            }
+        } else if ("W2_4_APPROVERS".equals(posting.getApprovalWorkflow())) {
+            switch (posting.getCurrentStatus()) {
+                case "PENDING_L1": nextState = "PENDING_L2"; nextRoleRequired = "TCSGLIF"; break; 
+                case "PENDING_L2": nextState = "PENDING_L3"; nextRoleRequired = "SBIGLIF"; break; 
+                case "PENDING_L3": nextState = "PENDING_L4"; nextRoleRequired = "SBIGLIF"; break; 
+                case "PENDING_L4": isFinalApproval = true; break; 
+            }
+        }
+
+        if (isFinalApproval) {
+            // Check Schedule Logic
+            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+                posting.setCurrentStatus("SCHEDULED");
+                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_SCHEDULED", executorId, dto.getRemarks());
+            } else {
+                posting.setCurrentStatus("POSTED");
+                posting.setExecutedAt(LocalDateTime.now());
+                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks());
+                
+                // TRIGGER YOUR ORACLE DB PROCEDURE HERE (e.g., PROCESS_JOURNAL_BATCH)
+                executeOraclePostingProcedure(batchId, executorId, dto.getRemarks());
+            }
+            posting.setNextApproval(null);
+        } else {
+            posting.setCurrentStatus(nextState);
+            posting.setNextApproval(nextRoleRequired);
+            logWorkflowAction(batchId, posting.getVidFk(), "APPROVED_" + posting.getCurrentStatus(), executorId, dto.getRemarks());
+        }
+
+        voucherPostingRepository.save(posting);
+    }
+
+    private void logWorkflowAction(String batchId, String vid, String action, String executorId, String remarks) {
+        VoucherWorkflow wf = new VoucherWorkflow();
+        wf.setBatchIdFk(batchId);
+        wf.setVidFk(vid);
+        wf.setLastAction(action);
+        wf.setLastActionBy(executorId);
+        wf.setRemarks(remarks);
+        voucherWorkflowRepository.save(wf);
+    }
+
+```
+### Step 4: Expose the Controller Endpoints
+Finally, map these new services to REST endpoints so your frontend Checker screen can call them.
+**File to Update:** VoucherPostingController.java
+**ADD THESE ENDPOINTS:**
+```java
+    @GetMapping("/checker/pending-approvals")
+    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
+        Integer userRole = jwtUtil.getUserRoleFromToken(token); // Extract role from JWT
+        return ResponseEntity.ok(voucherRequestService.getPendingBatchesForChecker(userRole));
+    }
+
+    @PostMapping("/workflow/action")
+    public ResponseEntity<Map<String, String>> processCheckerAction(
+            @RequestHeader("Authorization") String token, 
+            @Valid @RequestBody ProcessVoucherRequestDto dto) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        voucherRequestService.processWorkflowAction(dto, userId, userRole);
+
+        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Workflow action processed successfully."));
+    }
+
+```
+Once you plug these backend blocks in, the Manual Entry grid you just built will automatically route into this robust, role-based state machine. Should we look at building the frontend Checker UI to consume these APIs next?
