@@ -1,43 +1,251 @@
-This is a classic Spring Boot configuration error!
-The root cause is right at the end of your stack trace: Not a managed type: class com.fincore.VoucherService.Models.BranchMaster.
-This happens when Spring Data JPA tries to create a repository, but the EntityManager doesn't know that your @Entity class exists. If we look closely at your **OracleDbConfig.java** file, there is a copy-paste mismatch in the package scanning path.
-Spring is looking for entities in JournalService instead of VoucherService.
-### How to Fix It
-Open your com.fincore.VoucherService.config.OracleDbConfig file and locate the oracleEntityManagerFactory bean method.
-**Change this line:**
-```java
-.packages("com.fincore.JournalService.Models") // <--- Incorrect package path
+there is biggest change in the code like i have to change the workflow like for the accept reject 
 
-```
-**To this:**
-```java
-.packages("com.fincore.VoucherService.Models") // <--- Corrected package path
+currently we just have the one maker and one cheker
+but need to change this workflow
 
-```
-### The Corrected Method
-Here is exactly how that method should look in your OracleDbConfig.java file:
-```java
-    @Primary
-    @Bean(name = "oracleEntityManagerFactory")
-    public LocalContainerEntityManagerFactoryBean oracleEntityManagerFactory(
-            EntityManagerFactoryBuilder builder,
-            @Qualifier("oracleDataSource") DataSource dataSource) {
+i tell u flow 
+now we need to move this to advance part like 
+multi leval approver
+Approval Workflow 
 
-        log.info("ORACLE_EMF_INIT | Building EntityManagerFactory for com.fincore.VoucherService.Models");
+All voucher postings created by TCSGLIF to be approved by 3 approvers (1 TCSGLIF and 2 SBIGLIF). 
+
+In case vouchers created by any other role, to be approved by 4 approvers (2 TCSGLIF and 2 SBIGLIF). 
+
+Once approved by Last approver, the voucher will get posted. If execution schedule time is provided it will be executed on or after the scheduled time, else immediately. In case if the scheduled time is passed at the time of Final approval, it will be posted immediately. 
+
+The voucher’s life cycle will end when a voucher posting is rejected by any approver. 
+
+The users involved in workflow will get the notification of the voucher approval, rejection and schedule change. 
+
+Comments are mandatory while approving or rejecting the request. 
+
+The Maker and Last approver will have option to schedule the time of voucher posting. In case when Last approver schedules the execution time, it will override the scheduled time in case if it was provided by the Maker of the request. 
+
+Maker will have an option to cancel the vouchers created by him, before Approver accepts/rejects. Upon cancelling the vouchers, RVID can be used again. 
+
+No individual can approve the same voucher twice. 
+No individual can approve the vouchers created by himself. 
+
+EXISTING  TABLES
+
+JOURNAL REQUEST(in past the name of this is Journal so that in the DB still is journal)
+
+REQ_ID	NUMBER	No		1	
+REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
+REQ_DATE	DATE	No	SYSDATE 	3	The date when maker created the journal
+CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
+EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
+EXECUTION_DATE	DATE	Yes		6	Timestamp when this checker acted upon the journal
+EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		8	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		9	Unique identifier for the individual request.
+COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		10	Remarks inherited from the batch creation process.
+REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		11	The branch code requested for the transaction.
+REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		12	The 3-character currency code requested.
+REQ_CGL	VARCHAR2(50 CHAR)	Yes		13	The 10-digit CGL account code requested.
+REQ_AMOUNT	NUMBER(25,4)	Yes		14	Raw requested amount 
+POSTING_DATE	DATE	Yes		15	The transaction date for which txn to be posted
+REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		16	remarks from the uploaded file.
+REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		17	The product  code requested.
+CREATOR_ROLE	NUMBER(10,0)	Yes		18	
+CHANGE_TYPE	VARCHAR2(10 CHAR)	Yes		19	
+PAYLOAD	CLOB	Yes		20	
+REQ_CSV_DATE	DATE	Yes		21	
+
+journal Batch master
+
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	Unique identifier for the uploaded batch file.
+CREATOR_ID	VARCHAR2(50 BYTE)	Yes		2	User ID of the person who upload/create the batch.
+REQ_DATE	TIMESTAMP(6)	Yes		3	Timestamp when the batch was originally created.
+BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		4	Initial remarks provided by the creator upon create.
+TOTAL_ROWS	NUMBER	Yes	0	5	Total number of valid transaction rows contained in this batch.
+TOTAL_DEBIT	NUMBER(38,4)	Yes	0	6	Sum of all debit transaction amounts in the batch.
+TOTAL_CREDIT	NUMBER(38,4)	Yes	0	7	Sum of all credit transaction amounts in the batch.
+BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		8	Current workflow state (e.g., PENDING, ACCEPTED, REJECTED, ERROR).
+EXECUTOR_ID	VARCHAR2(50 BYTE)	Yes		9	User ID of the person who approved or rejected the batch.
+EXECUTION_DATE	TIMESTAMP(6)	Yes		10	Timestamp when the batch was approved or rejected.
+EXECUTOR_REMARKS	VARCHAR2(200 BYTE)	Yes		11	Remarks provided by the executor when approving or rejecting.
+
+
+one of the most imp part is this procedures in the DB 
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2,
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+    v_txn_count     NUMBER; 
+BEGIN
+    -- ==============================================================================
+    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
+
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
+
+    -- ==============================================================================
+    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_txn_count
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+    -- ==============================================================================
+    -- 1. Insert GL_TRANSACTIONS
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
+        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
+        'J' ,
+        '1' 
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+    -- ==============================================================================
+    -- 2. Insert MASTER_JOURNAL
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
+        JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
+        JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF,
+        JOURNAL_PDATE, PRODUCT_TYPE, REMARKS, TXN_TYPE
+    )
+    SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+        MASTER_JOURNAL_SEQ.nextval, ABS(REQ_AMOUNT), 'A', BATCH_ID,
+        REQ_BRANCH_CODE, REQ_CGL, 
+        SUBSTR(p_remarks, 1, 30), -- Defensive substring to prevent ORA-12899
+        REQ_CURRENCY, JOURNAL_ID,
+        NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), REQ_PRODUCT, REQ_NARRATION,
         
-        Map<String, Object> properties = new HashMap<>();
-        properties.put("hibernate.dialect", "org.hibernate.dialect.OracleDialect");
-        properties.put("hibernate.hbm2ddl.auto", "validate");
+        -- FIX: Adjusted to perfectly fit the VARCHAR2(3) schema limit
+        CASE WHEN REQ_AMOUNT > 0 THEN 'DR'
+             WHEN REQ_AMOUNT < 0 THEN 'CR'
+             ELSE 'NIL' END
+             
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        return builder
-                .dataSource(dataSource)
-                .packages("com.fincore.VoucherService.Models") // FIX IS HERE
-                .persistenceUnit("oracle")
-                .properties(properties)
-                .build();
-    }
+    -- ==============================================================================
+    -- 3. Merge GL Balances
+    -- ==============================================================================
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) as BAL_DATE,
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM JOURNAL_REQUEST j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.POSTING_DATE
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
 
-```
-### Why this happened
-When you define a custom EntityManagerFactory (which you did here to support multiple databases like Oracle and Hive), Spring Boot disables its automatic @EntityScan. You have to explicitly tell the builder which package contains your @Entity classes so Hibernate can map them. Once you point it to VoucherService.Models, it will find BranchMaster and successfully build the branchMasterRepository.
-Save the file, rebuild your project, and restart the service!
+    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- ==============================================================================
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, POSTING_DATE
+        FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
+
+    -- ==============================================================================
+    -- 5. Finalize Batch Status
+    -- ==============================================================================
+    UPDATE JOURNAL_REQUEST
+    SET REQ_STATUS = p_status,
+        EXECUTOR_ID = p_executor_id,
+        EXECUTION_DATE = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
+        EXECUTOR_REMARKS = p_remarks
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
+
+2nd one 
+create or replace PROCEDURE PURGE_JOURNAL_BATCH(
+    p_batch_id IN VARCHAR2,
+    p_user_id  IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+    v_deleted NUMBER;
+BEGIN
+    -- 1. Security + Ownership Check
+    BEGIN
+        SELECT BATCH_STATUS INTO v_status
+        FROM JOURNAL_BATCH_MASTER
+        WHERE BATCH_ID = p_batch_id AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(p_user_id));
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+    END;
+
+    IF v_status NOT IN ('PENDING', 'QUEUED', 'ERROR') THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+    END IF;
+
+    -- 2. Delete all rows (no chunked commits — let Spring manage tx)
+    DELETE FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id
+      AND REQ_STATUS IN ('P', 'R');
+
+    -- 3. Delete Master
+    DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
+
+    -- NO EXPLICIT COMMIT — Spring @Transactional handles it
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
+
+i hope now u understand that how this table is working toghther can create backend for this 
+now lets start with manual entry then we will go for the bulk one 
+in the manual entry tell mi file name method name and code which need to be replce give mi this details i will make changes accordingly 
+and alsop tell mi  what models  , dto , new serivce or existing service methods change tell mi step byu step
+
