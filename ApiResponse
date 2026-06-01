@@ -1,52 +1,39 @@
-Thank you for providing the exact data from your database! This makes it much easier.
-Based on the PERMISSIONS data you just shared, I can see the exact MENU_IDs we need:
- * **Maker Screen (Voucher Posting):** MENU_ID = 30 (URL: /journal-posting)
- * **Checker Screen (Voucher Authorization):** MENU_ID = 31 (URL: /journal-Authorization)
-Because we know the exact IDs now, you don't even need to use a subquery. You can run this fast, hardcoded SQL script to perfectly map your test roles to the screens.
-### Run this exact SQL script:
-```sql
--- ==============================================================================
--- 1. MAP TCSGLIF (Role 9001) - Needs BOTH Maker and Checker Access
--- ==============================================================================
--- Grants access to Maker Screen (30)
-INSERT INTO ROLE_PERMISSION (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) 
-VALUES (9001, 30, 1);
-
--- Grants access to Checker Screen (31)
-INSERT INTO ROLE_PERMISSION (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) 
-VALUES (9001, 31, 2);
-
-
--- ==============================================================================
--- 2. MAP SBIGLIF (Role 9002) - Needs ONLY Checker Access
--- ==============================================================================
--- Grants access to Checker Screen (31)
-INSERT INTO ROLE_PERMISSION (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) 
-VALUES (9002, 31, 1);
-
-
--- ==============================================================================
--- 3. MAP OTHER_MAKER (Role 9003) - Needs ONLY Maker Access
--- ==============================================================================
--- Grants access to Maker Screen (30)
-INSERT INTO ROLE_PERMISSION (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) 
-VALUES (9003, 30, 1);
-
-COMMIT;
+I see exactly what happened!
+The stepper is stuck on "Level 1" because your frontend is still calling the **old legacy API** to get the table data, which doesn't know about our new workflowState variable. Because the state is missing, the frontend is defaulting to "PENDING_L1".
+When we built the backend, we created a brand new endpoint (/checker/pending-approvals) specifically for this screen, but the frontend is still trying to call the old /pending-requests-summary endpoint.
+Here is the exact fix.
+### Step 1: Update the API Call in JournalAuthorization.jsx
+Find your fetchPendingBatches function (around line 188) and change the endpoint string.
+**FIND THIS BLOCK:**
+```javascript
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await callApi(
+        "/JS/voucher/pending-requests-summary", // <--- OLD API
+        null,
+        "GET"
+      );
+      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
 
 ```
-### Optional Extras (If your testing requires them)
-I noticed you also have other screens in your table like **Voucher Posting Status (ID 32)** and **Voucher Bulk Upload (ID 36)**.
-If you want your Makers (9001 and 9003) to also be able to see the Status screen and the Bulk Upload screen for testing, you can simply run these as well:
-```sql
--- Give Makers access to Status screen (32) and Bulk Upload (36)
-INSERT INTO ROLE_PERMISSION (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (9001, 32, 3);
-INSERT INTO ROLE_PERMISSION (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (9001, 36, 4);
-
-INSERT INTO ROLE_PERMISSION (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (9003, 32, 2);
-INSERT INTO ROLE_PERMISSION (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (9003, 36, 3);
-
-COMMIT;
+**REPLACE WITH THIS:**
+```javascript
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await callApi(
+        "/JS/voucher/checker/pending-approvals", // <--- NEW WORKFLOW API
+        null,
+        "GET"
+      );
+      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
 
 ```
-Once this is run, your JWT tokens will fetch these specific permissions, and your UI sidebar/routing will render correctly for all 6 test users. Let me know if you hit any roadblocks while logging in!
+### Important Workflow Note for Testing
+Because we built a highly secure Maker-Checker queue, **once you approve a batch, it will disappear from your screen.** If you are logged in as TCS_CHECK1 and you approve a batch:
+ 1. The backend updates it to PENDING_L2.
+ 2. The NEXT_APPROVAL role is changed to SBIGLIF.
+ 3. The row disappears from your screen (because it is no longer pending your action).
+ 4. You must log out, and log back in as SBI_CHECK1. When you open the screen, you will see the batch sitting there, and the Stepper will beautifully highlight **Level 2** as the active step!
+Make that one URL string change, save, and log in as the next Checker. The Stepper will jump to the correct level!
