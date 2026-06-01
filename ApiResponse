@@ -1,203 +1,23 @@
-I can see exactly why you are getting those errors.
-When you pasted the code, some of the **old legacy methods** (processAdvancedApproval and an extra duplicate processWorkflowAction) were left inside the file. Those old methods are still trying to call the deleted getNextApproval() string methods, which is causing your compilation to fail (cannot find symbol).
-Additionally, Spring JDBC recently deprecated the query(String, Object[], RowMapper) signature. We just need to switch it to use standard varargs query(String, RowMapper, Object...) to clear that warning.
-To fix this file completely, **delete processAdvancedApproval and any duplicate processWorkflowAction methods**, and replace them with these clean, dynamic, warning-free methods.
-### 1. Make Roles Dynamic (getRoleName)
-Instead of hardcoding 51 and 52, we will query your ROLES table directly.
-```java
-    @Override
-    public String getRoleName(Integer roleId) {
-        try {
-            // Dynamically fetch the role name from the database
-            return jdbcTemplate.queryForObject(
-                "SELECT ROLE_NAME FROM ROLES WHERE ROLE_ID = ?", 
-                String.class, 
-                roleId
-            );
-        } catch (EmptyResultDataAccessException e) {
-            return "OTHER";
-        }
-    }
+workflow transactions new stature is this work
 
-```
-### 2. Fix Deprecation & Hardcoded Roles in Summaries (getPendingBatchSummaries)
-We remove the 9001 hardcoding here, switch to the numeric NEXT_APPROVAL_ROLE_ID, and use the updated Spring JDBC varargs syntax to remove the deprecation warning.
-```java
-    @Override
-    public List<Map<String, Object>> getPendingBatchSummaries(Integer userRole) {
-        String sql = """
-            SELECT 
-                b.BATCH_ID, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
-                b.TOTAL_ROWS, b.TOTAL_DEBIT, b.TOTAL_CREDIT, 
-                p.CURRENT_STATUS, p.NEXT_APPROVAL_ROLE_ID
-            FROM JOURNAL_BATCH_MASTER b
-            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
-            WHERE p.NEXT_APPROVAL_ROLE_ID = ? 
-              AND p.CURRENT_STATUS LIKE 'PENDING_%'
-            ORDER BY b.REQ_DATE DESC
-        """;
+TRANSITION_ID	NUMBER	No	"FINCORE"."ISEQ$$_81448".nextval	1	
+WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		2	
+CURRENT_STATE	VARCHAR2(50 BYTE)	No		3	
+ACTION_TAKEN	VARCHAR2(50 BYTE)	No		4	
+NEXT_STATE	VARCHAR2(50 BYTE)	No		5	
+CURRENT_ROLE_ID	NUMBER(10,0)	Yes		6	
+IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
+"	7	
+SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		8	
 
-        // Notice the userRole is now passed at the end as a vararg, fixing the deprecation warning
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
-            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
-            map.put("requestStatus", rs.getString("CURRENT_STATUS"));
-            map.put("errorMessage", null);
-            return map;
-        }, userRole); 
-    }
 
-```
-### 3. Fix Deprecation in Grid Fetcher (getPendingBatchesForChecker)
-Same deprecation fix applied here.
-```java
-    @Override
-    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole) {
-        String sql = """
-            SELECT 
-                b.BATCH_ID, p.VID_FK, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
-                b.TOTAL_ROWS, p.CURRENT_STATUS, p.SCHEDULED_TIME
-            FROM JOURNAL_BATCH_MASTER b
-            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
-            WHERE p.NEXT_APPROVAL_ROLE_ID = ?
-            ORDER BY b.REQ_DATE DESC
-        """;
 
-        // Vararg syntax used here as well
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("workflowState", rs.getString("CURRENT_STATUS"));
-            return map;
-        }, userRole);
-    }
-
-```
-### 4. The Single, Unified Action Engine (processWorkflowAction)
-**Delete the old processAdvancedApproval entirely.** Replace your duplicate action methods with this single unified block. It has zero hardcoded roles and completely maps to the database engine.
-```java
-    @Transactional
-    public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
-        String batchId = dto.getBatchId();
-
-        VoucherPosting posting = voucherPostingRepository.findById(batchId)
-                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch ID not found in workflow tracking."));
-
-        // 1. Prevent Self-Approval
-        if (executorId.equalsIgnoreCase(posting.getCreatedBy())) {
-            throw new CustomExceptions.InvalidDataException("Security Violation: You cannot approve a batch you created.");
-        }
-
-        // 2. Prevent Duplicate Approvals
-        boolean hasAlreadyApproved = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId)
-                .stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
-        if (hasAlreadyApproved) {
-            throw new CustomExceptions.InvalidDataException("Security Violation: You have already approved this batch at a previous level.");
-        }
-
-        // 3. Dynamic Authorization Check
-        if (posting.getNextApprovalRoleId() != null && !posting.getNextApprovalRoleId().equals(executorRole)) {
-            throw new CustomExceptions.InvalidDataException("Unauthorized: You do not have the required Role to approve this step.");
-        }
-
-        // ==========================================
-        // 4. DYNAMIC STATE PROGRESSION
-        // ==========================================
-        String actionTaken = dto.getStatus().toString(); 
-
-        Map<String, Object> transitionRule;
-        try {
-            transitionRule = jdbcTemplate.queryForMap(
-                    "SELECT NEXT_STATE, NEXT_ROLE_ID, IS_FINAL_APPROVAL FROM WORKFLOW_TRANSITIONS " +
-                            "WHERE WORKFLOW_CODE = ? AND CURRENT_STATE = ? AND ACTION_TAKEN = ?",
-                    posting.getApprovalWorkflow(), posting.getCurrentStatus(), actionTaken
-            );
-        } catch (EmptyResultDataAccessException e) {
-            throw new CustomExceptions.InvalidDataException("Configuration Error: No transition rule found for Action: " + actionTaken + " from State: " + posting.getCurrentStatus());
-        }
-
-        String nextState = (String) transitionRule.get("NEXT_STATE");
-        String isFinal = (String) transitionRule.get("IS_FINAL_APPROVAL");
-        Number nextRoleNum = (Number) transitionRule.get("NEXT_ROLE_ID");
-        Integer nextRoleId = nextRoleNum != null ? nextRoleNum.intValue() : null;
-
-        // 5. Apply the Rule
-        if ("REJECTED".equals(actionTaken)) {
-            posting.setCurrentStatus(nextState);
-            posting.setNextApprovalRoleId(null);
-            voucherPostingRepository.save(posting);
-
-            logWorkflowAction(batchId, posting.getVidFk(), "REJECTED", executorId, dto.getRemarks(), null);
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
-            jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
-            notificationWriterService.createBatchRejectedNotification(batchId, posting.getCreatedBy(), executorId, dto.getRemarks());
-            return;
-        }
-
-        if ("Y".equals(isFinal)) {
-            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null) {
-                if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
-                    if (dto.getOverrideScheduleLapse() == null || !dto.getOverrideScheduleLapse()) {
-                        throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed. Do you want to post immediately or set a new schedule?");
-                    }
-                    if (dto.getNewScheduledTime() != null) {
-                        posting.setScheduledTime(dto.getNewScheduledTime());
-                        posting.setIsScheduleOverride("YES");
-                    } else {
-                        posting.setExecutionScheduled("NO");
-                    }
-                }
-            }
-
-            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
-                posting.setCurrentStatus("SCHEDULED");
-                posting.setNextApprovalRoleId(null);
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_SCHEDULED", executorId, dto.getRemarks(), posting.getScheduledTime());
-                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'SCHEDULED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
-            } else {
-                posting.setCurrentStatus("POSTED");
-                posting.setExecutedAt(LocalDateTime.now());
-                posting.setNextApprovalRoleId(null);
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks(), null);
-
-                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-                execDto.setBatchId(batchId);
-                execDto.setStatus(RequestStatus.ACCEPTED);
-                execDto.setRemarks(dto.getRemarks());
-                this.processBulkRequestsAsync(execDto, executorId, executorRole);
-            }
-            notificationWriterService.createBatchApprovedNotification(batchId, posting.getCreatedBy(), executorId);
-
-        } else {
-            posting.setCurrentStatus(nextState);
-            posting.setNextApprovalRoleId(nextRoleId);
-            logWorkflowAction(batchId, posting.getVidFk(), "APPROVED_" + posting.getCurrentStatus(), executorId, dto.getRemarks(), null);
-        }
-
-        voucherPostingRepository.save(posting);
-    }
-
-    // Consolidated Helper Method
-    private void logWorkflowAction(String batchId, String vid, String action, String executorId, String remarks, LocalDateTime scheduledTime) {
-        VoucherWorkflow wf = new VoucherWorkflow();
-        wf.setBatchIdFk(batchId);
-        wf.setVidFk(vid != null ? vid : "UNKNOWN");
-        wf.setLastAction(action);
-        wf.setLastActionBy(executorId);
-        wf.setLastActionAt(LocalDateTime.now());
-        wf.setRemarks(remarks);
-        wf.setScheduledTime(scheduledTime);
-        voucherWorkflowRepository.save(wf);
-    }
-
-```
-Once you clear out the dead legacy methods and drop these in, your project will compile without errors or deprecation warnings. Are we ready to test the full End-to-End Bulk Upload flow to ensure the async engine triggers this new dynamic workflow correctly?
+Workflow_3	INITIALIZE	CREATE	1	PENDING_L1	9001	N	Y
+Workflow_3	PENDING_L1	ACCEPTED	2	PENDING_L2	9001	N	N
+Workflow_3	PENDING_L2	ACCEPTED	3	PENDING_L3	9002	N	N
+Workflow_3	PENDING_L3	ACCEPTED	4	POSTED	9002	Y	Y
+Workflow_4	INITIALIZE	CREATE	8	PENDING_L1	9003	N	Y
+Workflow_4	PENDING_L1	ACCEPTED	9	PENDING_L2	9001	N	N
+Workflow_4	PENDING_L2	ACCEPTED	10	PENDING_L3	9001	N	N
+Workflow_4	PENDING_L3	ACCEPTED	11	PENDING_L4	9002	N	N
+Workflow_4	PENDING_L4	ACCEPTED	12	POSTED	9002	Y	Y
