@@ -1,80 +1,716 @@
-This is a brilliant architectural and UX decision. Rendering a massive data grid in the browser for thousands of rows can cause lag, and if they are going to download the Excel file to review it anyway, the grid is completely redundant.
-By removing the table, we can also **delete the backend API call that fetches the details**, which will make your application significantly faster!
-Here are the precise steps to strip out the grid and replace it with a clean, professional "Download to Review" Call-To-Action (CTA) below your new Stepper.
-### Step 1: Remove the Dead State Variables & Pagination Handlers
-Since we don't have a table anymore, we don't need pagination states or the API call to fetch the grid data.
-**FIND THIS BLOCK (Around line 112):**
-```javascript
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
-  const [viewingBatchState, setViewingBatchState] = useState(""); // --- NEW STATE ---
-  const [detailPage, setDetailPage] = useState(0);
-  const [detailRowsPerPage, setDetailRowsPerPage] = useState(10);
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+  TablePagination,
+  Alert,
+  FormHelperText,
+  Stepper,
+  Step,
+  StepLabel,
+  StepConnector,
+  stepConnectorClasses,
+  styled
+} from "@mui/material";
+
+
+
+
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Check as CheckIcon,
+  Clear as ClearIcon,
+  Visibility as VisibilityIcon,
+  FileDownload as FileDownloadIcon,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import { alpha } from "@mui/material/styles";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+const styles = {
+  mainContainer: {
+    padding: 3,
+    height: "100%",
+    width: "100%",
+  },
+  dataGridContainer: {
+    height: 600,
+    width: "100%",
+    backgroundColor: "background.paper",
+    boxShadow: 2,
+    borderRadius: 2,
+    border: 1,
+    borderColor: "divider",
+    "& .MuiDataGrid-columnHeaders": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+      fontWeight: "bold",
+      fontSize: "0.95rem",
+    },
+    "& .MuiDataGrid-row:hover": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
+    },
+  },
+  tableContainer: {
+    maxHeight: 450,
+    overflowY: "auto",
+    border: 1,
+    borderColor: "divider",
+    mt: 1
+  },
+  fixedContentBox: {
+    minHeight: 400,
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+  },
+  tableHeaderCell: {
+    fontWeight: "bold",
+    backgroundColor: "#f5f6f8",
+    color: "text.primary",
+    whiteSpace: "nowrap",
+    zIndex: 10,
+  },
+  stickyHeaderColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    top: 0,
+    zIndex: 20,
+    backgroundColor: "background.paper",
+    borderBottom: 1,
+    borderRight: 1,
+    borderColor: "divider",
+    fontWeight: "bold",
+  }),
+  stickyBodyColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    zIndex: 5,
+    backgroundColor: "background.paper",
+    borderRight: 1,
+    borderColor: "divider",
+  }),
+  dialogTitle: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    pb: 1,
+  },
+  dialogActions: { p: 2, borderTop: 1, borderColor: "divider" },
+  loadingContainer: {
+    height: "100%",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  helperText: {
+    fontSize: "0.75rem",
+    color: "text.secondary",
+    marginTop: "4px",
+  }
+};
+
+const formatCurrency = (val) => {
+  if (val === null || val === undefined || val === "") return "0.0000";
+  
+  // Ensure it's a string without using Number()
+  const strVal = String(val).trim();
+  
+  // Split into integer and decimal parts
+  const parts = strVal.split(".");
+  let intPart = parts[0];
+  let decPart = parts[1] || "";
+
+  // Pad or truncate to exactly 4 decimal places
+  decPart = decPart.padEnd(4, "0").substring(0, 4);
+
+  // Safely add commas to the integer part (e.g. 1000000 -> 1,000,000)
+  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+  return `${intPart}.${decPart}`;
+};
+
+const getTxnTypeColor = (txnType) =>
+  txnType === "Credit" ? "error" : "success";
+
+const CustomConnector = styled(StepConnector)(({ theme }) => ({
+  [`&.${stepConnectorClasses.alternativeLabel}`]: {
+    top: 10,
+    left: 'calc(-50% + 12px)',
+    right: 'calc(50% + 12px)',
+  },
+  [`&.${stepConnectorClasses.active}`]: {
+    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
+  },
+  [`&.${stepConnectorClasses.completed}`]: {
+    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
+  },
+  [`& .${stepConnectorClasses.line}`]: {
+    borderColor: theme.palette.divider,
+    borderTopWidth: 2,
+    borderRadius: 1,
+  },
+}));
+
+
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Pending Requests</Typography>
+    </Stack>
+  );
+}
+
+export default function JournalAuthorization() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
   const [detailTotalCount, setDetailTotalCount] = useState(0);
-
-```
-**REPLACE WITH THIS:**
-```javascript
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED");
+  const [executorRemarks, setExecutorRemarks] = useState("");
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [batchDetails, setBatchDetails] = useState([]);
+    const [viewingBatch, setViewingBatch] = useState(null);
+  // --- NEW: SCHEDULE LAPSE STATE ---
+  const [isScheduleLapseModalOpen, setIsScheduleLapseModalOpen] = useState(false);
+  const [newScheduleTime, setNewScheduleTime] = useState("");
+  const [detailLoading, setDetailLoading] = useState(false);
   const [viewingBatchId, setViewingBatchId] = useState(null);
   const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
-  const [viewingBatchState, setViewingBatchState] = useState(""); 
-  // (Removed table pagination states to keep code clean and fast)
+    const [viewingBatchState, setViewingBatchState] = useState(""); 
+  const handleDownloadExcel = async () => {
 
-```
-### Step 2: Remove the Heavy API Call on Modal Open
-We no longer need to call the paginated API when the Eye icon is clicked.
-**FIND THIS FUNCTION:**
-```javascript
-  const handleOpenViewModal = (batchId, creatorId, workflowState) => {
-    setViewingBatchId(batchId);
-    setViewingBatchCreatorId(String(creatorId));
-    setViewingBatchState(workflowState || "PENDING_L1"); 
+    if (!viewingBatchId) {
+      showSnackBar("Error: Batch ID is missing!", "error");
+      return;
+    }
+
+    try {
+      showSnackBar("Downloading Excel...", "info");
+
+      const response = await callApi(
+        `/JS/voucher/download-batch/${viewingBatchId}`,
+        null,
+        "GET",
+        "blob",
+        null,
+        {},
+        false
+      );
+
+      const blobData = response.data || response;
+      if (!blobData) {
+        throw new Error("No data received from backend");
+      }
+
+      const blob = new Blob([blobData], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = window.URL.createObjectURL(blob);
+
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", `Batch_${viewingBatchId}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      showSnackBar("Download complete.", "success");
+    } catch (e) {
+      console.error("Download failed:", e);
+      let errorMsg = "Failed to download Excel file.";
+      if (e.response && e.status === 404) {
+        errorMsg = "API endpoint not found (404).";
+      }
+      showSnackBar(errorMsg, "error");
+    }
+  };
+
+  useEffect(() => {
+    isMounted.current = true;
+    try {
+      const auth =
+        sessionStorage.getItem("persist:auth") ||
+        localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+      }
+    } catch (e) { }
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  const filterAndWarn = (val, type) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphanumeric and / & ( ) , . - are allowed.";
+
+    if (type === "alphanumeric_space") {
+      // 1. Strip any character that is NOT alphanumeric or in the allowed special chars list
+      filtered = val.replace(/[^a-zA-Z0-9 ]/g, "");
+      if (filtered !== val) {
+        hasError = true;
+      }
+
+      // 2. Strip leading space and collapse double spaces (enforces the (?!.* {2}) regex rule)
+      const beforeSpaceTrim = filtered;
+      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+      if (beforeSpaceTrim !== filtered && !hasError) {
+        hasError = true;
+        msg = "Remark should not start with space or contain consecutive spaces.";
+      }
+    }
+
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+    return filtered;
+  };
+  const handleRemarksChange = (e, setter) => {
+    const val = filterAndWarn(e.target.value, "alphanumeric_space");
+    if (val.length <= 30) {
+      setter(val);
+    }
+  };
+
+  // Validation logic: Remarks are strictly compulsory (min 2, max 30)
+  const isRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+
+  const isViewingSelfCreated =
+    currentUserId &&
+    viewingBatchCreatorId &&
+    String(currentUserId).trim().toUpperCase() ===
+    String(viewingBatchCreatorId).trim().toUpperCase();
+
+  const isLargeBatch = detailTotalCount > 2000;
+
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await callApi(
+        "/JS/voucher/pending-requests-summary",
+        null,
+        "GET"
+      );
+      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
+    } catch (err) {
+      if (isMounted.current && err.name !== "CanceledError")
+        showSnackBar("Failed to load requests", "error");
+    } finally {
+      if (isMounted.current) setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchPendingBatches();
+  }, [fetchPendingBatches]);
+
+
+
+  const fetchBatchDetailsPaginated = async (batchId, page, size) => {
+    setDetailLoading(true);
+    try {
+      const res = await callApi(
+        `/JS/voucher/by-batch-paginated/${batchId}?page=${page}&size=${size}`,
+        null,
+        "GET"
+      );
+
+      const contentArray = res?.content || (Array.isArray(res) ? res : []);
+
+      if (contentArray && isMounted.current) {
+        setDetailTotalCount(res?.totalElements || contentArray.length || 0);
+        const journalGroups = new Map();
+
+        contentArray.forEach((req, index) => {
+          try {
+            console.log("Backend Row Data in Authorization:", req);
+
+            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
+            const prefix = String(jId).split("-")[0];
+
+            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
+
+            const row = {
+              ...req,
+              journalPrefix: prefix, // Save the distinct prefix
+              amount: Math.abs(amountVal),
+      transactionType: amountVal < 0 ? "Credit" : "Debit",
+              branch: req.branchCode || req.reqBranchCode || "-",
+              currency: req.currency || req.reqCurrency || "-",
+              cgl: req.cgl || req.reqCgl || "-",
+              remarks: req.narration || req.reqNarration || "-",
+              product: req.productCode || req.reqProduct || "-",
+            };
+
+            // FIX: Group explicitly by Branch!
+            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
+            journalGroups.get(prefix).push(row);
+
+          } catch (e) {
+            console.error("Failed to map row details:", req, e);
+          }
+        });
+        setBatchDetails(Array.from(journalGroups.values()));
+      }
+    } catch (e) {
+      if (isMounted.current) showSnackBar("Failed to load details", "error");
+    } finally {
+      if (isMounted.current) setDetailLoading(false);
+    }
+  };
+  const handleOpenViewModal = (row) => {
+    setViewingBatch(row); // Store the row for the Live Stepper
+    setViewingBatchId(row.batchId);
+    setViewingBatchCreatorId(String(row.creatorId));
     setDetailPage(0);
     setDetailRowsPerPage(10);
     setIsViewModalOpen(true);
-    fetchBatchDetailsPaginated(batchId, 0, 10);
   };
 
-```
-**REPLACE WITH THIS:**
-```javascript
-  const handleOpenViewModal = (batchId, creatorId, workflowState) => {
-    setViewingBatchId(batchId);
-    setViewingBatchCreatorId(String(creatorId));
-    setViewingBatchState(workflowState || "PENDING_L1"); 
-    setIsViewModalOpen(true);
-    // Removed fetchBatchDetailsPaginated to save server load!
+  const handleDetailPageChange = (event, newPage) => {
+    setDetailPage(newPage);
+    fetchBatchDetailsPaginated(viewingBatchId, newPage, detailRowsPerPage);
   };
 
-```
-*(You can now safely **delete** the entire fetchBatchDetailsPaginated, handleDetailPageChange, and handleDetailRowsPerPageChange functions from your file to clean up the code!)*
-### Step 3: Redesign the View Modal UI
-We will remove the TableContainer and TablePagination completely, and instead put a clean, centralized "Download Excel" card right below the Stepper.
-**FIND THIS ENTIRE DIALOG BLOCK (Near the bottom of your file):**
-```javascript
-      {/* --- View Details Modal --- */}
-      <Dialog
-        open={isViewModalOpen}
-        onClose={handleCloseViewModal}
+  const handleDetailRowsPerPageChange = (event) => {
+    const newSize = parseInt(event.target.value, 10);
+    setDetailRowsPerPage(newSize);
+    setDetailPage(0);
+    fetchBatchDetailsPaginated(viewingBatchId, 0, newSize);
+  };
+
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setViewingBatchCreatorId(null);
+    fetchPendingBatches();
+  };
+
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+ const handleSubmitAction = async (overrideLapse = false) => {
+    if (!isRemarksValid(executorRemarks)) {
+      showSnackBar("Remarks are compulsory (2-30 chars).", "warning");
+      return;
+    }
+    setIsSubmitting(true);
+    
+    // Format the new schedule time if they provided one during a lapse override
+    let formattedNewSchedule = null;
+    if (overrideLapse && newScheduleTime) {
+       const dateObj = new Date(newScheduleTime);
+       formattedNewSchedule = dateObj.toISOString().slice(0, 19).replace('T', ' ');
+    }
+
+    try {
+      const response = await callApi(
+        "/JS/voucher/workflow/action", // <-- NEW ENDPOINT
+        {
+          batchId: selectedBatch.batchId,
+          status: modalMode,
+          remarks: executorRemarks.trim(),
+          overrideScheduleLapse: overrideLapse,
+          newScheduledTime: formattedNewSchedule
+        },
+        "POST"
+      );
+
+      showSnackBar(response?.message || "Workflow action processed successfully.", "success");
+
+      handleCloseModal();
+      setIsScheduleLapseModalOpen(false);
+      setNewScheduleTime("");
+      fetchPendingBatches();
+
+    } catch (e) {
+      // --- CATCH THE SCHEDULE LAPSE EDGE CASE ---
+      if (e.response && e.response.status === 409) {
+         setIsScheduleLapseModalOpen(true);
+         setIsModalOpen(false); // Hide the standard modal
+         setIsSubmitting(false);
+         return;
+      }
+
+      let errorMsg = "Failed to process request.";
+      if (e.response?.data?.message) {
+        errorMsg = e.response.data.message;
+      } else if (e.message) {
+        errorMsg = e.message;
+      }
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "workflowState",
+      headerName: "Workflow Progress",
+      width: 250,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const state = params.value || "PENDING_L1";
+        
+        // Determine the active step index based on the backend string
+        let activeStep = 0;
+        if (state.includes("L2")) activeStep = 1;
+        if (state.includes("L3")) activeStep = 2;
+        if (state.includes("L4")) activeStep = 3;
+        if (state === "POSTED" || state === "SCHEDULED" || state === "APPROVED") activeStep = 4;
+        
+        const isRejected = state === "REJECTED";
+
+        if (isRejected) {
+           return <Chip label="REJECTED" color="error" size="small" variant="filled" sx={{ mt: 1.5, fontWeight: "bold" }} />;
+        }
+
+        return (
+          <Box sx={{ width: '100%', mt: 0.5 }}>
+            <Stepper 
+              activeStep={activeStep} 
+              alternativeLabel 
+              connector={<CustomConnector />}
+            >
+              {/* Dynamic Steps. Assumes max 4 levels visually */}
+              {['L1', 'L2', 'L3', 'Final'].map((label, index) => (
+                <Step key={label}>
+                  <StepLabel 
+                    StepIconProps={{ 
+                      sx: { 
+                        width: 20, 
+                        height: 20, 
+                        color: activeStep >= index ? 'success.main' : 'text.disabled',
+                        '&.Mui-active': { color: 'primary.main' }
+                      } 
+                    }}
+                  >
+                    <Typography sx={{ fontSize: '0.65rem', mt: -1, fontWeight: activeStep === index ? 'bold' : 'normal' }}>
+                      {label}
+                    </Typography>
+                  </StepLabel>
+                </Step>
+              ))}
+            </Stepper>
+          </Box>
+        );
+      },
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Chip icon={<AccountCircleIcon />} label={p.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) =>
+        new Date(p.value).toLocaleString("en-IN", {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }),
+    },
+
+    {
+      field: "requestCount",
+      headerName: "No. of Entries",
+      width: 220,  // Increased width to ensure visibility
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 1,
+      minWidth: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const isSelf =
+          currentUserId &&
+          params.row.creatorId &&
+          String(currentUserId).trim().toUpperCase() ===
+          String(params.row.creatorId).trim().toUpperCase();
+        return (
+          <Stack direction="row" spacing={1} justifyContent="center">
+            <Tooltip title="View Detailed Status">
+              <IconButton
+                onClick={() => handleOpenViewModal(params.row)} // Passing the full row now
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={isSelf ? "Self-approval disabled" : "Accept"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "ACCEPTED")}
+                  color="success"
+                  disabled={isSelf}
+                >
+                  <CheckIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title={isSelf ? "Self-rejection disabled" : "Reject"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "REJECTED")}
+                  color="error"
+                  disabled={isSelf}
+                >
+                  <ClearIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Box sx={styles.mainContainer}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize
+        rowHeight={52}
+        initialState={{
+          pagination: { paginationModel: { page: 0, pageSize: 10 } },
+        }}
+        slots={{ noRowsOverlay: CustomNoRowsOverlay }}
+        sx={styles.dataGridContainer}
+      />
+
+      {/* --- Main Grid Approve/Reject Dialog --- */}
+
+{/* --- Schedule Lapsed Edge Case Modal --- */}
+      <Dialog 
+        open={isScheduleLapseModalOpen} 
+        onClose={() => setIsScheduleLapseModalOpen(false)}
+        maxWidth="sm"
         fullWidth
-        maxWidth="lg"
       >
-        <DialogTitle sx={styles.dialogTitle}>
-           {/* ... existing title with the old export button ... */}
+        <DialogTitle sx={{ color: "error.main", fontWeight: "bold" }}>
+          Schedule Lapsed
         </DialogTitle>
-        <DialogContent dividers sx={{ p: 0 }}>
-           {/* ... your Stepper and TableContainer ... */}
+        <DialogContent>
+          <Alert severity="warning" sx={{ mb: 3 }}>
+            The original scheduled execution time for this batch has passed.
+          </Alert>
+          <Typography variant="body1" gutterBottom>
+            Do you want to post this batch <strong>immediately</strong>, or set a <strong>new future schedule</strong>?
+          </Typography>
+          
+          <Paper elevation={0} sx={{ p: 2, mt: 3, backgroundColor: "action.hover", border: "1px dashed", borderColor: "divider" }}>
+            <Typography variant="subtitle2" gutterBottom>Optional: Set New Schedule</Typography>
+            <TextField 
+              type="datetime-local" 
+              size="small" 
+              fullWidth
+              InputLabelProps={{ shrink: true }} 
+              value={newScheduleTime} 
+              onChange={(e) => setNewScheduleTime(e.target.value)} 
+              inputProps={{ min: new Date().toISOString().slice(0, 16) }} 
+            />
+            <FormHelperText>Leave blank to post immediately upon acceptance.</FormHelperText>
+          </Paper>
         </DialogContent>
-        <DialogActions sx={styles.dialogActions}>
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={() => setIsScheduleLapseModalOpen(false)} color="inherit">
+            Cancel
+          </Button>
+          <Button 
+            onClick={() => handleSubmitAction(true)} 
+            variant="contained" 
+            color="primary"
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? <CircularProgress size={20} color="inherit" /> : "Confirm & Proceed"}
+          </Button>
         </DialogActions>
       </Dialog>
 
-```
-*(Highlight from {/* --- View Details Modal --- */} all the way to </Dialog>)*
-**REPLACE WITH THIS NEW, CLEANER MODAL:**
-```javascript
       {/* --- View Details Modal --- */}
-      <Dialog
+ <Dialog
         open={isViewModalOpen}
         onClose={handleCloseViewModal}
         fullWidth
@@ -177,6 +813,6 @@ We will remove the TableContainer and TablePagination completely, and instead pu
           </Box>
         </DialogContent>
       </Dialog>
-
-```
-This makes the modal incredibly fast to load, saves server resources, and perfectly guides the Checker to do exactly what they need to do: review the workflow state, download the file, and then accept/reject!
+    </Box>
+  );
+}
