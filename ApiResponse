@@ -1,70 +1,3 @@
-To make your React Stepper 100% dynamic, we need to stop hardcoding the array and instead fetch the steps from your new WORKFLOW_TRANSITIONS database table.
-We will do this in **Two Phases**. First, we will replace the code in your JournalAuthorization.jsx file. Second, we will add the tiny API endpoint in Java to feed it the data.
-Here is the step-by-step replacement for your React file.
-### PHASE 1: React Frontend Updates (JournalAuthorization.jsx)
-#### Step 1: Add the Dynamic State Variables
-We need variables to hold the dynamic array of steps fetched from the backend.
-**FIND THIS (Around line 152):**
-```javascript
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
-  const [viewingBatchState, setViewingBatchState] = useState(""); 
-
-```
-**REPLACE WITH THIS:**
-```javascript
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
-  const [viewingBatchState, setViewingBatchState] = useState(""); 
-  const [dynamicSteps, setDynamicSteps] = useState([]); // <-- NEW: Holds DB steps
-  const [isFetchingSteps, setIsFetchingSteps] = useState(false); // <-- NEW: Loading spinner state
-
-```
-#### Step 2: Update the Modal Open Handler to Fetch the Steps
-When the user clicks the Eye icon, we will ask the backend for the specific steps that belong to this batch's workflow (e.g., Workflow_3).
-**FIND THIS FUNCTION (Around line 282):**
-```javascript
-   const handleOpenViewModal = (row) => {
-    setViewingBatch(row); 
-    setViewingBatchId(row.batchId);
-    setViewingBatchCreatorId(String(row.creatorId));
-    
-    // Pass the workflow state so the Stepper highlights correctly!
-    setViewingBatchState(row.workflowState || "PENDING_L1"); 
-    
-    setIsViewModalOpen(true);
-  };
-
-```
-**REPLACE WITH THIS:**
-```javascript
-  const handleOpenViewModal = async (row) => {
-    setViewingBatch(row); 
-    setViewingBatchId(row.batchId);
-    setViewingBatchCreatorId(String(row.creatorId));
-    setViewingBatchState(row.workflowState || "PENDING_L1"); 
-    
-    setIsViewModalOpen(true);
-    setIsFetchingSteps(true);
-
-    try {
-      // Dynamically fetch the steps from the DB based on this batch's workflow code!
-      const workflowCode = row.approvalWorkflow || "Workflow_3"; 
-      const stepsData = await callApi(`/JS/voucher/workflow/steps/${workflowCode}`, null, "GET");
-      setDynamicSteps(Array.isArray(stepsData) ? stepsData : []);
-    } catch (err) {
-      console.error("Failed to load workflow steps", err);
-      showSnackBar("Failed to load dynamic workflow steps.", "error");
-    } finally {
-      setIsFetchingSteps(false);
-    }
-  };
-
-```
-#### Step 3: Simplify the DataGrid Column
-A dynamic stepper with 5 or 6 levels will break the UI inside a tiny DataGrid column. It is much cleaner to just show a bold "Status Chip" in the grid, and leave the big beautiful Stepper for the View Modal.
-**FIND THIS ENTIRE OBJECT in your columns array (Around line 395):**
-```javascript
     {
       field: "workflowState",
       headerName: "Workflow Progress",
@@ -74,143 +7,57 @@ A dynamic stepper with 5 or 6 levels will break the UI inside a tiny DataGrid co
       disableColumnMenu: true,
       sortable: false,
       renderCell: (params) => {
-          // ... all the old hardcoded Stepper logic ...
-      },
-    },
-
-```
-**REPLACE WITH THIS CLEAN STATUS CHIP:**
-```javascript
-    {
-      field: "workflowState",
-      headerName: "Current Status",
-      width: 200,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (params) => {
         const state = params.value || "PENDING_L1";
-        if (state === "REJECTED") {
+        const workflow = params.row.approvalWorkflow || "Workflow_4"; // Added in Phase 2
+        const isRejected = state === "REJECTED";
+
+        if (isRejected) {
            return <Chip label="REJECTED" color="error" size="small" variant="filled" sx={{ mt: 1.5, fontWeight: "bold" }} />;
         }
+
+        // Determine how many dots to show based on the workflow code we added to the Java API!
+        let stepLabels = ['L1', 'L2', 'L3', 'Final']; // Default fallback
+        if (workflow === 'Workflow_3') stepLabels = ['L1', 'L2', 'Final'];
+        if (workflow === 'Workflow_4') stepLabels = ['L1', 'L2', 'L3', 'L4', 'Final'];
+
+        // Determine active step safely
+        let activeStep = 0;
+        if (state.includes("L2")) activeStep = 1;
+        if (state.includes("L3")) activeStep = 2;
+        if (state.includes("L4")) activeStep = 3;
+        
+        // Push step to the end if it's completely finished
+        if (state === "POSTED" || state === "SCHEDULED" || state === "APPROVED") {
+            activeStep = stepLabels.length - 1; 
+        }
+
         return (
-          <Chip 
-            label={state.replace("_", " ")} 
-            color="primary" 
-            variant="outlined" 
-            size="small" 
-            sx={{ mt: 1.5, fontWeight: "bold" }} 
-          />
+          <Box sx={{ width: '100%', mt: 0.5 }}>
+            <Stepper 
+              activeStep={activeStep} 
+              alternativeLabel 
+              connector={<CustomConnector />}
+            >
+              {stepLabels.map((label, index) => (
+                <Step key={label}>
+                  <StepLabel 
+                    StepIconProps={{ 
+                      sx: { 
+                        width: 20, 
+                        height: 20, 
+                        color: activeStep >= index ? 'success.main' : 'text.disabled',
+                        '&.Mui-active': { color: 'primary.main' }
+                      } 
+                    }}
+                  >
+                    <Typography sx={{ fontSize: '0.65rem', mt: -1, fontWeight: activeStep === index ? 'bold' : 'normal' }}>
+                      {label}
+                    </Typography>
+                  </StepLabel>
+                </Step>
+              ))}
+            </Stepper>
+          </Box>
         );
       },
     },
-
-```
-#### Step 4: Make the Large Modal Stepper 100% Dynamic
-Now we replace the hardcoded [ {label: L1}, {label: L2} ] array with our new dynamicSteps array.
-**FIND THIS BLOCK inside your View Modal (Near the bottom):**
-```javascript
-              {viewingBatchState === "REJECTED" ? (
-                <Alert severity="error" sx={{ mt: 2 }}>This batch was REJECTED and the workflow has been terminated.</Alert>
-              ) : (
-                <Box sx={{ width: '100%', mt: 4, mb: 3 }}>
-                  <Stepper 
-                     // ... existing stepper code ...
-                  </Stepper>
-                </Box>
-              )}
-
-```
-**REPLACE WITH THIS:**
-```javascript
-              {viewingBatchState === "REJECTED" ? (
-                <Alert severity="error" sx={{ mt: 2 }}>This batch was REJECTED and the workflow has been terminated.</Alert>
-              ) : isFetchingSteps ? (
-                <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
-              ) : dynamicSteps.length > 0 ? (
-                <Box sx={{ width: '100%', mt: 4, mb: 3 }}>
-                  <Stepper 
-                    activeStep={dynamicSteps.findIndex(s => s.state === viewingBatchState)} 
-                    alternativeLabel
-                    connector={<CustomConnector />}
-                  >
-                    {dynamicSteps.map((step, index) => {
-                      const currentActiveIndex = dynamicSteps.findIndex(s => s.state === viewingBatchState);
-                      
-                      // If the state is POSTED, SCHEDULED, or APPROVED, all steps are colored green
-                      const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED";
-                      const isCompleted = isFullyDone || currentActiveIndex > index;
-                      const isCurrent = !isFullyDone && currentActiveIndex === index;
-
-                      return (
-                        <Step key={step.state}>
-                          <StepLabel 
-                            StepIconProps={{ 
-                              sx: { 
-                                width: 32, height: 32, 
-                                color: isCompleted ? 'success.main' : (isCurrent ? 'primary.main' : 'text.disabled') 
-                              } 
-                            }}
-                          >
-                            <Typography variant="body1" sx={{ fontWeight: isCurrent ? 'bold' : 'normal', color: isCurrent ? 'primary.main' : 'text.primary' }}>
-                              {step.label}
-                            </Typography>
-                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-                              Role ID: {step.role}
-                            </Typography>
-                          </StepLabel>
-                        </Step>
-                      );
-                    })}
-                  </Stepper>
-                </Box>
-              ) : (
-                <Alert severity="info" sx={{ mt: 2 }}>Workflow steps configuration not found.</Alert>
-              )}
-
-```
-### PHASE 2: The Java Backend Bridge (3 Small Additions)
-To make the React code above work, your Java backend needs to supply the data. Add these quickly to your backend files.
-**1. Update getPendingBatchesForChecker in VoucherRequestServiceImpl.java**
-You need to return the APPROVAL_WORKFLOW so React knows which workflow code to fetch. Add it to the SQL SELECT and map it:
-```java
-    // Change your SQL SELECT to include p.APPROVAL_WORKFLOW:
-    String sql = "SELECT b.BATCH_ID, p.VID_FK, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, " +
-                 "b.TOTAL_ROWS, p.CURRENT_STATUS, p.SCHEDULED_TIME, p.APPROVAL_WORKFLOW " + // <--- ADDED THIS
-                 "FROM JOURNAL_BATCH_MASTER ...";
-
-    // And add it to the mapper:
-    map.put("approvalWorkflow", rs.getString("APPROVAL_WORKFLOW")); // <--- ADDED THIS
-
-```
-**2. Add the Configuration Fetcher in VoucherRequestServiceImpl.java**
-Add this new method to read your dynamic database table and send the steps to React.
-```java
-    public List<Map<String, Object>> getWorkflowSteps(String workflowCode) {
-        // Gets the chronological sequence of steps from the DB!
-        String sql = "SELECT NEXT_STATE, CURRENT_ROLE_ID FROM WORKFLOW_TRANSITIONS " +
-                     "WHERE WORKFLOW_CODE = ? AND ACTION_TAKEN IN ('CREATE', 'ACCEPTED') " +
-                     "ORDER BY TRANSITION_ID ASC";
-                     
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> step = new HashMap<>();
-            String state = rs.getString("NEXT_STATE");
-            step.put("state", state);
-            step.put("label", state.replace("_", " ")); // e.g., "PENDING L1"
-            step.put("role", rs.getString("CURRENT_ROLE_ID") != null ? rs.getString("CURRENT_ROLE_ID") : "System");
-            return step;
-        }, workflowCode);
-    }
-
-```
-**3. Add the Endpoint in VoucherPostingController.java**
-Expose the method you just created to the React frontend.
-```java
-    @GetMapping("/workflow/steps/{workflowCode}")
-    public ResponseEntity<List<Map<String, Object>>> getWorkflowSteps(@PathVariable String workflowCode) {
-        return ResponseEntity.ok(voucherRequestService.getWorkflowSteps(workflowCode)); // (Don't forget to add this method signature to the Interface as well!)
-    }
-
-```
-**Boom!** If you add a "Level 5" in the Oracle database tomorrow, your React UI will instantly draw 5 circles. No deployments needed.
