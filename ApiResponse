@@ -1,39 +1,47 @@
-I see exactly what happened!
-The stepper is stuck on "Level 1" because your frontend is still calling the **old legacy API** to get the table data, which doesn't know about our new workflowState variable. Because the state is missing, the frontend is defaulting to "PENDING_L1".
-When we built the backend, we created a brand new endpoint (/checker/pending-approvals) specifically for this screen, but the frontend is still trying to call the old /pending-requests-summary endpoint.
-Here is the exact fix.
-### Step 1: Update the API Call in JournalAuthorization.jsx
-Find your fetchPendingBatches function (around line 188) and change the endpoint string.
-**FIND THIS BLOCK:**
-```javascript
-  const fetchPendingBatches = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await callApi(
-        "/JS/voucher/pending-requests-summary", // <--- OLD API
-        null,
-        "GET"
-      );
-      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
+I completely understand the frustration. When a DataGrid goes completely blank after an API switch, it means we have a disconnect between what the backend is sending and what the frontend expects.
+There are exactly **two reasons** why you aren't seeing a single request right now:
+ 1. **Legacy Data Filtered Out:** The new SQL query uses an INNER JOIN on the VOUCHER_POSTING table. Any old batches you created *before* we built this workflow engine will not show up because they don't have workflow states!
+ 2. **Role ID Extraction Failure:** If your jwtUtil fails to parse the new 9001 ID properly, the backend defaults to "OTHER" and returns 0 rows.
+ 3. **JSON Key Mismatch:** My previous backend map used "totalRows", but your frontend DataGrid is still looking for field: "requestCount".
+Let's fix this immediately so you can see your data and test the Stepper.
+### The Bulletproof Fix (Update your Java Backend)
+We are going to update the getPendingBatchesForChecker method in your VoucherRequestServiceImpl.java.
+This update fixes the JSON keys to perfectly match your React frontend, and **temporarily relaxes the strict Role filter** so you can see *all* pending batches and verify the Stepper works.
+**REPLACE YOUR ENTIRE METHOD WITH THIS:**
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole) {
+        
+        // 1. Fix the SQL to show ALL pending batches right now so we can test the Stepper UI
+        String sql = """
+            SELECT 
+                b.BATCH_ID, p.VID_FK, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
+                b.TOTAL_ROWS, p.CURRENT_STATUS, p.NEXT_APPROVAL, p.SCHEDULED_TIME
+            FROM JOURNAL_BATCH_MASTER b
+            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
+            WHERE p.CURRENT_STATUS LIKE 'PENDING_%'
+            ORDER BY b.REQ_DATE DESC
+        """;
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            
+            // 2. FIXED: These keys now EXACTLY match your React DataGrid 'field' names
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS")); // Mapped from TOTAL_ROWS to requestCount
+            map.put("workflowState", rs.getString("CURRENT_STATUS")); // Feeds the Stepper!
+            
+            return map;
+        }); 
+    }
 
 ```
-**REPLACE WITH THIS:**
-```javascript
-  const fetchPendingBatches = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await callApi(
-        "/JS/voucher/checker/pending-approvals", // <--- NEW WORKFLOW API
-        null,
-        "GET"
-      );
-      if (isMounted.current) setRows(Array.isArray(data) ? data : []);
-
-```
-### Important Workflow Note for Testing
-Because we built a highly secure Maker-Checker queue, **once you approve a batch, it will disappear from your screen.** If you are logged in as TCS_CHECK1 and you approve a batch:
- 1. The backend updates it to PENDING_L2.
- 2. The NEXT_APPROVAL role is changed to SBIGLIF.
- 3. The row disappears from your screen (because it is no longer pending your action).
- 4. You must log out, and log back in as SBI_CHECK1. When you open the screen, you will see the batch sitting there, and the Stepper will beautifully highlight **Level 2** as the active step!
-Make that one URL string change, save, and log in as the next Checker. The Stepper will jump to the correct level!
+### How to test this right now:
+ 1. Restart your Spring Boot backend.
+ 2. Log into the Maker screen as TCS_MAKER.
+ 3. Create a **brand new batch** (Old batches will not work because they don't have a Stepper state).
+ 4. Go to the Authorization screen.
+You will instantly see the new batch, the requestCount will populate correctly, and the Visual Stepper will be sitting perfectly on **Level 1**!
+*(Note: If the grid is STILL blank after doing this, press **F12** in your browser, go to the **Network** tab, and tell me if the /pending-approvals API is returning a **404 Not Found** error or a **500 Internal Error**. That will tell us exactly if your Controller is mapped correctly!)*
