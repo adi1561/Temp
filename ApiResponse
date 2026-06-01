@@ -1,379 +1,212 @@
-To integrate the new multi-level approval workflow and the **Custom Stepper** into your Checker screen, we need to make a few precise updates to your JournalAuthorization.jsx file.
-This will replace the basic "Status" chip with a live, visual Material-UI <Stepper> for each row, update the API payload, and handle the tricky **"Schedule Lapsed" (409 Conflict)** edge case by popping up a new dialog for the Final Approver.
-Here are the step-by-step blocks to find and replace.
-### Step 1: Update the Imports
-We need to add the Stepper components and fix the API payload dependencies.
-**FIND THIS BLOCK:**
+This is a fantastic idea. Removing the clutter of the financial totals from the main grid will make the screen much cleaner for the Checkers, and adding a large, detailed, live-updating stepper inside the View Modal will give them total visibility into exactly where the batch is in the workflow.
+Here are the precise blocks to find and replace in your JournalAuthorization.jsx file to implement this.
+### Step 1: Add a New State for the Detailed Stepper
+We need to track the entire row data (not just the ID) when the user clicks the Eye icon so we can power the detailed Stepper.
+**FIND THIS BLOCK (Near the top of your component state declarations):**
 ```javascript
-import {
-  Box,
-  Typography,
-  Chip,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
-  TextField,
-  Button,
-  CircularProgress,
-  Tooltip,
-  IconButton,
-  Stack,
-  Grid,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Paper,
-  Checkbox,
-  TablePagination,
-  Alert,
-  FormHelperText,
-} from "@mui/material";
-
-```
-**REPLACE WITH THIS:**
-```javascript
-import {
-  Box,
-  Typography,
-  Chip,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
-  TextField,
-  Button,
-  CircularProgress,
-  Tooltip,
-  IconButton,
-  Stack,
-  Grid,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Paper,
-  Checkbox,
-  TablePagination,
-  Alert,
-  FormHelperText,
-  Stepper,
-  Step,
-  StepLabel,
-  StepConnector,
-  stepConnectorClasses,
-  styled
-} from "@mui/material";
-
-```
-### Step 2: Add Custom Stepper Styles & New State Variables
-We need to add a custom compact styling for the Stepper so it fits beautifully inside the DataGrid rows, and add the state variables for the Schedule Lapse edge case.
-**FIND THIS BLOCK (Just below your getTxnTypeColor function, above CustomNoRowsOverlay):**
-```javascript
-const getTxnTypeColor = (txnType) =>
-  txnType === "Credit" ? "error" : "success";
-
-function CustomNoRowsOverlay() {
-
-```
-**REPLACE WITH THIS:**
-```javascript
-const getTxnTypeColor = (txnType) =>
-  txnType === "Credit" ? "error" : "success";
-
-// --- CUSTOM COMPACT STEPPER STYLING ---
-const CustomConnector = styled(StepConnector)(({ theme }) => ({
-  [`&.${stepConnectorClasses.alternativeLabel}`]: {
-    top: 10,
-    left: 'calc(-50% + 12px)',
-    right: 'calc(50% + 12px)',
-  },
-  [`&.${stepConnectorClasses.active}`]: {
-    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
-  },
-  [`&.${stepConnectorClasses.completed}`]: {
-    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
-  },
-  [`& .${stepConnectorClasses.line}`]: {
-    borderColor: theme.palette.divider,
-    borderTopWidth: 2,
-    borderRadius: 1,
-  },
-}));
-
-function CustomNoRowsOverlay() {
-
-```
-**FIND YOUR STATE VARIABLES (Inside JournalAuthorization):**
-```javascript
-  const [modalMode, setModalMode] = useState("ACCEPTED");
-  const [executorRemarks, setExecutorRemarks] = useState("");
   const [isViewModalOpen, setIsViewModalOpen] = useState(false);
   const [batchDetails, setBatchDetails] = useState([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
 
 ```
 **REPLACE WITH THIS:**
 ```javascript
-  const [modalMode, setModalMode] = useState("ACCEPTED");
-  const [executorRemarks, setExecutorRemarks] = useState("");
   const [isViewModalOpen, setIsViewModalOpen] = useState(false);
   const [batchDetails, setBatchDetails] = useState([]);
-  
-  // --- NEW: SCHEDULE LAPSE STATE ---
-  const [isScheduleLapseModalOpen, setIsScheduleLapseModalOpen] = useState(false);
-  const [newScheduleTime, setNewScheduleTime] = useState("");
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [viewingBatch, setViewingBatch] = useState(null); // <-- NEW: Store the whole batch object
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
 
 ```
-### Step 3: Update the API Call (handleSubmitAction)
-This maps the request to the new /workflow/action API and catches the 409 status code if the schedule has lapsed.
-**FIND THIS ENTIRE FUNCTION:**
+### Step 2: Update the handleOpenViewModal Function
+Now we update the handler to accept the full row object.
+**FIND THIS FUNCTION:**
 ```javascript
-  const handleSubmitAction = async () => {
-    if (!isRemarksValid(executorRemarks)) {
-      showSnackBar("Remarks are compulsory (2-30 chars).", "warning");
-      return;
-    }
-    setIsSubmitting(true);
-    try {
-      const response = await callApi(
-        "/JS/voucher/process-bulk",
-        {
-          batchId: selectedBatch.batchId,
-          status: modalMode,
-          remarks: executorRemarks.trim(),
-        },
-        "POST"
-      );
-
-      // Dynamically change text based on ACCEPTED or REJECTED
-      const fallbackMsg = modalMode === "ACCEPTED"
-        ? "Approval process started in background. You will be notified upon completion."
-        : "Rejection process started in background. You will be notified upon completion.";
-
-      const displayMessage = response?.message || fallbackMsg;
-      showSnackBar(displayMessage, "info");
-
-      handleCloseModal();
-      fetchPendingBatches();
-    } catch (e) {
-      let errorMsg = "Failed to process request.";
-      if (e.response && e.response.data && e.response.data.message) {
-        errorMsg = e.response.data.message;
-      } else if (e.message) {
-        errorMsg = e.message;
-      }
-      showSnackBar(errorMsg, "error");
-    } finally {
-      setIsSubmitting(false);
-    }
+  const handleOpenViewModal = (batchId, creatorId) => {
+    setViewingBatchId(batchId);
+    setViewingBatchCreatorId(String(creatorId));
+    setDetailPage(0);
+    setDetailRowsPerPage(10);
+    setIsViewModalOpen(true);
+    fetchBatchDetailsPaginated(batchId, 0, 10);
   };
 
 ```
 **REPLACE WITH THIS:**
 ```javascript
-  const handleSubmitAction = async (overrideLapse = false) => {
-    if (!isRemarksValid(executorRemarks)) {
-      showSnackBar("Remarks are compulsory (2-30 chars).", "warning");
-      return;
-    }
-    setIsSubmitting(true);
-    
-    // Format the new schedule time if they provided one during a lapse override
-    let formattedNewSchedule = null;
-    if (overrideLapse && newScheduleTime) {
-       const dateObj = new Date(newScheduleTime);
-       formattedNewSchedule = dateObj.toISOString().slice(0, 19).replace('T', ' ');
-    }
-
-    try {
-      const response = await callApi(
-        "/JS/voucher/workflow/action", // <-- NEW ENDPOINT
-        {
-          batchId: selectedBatch.batchId,
-          status: modalMode,
-          remarks: executorRemarks.trim(),
-          overrideScheduleLapse: overrideLapse,
-          newScheduledTime: formattedNewSchedule
-        },
-        "POST"
-      );
-
-      showSnackBar(response?.message || "Workflow action processed successfully.", "success");
-
-      handleCloseModal();
-      setIsScheduleLapseModalOpen(false);
-      setNewScheduleTime("");
-      fetchPendingBatches();
-
-    } catch (e) {
-      // --- CATCH THE SCHEDULE LAPSE EDGE CASE ---
-      if (e.response && e.response.status === 409) {
-         setIsScheduleLapseModalOpen(true);
-         setIsModalOpen(false); // Hide the standard modal
-         setIsSubmitting(false);
-         return;
-      }
-
-      let errorMsg = "Failed to process request.";
-      if (e.response?.data?.message) {
-        errorMsg = e.response.data.message;
-      } else if (e.message) {
-        errorMsg = e.message;
-      }
-      showSnackBar(errorMsg, "error");
-    } finally {
-      setIsSubmitting(false);
-    }
+  const handleOpenViewModal = (row) => {
+    setViewingBatch(row); // Store the row for the Live Stepper
+    setViewingBatchId(row.batchId);
+    setViewingBatchCreatorId(String(row.creatorId));
+    setDetailPage(0);
+    setDetailRowsPerPage(10);
+    setIsViewModalOpen(true);
+    fetchBatchDetailsPaginated(row.batchId, 0, 10);
   };
 
 ```
-### Step 4: Replace the Column Definition (The Visual Stepper)
-We are swapping the old requestStatus column for a wide, beautiful workflowState visual stepper.
-**FIND THIS COLUMN BLOCK (Inside const columns = [):**
+### Step 3: Clean Up the DataGrid Columns
+We are going to remove the totalDebit and totalCredit columns to make the grid cleaner, and update the Eye icon to pass the whole row.
+**FIND THIS BLOCK (Inside const columns = [):**
 ```javascript
     {
-      field: "requestStatus",
-      headerName: "Status",
-      width: 125,
+      field: "requestCount",
+      headerName: "No. of Entries",
+      width: 220,  // Increased width to ensure visibility
       align: "center",
       headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+       width: 220, 
+      align: "right",
+      headerAlign: "right",
       disableColumnMenu: true,
       sortable: false,
       renderCell: (p) => (
-        <Chip label={p.value} color="warning" size="small" variant="outlined" />
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
       ),
     },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 150,
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
 
 ```
-**REPLACE WITH THIS:**
+*(Highlight all of that down to the actions column definition)*
+**REPLACE WITH THIS (Removes Debit/Credit columns completely):**
 ```javascript
     {
-      field: "workflowState",
-      headerName: "Workflow Progress",
-      width: 250,
+      field: "requestCount",
+      headerName: "No. of Entries",
+      width: 180, 
       align: "center",
       headerAlign: "center",
       disableColumnMenu: true,
       sortable: false,
-      renderCell: (params) => {
-        const state = params.value || "PENDING_L1";
-        
-        // Determine the active step index based on the backend string
-        let activeStep = 0;
-        if (state.includes("L2")) activeStep = 1;
-        if (state.includes("L3")) activeStep = 2;
-        if (state.includes("L4")) activeStep = 3;
-        if (state === "POSTED" || state === "SCHEDULED" || state === "APPROVED") activeStep = 4;
-        
-        const isRejected = state === "REJECTED";
-
-        if (isRejected) {
-           return <Chip label="REJECTED" color="error" size="small" variant="filled" sx={{ mt: 1.5, fontWeight: "bold" }} />;
-        }
-
-        return (
-          <Box sx={{ width: '100%', mt: 0.5 }}>
-            <Stepper 
-              activeStep={activeStep} 
-              alternativeLabel 
-              connector={<CustomConnector />}
-            >
-              {/* Dynamic Steps. Assumes max 4 levels visually */}
-              {['L1', 'L2', 'L3', 'Final'].map((label, index) => (
-                <Step key={label}>
-                  <StepLabel 
-                    StepIconProps={{ 
-                      sx: { 
-                        width: 20, 
-                        height: 20, 
-                        color: activeStep >= index ? 'success.main' : 'text.disabled',
-                        '&.Mui-active': { color: 'primary.main' }
-                      } 
-                    }}
-                  >
-                    <Typography sx={{ fontSize: '0.65rem', mt: -1, fontWeight: activeStep === index ? 'bold' : 'normal' }}>
-                      {label}
-                    </Typography>
-                  </StepLabel>
-                </Step>
-              ))}
-            </Stepper>
-          </Box>
-        );
-      },
     },
+    {
+      field: "actions",
+      headerName: "Actions",
 
 ```
-*(Optional: In your <DataGrid> properties further down, change rowHeight={52} to rowHeight={65} so the stepper breathes better vertically).*
-### Step 5: Add the Schedule Lapse Dialog
-Finally, we need to render the UI for the 409 Conflict popup.
-**FIND THIS BLOCK (Near the bottom of your file, right before the View Details Modal):**
+**AND IMMEDIATELY BELOW THAT, FIND THE EYE ICON:**
 ```javascript
-      </Dialog>
-
-      {/* --- View Details Modal --- */}
-      <Dialog
+            <Tooltip title="View">
+              <IconButton
+                onClick={() =>
+                  handleOpenViewModal(params.row.batchId, params.row.creatorId)
+                }
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
 
 ```
-**INSERT THIS SCHEDULE LAPSE MODAL IN BETWEEN:**
+**REPLACE WITH THIS:**
 ```javascript
-      </Dialog>
-
-      {/* --- Schedule Lapsed Edge Case Modal --- */}
-      <Dialog 
-        open={isScheduleLapseModalOpen} 
-        onClose={() => setIsScheduleLapseModalOpen(false)}
-        maxWidth="sm"
-        fullWidth
-      >
-        <DialogTitle sx={{ color: "error.main", fontWeight: "bold" }}>
-          Schedule Lapsed
-        </DialogTitle>
-        <DialogContent>
-          <Alert severity="warning" sx={{ mb: 3 }}>
-            The original scheduled execution time for this batch has passed.
-          </Alert>
-          <Typography variant="body1" gutterBottom>
-            Do you want to post this batch <strong>immediately</strong>, or set a <strong>new future schedule</strong>?
-          </Typography>
-          
-          <Paper elevation={0} sx={{ p: 2, mt: 3, backgroundColor: "action.hover", border: "1px dashed", borderColor: "divider" }}>
-            <Typography variant="subtitle2" gutterBottom>Optional: Set New Schedule</Typography>
-            <TextField 
-              type="datetime-local" 
-              size="small" 
-              fullWidth
-              InputLabelProps={{ shrink: true }} 
-              value={newScheduleTime} 
-              onChange={(e) => setNewScheduleTime(e.target.value)} 
-              inputProps={{ min: new Date().toISOString().slice(0, 16) }} 
-            />
-            <FormHelperText>Leave blank to post immediately upon acceptance.</FormHelperText>
-          </Paper>
-        </DialogContent>
-        <DialogActions sx={{ p: 2 }}>
-          <Button onClick={() => setIsScheduleLapseModalOpen(false)} color="inherit">
-            Cancel
-          </Button>
-          <Button 
-            onClick={() => handleSubmitAction(true)} 
-            variant="contained" 
-            color="primary"
-            disabled={isSubmitting}
-          >
-            {isSubmitting ? <CircularProgress size={20} color="inherit" /> : "Confirm & Proceed"}
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* --- View Details Modal --- */}
-      <Dialog
+            <Tooltip title="View Detailed Status">
+              <IconButton
+                onClick={() => handleOpenViewModal(params.row)} // Passing the full row now
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
 
 ```
+### Step 4: Inject the Detailed Live Stepper into the View Modal
+Now we build the "Bigger Fit" detailed stepper at the top of the View Modal, right above the table.
+**FIND THIS EXACT LINE (Inside your View Modal <DialogContent>):**
+```javascript
+        <DialogContent dividers sx={{ p: 0 }}>
+          <Box sx={styles.fixedContentBox}>
+
+            <TableContainer component={Paper} sx={{ ...styles.tableContainer, position: "relative", minHeight: 350 }}>
+
+```
+**REPLACE WITH THIS:**
+```javascript
+        <DialogContent dividers sx={{ p: 0, backgroundColor: "#f9fafc" }}>
+          <Box sx={{ display: "flex", flexDirection: "column", height: "100%" }}>
+            
+            {/* --- NEW: DETAILED LIVE WORKFLOW STEPPER --- */}
+            {viewingBatch && (
+              <Paper elevation={0} sx={{ p: 3, m: 2, borderRadius: 2, border: "1px solid", borderColor: "divider", backgroundColor: "background.paper" }}>
+                <Typography variant="h6" fontWeight="bold" color="primary" gutterBottom sx={{ display: 'flex', alignItems: 'center' }}>
+                  <CheckIcon sx={{ mr: 1 }} /> Live Approval Workflow Tracker
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 4 }}>
+                  Current Status of Batch: <strong>{viewingBatch.batchId}</strong>
+                </Typography>
+                
+                {(() => {
+                  const state = viewingBatch.workflowState || viewingBatch.requestStatus || "PENDING_L1";
+                  let activeStep = 0;
+                  if (state.includes("L2")) activeStep = 1;
+                  if (state.includes("L3")) activeStep = 2;
+                  if (state.includes("L4")) activeStep = 3;
+                  if (state === "POSTED" || state === "SCHEDULED" || state === "APPROVED") activeStep = 4;
+                  
+                  const isRejected = state === "REJECTED";
+
+                  return (
+                    <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />}>
+                      {['Maker Entry', 'Level 1 Checker', 'Level 2 Checker', 'Final Approver'].map((label, index) => (
+                        <Step key={label}>
+                          <StepLabel 
+                            error={isRejected && activeStep === index}
+                            StepIconProps={{ 
+                              sx: { 
+                                width: 34,  // BIGGER ICONS
+                                height: 34, 
+                                color: activeStep >= index ? 'success.main' : 'text.disabled',
+                                '&.Mui-active': { color: 'primary.main' },
+                                '&.Mui-error': { color: 'error.main' }
+                              } 
+                            }}
+                          >
+                            <Typography variant="subtitle1" sx={{ fontWeight: activeStep === index ? 'bold' : '500', mt: 1, color: "text.primary" }}>
+                              {label}
+                            </Typography>
+                            <Typography variant="caption" sx={{ display: 'block', mt: 0.5, color: isRejected && activeStep === index ? "error.main" : "text.secondary", fontWeight: "bold" }}>
+                              {index < activeStep ? '✓ Approved' : (index === activeStep ? (isRejected ? '❌ Rejected' : '⏳ Currently Pending') : 'Awaiting')}
+                            </Typography>
+                          </StepLabel>
+                        </Step>
+                      ))}
+                    </Stepper>
+                  );
+                })()}
+              </Paper>
+            )}
+
+            <TableContainer component={Paper} sx={{ ...styles.tableContainer, position: "relative", minHeight: 350, mx: 2, width: 'auto', borderRadius: 2 }}>
+
+```
+### What This Does:
+ 1. **Cleaner Grid:** The Checkers no longer have to squint at massive arrays of zeros on the dashboard.
+ 2. **Immersive Workflow View:** When they click the Eye icon, they are instantly greeted by a large, colorful tracker at the top of the modal.
+ 3. **Live Updates:** It automatically calculates the activeStep dynamically based on the state passed by your backend (PENDING_L1, L2, L3, POSTED, or REJECTED), showing green checkmarks for completed steps, blue for the active step, and red if it was rejected!
