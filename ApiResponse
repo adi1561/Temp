@@ -1,169 +1,160 @@
-Here is the code to clean up the modal, remove the unwanted text, and make the layout beautifully spaced out so it looks like a premium, professional enterprise application.
-I have increased the outer padding, the space between the two cards, and the space between the text rows inside the cards so everything breathes properly. I also removed the color from the "Batch Execution Details" title to keep it clean and uniform.
-### The Fix
-Scroll down to the bottom of your file where the **View Details Modal** is (<Dialog open={isViewModalOpen}>).
-Replace the entire <DialogContent> block with this updated version:
+This is a brilliant addition. A read-only "Action History / Comment" section directly below the stepper gives complete transparency to the workflow, allowing users to see exactly *who* did *what*, *when*, and read their specific remarks.
+Based on the Flowbite design you provided, we will build a clean, vertically stacked list of cards featuring an Avatar, the User's actual Name, the Timestamp, the Action they took (e.g., "Approved by Verifier"), and their written Remarks.
+Here is the complete implementation for both the Java Backend and the React Frontend.
+### Step 1: Backend API (Java)
+We need a new API endpoint that queries your VOUCHER_WORKFLOW table and joins it with your Users table to grab the actual name instead of just the ID.
+**1. Update VoucherRequestServiceImpl.java:**
+Add this new method. *(Note: I am assuming your users table is named USERS with columns USER_ID and USER_NAME. Please update those two table/column names in the SQL below to match your actual database).*
+```java
+    @Override
+    public List<Map<String, Object>> getWorkflowHistory(String batchId) {
+        // LEFT JOIN ensures we still get the record even if the user name isn't found
+        String sql = """
+            SELECT 
+                w.LAST_ACTION_BY, 
+                COALESCE(u.USER_NAME, w.LAST_ACTION_BY) AS ACTION_USER_NAME, 
+                w.LAST_ACTION, 
+                w.LAST_ACTION_AT, 
+                w.REMARKS 
+            FROM VOUCHER_WORKFLOW w 
+            LEFT JOIN USERS u ON CAST(w.LAST_ACTION_BY AS VARCHAR2(100)) = CAST(u.USER_ID AS VARCHAR2(100))
+            WHERE w.BATCH_ID_FK = ? 
+            ORDER BY w.LAST_ACTION_AT ASC
+        """;
+        
+        return jdbcTemplate.queryForList(sql, batchId);
+    }
+
+```
+*(Add List<Map<String, Object>> getWorkflowHistory(String batchId); to your interface as well).*
+**2. Update VoucherPostingController.java:**
+Expose the endpoint so React can call it.
+```java
+    @GetMapping("/workflow-history/{batchId}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowHistory(@PathVariable String batchId) {
+        return ResponseEntity.ok(voucherRequestService.getWorkflowHistory(batchId));
+    }
+
+```
+### Step 2: Frontend API Call (React)
+Open your JournalAuthorization.jsx file. We need to add state for this new history data and update the Promise.all block to fetch it simultaneously with the other modal data.
+**1. Add the State:**
+Near the top of your component (around line 160), add:
 ```javascript
-        <DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc" }}>
-          {/* Scrollable Container */}
-          <Box sx={{ maxHeight: '75vh', overflowY: 'auto', display: "flex", flexDirection: "column" }}>
+  const [workflowHistory, setWorkflowHistory] = useState([]);
 
-            {/* --- PROFESSIONAL HEADER CARDS --- */}
-            {/* Increased outer padding to p: 4 for a more spacious look */}
-            <Box sx={{ p: 4, backgroundColor: "white", borderBottom: "1px solid", borderColor: "divider" }}>
+```
+**2. Update handleOpenViewModal:**
+Find this function and add the third API call to the Promise.all array:
+```javascript
+  const handleOpenViewModal = async (row) => {
+    setViewingBatch(row);
+    setViewingBatchId(row.batchId);
+    setViewingBatchCreatorId(String(row.creatorId));
+    setViewingBatchState(row.workflowState || "PENDING_L1");
+
+    setIsViewModalOpen(true);
+    setIsFetchingSteps(true);
+    setIsFetchingVid(true);
+
+    try {
+      const workflowCode = row.approvalWorkflow || "Workflow_3";
+      
+      // FETCH ALL 3 APIS CONCURRENTLY!
+      const [stepsData, summaryData, historyData] = await Promise.all([
+        callApi(`/JS/voucher/workflow/steps/${workflowCode}`, null, "GET"),
+        callApi(`/JS/voucher/batch-summary/${row.batchId}`, null, "GET"),
+        callApi(`/JS/voucher/workflow-history/${row.batchId}`, null, "GET") // <-- NEW API
+      ]);
+      
+      setDynamicSteps(Array.isArray(stepsData) ? stepsData : []);
+      setVidDetails(summaryData); 
+      setWorkflowHistory(Array.isArray(historyData) ? historyData : []); // <-- SAVE HISTORY
+    } catch (err) {
+      showSnackBar("Failed to load batch details.", "error");
+    } finally {
+      setIsFetchingSteps(false);
+      setIsFetchingVid(false);
+    }
+  };
+
+```
+### Step 3: UI Implementation (React)
+Now we will build the Flowbite-inspired comments section. We will place this directly below the Horizontal Stepper in your View Details Modal.
+**Scroll down to your <Dialog open={isViewModalOpen}>.** Find the <Box> that holds your Horizontal Timeline, and paste this **new History block directly below it**, right before the Download Footer block.
+```javascript
+            {/* --- WORKFLOW HISTORY / COMMENTS SECTION (FLOWBITE DESIGN) --- */}
+            <Box sx={{ p: 4, backgroundColor: "#f1f5f9", borderTop: "1px solid", borderColor: "divider" }}>
+              <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
+                Action History & Remarks ({workflowHistory.length})
+              </Typography>
               
-              {/* --- DYNAMIC DETAILS GRIDS --- */}
-              {isFetchingVid ? (
-                <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress size={24} /></Box>
-              ) : vidDetails && vidDetails.VID ? (
-                // Increased spacing between the two main cards to 4
-                <Grid container spacing={4}>
-                  
-                  {/* SECTION 1: VOUCHER ORIGIN DETAILS */}
-                  <Grid item xs={12} md={6}>
-                    {/* Increased inner padding to p: 3 */}
-                    <Paper elevation={0} sx={{ p: 3, backgroundColor: "#f8fafc", borderRadius: 2, height: '100%', border: "1px solid #e2e8f0" }}>
-                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid #cbd5e1", pb: 1, mb: 2 }}>
-                        Voucher Origin (VID: {vidDetails.VID})
-                      </Typography>
-                      {/* Increased inner text spacing to 3 */}
-                      <Grid container spacing={3}>
-                        <Grid item xs={6}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
-                          {/* Upgraded from body2 to body1 for professional readability */}
-                          <Typography variant="body1" fontWeight="500">{vidDetails.CATEGORY_NAME}</Typography>
-                        </Grid>
-                        <Grid item xs={6}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Origin Remarks</Typography>
-                          <Typography variant="body1" fontWeight="500" noWrap title={vidDetails.VID_REMARKS}>
-                            {vidDetails.VID_REMARKS || "N/A"}
-                          </Typography>
-                        </Grid>
-                        <Grid item xs={12}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Description</Typography>
-                          <Typography variant="body1" fontWeight="500">{vidDetails.DESCRIPTION || "N/A"}</Typography>
-                        </Grid>
-                      </Grid>
-                    </Paper>
-                  </Grid>
-
-                  {/* SECTION 2: BATCH EXECUTION DETAILS */}
-                  <Grid item xs={12} md={6}>
-                    <Paper elevation={0} sx={{ p: 3, backgroundColor: "#f8fafc", borderRadius: 2, height: '100%', border: "1px solid #e2e8f0" }}>
-                      {/* Removed secondary.main color, standardizing to text.primary */}
-                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid #cbd5e1", pb: 1, mb: 2 }}>
-                        Batch Execution Details
-                      </Typography>
-                      <Grid container spacing={3}>
-                        <Grid item xs={6}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created By</Typography>
-                          <Stack direction="row" spacing={1} alignItems="center">
-                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
-                            <Typography variant="body1" fontWeight="500">{vidDetails.BATCH_CREATED_BY}</Typography>
-                          </Stack>
-                        </Grid>
-                        <Grid item xs={6}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Creator Role</Typography>
-                          <Typography variant="body1" fontWeight="500">{vidDetails.CREATORS_ROLE || "N/A"}</Typography>
-                        </Grid>
-                        <Grid item xs={6}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created At</Typography>
-                          <Typography variant="body1" fontWeight="500">
-                             {vidDetails.BATCH_CREATED_AT ? new Date(vidDetails.BATCH_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
-                          </Typography>
-                        </Grid>
-                        <Grid item xs={6}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Scheduled Time</Typography>
-                          <Typography variant="body1" fontWeight="500" color={vidDetails.SCHEDULED_TIME ? "info.main" : "text.primary"}>
-                             {vidDetails.SCHEDULED_TIME ? new Date(vidDetails.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "Immediate"}
-                          </Typography>
-                        </Grid>
-                        {vidDetails.EXECUTED_AT && (
-                          <Grid item xs={12}>
-                            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Executed At</Typography>
-                            <Typography variant="body1" fontWeight="500" color="success.main">
-                               {new Date(vidDetails.EXECUTED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}
-                            </Typography>
-                          </Grid>
-                        )}
-                      </Grid>
-                    </Paper>
-                  </Grid>
-
-                </Grid>
-              ) : null}
-            </Box>
-
-            {/* --- HORIZONTAL TIMELINE --- */}
-            <Box sx={{ p: 4, flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-              {viewingBatchState === "REJECTED" ? (
-                <Alert severity="error" variant="filled" sx={{ mt: 2, fontWeight: "bold" }}>
-                  This batch was REJECTED and the workflow has been terminated.
-                </Alert>
-              ) : isFetchingSteps ? (
-                <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
-              ) : dynamicSteps.length > 0 ? (
-                <Stepper
-                  activeStep={
-                    (viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED")
-                      ? dynamicSteps.length
-                      : dynamicSteps.findIndex(s => s.state === viewingBatchState)
-                  }
-                  alternativeLabel
-                  connector={<CustomConnector />}
-                >
-                  {dynamicSteps.map((step, index) => {
-                    const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED";
-                    const activeStepIndex = isFullyDone ? dynamicSteps.length : dynamicSteps.findIndex(s => s.state === viewingBatchState);
-
-                    const isCompleted = index < activeStepIndex;
-                    const isCurrent = index === activeStepIndex;
+              {isFetchingSteps ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}><CircularProgress size={24}/></Box>
+              ) : workflowHistory.length === 0 ? (
+                <Alert severity="info" sx={{ borderRadius: 2 }}>No action history found for this batch.</Alert>
+              ) : (
+                <Stack spacing={2.5}>
+                  {workflowHistory.map((history, idx) => {
+                    // Extract initials for the Avatar
+                    const userName = history.ACTION_USER_NAME || "User";
+                    const initial = userName.charAt(0).toUpperCase();
 
                     return (
-                      <Step key={step.state} completed={isCompleted} active={isCurrent}>
-                        <StepLabel StepIconComponent={CustomWorkflowIcon}>
-                          <Typography variant="subtitle2" sx={{ fontWeight: isCurrent ? 'bold' : 'normal', color: isCurrent ? 'primary.main' : 'text.primary', mt: 1 }}>
-                            {step.designation} 
-                          </Typography>
+                      <Box key={idx} sx={{ display: 'flex', gap: 2 }}>
+                         {/* Avatar Profile Picture */}
+                         <Box>
+                           <Avatar sx={{ bgcolor: 'primary.main', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>
+                             {initial}
+                           </Avatar>
+                         </Box>
 
-                          <Chip
-                            label={getRoleDisplayName(step.role)}
-                            size="small"
-                            variant={isCurrent ? "filled" : "outlined"}
-                            color={isCurrent ? "primary" : "default"}
-                            sx={{ mt: 1, height: 22, fontSize: "0.65rem", fontWeight: "bold" }}
-                          />
+                         {/* Comment Card Container */}
+                         <Box sx={{ 
+                           flexGrow: 1, 
+                           backgroundColor: "white", 
+                           p: 2.5, 
+                           borderRadius: 2, 
+                           border: "1px solid", 
+                           borderColor: "#e2e8f0",
+                           boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)"
+                         }}>
+                            {/* Header: Name and Date */}
+                            <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                              <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
+                                {userName}
+                              </Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                • {new Date(history.LAST_ACTION_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
+                              </Typography>
+                            </Box>
 
-                          {/* Keeping the time pending under the active step */}
-                          {isCurrent && (
-                            <Typography variant="caption" display="block" color="warning.main" fontWeight="bold" sx={{ mt: 1 }}>
-                              Pending: {calculateTimeElapsed(viewingBatch?.requestDate)}
+                            {/* Badge: The Action Taken (e.g. Approved by Verifier) */}
+                            <Chip 
+                              label={history.LAST_ACTION || "System Action"} 
+                              size="small" 
+                              sx={{ 
+                                mb: 1.5, height: 22, fontSize: "0.7rem", fontWeight: "bold",
+                                backgroundColor: history.LAST_ACTION?.includes("Reject") ? "#fee2e2" : "#e0e7ff",
+                                color: history.LAST_ACTION?.includes("Reject") ? "#991b1b" : "#3730a3"
+                              }} 
+                            />
+
+                            {/* Body: The Remarks Text */}
+                            <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                               {history.REMARKS || "No remarks provided."}
                             </Typography>
-                          )}
-                        </StepLabel>
-                      </Step>
+                         </Box>
+                      </Box>
                     );
                   })}
-                </Stepper>
-              ) : (
-                <Alert severity="info" sx={{ mt: 2 }}>Workflow configuration not found.</Alert>
+                </Stack>
               )}
             </Box>
 
-            {/* --- PROFESSIONAL DOWNLOAD FOOTER --- */}
-            <Box sx={{ p: 2, backgroundColor: "white", borderTop: "1px solid", borderColor: "divider", display: "flex", justifyContent: "flex-end" }}>
-              <Button
-                variant="outlined"
-                startIcon={<FileDownloadIcon />}
-                onClick={handleDownloadExcel}
-                disabled={!viewingBatchId}
-                sx={{ borderColor: "#217346", color: "#217346", "&:hover": { backgroundColor: "#e8f5e9", borderColor: "#1e6b40" } }}
-              >
-                Download Full Batch Report
-              </Button>
-            </Box>
-
-          </Box>
-        </DialogContent>
-
 ```
+### What this gives you:
+ 1. **Avatar Icons:** It grabs the first letter of the user's name and places it in a professional circular avatar.
+ 2. **Name & Timestamp:** Displays horizontally exactly like the design you shared (Adesh Kulkarni • Jun 2, 2026, 3:11 PM).
+ 3. **Action Badge:** Displays a beautiful dynamic chip (Approved by Reviewer) so you know *what* action the comment belongs to. It dynamically turns red if the action contains the word "Reject".
+ 4. **No New Inputs:** It strictly keeps it "Read-Only" as requested, omitting the "Write a comment..." text box from the Flowbite template.
