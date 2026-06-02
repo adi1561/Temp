@@ -1,149 +1,80 @@
-I understand completely. We will revert the big stepper back to a beautiful **horizontal** layout.
-Regarding the role names (showing 9001 instead of the name): If the Java database JOIN isn't mapping the names correctly yet, the easiest and most bulletproof way to fix this immediately is to map the IDs to their names directly in the frontend.
-Here is the updated code. It gives you the **Horizontal Stepper**, adds a **Role Name Mapper**, and places the **Total Time Elapsed** clearly at the top.
-### Step 1: Add the Role Mapper Function
-Put this right next to your calculateTimeElapsed function (near the top of your component):
-```javascript
-  const getRoleDisplayName = (roleValue) => {
-    // If the backend sends raw IDs, map them to professional names
-    const roleMap = {
-      "9001": "TCSGLIF Maker/Checker",
-      "9002": "SBIGLIF Checker",
-      "9003": "Branch Maker",
-      "null": "System Execution",
-      "System": "System Execution"
-    };
-    return roleMap[String(roleValue)] || roleValue || "System";
-  };
+You are absolutely right. Hardcoding those names in the React frontend completely defeats the purpose of having a dynamic database!
+If you are still seeing 9001 or 9002 in the UI, it means the Java API is just sending the raw ID, and we need to fix it at the **Database/Java level**.
+Here is how to make it 100% dynamic from the database, so React just blindly displays whatever the database tells it.
+### Step 1: Ensure Your Java API is doing a JOIN
+In your VoucherRequestServiceImpl.java, we need to update the getWorkflowSteps method. Instead of just querying WORKFLOW_TRANSITIONS, we will do a LEFT JOIN on your ROLES table to fetch the exact ROLE_NAME.
+**Replace your getWorkflowSteps method with this:**
+```java
+    public List<Map<String, Object>> getWorkflowSteps(String workflowCode) {
+        // Advanced SQL: Join the Transitions table with the Roles table dynamically
+        String sql = """
+            SELECT w.NEXT_STATE, w.CURRENT_ROLE_ID, r.ROLE_NAME 
+            FROM WORKFLOW_TRANSITIONS w 
+            LEFT JOIN ROLES r ON w.CURRENT_ROLE_ID = r.ROLE_ID 
+            WHERE w.WORKFLOW_CODE = ? AND w.ACTION_TAKEN IN ('CREATE', 'ACCEPTED') 
+            ORDER BY w.TRANSITION_ID ASC
+        """;
+                     
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> step = new HashMap<>();
+            String state = rs.getString("NEXT_STATE");
+            
+            step.put("state", state);
+            step.put("label", state.replace("_", " ")); // e.g., "PENDING L1"
+            
+            // FETCH THE ACTUAL NAME FROM THE DB!
+            String roleName = rs.getString("ROLE_NAME");
+            
+            // If roleName is found, send it. Otherwise, default to "System"
+            step.put("role", roleName != null ? roleName : "System"); 
+            
+            return step;
+        }, workflowCode);
+    }
 
 ```
-### Step 2: Replace the View Modal Dialog
-Scroll down to the bottom of your file and replace the entire isViewModalOpen Dialog with this updated horizontal version:
-```javascript
-      {/* --- View Details Modal (PROFESSIONAL HORIZONTAL TIMELINE) --- */}
-      <Dialog
-        open={isViewModalOpen}
-        onClose={handleCloseViewModal}
-        fullWidth
-        maxWidth="md"
-      >
-        <DialogTitle sx={styles.dialogTitle}>
-          <Typography variant="h6" fontWeight="bold">
-            Batch Workflow Details: {viewingBatchId}
-          </Typography>
-          <IconButton onClick={handleCloseViewModal}>
-            <CloseIcon />
-          </IconButton>
-        </DialogTitle>
+### Step 2: Remove the Hardcoded Map from React
+Now that the backend is sending the beautiful role names directly, we can strip that hardcoded map out of React.
+ 1. **Delete this function** from the top of your JournalAuthorization.jsx:
+   ```javascript
+   const getRoleDisplayName = (roleValue) => { ... } // DELETE THIS ENTIRE FUNCTION
+   
+   ```
+ 2. **Update the Chip inside your Stepper:**
+   Scroll down to the Big Horizontal Stepper at the bottom of your file, find the <Chip> tag, and change the label property to just {step.role}.
+   **REPLACE THIS:**
+   ```javascript
+       <Chip 
+         label={getRoleDisplayName(step.role)} 
+         size="small" 
+         // ...
+   
+   ```
+   **WITH THIS:**
+   ```javascript
+       <Chip 
+         label={step.role} // Now it just renders whatever the DB sends!
+         size="small" 
+         variant={isCurrent ? "filled" : "outlined"}
+         color={isCurrent ? "primary" : "default"}
+         sx={{ mt: 1, height: 22, fontSize: "0.65rem", fontWeight: "bold" }} 
+       />
+   
+   ```
+### Step 3: Quick Database Check
+If you do this and the UI suddenly says **"System"** instead of the role name, it means your ROLES table doesn't have the new 9001 and 9002 IDs in it yet!
+If that happens, just run this quick insert in your Oracle Database:
+```sql
+INSERT INTO ROLES (ROLE_ID, ROLE_NAME, DESCRIPTION, ROLE_STATUS) 
+VALUES (9001, 'TCSGLIF Maker/Checker', 'TCS Team Role', 'ACTIVE');
 
-        <DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc" }}>
-          <Box sx={{ minHeight: 350, display: "flex", flexDirection: "column" }}>
+INSERT INTO ROLES (ROLE_ID, ROLE_NAME, DESCRIPTION, ROLE_STATUS) 
+VALUES (9002, 'SBIGLIF Checker', 'SBI Team Role', 'ACTIVE');
 
-            {/* --- PROFESSIONAL HEADER CARD --- */}
-            <Box sx={{ p: 3, backgroundColor: "white", borderBottom: "1px solid", borderColor: "divider" }}>
-              <Grid container spacing={2} alignItems="center">
-                <Grid item xs={12} sm={6}>
-                   <Typography variant="body2" color="text.secondary">Creator ID</Typography>
-                   <Typography variant="subtitle1" fontWeight="bold">
-                     <AccountCircleIcon sx={{ fontSize: 18, verticalAlign: "middle", mr: 0.5, color: "primary.main" }}/>
-                     {viewingBatchCreatorId}
-                   </Typography>
-                </Grid>
-                <Grid item xs={12} sm={6} sx={{ textAlign: { sm: "right" } }}>
-                   <Typography variant="body2" color="text.secondary">Total Time Elapsed</Typography>
-                   <Typography variant="subtitle1" fontWeight="bold" color="warning.dark">
-                     ⏱️ {calculateTimeElapsed(viewingBatch?.requestDate)}
-                   </Typography>
-                </Grid>
-              </Grid>
-            </Box>
+INSERT INTO ROLES (ROLE_ID, ROLE_NAME, DESCRIPTION, ROLE_STATUS) 
+VALUES (9003, 'Branch Maker', 'Branch Team Role', 'ACTIVE');
 
-            {/* --- HORIZONTAL TIMELINE --- */}
-            <Box sx={{ p: 4, flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-              {viewingBatchState === "REJECTED" ? (
-                <Alert severity="error" variant="filled" sx={{ mt: 2, fontWeight: "bold" }}>
-                  This batch was REJECTED and the workflow has been terminated.
-                </Alert>
-              ) : isFetchingSteps ? (
-                <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
-              ) : dynamicSteps.length > 0 ? (
-                <Stepper 
-                  activeStep={
-                     (viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED")
-                     ? dynamicSteps.length 
-                     : dynamicSteps.findIndex(s => s.state === viewingBatchState)
-                  } 
-                  alternativeLabel // <--- Switched back to Horizontal!
-                  connector={<CustomConnector />}
-                >
-                  {dynamicSteps.map((step, index) => {
-                    const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED";
-                    const currentIndex = dynamicSteps.findIndex(s => s.state === viewingBatchState);
-                    
-                    const isCompleted = isFullyDone || index <= currentIndex;
-                    const isCurrent = !isFullyDone && index === currentIndex;
-
-                    return (
-                      <Step key={step.state} completed={isCompleted}>
-                        <StepLabel 
-                          StepIconProps={{ 
-                            sx: { 
-                              width: 32, height: 32, 
-                              color: isCompleted ? 'success.main' : 'text.disabled',
-                              '&.Mui-completed': { color: 'success.main' },
-                              '&.Mui-active': { color: isCompleted ? 'success.main' : 'primary.main' }
-                            } 
-                          }}
-                        >
-                           <Typography variant="subtitle2" sx={{ fontWeight: isCurrent ? 'bold' : 'normal', color: isCurrent ? 'primary.main' : 'text.primary', mt: 1 }}>
-                             {step.label}
-                           </Typography>
-                           
-                           {/* Shows actual Role Name using our mapper */}
-                           <Chip 
-                             label={getRoleDisplayName(step.role)} 
-                             size="small" 
-                             variant={isCurrent ? "filled" : "outlined"}
-                             color={isCurrent ? "primary" : "default"}
-                             sx={{ mt: 1, height: 22, fontSize: "0.65rem", fontWeight: "bold" }} 
-                           />
-
-                           {/* Show time pending underneath the active step */}
-                           {isCurrent && (
-                              <Typography variant="caption" display="block" color="warning.main" fontWeight="bold" sx={{ mt: 1 }}>
-                                Pending: {calculateTimeElapsed(viewingBatch?.requestDate)}
-                              </Typography>
-                           )}
-                        </StepLabel>
-                      </Step>
-                    );
-                  })}
-                </Stepper>
-              ) : (
-                <Alert severity="info" sx={{ mt: 2 }}>Workflow configuration not found.</Alert>
-              )}
-            </Box>
-
-            {/* --- PROFESSIONAL DOWNLOAD FOOTER --- */}
-            <Box sx={{ p: 2, backgroundColor: "white", borderTop: "1px solid", borderColor: "divider", display: "flex", justifyContent: "flex-end" }}>
-               <Button 
-                 variant="outlined" 
-                 startIcon={<FileDownloadIcon />} 
-                 onClick={handleDownloadExcel}
-                 disabled={!viewingBatchId}
-                 sx={{ borderColor: "#217346", color: "#217346", "&:hover": { backgroundColor: "#e8f5e9", borderColor: "#1e6b40" } }}
-               >
-                 Download Full Batch Report
-               </Button>
-            </Box>
-
-          </Box>
-        </DialogContent>
-      </Dialog>
+COMMIT;
 
 ```
-### What this accomplishes:
- 1. **Horizontal Stepper:** It is back to spanning left-to-right (alternativeLabel), connected by lines.
- 2. **Clean Role Names:** Instead of relying purely on the Java JOIN, getRoleDisplayName(step.role) catches the 9001 or 9002 strings and instantly renders them as "TCSGLIF Maker/Checker" or "SBIGLIF Checker".
- 3. **Total Time:** The total time elapsed is prominently displayed at the top right of the modal card.
- 4. **Active Step Time:** The specific step currently waiting for approval will also show exactly how long it has been waiting directly underneath the circle.
+With these 3 steps, your Stepper is now a 100% perfect reflection of your database. If you change a role's name in the ROLES table tomorrow, it will instantly update on the frontend without touching a single line of code!
