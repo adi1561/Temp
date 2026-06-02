@@ -1,54 +1,191 @@
-we need to show same additional data for the each request that is as follow 
-first is like as u know when ever we are creating the voucher at that time we are choosing the VID 
-VID now using this VID we need to find out the details from the table called as the Request voucher 
-which is alredy there
-ID	NUMBER	No	"FINCORE"."ISEQ$$_81233".nextval	1	
-VID	VARCHAR2(20 BYTE)	No		2	
-CATEGORY_ID	NUMBER	No		3	
-DESCRIPTION	VARCHAR2(500 BYTE)	No		4	
-ALLOWED_ROLE	NUMBER	No		5	
-SD_REQ_NO	VARCHAR2(100 BYTE)	Yes		6	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		7	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	8	
-TERMINATED_BY	VARCHAR2(100 BYTE)	Yes		9	
-TERMINATED_AT	TIMESTAMP(6)	Yes		10	
-STATUS	VARCHAR2(30 BYTE)	No		11	
-REMARKS	VARCHAR2(500 BYTE)	Yes		12	
+Yes, creating a unified API is the exact right approach here. Instead of making the React frontend fire multiple separate requests to piece this together, we can write a single, highly optimized SQL JOIN in the backend. This reduces network latency and keeps your React components clean.
+Here is how to build this aggregated API and display the data beautifully in the modal.
+### Step 1: Create the Aggregated API (Java Backend)
+We will join all three tables (VOUCHER_POSTING, REQUEST_VOUCHER, and VOUCHER_CATEGORY) using the BATCH_ID.
+**1. Add this method to your VoucherRequestServiceImpl.java:**
+```java
+    @Override
+    public Map<String, Object> getBatchSummaryDetails(String batchId) {
+        String sql = """
+            SELECT 
+                vp.VID_FK AS VID,
+                vp.CREATED_BY AS BATCH_CREATED_BY,
+                vp.CREATED_AT AS BATCH_CREATED_AT,
+                vp.CREATORS_ROLE,
+                vp.SCHEDULED_TIME,
+                vp.EXECUTED_AT,
+                vc.CATEGORY_NAME,
+                rv.DESCRIPTION,
+                rv.REMARKS AS VID_REMARKS
+            FROM VOUCHER_POSTING vp
+            LEFT JOIN REQUEST_VOUCHER rv ON vp.VID_FK = rv.VID
+            LEFT JOIN VOUCHER_CATEGORY vc ON rv.CATEGORY_ID = vc.ID
+            WHERE vp.BATCH_ID = ?
+        """;
+        
+        try {
+            return jdbcTemplate.queryForMap(sql, batchId);
+        } catch (EmptyResultDataAccessException e) {
+            return new HashMap<>(); // Return empty if batch not found
+        }
+    }
 
-we need to show this things 
-VID
-CATEGORY_ID -> there is onther table called as voucher category
+```
+*(Make sure to add Map<String, Object> getBatchSummaryDetails(String batchId); to your interface as well).*
+**2. Expose the API in your Controller:**
+```java
+    @GetMapping("/batch-summary/{batchId}")
+    public ResponseEntity<Map<String, Object>> getBatchSummaryDetails(@PathVariable String batchId) {
+        return ResponseEntity.ok(voucherRequestService.getBatchSummaryDetails(batchId));
+    }
 
-ID	NUMBER	No	"FINCORE"."ISEQ$$_81221".nextval	1	
-CATEGORY_NAME	VARCHAR2(100 BYTE)	No		2	
-CREATED_DATE	TIMESTAMP(6)	Yes	"CURRENT_TIMESTAMP
-"	3	
-CREATED_BY
-CREATED_AT
-only 
+```
+### Step 2: Update React State & API Call
+Now we update JournalAuthorization.jsx to call this new endpoint instead of the old vid-details one.
+**1. Find your handleOpenViewModal function and update the Promise.all block:**
+```javascript
+  const handleOpenViewModal = async (row) => {
+    setViewingBatch(row);
+    setViewingBatchId(row.batchId);
+    setViewingBatchCreatorId(String(row.creatorId));
+    setViewingBatchState(row.workflowState || "PENDING_L1");
 
+    setIsViewModalOpen(true);
+    setIsFetchingSteps(true);
+    setIsFetchingVid(true); // Reusing this state for the summary data
 
+    try {
+      const workflowCode = row.approvalWorkflow || "Workflow_3";
+      
+      // CHANGE: Fetching the unified batch-summary API instead of just VID
+      const [stepsData, summaryData] = await Promise.all([
+        callApi(`/JS/voucher/workflow/steps/${workflowCode}`, null, "GET"),
+        callApi(`/JS/voucher/batch-summary/${row.batchId}`, null, "GET") 
+      ]);
+      
+      let fetchedSteps = Array.isArray(stepsData) ? [...stepsData] : [];
 
-onther details from the onther details 
-using the batch id from the voucher posting table 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-CREATORS_ROLE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-CURRENT_STATUS	VARCHAR2(30 BYTE)	Yes		6	
-OLD_NEXT_APPROVAL	VARCHAR2(100 BYTE)	Yes		7	
-EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		8	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		9	
-APPROVAL_WORKFLOW	VARCHAR2(100 BYTE)	Yes		10	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		11	
-EXECUTED_AT	TIMESTAMP(6)	Yes		12	
-NEXT_APPROVAL_ROLE_ID	NUMBER(10,0)	Yes		13	
+      fetchedSteps = fetchedSteps.map(step => {
+         if (step.state === 'POSTED' || step.state === 'APPROVED') {
+             return { ...step, designation: 'Executed', role: 'System' };
+         }
+         return step;
+      });
 
-we need to show 
-CREATED_BY
-CREATED_AT
-CREATORS_ROLE
-SCHEDULED_TIME
-EXECUTED_AT
-from the above table 
+      if (!fetchedSteps.find(s => s.state === 'POSTED' || s.designation === 'Executed')) {
+          fetchedSteps.push({ state: 'POSTED', designation: 'Executed', role: 'System' });
+      }
+      
+      setDynamicSteps(fetchedSteps);
+      
+      // Save the combined data to state
+      setVidDetails(summaryData); 
+    } catch (err) {
+      showSnackBar("Failed to load batch summary.", "error");
+    } finally {
+      setIsFetchingSteps(false);
+      setIsFetchingVid(false);
+    }
+  };
+
+```
+### Step 3: Display the Professional UI Grid
+We will split the top of your View Modal into two distinct sections: **Voucher Origin Details** (from the REQUEST_VOUCHER table) and **Batch Execution Details** (from the VOUCHER_POSTING table).
+**Replace the Header Card section inside your <DialogContent> with this:**
+```javascript
+            {/* --- PROFESSIONAL HEADER CARDS --- */}
+            <Box sx={{ p: 3, backgroundColor: "white", borderBottom: "1px solid", borderColor: "divider" }}>
+              
+              <Grid container spacing={3} alignItems="center" sx={{ mb: 2 }}>
+                <Grid item xs={12} sm={6}>
+                  <Typography variant="body2" color="text.secondary">Current Batch State</Typography>
+                  <Typography variant="subtitle1" fontWeight="bold" color="primary.main">
+                     {viewingBatchState}
+                  </Typography>
+                </Grid>
+                <Grid item xs={12} sm={6} sx={{ textAlign: { sm: "right" } }}>
+                   <Typography variant="body2" color="text.secondary">Total Time Elapsed</Typography>
+                   <Typography variant="subtitle1" fontWeight="bold" color="warning.dark">
+                     ⏳ {calculateTimeElapsed(viewingBatch?.requestDate)}
+                   </Typography>
+                </Grid>
+              </Grid>
+
+              {/* --- DYNAMIC DETAILS GRIDS --- */}
+              {isFetchingVid ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}><CircularProgress size={24} /></Box>
+              ) : vidDetails && vidDetails.VID ? (
+                <Grid container spacing={3}>
+                  
+                  {/* SECTION 1: VOUCHER ORIGIN DETAILS */}
+                  <Grid item xs={12} md={6}>
+                    <Paper elevation={0} sx={{ p: 2, backgroundColor: "#f8fafc", borderRadius: 2, height: '100%', border: "1px solid #e2e8f0" }}>
+                      <Typography variant="subtitle2" color="primary.main" gutterBottom sx={{ borderBottom: "1px solid #cbd5e1", pb: 0.5, mb: 1.5 }}>
+                        Voucher Origin (VID: {vidDetails.VID})
+                      </Typography>
+                      <Grid container spacing={2}>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block">Category</Typography>
+                          <Typography variant="body2" fontWeight="bold">{vidDetails.CATEGORY_NAME}</Typography>
+                        </Grid>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block">Origin Remarks</Typography>
+                          <Typography variant="body2" fontWeight="bold" noWrap title={vidDetails.VID_REMARKS}>
+                            {vidDetails.VID_REMARKS || "N/A"}
+                          </Typography>
+                        </Grid>
+                        <Grid item xs={12}>
+                          <Typography variant="caption" color="text.secondary" display="block">Description</Typography>
+                          <Typography variant="body2" fontWeight="bold">{vidDetails.DESCRIPTION || "N/A"}</Typography>
+                        </Grid>
+                      </Grid>
+                    </Paper>
+                  </Grid>
+
+                  {/* SECTION 2: BATCH EXECUTION DETAILS */}
+                  <Grid item xs={12} md={6}>
+                    <Paper elevation={0} sx={{ p: 2, backgroundColor: "#f8fafc", borderRadius: 2, height: '100%', border: "1px solid #e2e8f0" }}>
+                      <Typography variant="subtitle2" color="secondary.main" gutterBottom sx={{ borderBottom: "1px solid #cbd5e1", pb: 0.5, mb: 1.5 }}>
+                        Batch Execution Details
+                      </Typography>
+                      <Grid container spacing={2}>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block">Created By</Typography>
+                          <Stack direction="row" spacing={0.5} alignItems="center">
+                            <AccountCircleIcon sx={{ fontSize: 16, color: "text.secondary" }} />
+                            <Typography variant="body2" fontWeight="bold">{vidDetails.BATCH_CREATED_BY}</Typography>
+                          </Stack>
+                        </Grid>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block">Creator Role</Typography>
+                          <Typography variant="body2" fontWeight="bold">{vidDetails.CREATORS_ROLE || "N/A"}</Typography>
+                        </Grid>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block">Created At</Typography>
+                          <Typography variant="body2" fontWeight="bold">
+                             {vidDetails.BATCH_CREATED_AT ? new Date(vidDetails.BATCH_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
+                          </Typography>
+                        </Grid>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block">Scheduled Time</Typography>
+                          <Typography variant="body2" fontWeight="bold" color={vidDetails.SCHEDULED_TIME ? "info.main" : "text.primary"}>
+                             {vidDetails.SCHEDULED_TIME ? new Date(vidDetails.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "Immediate"}
+                          </Typography>
+                        </Grid>
+                        {vidDetails.EXECUTED_AT && (
+                          <Grid item xs={12}>
+                            <Typography variant="caption" color="text.secondary" display="block">Executed At</Typography>
+                            <Typography variant="body2" fontWeight="bold" color="success.main">
+                               {new Date(vidDetails.EXECUTED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}
+                            </Typography>
+                          </Grid>
+                        )}
+                      </Grid>
+                    </Paper>
+                  </Grid>
+
+                </Grid>
+              ) : null}
+            </Box>
+
+```
