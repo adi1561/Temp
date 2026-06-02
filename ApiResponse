@@ -1,15 +1,82 @@
-9001	TCSGLIF	TCS Maker and Checker Role	ACTIVE
-9002	SBIGLIF	SBI Senior Checker Role	ACTIVE
+Yes, creating a dedicated API to fetch the Roles from the database is the absolute best enterprise practice. This way, if you add a new role or change a name in the DB, the frontend automatically adapts without any code changes!
+We will do this in two quick phases: **Create the Java API** and **Consume it in React**.
+### PHASE 1: Create the Java API
+**1. Add to your Interface (VoucherRequestService.java)**
+Open your interface file and add this method signature:
+```java
+Map<String, String> getActiveRoles();
 
-there is table called as ROLES in that 
-ROLE_ID	NUMBER(10,0)	No	NULL 	1	 Unique identifier for the role
-ROLE_NAME	VARCHAR2(255 CHAR)	No		2	 Name of the role
-DESCRIPTION	VARCHAR2(255 CHAR)	Yes		3	 Description of the role
-ROLE_STATUS	VARCHAR2(255 CHAR)	No	"'ACTIVE'
-   "	4	Status of the role ( Active/Blocked)
-   this are details for tha table in that 
-   
-9001	TCSGLIF	TCS Maker and Checker Role	ACTIVE
-9002	SBIGLIF	SBI Senior Checker Role	ACTIVE
+```
+**2. Add to your Service Implementation (VoucherRequestServiceImpl.java)**
+Open your implementation file and paste this method anywhere inside the class. This will fetch all active roles and map the ID to the Name.
+```java
+    @Override
+    public Map<String, String> getActiveRoles() {
+        String sql = "SELECT ROLE_ID, ROLE_NAME FROM ROLES WHERE ROLE_STATUS = 'ACTIVE'";
+        
+        // Use ResultSetExtractor to build a single Map of { "9001": "TCSGLIF" }
+        return jdbcTemplate.query(sql, rs -> {
+            Map<String, String> roleMap = new HashMap<>();
+            while (rs.next()) {
+                roleMap.put(String.valueOf(rs.getLong("ROLE_ID")), rs.getString("ROLE_NAME"));
+            }
+            return roleMap;
+        });
+    }
 
-i want to show -> TCSGLIF name from this DB only not hardcoded from the frontend can we create the api for this 
+```
+**3. Add to your Controller (VoucherPostingController.java)**
+Open your controller and add this endpoint so the frontend can call it:
+```java
+    @GetMapping("/active-roles")
+    public ResponseEntity<Map<String, String>> getActiveRoles() {
+        return ResponseEntity.ok(voucherRequestService.getActiveRoles());
+    }
+
+```
+*Restart your Spring Boot application after making these changes.*
+### PHASE 2: Update React to use the API
+Now we will update JournalAuthorization.jsx to fetch this data when the page loads, store it in state, and use it in the stepper.
+**1. Add a State Variable for the Roles**
+Find your useState declarations (around line 155) and add this:
+```javascript
+  const [dbRoleMap, setDbRoleMap] = useState({}); // Stores the dynamic roles from DB
+
+```
+**2. Fetch the Roles on Page Load**
+Add a new useEffect right below your existing fetchPendingBatches logic to call the new API:
+```javascript
+  useEffect(() => {
+    const fetchRoles = async () => {
+      try {
+        // Fetch the { "9001": "TCSGLIF" } map from our new API
+        const rolesData = await callApi("/JS/voucher/active-roles", null, "GET");
+        if (rolesData && isMounted.current) {
+          setDbRoleMap(rolesData);
+        }
+      } catch (err) {
+        console.error("Failed to fetch roles mapping", err);
+      }
+    };
+    fetchRoles();
+  }, [callApi]);
+
+```
+**3. Replace the Hardcoded Function**
+Find your getRoleDisplayName function near the top of your component and replace it entirely with this dynamic version:
+```javascript
+  const getRoleDisplayName = (roleValue) => {
+    if (!roleValue || roleValue === "null" || roleValue === "System") return "System Execution";
+    
+    // Now it looks inside the dynamic DB map instead of a hardcoded one!
+    return dbRoleMap[String(roleValue)] || roleValue; 
+  };
+
+```
+### How this works perfectly:
+ 1. When the page loads, React calls /api/voucher/active-roles.
+ 2. The Java backend runs SELECT ROLE_ID, ROLE_NAME FROM ROLES.
+ 3. Java returns a JSON object like: {"9001": "TCSGLIF", "9002": "SBIGLIF"}.
+ 4. React saves that object into dbRoleMap.
+ 5. When the Stepper draws the circles, it passes 9001 into getRoleDisplayName(), which looks at your dynamic map and perfectly outputs **"TCSGLIF"**.
+No more hardcoded roles!
