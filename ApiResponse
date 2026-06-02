@@ -1,160 +1,30 @@
-This is a brilliant addition. A read-only "Action History / Comment" section directly below the stepper gives complete transparency to the workflow, allowing users to see exactly *who* did *what*, *when*, and read their specific remarks.
-Based on the Flowbite design you provided, we will build a clean, vertically stacked list of cards featuring an Avatar, the User's actual Name, the Timestamp, the Action they took (e.g., "Approved by Verifier"), and their written Remarks.
-Here is the complete implementation for both the Java Backend and the React Frontend.
-### Step 1: Backend API (Java)
-We need a new API endpoint that queries your VOUCHER_WORKFLOW table and joins it with your Users table to grab the actual name instead of just the ID.
-**1. Update VoucherRequestServiceImpl.java:**
-Add this new method. *(Note: I am assuming your users table is named USERS with columns USER_ID and USER_NAME. Please update those two table/column names in the SQL below to match your actual database).*
-```java
-    @Override
-    public List<Map<String, Object>> getWorkflowHistory(String batchId) {
-        // LEFT JOIN ensures we still get the record even if the user name isn't found
-        String sql = """
-            SELECT 
-                w.LAST_ACTION_BY, 
-                COALESCE(u.USER_NAME, w.LAST_ACTION_BY) AS ACTION_USER_NAME, 
-                w.LAST_ACTION, 
-                w.LAST_ACTION_AT, 
-                w.REMARKS 
-            FROM VOUCHER_WORKFLOW w 
-            LEFT JOIN USERS u ON CAST(w.LAST_ACTION_BY AS VARCHAR2(100)) = CAST(u.USER_ID AS VARCHAR2(100))
-            WHERE w.BATCH_ID_FK = ? 
-            ORDER BY w.LAST_ACTION_AT ASC
-        """;
-        
-        return jdbcTemplate.queryForList(sql, batchId);
+ @ExceptionHandler(org.springframework.dao.DataAccessException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleDatabaseOperation(
+            org.springframework.dao.DataAccessException ex,
+            jakarta.servlet.http.HttpServletRequest request) {
+
+        // 1. Extract the root ORA- code from Oracle
+        Throwable rootCause = org.springframework.core.NestedExceptionUtils.getMostSpecificCause(ex);
+        String errorCode = "DB_TECHNICAL_ERROR";
+
+        if (rootCause instanceof java.sql.SQLException) {
+            errorCode = "ORA-" + ((java.sql.SQLException) rootCause).getErrorCode();
+        }
+
+        log.error("DATABASE_FAULT | Path: {} | ErrorCode: {} | Status: Masked",
+                request.getRequestURI(), errorCode);
+
+        // 2. Return a clean, safe response to the frontend
+        return buildResponse(
+                HttpStatus.INTERNAL_SERVER_ERROR,
+                "Database Error",
+                "A technical error occurred in the data layer. Reference: " + errorCode,
+                request.getRequestURI(),
+                null
+        );
     }
 
-```
-*(Add List<Map<String, Object>> getWorkflowHistory(String batchId); to your interface as well).*
-**2. Update VoucherPostingController.java:**
-Expose the endpoint so React can call it.
-```java
-    @GetMapping("/workflow-history/{batchId}")
-    public ResponseEntity<List<Map<String, Object>>> getWorkflowHistory(@PathVariable String batchId) {
-        return ResponseEntity.ok(voucherRequestService.getWorkflowHistory(batchId));
-    }
+2026-06-02T18:21:59.643+05:30  INFO 34800 --- [VoucherService] [nio-9999-exec-2] o.s.web.servlet.DispatcherServlet        : Completed initialization in 1 ms
+2026-06-02T18:21:59.749+05:30 ERROR 34800 --- [VoucherService] [nio-9999-exec-2] c.f.V.Exception.GlobalExceptionHandler   : DATABASE_FAULT | Path: /api/voucher/workflow-history/0008396 | ErrorCode: DB_TECHNICAL_ERROR | Status: Masked
 
-```
-### Step 2: Frontend API Call (React)
-Open your JournalAuthorization.jsx file. We need to add state for this new history data and update the Promise.all block to fetch it simultaneously with the other modal data.
-**1. Add the State:**
-Near the top of your component (around line 160), add:
-```javascript
-  const [workflowHistory, setWorkflowHistory] = useState([]);
 
-```
-**2. Update handleOpenViewModal:**
-Find this function and add the third API call to the Promise.all array:
-```javascript
-  const handleOpenViewModal = async (row) => {
-    setViewingBatch(row);
-    setViewingBatchId(row.batchId);
-    setViewingBatchCreatorId(String(row.creatorId));
-    setViewingBatchState(row.workflowState || "PENDING_L1");
-
-    setIsViewModalOpen(true);
-    setIsFetchingSteps(true);
-    setIsFetchingVid(true);
-
-    try {
-      const workflowCode = row.approvalWorkflow || "Workflow_3";
-      
-      // FETCH ALL 3 APIS CONCURRENTLY!
-      const [stepsData, summaryData, historyData] = await Promise.all([
-        callApi(`/JS/voucher/workflow/steps/${workflowCode}`, null, "GET"),
-        callApi(`/JS/voucher/batch-summary/${row.batchId}`, null, "GET"),
-        callApi(`/JS/voucher/workflow-history/${row.batchId}`, null, "GET") // <-- NEW API
-      ]);
-      
-      setDynamicSteps(Array.isArray(stepsData) ? stepsData : []);
-      setVidDetails(summaryData); 
-      setWorkflowHistory(Array.isArray(historyData) ? historyData : []); // <-- SAVE HISTORY
-    } catch (err) {
-      showSnackBar("Failed to load batch details.", "error");
-    } finally {
-      setIsFetchingSteps(false);
-      setIsFetchingVid(false);
-    }
-  };
-
-```
-### Step 3: UI Implementation (React)
-Now we will build the Flowbite-inspired comments section. We will place this directly below the Horizontal Stepper in your View Details Modal.
-**Scroll down to your <Dialog open={isViewModalOpen}>.** Find the <Box> that holds your Horizontal Timeline, and paste this **new History block directly below it**, right before the Download Footer block.
-```javascript
-            {/* --- WORKFLOW HISTORY / COMMENTS SECTION (FLOWBITE DESIGN) --- */}
-            <Box sx={{ p: 4, backgroundColor: "#f1f5f9", borderTop: "1px solid", borderColor: "divider" }}>
-              <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
-                Action History & Remarks ({workflowHistory.length})
-              </Typography>
-              
-              {isFetchingSteps ? (
-                <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}><CircularProgress size={24}/></Box>
-              ) : workflowHistory.length === 0 ? (
-                <Alert severity="info" sx={{ borderRadius: 2 }}>No action history found for this batch.</Alert>
-              ) : (
-                <Stack spacing={2.5}>
-                  {workflowHistory.map((history, idx) => {
-                    // Extract initials for the Avatar
-                    const userName = history.ACTION_USER_NAME || "User";
-                    const initial = userName.charAt(0).toUpperCase();
-
-                    return (
-                      <Box key={idx} sx={{ display: 'flex', gap: 2 }}>
-                         {/* Avatar Profile Picture */}
-                         <Box>
-                           <Avatar sx={{ bgcolor: 'primary.main', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>
-                             {initial}
-                           </Avatar>
-                         </Box>
-
-                         {/* Comment Card Container */}
-                         <Box sx={{ 
-                           flexGrow: 1, 
-                           backgroundColor: "white", 
-                           p: 2.5, 
-                           borderRadius: 2, 
-                           border: "1px solid", 
-                           borderColor: "#e2e8f0",
-                           boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)"
-                         }}>
-                            {/* Header: Name and Date */}
-                            <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
-                              <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
-                                {userName}
-                              </Typography>
-                              <Typography variant="caption" color="text.secondary">
-                                • {new Date(history.LAST_ACTION_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
-                              </Typography>
-                            </Box>
-
-                            {/* Badge: The Action Taken (e.g. Approved by Verifier) */}
-                            <Chip 
-                              label={history.LAST_ACTION || "System Action"} 
-                              size="small" 
-                              sx={{ 
-                                mb: 1.5, height: 22, fontSize: "0.7rem", fontWeight: "bold",
-                                backgroundColor: history.LAST_ACTION?.includes("Reject") ? "#fee2e2" : "#e0e7ff",
-                                color: history.LAST_ACTION?.includes("Reject") ? "#991b1b" : "#3730a3"
-                              }} 
-                            />
-
-                            {/* Body: The Remarks Text */}
-                            <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-                               {history.REMARKS || "No remarks provided."}
-                            </Typography>
-                         </Box>
-                      </Box>
-                    );
-                  })}
-                </Stack>
-              )}
-            </Box>
-
-```
-### What this gives you:
- 1. **Avatar Icons:** It grabs the first letter of the user's name and places it in a professional circular avatar.
- 2. **Name & Timestamp:** Displays horizontally exactly like the design you shared (Adesh Kulkarni • Jun 2, 2026, 3:11 PM).
- 3. **Action Badge:** Displays a beautiful dynamic chip (Approved by Reviewer) so you know *what* action the comment belongs to. It dynamically turns red if the action contains the word "Reject".
- 4. **No New Inputs:** It strictly keeps it "Read-Only" as requested, omitting the "Write a comment..." text box from the Flowbite template.
