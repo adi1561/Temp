@@ -1,15 +1,199 @@
-now 
-ROLE_ID	NUMBER(10,0)	No	NULL 	1	 Unique identifier for the role
-ROLE_NAME	VARCHAR2(255 CHAR)	No		2	 Name of the role
-DESCRIPTION	VARCHAR2(255 CHAR)	Yes		3	 Description of the role
-ROLE_STATUS	VARCHAR2(255 CHAR)	No	"'ACTIVE'
-   "	4	Status of the role ( Active/Blocked)
-   
-   currently in the stepper bigger one we are showing the Role id but i want to show the actual role name
-   and how much time it takes for going to next 
-   how much time it is there for gogin next step something like this 
-   less then 1 hr show in min other wise grater then this show in the HR like 1 hr 12 min somnething like this 
-   also improve the UI it is not looking profetional at all
+This is a fantastic request. To make this look like a true enterprise application, we are going to do three things:
+ 1. **Update the Java API** to grab the actual ROLE_NAME from your database instead of the ID.
+ 2. **Clean up the Mini-Stepper** in the grid by removing the text below the circles, leaving just the clean, minimalist dots.
+ 3. **Completely Overhaul the View Modal**. We will switch it to a highly professional **Vertical Timeline** that calculates the exact time elapsed (in hours and minutes) that the batch has been sitting in its current state.
+Here is the step-by-step implementation.
+### Step 1: Update Java Backend to send the Role Name
+In your VoucherRequestServiceImpl.java, update the getWorkflowSteps method we created earlier so it performs a LEFT JOIN on your ROLES table. This replaces the raw ID with the actual name.
+**REPLACE YOUR EXISTING getWorkflowSteps WITH THIS:**
+```java
+    public List<Map<String, Object>> getWorkflowSteps(String workflowCode) {
+        // Advanced Join: Fetches the Role Name instead of just the ID
+        String sql = "SELECT w.NEXT_STATE, w.CURRENT_ROLE_ID, r.ROLE_NAME " +
+                     "FROM WORKFLOW_TRANSITIONS w " +
+                     "LEFT JOIN ROLES r ON w.CURRENT_ROLE_ID = r.ROLE_ID " +
+                     "WHERE w.WORKFLOW_CODE = ? AND w.ACTION_TAKEN IN ('CREATE', 'ACCEPTED') " +
+                     "ORDER BY w.TRANSITION_ID ASC";
+                     
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> step = new HashMap<>();
+            String state = rs.getString("NEXT_STATE");
+            step.put("state", state);
+            step.put("label", state.replace("_", " ")); // e.g., "PENDING L1"
+            
+            // Send the actual Role Name! (Fallback to "System" if null)
+            String roleName = rs.getString("ROLE_NAME");
+            step.put("role", roleName != null ? roleName : "System Execution");
+            return step;
+        }, workflowCode);
+    }
 
-and from the mini stepper remove the L1  L2 and all which is there below that circle   
-   
+```
+### Step 2: Remove Text from the Mini-Stepper (React)
+In your JournalAuthorization.jsx, find the workflowState column in your columns array. We will simply remove the <Typography> tag inside the <StepLabel>.
+**FIND THIS BLOCK inside your columns array:**
+```javascript
+                  <StepLabel 
+                    StepIconProps={{ 
+                      sx: { 
+                        width: 20, 
+                        height: 20, 
+                        color: isCompleted ? 'success.main' : 'text.disabled',
+                        '&.Mui-completed': { color: 'success.main' }, 
+                        '&.Mui-active': { color: isCompleted ? 'success.main' : 'primary.main' }
+                      } 
+                    }}
+                  >
+                    <Typography sx={{ fontSize: '0.65rem', mt: -1, fontWeight: isCurrent ? 'bold' : 'normal' }}>
+                      {label}
+                    </Typography>
+                  </StepLabel>
+
+```
+**REPLACE IT WITH THIS (Clean, dot-only version):**
+```javascript
+                  <StepLabel 
+                    StepIconProps={{ 
+                      sx: { 
+                        width: 22, // Slightly larger dots since the text is gone
+                        height: 22, 
+                        color: isCompleted ? 'success.main' : 'text.disabled',
+                        '&.Mui-completed': { color: 'success.main' }, 
+                        '&.Mui-active': { color: isCompleted ? 'success.main' : 'primary.main' }
+                      } 
+                    }}
+                  /> {/* Note the self-closing tag! We removed the Typography label entirely */}
+
+```
+### Step 3: The Professional Vertical Stepper with Time Calculation (React)
+First, add this time calculation helper function anywhere near the top of your JournalAuthorization.jsx file (outside of your main component):
+```javascript
+// Calculates time difference and formats it as "X hr Y min" or "X min"
+const calculateTimeElapsed = (startDateString) => {
+  if (!startDateString) return "N/A";
+  const start = new Date(startDateString);
+  const now = new Date();
+  
+  const diffMs = Math.abs(now - start);
+  const diffMins = Math.floor(diffMs / 60000);
+  
+  if (diffMins === 0) return "Just now";
+  if (diffMins < 60) return `${diffMins} min`;
+  
+  const hours = Math.floor(diffMins / 60);
+  const mins = diffMins % 60;
+  return mins > 0 ? `${hours} hr ${mins} min` : `${hours} hr`;
+};
+
+```
+Next, scroll all the way down to your <Dialog open={isViewModalOpen}> at the bottom of the file. **Replace the entire <DialogContent> block with this highly professional, vertical timeline design:**
+```javascript
+        <DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc" }}>
+          <Box sx={{ minHeight: 400, display: "flex", flexDirection: "column" }}>
+
+            {/* --- PROFESSIONAL HEADER CARD --- */}
+            <Box sx={{ p: 3, backgroundColor: "white", borderBottom: "1px solid", borderColor: "divider" }}>
+              <Grid container spacing={2} alignItems="center">
+                <Grid item xs={12} sm={6}>
+                   <Typography variant="body2" color="text.secondary">Creator ID</Typography>
+                   <Typography variant="subtitle1" fontWeight="bold">
+                     <AccountCircleIcon sx={{ fontSize: 18, verticalAlign: "middle", mr: 0.5, color: "primary.main" }}/>
+                     {viewingBatchCreatorId}
+                   </Typography>
+                </Grid>
+                <Grid item xs={12} sm={6} sx={{ textAlign: { sm: "right" } }}>
+                   <Typography variant="body2" color="text.secondary">Time Pending</Typography>
+                   <Typography variant="subtitle1" fontWeight="bold" color="warning.dark">
+                     ⏳ {calculateTimeElapsed(viewingBatch?.requestDate)}
+                   </Typography>
+                </Grid>
+              </Grid>
+            </Box>
+
+            {/* --- VERTICAL TIMELINE --- */}
+            <Box sx={{ p: 4, flexGrow: 1 }}>
+              {viewingBatchState === "REJECTED" ? (
+                <Alert severity="error" variant="filled" sx={{ mt: 2, fontWeight: "bold" }}>
+                  This batch was REJECTED and the workflow has been terminated.
+                </Alert>
+              ) : isFetchingSteps ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
+              ) : dynamicSteps.length > 0 ? (
+                <Stepper 
+                  activeStep={
+                     (viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED")
+                     ? dynamicSteps.length 
+                     : dynamicSteps.findIndex(s => s.state === viewingBatchState)
+                  } 
+                  orientation="vertical" // Switched to a professional vertical timeline
+                >
+                  {dynamicSteps.map((step, index) => {
+                    const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED";
+                    const currentIndex = dynamicSteps.findIndex(s => s.state === viewingBatchState);
+                    
+                    const isCompleted = isFullyDone || index <= currentIndex;
+                    const isCurrent = !isFullyDone && index === currentIndex;
+
+                    return (
+                      <Step key={step.state} completed={isCompleted}>
+                        <StepLabel 
+                          StepIconProps={{ 
+                            sx: { 
+                              width: 28, height: 28, 
+                              color: isCompleted ? 'success.main' : 'text.disabled',
+                              '&.Mui-completed': { color: 'success.main' },
+                              '&.Mui-active': { color: isCompleted ? 'success.main' : 'primary.main' }
+                            } 
+                          }}
+                        >
+                          <Box sx={{ display: "flex", flexDirection: "column", ml: 1 }}>
+                             <Typography variant="subtitle1" sx={{ fontWeight: isCurrent ? 'bold' : 'normal', color: isCurrent ? 'primary.main' : 'text.primary' }}>
+                               {step.label}
+                             </Typography>
+                             
+                             <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 0.5 }}>
+                               <Chip 
+                                 label={step.role} 
+                                 size="small" 
+                                 variant={isCurrent ? "filled" : "outlined"}
+                                 color={isCurrent ? "primary" : "default"}
+                                 sx={{ height: 20, fontSize: "0.7rem", fontWeight: "bold" }} 
+                               />
+                               {isCurrent && (
+                                  <Typography variant="caption" color="warning.main" fontWeight="bold">
+                                    Waiting for {calculateTimeElapsed(viewingBatch?.requestDate)}
+                                  </Typography>
+                               )}
+                             </Stack>
+                          </Box>
+                        </StepLabel>
+                      </Step>
+                    );
+                  })}
+                </Stepper>
+              ) : (
+                <Alert severity="info" sx={{ mt: 2 }}>Workflow configuration not found.</Alert>
+              )}
+            </Box>
+
+            {/* --- PROFESSIONAL DOWNLOAD FOOTER --- */}
+            <Box sx={{ p: 2, backgroundColor: "white", borderTop: "1px solid", borderColor: "divider", display: "flex", justifyContent: "flex-end" }}>
+               <Button 
+                 variant="outlined" 
+                 startIcon={<FileDownloadIcon />} 
+                 onClick={handleDownloadExcel}
+                 disabled={!viewingBatchId}
+                 sx={{ borderColor: "#217346", color: "#217346", "&:hover": { backgroundColor: "#e8f5e9", borderColor: "#1e6b40" } }}
+               >
+                 Download Full Batch Report
+               </Button>
+            </Box>
+
+          </Box>
+        </DialogContent>
+
+```
+### What these changes achieve:
+ 1. **Vertical Timeline:** The view modal is now a beautiful top-to-bottom timeline. This is standard in enterprise apps (like AWS or Jira) because it accommodates text, roles, and timestamps much better than horizontal layouts.
+ 2. **Dynamic Time Elapsed:** It takes the batch's requestDate and calculates exactly how long it has been sitting in the queue (e.g., Waiting for 1 hr 12 min).
+ 3. **Role Names:** The timeline now displays the beautiful Role Names (e.g., Voucher Authorization Checker) fetched from your database instead of obscure IDs like 9002.
