@@ -1,20 +1,46 @@
- @ExceptionHandler(org.springframework.dao.DataAccessException.class)
+    @Override
+    public List<Map<String, Object>> getWorkflowHistory(String batchId) {
+        // Safe, simplified query using ONLY the columns from your VOUCHER_WORKFLOW schema
+        String sql = """
+            SELECT 
+                LAST_ACTION_BY AS ACTION_USER_NAME, 
+                LAST_ACTION, 
+                LAST_ACTION_AT, 
+                REMARKS 
+            FROM VOUCHER_WORKFLOW 
+            WHERE BATCH_ID_FK = ? 
+            ORDER BY LAST_ACTION_AT ASC
+        """;
+        
+        return jdbcTemplate.queryForList(sql, batchId);
+    }
+
+
+
+
+    @ExceptionHandler(org.springframework.dao.DataAccessException.class)
     public ResponseEntity<ApiErrorResponseDto> handleDatabaseOperation(
             org.springframework.dao.DataAccessException ex,
             jakarta.servlet.http.HttpServletRequest request) {
 
-        // 1. Extract the root ORA- code from Oracle
-        Throwable rootCause = org.springframework.core.NestedExceptionUtils.getMostSpecificCause(ex);
         String errorCode = "DB_TECHNICAL_ERROR";
 
-        if (rootCause instanceof java.sql.SQLException) {
-            errorCode = "ORA-" + ((java.sql.SQLException) rootCause).getErrorCode();
+        // 1. Traverse the entire exception chain to hunt for the SQLException
+        Throwable cause = ex;
+        while (cause != null) {
+            if (cause instanceof java.sql.SQLException sqlEx) {
+                // Found it! Grab the Oracle Error Code and stop digging.
+                errorCode = "ORA-" + sqlEx.getErrorCode();
+                break;
+            }
+            cause = cause.getCause();
         }
 
-        log.error("DATABASE_FAULT | Path: {} | ErrorCode: {} | Status: Masked",
-                request.getRequestURI(), errorCode);
+        // 2. Log the sanitized code + the actual message for backend debugging
+        log.error("DATABASE_FAULT | Path: {} | ErrorCode: {} | Real Message: {}",
+                request.getRequestURI(), errorCode, ex.getMessage());
 
-        // 2. Return a clean, safe response to the frontend
+        // 3. Return a clean, safe response to the frontend
         return buildResponse(
                 HttpStatus.INTERNAL_SERVER_ERROR,
                 "Database Error",
@@ -23,8 +49,3 @@
                 null
         );
     }
-
-2026-06-02T18:21:59.643+05:30  INFO 34800 --- [VoucherService] [nio-9999-exec-2] o.s.web.servlet.DispatcherServlet        : Completed initialization in 1 ms
-2026-06-02T18:21:59.749+05:30 ERROR 34800 --- [VoucherService] [nio-9999-exec-2] c.f.V.Exception.GlobalExceptionHandler   : DATABASE_FAULT | Path: /api/voucher/workflow-history/0008396 | ErrorCode: DB_TECHNICAL_ERROR | Status: Masked
-
-
