@@ -1,35 +1,163 @@
-ok there is one more problem is like 
-there is table called as users which as below from that i need to take the user name first name and last name fetch this and show to the
+This is the exact way to build a robust, enterprise-grade UI. By joining the USERS table directly in the backend, the React frontend doesn't have to do any heavy lifting, and creating a dedicated scrollable box for a 500-word description ensures the layout never breaks.
+Here is the complete implementation to achieve this.
+### 1. Backend: Update the SQL Queries (Java)
+We will update both of your APIs in VoucherRequestServiceImpl.java to perform a LEFT JOIN on the USERS table. We will concatenate the FIRST_NAME and LAST_NAME, and safely fall back to the ID if the user isn't found.
+**Update getWorkflowHistory:**
+```java
+    @Override
+    public List<Map<String, Object>> getWorkflowHistory(String batchId) {
+        String sql = """
+            SELECT 
+                w.LAST_ACTION_BY, 
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, w.LAST_ACTION_BY) AS ACTION_USER_NAME, 
+                w.LAST_ACTION, 
+                w.LAST_ACTION_AT, 
+                w.REMARKS 
+            FROM VOUCHER_WORKFLOW w 
+            LEFT JOIN USERS u ON w.LAST_ACTION_BY = u.USER_ID
+            WHERE w.BATCH_ID_FK = ? 
+            ORDER BY w.LAST_ACTION_AT ASC
+        """;
+        
+        return jdbcTemplate.queryForList(sql, batchId);
+    }
 
-we need to show this details 
-Batch Execution Details
-here also 
-Created By
-9130111
+```
+**Update getBatchSummaryDetails:**
+This query is expanded to join the USERS table twice (once for the Batch Creator, once for the VID Creator) and extracts the rv.CREATED_AT timestamp.
+```java
+    @Override
+    public Map<String, Object> getBatchSummaryDetails(String batchId) {
+        String sql = """
+            SELECT 
+                vp.VID_FK AS VID,
+                vp.CREATED_BY AS BATCH_CREATOR_ID,
+                COALESCE(bu.FIRST_NAME || ' ' || bu.LAST_NAME, vp.CREATED_BY) AS BATCH_CREATED_BY_NAME,
+                vp.CREATED_AT AS BATCH_CREATED_AT,
+                vp.CREATORS_ROLE,
+                vp.SCHEDULED_TIME,
+                vp.EXECUTED_AT,
+                vc.CATEGORY_NAME,
+                rv.CREATED_BY AS VID_CREATOR_ID,
+                COALESCE(vu.FIRST_NAME || ' ' || vu.LAST_NAME, rv.CREATED_BY) AS VID_CREATED_BY_NAME,
+                rv.CREATED_AT AS VID_CREATED_AT,
+                rv.DESCRIPTION
+            FROM VOUCHER_POSTING vp
+            LEFT JOIN REQUEST_VOUCHER rv ON vp.VID_FK = rv.VID
+            LEFT JOIN VOUCHER_CATEGORY vc ON rv.CATEGORY_ID = vc.ID
+            LEFT JOIN USERS bu ON vp.CREATED_BY = bu.USER_ID
+            LEFT JOIN USERS vu ON rv.CREATED_BY = vu.USER_ID
+            WHERE vp.BATCH_ID = ?
+        """;
+        
+        try {
+            return jdbcTemplate.queryForMap(sql, batchId);
+        } catch (EmptyResultDataAccessException e) {
+            return new HashMap<>();
+        }
+    }
 
-Voucher (VID: VID-2606-00001)
-add here also
-CREATED_BY
-CREATED_AT
-Origin Remarks -> remove this
-Description -> it is about 500 words so make a Good Design which can handle this profetionally
+```
+*(Restart your Spring Boot server after making these changes).*
+### 2. Frontend: Update the UI Grids (React)
+Open your JournalAuthorization.jsx file. Scroll down to your View Details Modal where the two cards are located (Voucher Origin and Batch Execution).
+Replace the <Grid container spacing={4}> that holds those two cards with this updated version. It removes the "Remarks", adds the full Names, adds the Origin Date, and wraps the Description in a beautiful, professional scrollable container.
+```javascript
+                <Grid container spacing={4}>
+                  
+                  {/* SECTION 1: VOUCHER ORIGIN DETAILS */}
+                  <Grid item xs={12} md={6}>
+                    <Paper elevation={0} sx={{ p: 3, backgroundColor: "#f8fafc", borderRadius: 2, height: '100%', border: "1px solid #e2e8f0" }}>
+                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid #cbd5e1", pb: 1, mb: 2 }}>
+                        Voucher Origin (VID: {vidDetails.VID})
+                      </Typography>
+                      <Grid container spacing={3}>
+                        <Grid item xs={12} sm={6}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
+                          <Typography variant="body1" fontWeight="500">{vidDetails.CATEGORY_NAME}</Typography>
+                        </Grid>
+                        <Grid item xs={12} sm={6}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Origin Created At</Typography>
+                          <Typography variant="body1" fontWeight="500">
+                            {vidDetails.VID_CREATED_AT ? new Date(vidDetails.VID_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
+                          </Typography>
+                        </Grid>
+                        <Grid item xs={12}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Origin Created By</Typography>
+                          <Stack direction="row" spacing={1} alignItems="center">
+                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
+                            <Typography variant="body1" fontWeight="500">
+                              {vidDetails.VID_CREATED_BY_NAME} <Typography component="span" variant="caption" color="text.secondary">({vidDetails.VID_CREATOR_ID})</Typography>
+                            </Typography>
+                          </Stack>
+                        </Grid>
+                        <Grid item xs={12}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Description</Typography>
+                          {/* PROFESSIONAL LONG-TEXT SCROLL BOX */}
+                          <Box sx={{ 
+                            maxHeight: 110, 
+                            overflowY: 'auto', 
+                            p: 1.5, 
+                            backgroundColor: '#ffffff', 
+                            border: '1px solid #cbd5e1', 
+                            borderRadius: 1,
+                            '&::-webkit-scrollbar': { width: '6px' },
+                            '&::-webkit-scrollbar-thumb': { backgroundColor: '#cbd5e1', borderRadius: '4px' }
+                          }}>
+                            <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+                              {vidDetails.DESCRIPTION || "No description provided."}
+                            </Typography>
+                          </Box>
+                        </Grid>
+                      </Grid>
+                    </Paper>
+                  </Grid>
 
+                  {/* SECTION 2: BATCH EXECUTION DETAILS */}
+                  <Grid item xs={12} md={6}>
+                    <Paper elevation={0} sx={{ p: 3, backgroundColor: "#f8fafc", borderRadius: 2, height: '100%', border: "1px solid #e2e8f0" }}>
+                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid #cbd5e1", pb: 1, mb: 2 }}>
+                        Batch Execution Details
+                      </Typography>
+                      <Grid container spacing={3}>
+                        <Grid item xs={12}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created By</Typography>
+                          <Stack direction="row" spacing={1} alignItems="center">
+                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
+                            {/* Uses the Full Name from the new Database Join */}
+                            <Typography variant="body1" fontWeight="500">
+                              {vidDetails.BATCH_CREATED_BY_NAME} <Typography component="span" variant="caption" color="text.secondary">({vidDetails.BATCH_CREATOR_ID})</Typography>
+                            </Typography>
+                          </Stack>
+                        </Grid>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Creator Role</Typography>
+                          <Typography variant="body1" fontWeight="500">{vidDetails.CREATORS_ROLE || "N/A"}</Typography>
+                        </Grid>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created At</Typography>
+                          <Typography variant="body1" fontWeight="500">
+                             {vidDetails.BATCH_CREATED_AT ? new Date(vidDetails.BATCH_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
+                          </Typography>
+                        </Grid>
+                        <Grid item xs={6}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Scheduled Time</Typography>
+                          <Typography variant="body1" fontWeight="500" color={vidDetails.SCHEDULED_TIME ? "info.main" : "text.primary"}>
+                             {vidDetails.SCHEDULED_TIME ? new Date(vidDetails.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "Immediate"}
+                          </Typography>
+                        </Grid>
+                        {vidDetails.EXECUTED_AT && (
+                          <Grid item xs={12}>
+                            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Executed At</Typography>
+                            <Typography variant="body1" fontWeight="500" color="success.main">
+                               {new Date(vidDetails.EXECUTED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}
+                            </Typography>
+                          </Grid>
+                        )}
+                      </Grid>
+                    </Paper>
+                  </Grid>
 
-USER_ID	VARCHAR2(255 CHAR)	No		1	 Unique identifier for the user
-FIRST_NAME	VARCHAR2(255 CHAR)	Yes		2	 User's first name
-LAST_NAME	VARCHAR2(255 CHAR)	Yes		3	 User's last name
-PHONE_NUMBER	VARCHAR2(255 CHAR)	Yes		4	 User's phone number
-EMAIL	VARCHAR2(255 CHAR)	No		5	 User's primary email address
-PASSWORD_HASH	VARCHAR2(255 BYTE)	Yes		6	 Hashed and salted password
-ACCOUNT_STATUS	VARCHAR2(255 CHAR)	No		7	 Status of the user's account
-CREATED_AT	TIMESTAMP(6)	No	SYSTIMESTAMP	8	 Timestamp when the user account was created
-UPDATED_AT	TIMESTAMP(6)	No	SYSTIMESTAMP	9	 Timestamp when the user account was last updated
-LAST_LOGIN_AT	TIMESTAMP(6)	Yes		10	 Timestamp of the user's last successful login
-IS_DELETED	CHAR(1 BYTE)	No	'N'	11	 Flag for soft deletion: Y if deleted, N otherwise
-DELETED_AT	TIMESTAMP(6)	Yes		12	 Timestamp when the user was soft-deleted
-TEMP_PASSWORD_SET_AT	TIMESTAMP(6)	Yes	SYSTIMESTAMP	13	 Timestamp when the current temporary password was set via OTP
-MIDDLE_NAME	VARCHAR2(255 CHAR)	Yes		14	 User's middle name
-USER_WRONG_PASSWORD_COUNT	NUMBER(5,0)	No	0	15	Number of wrong login attempts 
-BRANCH	NUMBER(5,0)	No		16	Branch Number
-PASSWORD_LOGIN	VARCHAR2(20 BYTE)	No	"'ACTIVE'
-   "	17	Status of users ability to login through password ( ACTIVE OR INACTIVE)
+                </Grid>
+
+```
