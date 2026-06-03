@@ -1,979 +1,166 @@
-import React, { useState, useEffect, useCallback } from "react";
-import {
-  Box,
-  Typography,
-  Grid,
-  TextField,
-  Button,
-  Paper,
-  IconButton,
-  MenuItem,
-  CircularProgress,
-  Autocomplete,
-  Tooltip,
-  Checkbox,
-  FormControlLabel,
-  Chip,
-  FormHelperText,
-  Divider,
-  Card,
-  CardActionArea,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  TablePagination,
-  Collapse,
-  Radio
-} from "@mui/material";
-import AddIcon from "@mui/icons-material/Add";
-import DeleteIcon from "@mui/icons-material/Delete";
-import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
-import KeyboardArrowUpIcon from '@mui/icons-material/KeyboardArrowUp';
-import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
-import ScheduleIcon from "@mui/icons-material/Schedule";
-import ArrowBackIcon from "@mui/icons-material/ArrowBack";
-import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
-import DateRangeTwoToneIcon from '@mui/icons-material/DateRangeTwoTone';
-import EditNoteIcon from '@mui/icons-material/EditNote';
-import UploadFileIcon from '@mui/icons-material/UploadFile';
-import TableChartIcon from '@mui/icons-material/TableChart';
-import { debounce } from "lodash";
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-const initialRowState = {
-  id: Date.now(),
-  branch: null,
-  currency: "",
-  cgl: null,
-  amount: "",
-  txnType: "",
-  remarks: "",
-  productCode: "",
-};
+To make these professional upgrades, we need to completely rethink the backend query to do the heavy lifting (joining tables, applying the strict filters), and then overhaul the React frontend to display the new detailed Paper cards in your wizard steps.
+Here is the complete, step-by-step implementation.
+### Step 1: Create the New Backend API (Java)
+Instead of the old /filter endpoint with multiple optional parameters, we will create a strict endpoint that inherently joins the USERS and VOUCHER_CATEGORY tables. It will only return vouchers that are AVAILABLE and explicitly matched to the provided roleId.
+**Add this to your RequestVoucherService / Controller:**
+```java
+    @GetMapping("/available")
+    public ResponseEntity<List<Map<String, Object>>> getAvailableVouchers(@RequestParam Long roleId) {
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                rv.CREATED_BY AS CREATOR_ID,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT
+            FROM REQUEST_VOUCHER rv
+            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
+            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
+            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'AVAILABLE'
+            ORDER BY rv.CREATED_AT DESC
+        """;
+        
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(sql, roleId);
+        return ResponseEntity.ok(results);
+    }
 
-const formatBigIntForDisplay = (val) => {
-  if (typeof val !== "bigint") {
-    val = BigInt(val || 0);
-  }
-  const str = val.toString().padStart(5, "0");
-  const integer = str.slice(0, -4);
-  const fractional = str.slice(-4);
-  return `${integer || "0"}.${fractional}`;
-};
-export default function JournalPosting() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-  
-  // --- INTERNAL WIZARD STATE ---
-  const [activeStep, setActiveStep] = useState(0);
+```
+### Step 2: Update the React State & API Fetch
+Open your JournalPosting.jsx file. We need to extract the user's role ID from the session and pass it to the new API.
+**1. Add a state for the role ID:**
+Near your currentUserId state (around line 50), add:
+```javascript
+  const [currentRoleId, setCurrentRoleId] = useState(null);
 
-  // --- VOUCHER TABLE STATE ---
-  const [voucherList, setVoucherList] = useState([]);
-  const [selectedVoucher, setSelectedVoucher] = useState(null);
-  const [expandedRow, setExpandedRow] = useState(null); // Tracks which row is clicked open
-  const [page, setPage] = useState(0);
-  const [rowsPerPage, setRowsPerPage] = useState(5);
-  
-  
-  // --- STEPPER & WIZARD STATE ---
-  const steps = ['Select Voucher', 'Entry Method', 'Data Entry'];
-
-  const [groupedVouchers, setGroupedVouchers] = useState({});
-  const [scheduledTime, setScheduledTime] = useState("");
-
-  const [rows, setRows] = useState([initialRowState]);
-  const [currencyOptions, setCurrencyOptions] = useState([]);
-
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
-  const [postingDate, setPostingDate] = useState("");
-
-  const [checked, setChecked] = useState(false);
-
-  const [isPageLoading, setIsPageLoading] = useState(true);
-  const [isEodRunning, setIsEodRunning] = useState(false);
-
-  // Replaces anything that is NOT an alphabet, number, or space
-  const REMARKS_REPLACE_REGEX = /[^a-zA-Z0-9 ]/g;
-
-  // Replaces anything that is NOT a digit (CGL is strictly digits)
-  const CGL_REPLACE_REGEX = /[^0-9]/g;
-
-  // Replaces anything that is NOT alphanumeric (Branch is strictly alphanumeric)
-  const BRANCH_REPLACE_REGEX = /[^0-9]/g;
-
-
-
-  // Track input values to prevent empty dropdown tray on focus
-  const [branchInputValues, setBranchInputValues] = useState({});
-  const [cglInputValues, setCglInputValues] = useState({});
-
-  const [branchSearch, setBranchSearch] = useState({
-    loadingId: null,
-    options: [],
-  });
-  const [cglSearch, setCglSearch] = useState({
-    loadingId: null,
-    options: []
-  });
-
+```
+**2. Update the session extraction useEffect:**
+Update your auth check to also grab the role ID.
+```javascript
   useEffect(() => {
-    const fetchInitialData = async () => {
-      try {
-        setIsPageLoading(true);
+    isMounted.current = true;
+    try {
+      const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+        // Assuming your auth object holds the role ID. Adjust the property name if needed.
+        if (user?.roleId) setCurrentRoleId(user.roleId); 
+      }
+    } catch (e) { }
+    return () => { isMounted.current = false; };
+  }, []);
 
-        // 1. FIRST: Check the EOD Status from your new API
-        const eodResponse = await callApi("/JS/voucher/eod_status", null, "GET");
-
-        // The API returns an array: [{ "eodStatus": 0 }]
-        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
-          if (eodResponse[0].eodStatus === 1) {
-            setIsEodRunning(true);
-            setIsPageLoading(false);
-            return; // STOP loading everything else, block the screen
-          }
-        }
-
-        // 2. IF EOD IS NOT RUNNING: Continue loading the normal page data
-        const dateResponse = await callApi("/JS/voucher/current-posting-date", null, "GET");
-
-        if (dateResponse) {
-          try {
-            const [year, month, day] = dateResponse.split("-");
-            const formattedDate = `${day}-${month}-${year}`;
-            setPostingDate(formattedDate);
-          } catch (e) {
-            console.error("Could not parse date:", dateResponse, e);
-            setPostingDate(dateResponse);
-          }
-        } else {
-          showSnackBar("Failed to load official posting date.", "error");
-          setPostingDate("Error");
-        }
-
-        const currencyResponse = await callApi("/CM/common-master/currency", null, "GET");
-        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
-          const uniqueCurrencies = [...new Set(currencyResponse.data)];
-          setCurrencyOptions(uniqueCurrencies);
-        } else {
-          showSnackBar("Failed to load currencies.", "error");
-        }
-
-        // --- NEW: FETCH VOUCHERS FOR ACCORDION ---
-     const vouchersResponse = await callApi("/JS/voucher/filter", null, "GET");
+```
+**3. Update the API Fetch call:**
+Inside your fetchInitialData function, change the old /JS/voucher/filter call to use the new API and pass the roleId:
+```javascript
+        // --- FETCH VOUCHERS FOR ACCORDION ---
+        // Fallback to a default role (e.g., 9001) if currentRoleId isn't loaded yet
+        const roleToFetch = currentRoleId || 9001; 
+        const vouchersResponse = await callApi(`/JS/voucher/available?roleId=${roleToFetch}`, null, "GET");
+        
         if (vouchersResponse && Array.isArray(vouchersResponse)) {
           setVoucherList(vouchersResponse);
         }
-      } catch (error) {
-        console.error("Error fetching initial data:", error);
-        showSnackBar("An error occurred while loading page data.", "error");
-      } finally {
-        setIsPageLoading(false);
-      }
-    };
 
-    fetchInitialData();
-  }, [callApi, showSnackBar]);
+```
+### Step 3: Update Step 0 (The Table Display)
+Now that the backend is returning the exact names and categories, we need to update the table inside activeStep === 0 to display them beautifully.
+**Find the <TableBody> inside activeStep === 0 and replace the cells:**
+```javascript
+                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                              {row.VID}
+                            </TableCell>
+                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                              {row.CATEGORY_NAME || "General"}
+                            </TableCell>
+                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                              {row.CREATOR_NAME} <Typography component="span" variant="caption" color="text.secondary">({row.CREATOR_ID})</Typography>
+                            </TableCell>
 
-  const handleNext = () => {
-    if (activeStep === 0 && !selectedVoucher) {
-      showSnackBar("Please select a voucher from the list first.", "warning");
-      return;
-    }
-    setActiveStep((prevStep) => prevStep + 1);
-  };
-  
+```
+*(Note: Notice the keys are now uppercase like row.VID and row.CATEGORY_NAME to match the exact SQL output).*
+### Step 4: Overhaul the "Selected Voucher" Display (Step 1 & Step 2)
+We will create a stunning, professional Paper component to display the selected voucher details, and we will reuse it in both Step 1 (Method Selection) and Step 2 (Data Entry).
+**First, create this helper component right above your return ( statement inside the component:**
+```javascript
+  // --- PROFESSIONAL SELECTED VOUCHER CARD ---
+  const SelectedVoucherCard = ({ onBackClick, showBackButton = false }) => {
+    if (!selectedVoucher) return null;
 
-  const handleMethodSelection = (method) => {
-    if (method === "BULK") {
-      showSnackBar("Bulk Upload flow coming soon!", "info");
-    } else {
-      handleNext(); 
-    }
-  };
-
-
-    const handleChangePage = (event, newPage) => {
-    setPage(newPage);
-  };
-
-  const handleChangeRowsPerPage = (event) => {
-    setRowsPerPage(parseInt(event.target.value, 10));
-    setPage(0);
-  };
-
-  const handleRowExpand = (id) => {
-    setExpandedRow(expandedRow === id ? null : id);
-  };
-  const handleBack = () => {
-    setActiveStep((prevStep) => prevStep - 1);
-  };
-
-  const filterRemarks = (val) => {
-    let filtered = val.replace(/[^a-zA-Z0-9 ]/g, ""); // Allow only alphanumeric and spaces
-    filtered = filtered.replace(/^\s+/, ""); // Remove leading spaces
-    filtered = filtered.replace(/\s{2,}/g, " "); // Replace multiple consecutive spaces with a single space
-    return filtered;
-  };
-
-
-  // 1. Common remarks can be empty. If filled, must be 2-30.
-  const isCommonRemarksValid = (val) => val.trim().length === 0 || (val.trim().length >= 2 && val.trim().length <= 30);
-
-  // 2. Row remarks are STRICTLY compulsory (2-30 chars).
-  const isRowRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
-  const filterAndWarn = (val, type) => {
-    let filtered = val;
-    let hasError = false;
-    let msg = "Only alphabets and numbers are allowed.";
-
-    if (type === "alphanumeric_space") {
-      // 1. Strip any character using the centralized regex
-      filtered = val.replace(REMARKS_REPLACE_REGEX, "");
-
-      if (filtered !== val) {
-        hasError = true;
-      }
-
-      // 2. Strip leading space and collapse double spaces
-      const beforeSpaceTrim = filtered;
-      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
-      if (beforeSpaceTrim !== filtered && !hasError) {
-        hasError = true;
-        msg = "Remark should not start with space or contain consecutive spaces.";
-      }
-    }
-
-    if (hasError) {
-      showSnackBar(msg, "warning");
-    }
-    return filtered;
-  };
-
-  // Both Common Batch Remarks and Row Remarks are now strictly compulsory (2-30 chars)
-  const isRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
-  const handleAddRow = () => {
-    const lastRow = rows[rows.length - 1];
-
-    if (
-      !lastRow.branch ||
-      !lastRow.currency ||
-      !lastRow.cgl ||
-      !lastRow.amount ||
-      !lastRow.txnType ||
-      !isRowRemarksValid(lastRow.remarks)
-    ) {
-      showSnackBar(
-        "Please fill all required fields (*) in the current row before adding a new one.",
-        "warning"
-      );
-      return;
-    }
-
-    const newRow = {
-      ...initialRowState,
-      id: Date.now(),
-      remarks: checked ? commonBatchRemarks : "",
-    };
-    setRows([...rows, newRow]);
-  };
-
-  const handleRemarksSync = (event) => {
-    const isChecked = event.target.checked;
-    setChecked(isChecked);
-
-    if (isChecked) {
-      const newRows = rows.map((row) => ({
-        ...row,
-        remarks: commonBatchRemarks,
-      }));
-      setRows(newRows);
-    } else {
-      const newRows = rows.map((row) => ({
-        ...row,
-        remarks: "",
-      }));
-      setRows(newRows);
-    }
-  };
-
-  const handleDeleteRow = (id) => {
-    if (rows.length > 1) {
-      setRows(rows.filter((row) => row.id !== id));
-      // Cleanup input tracking
-      const newBranchInputs = { ...branchInputValues };
-      delete newBranchInputs[id];
-      setBranchInputValues(newBranchInputs);
-      const newCglInputs = { ...cglInputValues };
-      delete newCglInputs[id];
-      setCglInputValues(newCglInputs);
-    } else {
-      showSnackBar("Cannot delete the first row.", "warning");
-    }
-  };
-
-  const handleRowChange = (id, field, value) => {
-    setRows((prevRows) =>
-      prevRows.map((row) => {
-        if (row.id === id) {
-          return { ...row, [field]: value };
-        }
-        return row;
-      })
-    );
-  };
-
-  const searchBranches = useCallback(
-    debounce(async (query, rowId) => {
-      if (!query || query.trim().length < 3) {
-        setBranchSearch({ loadingId: null, options: [] });
-        return;
-      }
-      setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
-      try {
-        const response = await callApi(
-          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
-          null,
-          "GET"
-        );
-
-        setBranchSearch({ loadingId: null, options: response || [] });
-      } catch (error) {
-        showSnackBar("Branch search failed.", "error");
-        setBranchSearch({ loadingId: null, options: [] });
-      }
-    }, 300),
-    [callApi, showSnackBar]
-  );
-
-  const searchCgls = useCallback(
-    debounce(async (query, rowId) => {
-      // Changed from === 0 to < 3 to enforce the minimum character limit
-      if (!query || query.trim().length < 3) {
-        setCglSearch({ loadingId: null, options: [] });
-        return;
-      }
-      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
-
-      try {
-        const response = await callApi(
-          `/JS/cgl-journal/search?query=${encodeURIComponent(query)}`,
-          null,
-          "GET"
-        );
-
-        setCglSearch({ loadingId: null, options: response || [] });
-      } catch (error) {
-        showSnackBar("CGL search failed.", "error");
-        setCglSearch({ loadingId: null, options: [] });
-      }
-    }, 300),
-    [callApi, showSnackBar]
-  );
-
-  const handleSubmit = async () => {
-    if (!isCommonRemarksValid(commonBatchRemarks)) {
-      showSnackBar("Common Batch Remarks must be 2-30 characters if provided.", "error");
-      return;
-    }
-
-
-    setIsSubmitting(true);
-
-    const [day, month, year] = postingDate.split("-");
-    const formattedBackendDate = `${year}-${month}-${day}`;
-
-
-    const branchCurrencyTotals = new Map();
-    const branchEntryCheck = new Map();
-    const rowPayloads = [];
-
-    for (const [index, row] of rows.entries()) {
-      if (
-        !row.branch ||
-        !row.currency ||
-        !row.cgl ||
-        !row.amount ||
-        parseFloat(row.amount) === 0 ||
-        !row.txnType ||
-        !isRowRemarksValid(row.remarks)
-      ) {
-        showSnackBar(
-          `Row ${index + 1} is incomplete or has a zero amount. Amount must be greater than 0, and remarks must be 2-30 characters.`,
-          "error"
-        );
-        setIsSubmitting(false);
-        return;
-      }
-
-
-      const branchCode = row.branch.code;
-      const branchName = row.branch.name;
-      const currency = row.currency;
-
-      const cglNumber = String(row.cgl.cglNumber);
-      const isMemo = cglNumber.startsWith("5");
-      const type = isMemo ? "MEMO" : "NORMAL";
-
-      const [integerPart = "0", fractionalPart = "0"] = (
-        row.amount || "0"
-      ).split(".");
-      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
-      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
-
-      const compositeKey = `${branchCode}-${currency}-${type}`;
-
-      if (!branchCurrencyTotals.has(compositeKey)) {
-        branchCurrencyTotals.set(compositeKey, {
-          totalDebit: 0n,
-          totalCredit: 0n,
-          branchName: branchName,
-          branchCode: branchCode,
-          currency: currency,
-          type: type,
-        });
-      }
-      const currencyTotals = branchCurrencyTotals.get(compositeKey);
-
-      if (row.txnType === "Debit") {
-        currencyTotals.totalDebit += amountAsBigInt;
-      } else if (row.txnType === "Credit") {
-        currencyTotals.totalCredit += amountAsBigInt;
-      }
-
-      if (!branchEntryCheck.has(branchCode)) {
-        branchEntryCheck.set(branchCode, {
-          hasDebit: false,
-          hasCredit: false,
-          branchName: branchName,
-        });
-      }
-      const branchCheck = branchEntryCheck.get(branchCode);
-
-      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
-        branchCheck.hasDebit = true;
-      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
-        branchCheck.hasCredit = true;
-      }
-
-      const finalAmount =
-        row.txnType === "Credit" ? "-" + row.amount : row.amount;
-
-      rowPayloads.push({
-        branch: row.branch.code,
-        currency: row.currency,
-        cgl: row.cgl.cglNumber,
-        amount: finalAmount,
-        productType: row.productCode,
-        remarks: row.remarks,
-        arFlag: "A",
-        postingDate: formattedBackendDate
-      });
-    }
-
-    for (const [branchCode, totals] of branchEntryCheck.entries()) {
-      const { hasDebit, hasCredit } = totals;
-      if (!hasDebit || !hasCredit) {
-        showSnackBar("Branch must have at least one Debit and one Credit entry.", "error");
-        setIsSubmitting(false);
-        return;
-      }
-    }
-
-
-    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
-      const { totalDebit, totalCredit } = totals;
-
-      if (totalDebit !== totalCredit) {
-        showSnackBar("Branch and Currency Debit/Credit Mismatch for Real/Memo CGL.", "error");
-        setIsSubmitting(false);
-        return;
-      }
-    }
-
-    let formattedSchedule = null;
-    if (scheduledTime) {
-       const dateObj = new Date(scheduledTime);
-       formattedSchedule = dateObj.toISOString().slice(0, 19).replace('T', ' ');
-    }
-
- const finalPayload = {
-      vid: selectedVoucher?.vid,           // NEW
-      scheduledTime: formattedSchedule,    // NEW
-      commonBatchRemarks: commonBatchRemarks.trim(),
-      rows: rowPayloads,
-    };
-
-    try {
-      const response = await callApi(
-        "/JS/voucher/create-batch",
-        finalPayload,
-        "POST"
-      );
-
-      const newBatchId = response?.[0]?.batchId || "N/A";
-
-        showSnackBar(
-        "Your Request has been initiated",
-        "info"
-      );
-      setRows([{ ...initialRowState, id: Date.now() }]);
-      setCommonBatchRemarks("");
-      setChecked(false);
-      setBranchInputValues({});
-      setCglInputValues({});
-      
-      // --- NEW: RESET WIZARD STATE ---
-  setScheduledTime("");
-      setSelectedVoucher(null);
-      setActiveStep(0); // Send back to step 1
-    } catch (error) {
-      // If it fails instantly (e.g. server down, bad network), show an error snackbar
-      const errMsg = error?.response?.data?.message || error.message || "System error occurred.";
-      showSnackBar(`Failed to initiate request: ${errMsg}`, "error");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const isFormReadyToSubmit = rows.every(
-    (row) =>
-      row.branch &&
-      row.currency &&
-      row.cgl &&
-      row.amount &&
-      parseFloat(row.amount) > 0 &&
-      row.txnType &&
-      isRowRemarksValid(row.remarks)
-  );
-  if (isPageLoading) {
     return (
-      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '80vh' }}>
-        <CircularProgress size={60} />
-      </Box>
-    );
-  }
-  if (isEodRunning) {
-    return (
-     <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'top', height: '25vh', p: 2, marginBottom: '500px' }}>
-        <Paper elevation={4} sx={{ p: 6, textAlign: 'center', borderRadius: 4, }}>
-          <Typography variant="h4" color="error" fontWeight="bold" gutterBottom>EOD is Currently Running</Typography>
-          <Typography variant="h6" color="text.secondary" sx={{ mt: 2 }}>Journal Posting is temporarily disabled.</Typography>
-          <Typography variant="body1" color="text.secondary" sx={{ mt: 1 }}>Please wait until the End of Day process completes to post new transactions.</Typography>
-        </Paper>
-      </Box>
-    );
-  }
-   return (
-    <Box sx={{ p: { xs: 1, md: 3 }, width: "100%" }}>
-      
-      {/* INTERNAL STEP 0: VOUCHER SELECTION TABLE */}
-      {activeStep === 0 && (
-        <Box>
-          <Typography variant="h6" fontWeight="bold" gutterBottom color="primary.main">
-            Select Voucher Id (VID)
+      <Paper elevation={0} sx={{ p: 3, mb: 4, backgroundColor: "#f8fafc", borderRadius: 2, border: "1px solid", borderColor: "divider" }}>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
+          <Typography variant="subtitle1" fontWeight="bold" color="text.primary">
+            Selected Voucher Details
           </Typography>
-   
-
-<Paper elevation={2} sx={{ width: '100%', mb: 2, borderRadius: 2, overflow: 'hidden' }}>
-            <TableContainer sx={{ overflowX: "hidden" }}>
-              <Table size="medium" sx={{ tableLayout: "fixed" }}>
-                <TableHead sx={{ backgroundColor: "action.hover" }}>
-                  <TableRow>
-                    <TableCell padding="checkbox" sx={{ width: '5%' }}></TableCell>
-                    <TableCell sx={{ fontWeight: 'bold', width: '25%' }}>VID</TableCell>
-                    <TableCell sx={{ fontWeight: 'bold', width: '35%' }}>Category</TableCell>
-                    <TableCell sx={{ fontWeight: 'bold', width: '35%' }}>Created By</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {voucherList
-                    .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
-                    .map((row) => {
-                      const isSelected = selectedVoucher?.id === row.id;
-                      const isExpanded = expandedRow === row.id;
-
-                      return (
-                        <React.Fragment key={row.id}>
-                          {/* MAIN ROW */}
-                          <TableRow 
-                            hover 
-                            onClick={() => {
-                              setSelectedVoucher(row);
-                              handleRowExpand(row.id); // Triggers the smooth collapse
-                            }}
-                            sx={{ 
-                              cursor: 'pointer',
-                              backgroundColor: isSelected ? "action.selected" : "inherit",
-                              '& > *': { borderBottom: isExpanded ? 'none' : '1px solid rgba(224, 224, 224, 1)' } 
-                            }}
-                          >
-                            <TableCell padding="checkbox">
-                              <Radio checked={isSelected} color="primary" />
-                            </TableCell>
-                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              {row.vid}
-                            </TableCell>
-                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              {row.category || "General"}
-                            </TableCell>
-                            <TableCell sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              {row.createdBy || "System"}
-                            </TableCell>
-                          </TableRow>
-                          
-                          <TableRow sx={{ backgroundColor: "background.default" }}>
-                            {/* Notice colSpan is now 4 to match the new column count */}
-                            <TableCell style={{ paddingBottom: 0, paddingTop: 0, borderBottom: isExpanded ? '1px solid rgba(224, 224, 224, 1)' : 'none' }} colSpan={4}>
-                              <Collapse in={isExpanded} timeout="auto" unmountOnExit>
-                                <Box sx={{ margin: 2, p: 2, borderRadius: 2}}>
-                                  <Typography variant="body2" color="text.secondary">
-                                    <strong style={{ color: "black" }}>Description:</strong> {row.description || "No description provided for this voucher configuration."}
-                                  </Typography>
-                                </Box>
-                              </Collapse>
-                            </TableCell>
-                          </TableRow>
-                        </React.Fragment>
-                      );
-                    })}
-                  {voucherList.length === 0 && (
-                     <TableRow>
-                       <TableCell colSpan={4} align="center" sx={{ py: 3 }}>
-                         No configurations found.
-                       </TableCell>
-                     </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </TableContainer>
-            <TablePagination
-              rowsPerPageOptions={[5, 10, 25]}
-              component="div"
-              count={voucherList.length}
-              rowsPerPage={rowsPerPage}
-              page={page}
-              onPageChange={handleChangePage}
-              onRowsPerPageChange={handleChangeRowsPerPage}
-            />
-          </Paper>
-
-          <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 3 }}>
-            <Button variant="contained" onClick={handleNext} disabled={!selectedVoucher} endIcon={<ArrowForwardIcon />} sx={{ px: 4 }}>
-              Next
+          {showBackButton && (
+            <Button startIcon={<ArrowBackIcon />} onClick={onBackClick} variant="outlined" size="small">
+              Change Voucher
             </Button>
-          </Box>
+          )}
         </Box>
-      )}
+        
+        <Grid container spacing={3}>
+          <Grid item xs={12} sm={3}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>VID</Typography>
+            <Typography variant="body1" fontWeight="bold" color="primary">{selectedVoucher.VID}</Typography>
+          </Grid>
+          <Grid item xs={12} sm={3}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
+            <Typography variant="body1" fontWeight="500">{selectedVoucher.CATEGORY_NAME}</Typography>
+          </Grid>
+          <Grid item xs={12} sm={3}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created By</Typography>
+            <Typography variant="body1" fontWeight="500">
+              {selectedVoucher.CREATOR_NAME} <Typography component="span" variant="caption" color="text.secondary">({selectedVoucher.CREATOR_ID})</Typography>
+            </Typography>
+          </Grid>
+          <Grid item xs={12} sm={3}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created At</Typography>
+            <Typography variant="body1" fontWeight="500">
+              {selectedVoucher.CREATED_AT ? new Date(selectedVoucher.CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
+            </Typography>
+          </Grid>
+          <Grid item xs={12}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Description</Typography>
+            <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+              {selectedVoucher.DESCRIPTION || "No description provided."}
+            </Typography>
+          </Grid>
+        </Grid>
+      </Paper>
+    );
+  };
 
+```
+**Next, replace the top of Step 1 (activeStep === 1) with this card:**
+Find where it says Selected VID : <b>{selectedVoucher?.vid}</b> and replace it so Step 1 looks like this:
+```javascript
       {/* INTERNAL STEP 1: CHOOSE ENTRY METHOD */}
       {activeStep === 1 && (
-        <Box sx={{ minHeight: "50vh", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-          <Typography variant="h5" align="center" fontWeight="bold" gutterBottom>
+        <Box sx={{ display: "flex", flexDirection: "column" }}>
+          
+          <SelectedVoucherCard />
+
+          <Typography variant="h5" align="center" fontWeight="bold" gutterBottom sx={{ mt: 2 }}>
             How would you like to input the data?
           </Typography>
-          <Typography variant="body1" align="center" color="text.secondary" sx={{ mb: 6 }}>
-            Selected VID : <b>{selectedVoucher?.vid}</b>
-          </Typography>
- {/* Using Flexbox with fixed widths instead of dynamic Grids for perfect symmetry */}
-          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 4, justifyContent: "center", alignItems: "center" }}>
-            
-            {/* MANUAL ENTRY CARD */}
-            <Card elevation={2} sx={{ width: 320, height: 260, borderRadius: 3, transition: "0.3s", "&:hover": { transform: "translateY(-5px)", boxShadow: 6 } }}>
-              <CardActionArea onClick={() => handleMethodSelection("MANUAL")} sx={{ height: "100%", p: 4, textAlign: "center", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-                <EditNoteIcon color="primary" sx={{ fontSize: 60, mb: 2 }} />
-                <Typography variant="h6" fontWeight="bold" gutterBottom>Manual Entry</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Manual Voucher Posting  
-                </Typography>
-              </CardActionArea>
-            </Card>
 
-            {/* EXCEL UPLOAD CARD */}
-            <Card elevation={2} sx={{ width: 320, height: 260, borderRadius: 3, transition: "0.3s", "&:hover": { transform: "translateY(-5px)", boxShadow: 6 } }}>
-              <CardActionArea onClick={() => handleMethodSelection("BULK")} sx={{ height: "100%", p: 4, textAlign: "center", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-                {/* Standard Excel Green Hex Code */}
-                <TableChartIcon sx={{ fontSize: 60, mb: 2, color: "#217346" }} /> 
-                <Typography variant="h6" fontWeight="bold" gutterBottom>Excel Upload</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Upload an Excel file (.xlsx or .xls) to process hundreds of voucher entries instantly.
-                </Typography>
-              </CardActionArea>
-            </Card>
-            
-          </Box>
-          
-          <Box sx={{ display: 'flex', justifyContent: 'flex-start', mt: 6 }}>
-            <Button variant="outlined" onClick={handleBack} startIcon={<ArrowBackIcon />}>
-              Previous
-            </Button>
-          </Box>
-        </Box>
-      )}
-
+```
+**Finally, replace the top of Step 2 (activeStep === 2) with this card:**
+Find the old <Paper> at the very top of Step 2 that had the "Change Method" button, and replace it completely with the new card:
+```javascript
       {/* INTERNAL STEP 2: DATA ENTRY GRID */}
       {activeStep === 2 && (
         <Box>
-          <Paper elevation={1} sx={{ p: 2, mb: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'background.default', border: "1px solid", borderColor: "divider" }}>
-            <Box>
-              <Typography variant="subtitle2" color="text.secondary">Selected VID </Typography>
-              <Typography variant="h6" fontWeight="bold" color="primary">{selectedVoucher?.vid}</Typography>
-            </Box>
-            <Button startIcon={<ArrowBackIcon />} onClick={handleBack} variant="outlined" size="small">Change Method</Button>
-          </Paper>
+          {/* Replaces the old basic header with the professional detailed card */}
+          <SelectedVoucherCard onBackClick={handleBack} showBackButton={true} />
 
           <Box component={Paper} elevation={3} sx={{ p: 2 }}>
-            {/* ... EXISTING GRID START ... */}
-            <Box>
-              <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                <DateRangeTwoToneIcon />
-                <Typography variant="h6" fontWeight="500" component="span" sx={{ ml: 0.5 }}>Posting Date:</Typography>
-                <Typography variant="body1" fontWeight="500" component="span">{postingDate}</Typography>
-              </Box>
-              <Box>
-                <Typography component="span" sx={{ color: "error.main", fontSize: "13px" }}>
-                  Note: All vouchers will be Posted on this Date
-                </Typography>
-              </Box>
-            </Box>
-            <Divider sx={{ py: 0.5 }}></Divider>
+            {/* ... EXISTING GRID START (Posting Date, etc) ... */}
 
-            <Grid item xs={12} md={12} sx={{ mt: 3, width: "100%" }}>
-              <TextField
-                label="Common Batch Remarks"
-                value={commonBatchRemarks}
-                onChange={(e) => {
-                  const newValue = filterAndWarn(e.target.value, "alphanumeric_space");
-                  if (newValue.length <= 30) {
-                    setCommonBatchRemarks(newValue);
-                    if (checked) {
-                      setRows(rows.map((row) => ({ ...row, remarks: newValue })));
-                    }
-                  }
-                }}
-                fullWidth required multiline rows={1} inputProps={{ maxLength: 30 }}
-                error={commonBatchRemarks.length > 0 && !isCommonRemarksValid(commonBatchRemarks)}
-              />
-              <FormHelperText sx={{ color: "text.secondary", textAlign: "left", ml: 1.5 }}>
-                Allowed 2-30 chars (alphabets, numbers)
-              </FormHelperText>
-              <Box sx={{ display: "flex", alignItems: "center", mt: 2 }}>
-                <FormControlLabel
-                  control={<Checkbox checked={checked} onChange={handleRemarksSync} color="primary" disabled={commonBatchRemarks.length > 0 && !isRemarksValid(commonBatchRemarks)} />}
-                  label="Apply this remark to all below transactions"
-                />
-              </Box>
-            </Grid>
-
-            <Box sx={{ mt: 2 }}>
-              {rows.map((row, index) => {
-                const isINR = row.currency === "INR";
-                const amountRegex = isINR ? /^\d{0,16}(\.\d{0,2})?$/ : /^\d{0,16}(\.\d{0,4})?$/;
-
-                return (
-                  <React.Fragment key={row.id}>
-                    <Grid container spacing={2} alignItems="flex-start">
-                      {/* Branch */}
-                      <Grid item xs={12} md={3} sx={{ flexGrow: 1.8 }}>
-                        <Autocomplete
-                          popupIcon={null} autoHighlight options={branchSearch.options}
-                          getOptionLabel={(option) => option && option.code ? `${option.code} - ${option.name}` : ""}
-                          value={row.branch || null}
-                          onChange={(event, newValue) => handleRowChange(row.id, "branch", newValue)}
-                          inputValue={branchInputValues[row.id] || ""}
-                          onInputChange={(event, newInputValue, reason) => {
-                            if (reason === 'input') {
-                              const cleanInput = newInputValue.replace(BRANCH_REPLACE_REGEX, "").substring(0, 5);
-                              setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                              searchBranches(cleanInput, row.id);
-                            } else {
-                              setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                            }
-                          }}
-                          loading={branchSearch.loadingId === row.id} filterOptions={(x) => x}
-                          isOptionEqualToValue={(option, value) => option?.code === value?.code}
-                          noOptionsText={(branchInputValues[row.id] || "").length < 3 ? "Please enter at least 3 digits" : "No Branch found"}
-                          renderInput={(params) => (
-                            <Tooltip title="Search by Branch Code" placement="top-start">
-                              <TextField {...params} label="Branch *" placeholder="Enter branch code..." InputLabelProps={{ shrink: true }} InputProps={{ ...params.InputProps, endAdornment: (<Box>{branchSearch.loadingId === row.id ? (<CircularProgress color="inherit" size={20} />) : null}{params.InputProps.endAdornment}</Box>) }} />
-                            </Tooltip>
-                          )}
-                        />
-                        <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2, display: "block", textAlign: "left" }}>
-                          Min 3 Digits required
-                        </Typography>
-                      </Grid>
-
-                      {/* Currency */}
-                      <Grid item xs={12} md={1.5} sx={{ flexGrow: 1.5 }}>
-                        <TextField
-                          select label="Currency *" value={row.currency} fullWidth InputLabelProps={{ shrink: true }}
-                          onChange={(e) => { handleRowChange(row.id, "currency", e.target.value); handleRowChange(row.id, "amount", ""); }}
-                          SelectProps={{ displayEmpty: true, renderValue: (selected) => !selected ? <span style={{ color: 'gray', opacity: 0.8 }}>Select Currency</span> : selected, MenuProps: { anchorOrigin: { vertical: "bottom", horizontal: "left" }, transformOrigin: { vertical: "top", horizontal: "left" }, PaperProps: { style: { maxHeight: 250 } } } }}
-                        >
-                          {currencyOptions.map((c) => (<MenuItem key={c} value={c}>{c}</MenuItem>))}
-                        </TextField>
-                      </Grid>
-
-                      {/* CGL */}
-                      <Grid item xs={12} md={2} sx={{ flexGrow: 1.8 }}>
-                        <Autocomplete
-                          popupIcon={null} autoHighlight options={cglSearch.options}
-                          getOptionLabel={(option) => option && option.cglNumber ? `${option.cglNumber} - ${option.description}` : ""}
-                          value={row.cgl || null}
-                          onChange={(event, newValue) => handleRowChange(row.id, "cgl", newValue)}
-                          inputValue={cglInputValues[row.id] || ""}
-                          onInputChange={(event, newInputValue, reason) => {
-                            if (reason === 'input') {
-                              const cleanInput = newInputValue.replace(CGL_REPLACE_REGEX, "").substring(0, 10);
-                              setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
-                              searchCgls(cleanInput, row.id);
-                            } else {
-                              setCglInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
-                            }
-                          }}
-                          loading={cglSearch.loadingId === row.id} filterOptions={(x) => x}
-                          isOptionEqualToValue={(option, value) => option?.cglNumber === value?.cglNumber}
-                          noOptionsText={(cglInputValues[row.id] || "").length < 3 ? "Type at least 3 digits of CGL Number..." : "CGL not found"}
-                          renderInput={(params) => (
-                            <Tooltip title="Search by CGL Number" placement="top-start">
-                              <TextField {...params} label="CGL *" placeholder="Search CGL number..." InputLabelProps={{ shrink: true }} InputProps={{ ...params.InputProps, endAdornment: (<Box sx={{ marginLeft: "2%", display: "flex", alignItems: "center" }}>{row.cgl && String(row.cgl.cglNumber).startsWith("5") && (<Chip label="MEMO" size="small" color="warning" sx={{ height: 20, fontSize: "0.7rem", mr: 1 }} />)}{cglSearch.loadingId === row.id ? <CircularProgress color="inherit" size={20} /> : null}{params.InputProps.endAdornment}</Box>) }} />
-                            </Tooltip>
-                          )}
-                        />
-                        <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2, display: "block", textAlign: "left" }}>
-                          Min 3 digits required
-                        </Typography>
-                      </Grid>
-
-                      {/* Amount */}
-                      <Grid item xs={12} md={2} sx={{ flexGrow: 1.5 }}>
-                        <TextField
-                          label="Amount *" type="text" value={row.amount} InputLabelProps={{ shrink: true }} disabled={!row.currency} fullWidth placeholder={isINR ? "0.00" : "0.0000"} inputProps={{ style: { textAlign: "right" } }}
-                          onChange={(e) => {
-                            const rawVal = e.target.value;
-                            if (/[^0-9.]/.test(rawVal)) {
-                              showSnackBar("Only numbers and decimal point are allowed.", "warning"); return;
-                            }
-                            if (rawVal === "" || amountRegex.test(rawVal)) { handleRowChange(row.id, "amount", rawVal); } 
-                            else { showSnackBar("Exceeded maximum digits or decimal places.", "warning"); }
-                          }}
-                        />
-                        <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2, display: "block", textAlign: "left" }}>
-                          {!row.currency ? "Select Currency first" : isINR ? "Max 16 digits, 2 decimals (numbers)" : "Max 16 digits, 4 decimals (numbers)"}
-                        </Typography>
-                      </Grid>
-
-                      {/* Txn Type */}
-                      <Grid item xs={12} md={1} sx={{ flexGrow: 1.3 }}>
-                        <TextField select label="Type *" value={row.txnType} fullWidth InputLabelProps={{ shrink: true }} onChange={(e) => handleRowChange(row.id, "txnType", e.target.value)} SelectProps={{ displayEmpty: true, renderValue: (selected) => !selected ? <span style={{ color: 'gray', opacity: 0.8 }}>Type</span> : selected }}>
-                          <MenuItem value="Debit">Debit</MenuItem>
-                          <MenuItem value="Credit">Credit</MenuItem>
-                        </TextField>
-                      </Grid>
-
-                      {/* Product Code */}
-                      <Grid item xs={12} md={2} sx={{ flexGrow: 1.5 }}>
-                        <TextField label="Product Code" value={row.productCode} InputLabelProps={{ shrink: true }} placeholder="Enter Product Code.." fullWidth inputProps={{ maxLength: 8 }} onChange={(e) => { const rawVal = e.target.value; const cleanVal = rawVal.replace(/[^0-9]/g, ""); if (rawVal !== cleanVal) { showSnackBar("Only digits are allowed.", "warning"); } if (cleanVal.length <= 8) { handleRowChange(row.id, "productCode", cleanVal); } }} />
-                        <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mt: 0.5, ml: 1.2, display: "block", textAlign: "left" }}>Max 8 digits (numbers)</Typography>
-                      </Grid>
-
-                      {/* Remarks (Individual) */}
-                      <Grid item xs={12} md={2} sx={{ flexGrow: 2 }}>
-                        <TextField label="Remarks *" value={row.remarks} InputLabelProps={{ shrink: true }} placeholder="Enter remarks..." fullWidth inputProps={{ maxLength: 30 }} disabled={checked} error={row.remarks.length > 0 && !isRowRemarksValid(row.remarks)} onChange={(e) => { const val = filterAndWarn(e.target.value, "alphanumeric_space"); if (val.length <= 30) { handleRowChange(row.id, "remarks", val); } }} />
-                        <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", ml: 1.2, display: "block", textAlign: "left" }}>Allowed 2-30 chars (alphabets, numbers)</Typography>
-                      </Grid>
-
-                      {/* Delete Action */}
-                      <Grid item xs={12} md={0.5} sx={{ textAlign: "center" }}>
-                        <Tooltip title="Delete row" arrow>
-                          <IconButton onClick={() => handleDeleteRow(row.id)} aria-label="delete row" sx={{ color: "inherit", "&:hover": { color: "error.main", backgroundColor: "action.hover" } }}>
-                            <DeleteIcon />
-                          </IconButton>
-                        </Tooltip>
-                      </Grid>
-                    </Grid>
-
-                    {index < rows.length - 1 && (<Box sx={{ borderBottom: 1, borderColor: "divider", my: 2 }} />)}
-                  </React.Fragment>
-                );
-              })}
-
-              {/* --- NEW: SCHEDULE EXECUTION MOVED TO THE END --- */}
-              <Paper elevation={0} sx={{ p: 2, mb: 3, mt: 4, border: "1px dashed", borderColor: "primary.main", borderRadius: 2, backgroundColor: "action.hover" }}>
-                <Typography variant="subtitle1" fontWeight="bold" gutterBottom sx={{ display: 'flex', alignItems: 'center' }}>
-                  <ScheduleIcon sx={{ mr: 1 }} color="primary" />  Schedule Execution
-                </Typography>
-                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                  Set a future date to delay posting. If left blank, the batch will post immediately after final approval.
-                </Typography>
-                <TextField 
-                  type="datetime-local" 
-                  size="small" 
-                  InputLabelProps={{ shrink: true }} 
-                  value={scheduledTime} 
-                  onChange={(e) => setScheduledTime(e.target.value)} 
-                  inputProps={{ min: new Date().toISOString().slice(0, 16) }} 
-                />
-              </Paper>
-
-              {/* ACTION BUTTONS */}
-              <Box sx={{ mt: 3, display: "flex", gap: 2, justifyContent: "right" }}>
-                <Button variant="contained" startIcon={<AddIcon />} onClick={handleAddRow}>Add Row</Button>
-                <Button variant="contained" color="success" onClick={handleSubmit} disabled={isSubmitting || !isCommonRemarksValid(commonBatchRemarks) || !isFormReadyToSubmit}>
-                  {isSubmitting ? <CircularProgress size={24} color="inherit" /> : "Submit Request"}
-                </Button>
-              </Box>
-            </Box>
-          </Box>
-        </Box>
-      )}
-    </Box>
-  );
-}
-
-lets go to the voucher posting screen in which same change are required there 
-created By -> Dont want id i want first and last name as we did in last screen from the users table 
-in bracket give id 
-
-when ever we are showing the data the things we need to change is like 
-ID	NUMBER	No	"FINCORE"."ISEQ$$_81233".nextval	1	
-VID	VARCHAR2(20 BYTE)	No		2	
-CATEGORY_ID	NUMBER	No		3	
-DESCRIPTION	VARCHAR2(500 BYTE)	No		4	
-ALLOWED_ROLE	NUMBER	No		5	
-SD_REQ_NO	VARCHAR2(100 BYTE)	Yes		6	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		7	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	8	
-TERMINATED_BY	VARCHAR2(100 BYTE)	Yes		9	
-TERMINATED_AT	TIMESTAMP(6)	Yes		10	
-STATUS	VARCHAR2(30 BYTE)	No		11	
-REMARKS	VARCHAR2(500 BYTE)	Yes		12	
-
-from this table what ever the i dont want the filter like 
-    @GetMapping("/filter")
-    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(
-            @RequestParam(required = false) String category,
-            @RequestParam(required = false) String role,
-            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
-
-        List<RequestVoucher> results = requestVoucherService.getFilteredVouchers(category, role, date);
-        return ResponseEntity.ok(results);
-    }
-	
-	catgory role etc 
-	
-	i want like if the if the loged in user role is requal to the Allowed that data u need to show (ALLOWED_ROLE)
-	and other filter is status should be AVAILABLE
-	
-	where we are showing the Selected VID
-    there i want to show the Discription and catagory also
-	
-	sequnce and additional things like 
-	VID , CATEGORY -> from the table voucher catgory as u know, created By (name)(id) , created At
-	also add the paper so that it will looks proftional and also 
-
+```
+By standardizing this card into a sub-component (SelectedVoucherCard), your UI remains perfectly consistent across both screens, and you gain access to the Category, Description, and Full Name details instantly!
