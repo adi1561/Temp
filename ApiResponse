@@ -1,11 +1,326 @@
-i want the new flow 
-like 
-as the user enter the data manual or Bulk take him to the next screen where 
-u are saying 
-"your request has been submitted and pending for approals "
-ask
-do u want to Scadual this excution 
-if yes  give him Calnder or something like this so he can scadule 
-2nd
-options Should be 
-execute imeditly -> in this case take him to the starting point of the posting 
+This is a fantastic UX improvement. Moving the schedule option to a dedicated "Post-Submission Success Screen" (Step 3) removes clutter from the data entry phase and gives the user a clear sense of accomplishment before asking them about future execution.
+Here are the exact Find & Replace steps to build this new flow across your two files.
+### PART 1: Changes in JournalPosting.jsx (The Main File)
+**1. Add the New State Variables**
+We need to track the batchId that was just created and handle the new Step 3 UI state.
+**FIND THIS (around line 63):**
+```javascript
+  const [activeStep, setActiveStep] = useState(0);
+  const [entryMethod, setEntryMethod] = useState("MANUAL"); // Tracks Manual vs Bulk
+
+```
+**REPLACE WITH:**
+```javascript
+  const [activeStep, setActiveStep] = useState(0);
+  const [entryMethod, setEntryMethod] = useState("MANUAL"); // Tracks Manual vs Bulk
+  
+  // --- NEW: POST-SUBMISSION STATE ---
+  const [submittedBatchId, setSubmittedBatchId] = useState(null);
+  const [showSchedulePicker, setShowSchedulePicker] = useState(false);
+  const [isApplyingSchedule, setIsApplyingSchedule] = useState(false);
+
+```
+**2. Update the Reset Function**
+Ensure the new states reset when going back to the start.
+**FIND THIS:**
+```javascript
+  const handleResetWizard = () => {
+    setActiveStep(0);
+    setSelectedVoucher(null);
+    setEntryMethod("MANUAL");
+    setRows([{ ...initialRowState, id: Date.now() }]);
+    setCommonBatchRemarks("");
+    setScheduledTime("");
+    setChecked(false);
+  };
+
+```
+**REPLACE WITH:**
+```javascript
+  const handleResetWizard = () => {
+    setActiveStep(0);
+    setSelectedVoucher(null);
+    setEntryMethod("MANUAL");
+    setRows([{ ...initialRowState, id: Date.now() }]);
+    setCommonBatchRemarks("");
+    setScheduledTime("");
+    setChecked(false);
+    setSubmittedBatchId(null);
+    setShowSchedulePicker(false);
+  };
+
+  const handleApplySchedule = async () => {
+    if (!scheduledTime) {
+      showSnackBar("Please select a date and time.", "warning");
+      return;
+    }
+    setIsApplyingSchedule(true);
+    try {
+      const dateObj = new Date(scheduledTime);
+      const formattedSchedule = dateObj.toISOString().slice(0, 19).replace('T', ' ');
+
+      // Make sure this endpoint matches your backend API for updating a schedule!
+      await callApi("/JS/voucher/update-schedule", {
+        batchId: submittedBatchId,
+        scheduledTime: formattedSchedule
+      }, "POST");
+
+      showSnackBar("Schedule applied successfully!", "success");
+      handleResetWizard();
+    } catch (e) {
+      showSnackBar("Failed to apply schedule.", "error");
+    } finally {
+      setIsApplyingSchedule(false);
+    }
+  };
+
+```
+**3. Remove Scheduled Time from handleSubmit payload & Move to Step 3**
+In manual submission, we will ignore scheduling at creation, and instead move the user to Step 3 upon success.
+**FIND THIS ENTIRE BLOCK (inside handleSubmit):**
+```javascript
+    let formattedSchedule = null;
+    if (scheduledTime) {
+      const dateObj = new Date(scheduledTime);
+      formattedSchedule = dateObj.toISOString().slice(0, 19).replace('T', ' ');
+    }
+
+    const finalPayload = {
+      vid: selectedVoucher?.vid,           // NEW
+      scheduledTime: formattedSchedule,    // NEW
+      commonBatchRemarks: commonBatchRemarks.trim(),
+      rows: rowPayloads,
+    };
+
+    try {
+      const response = await callApi(
+        "/JS/voucher/create-batch",
+        finalPayload,
+        "POST"
+      );
+
+      const newBatchId = response?.[0]?.batchId || "N/A";
+
+      showSnackBar(
+        "Your Request has been initiated",
+        "info"
+      );
+      setRows([{ ...initialRowState, id: Date.now() }]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+      setBranchInputValues({});
+      setCglInputValues({});
+
+      // --- NEW: RESET WIZARD STATE ---
+      setScheduledTime("");
+      setSelectedVoucher(null);
+      setActiveStep(0); // Send back to step 1
+
+```
+**REPLACE WITH:**
+```javascript
+    const finalPayload = {
+      vid: selectedVoucher?.VID || selectedVoucher?.vid,
+      scheduledTime: null, // Handled in Step 3 now
+      commonBatchRemarks: commonBatchRemarks.trim(),
+      rows: rowPayloads,
+    };
+
+    try {
+      const response = await callApi(
+        "/JS/voucher/create-batch",
+        finalPayload,
+        "POST"
+      );
+
+      // Extract the Batch ID created by the backend
+      const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
+      setSubmittedBatchId(newBatchId);
+
+      setRows([{ ...initialRowState, id: Date.now() }]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+      setBranchInputValues({});
+      setCglInputValues({});
+
+      // Move to the new Success & Scheduling Screen (Step 3)
+      setActiveStep(3); 
+
+```
+**4. Remove the Old Schedule Box from Step 2 (Manual Entry UI)**
+**FIND THIS:**
+```javascript
+              {/* --- NEW: SCHEDULE EXECUTION MOVED TO THE END --- */}
+              <Paper elevation={0} sx={{ p: 2, mb: 3, mt: 4, border: "1px dashed", borderColor: "primary.main", borderRadius: 2, backgroundColor: "action.hover" }}>
+                <Typography variant="subtitle1" fontWeight="bold" gutterBottom sx={{ display: 'flex', alignItems: 'center' }}>
+                  <ScheduleIcon sx={{ mr: 1 }} color="primary" />  Schedule Execution
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                  Set a future date to delay posting. If left blank, the batch will post immediately after final approval.
+                </Typography>
+                <TextField
+                  type="datetime-local"
+                  size="small"
+                  InputLabelProps={{ shrink: true }}
+                  value={scheduledTime}
+                  onChange={(e) => setScheduledTime(e.target.value)}
+                  inputProps={{ min: new Date().toISOString().slice(0, 16) }}
+                />
+              </Paper>
+
+```
+**REPLACE WITH:**
+*(Leave it completely blank. We delete the block entirely because it is moving to Step 3!)*
+**5. Add the New Step 3 UI (Success & Schedule Screen)**
+**FIND THIS (at the very bottom of the file):**
+```javascript
+      {/* EXTERNAL STEP 2: BULK UPLOAD EXCEL COMPONENT */}
+      {activeStep === 2 && entryMethod === "BULK" && (
+        <JournalBulkUpload 
+            selectedVoucher={selectedVoucher} 
+            onBack={handleBack} 
+            onReset={handleResetWizard} 
+        />
+      )}
+
+    </Box>
+  );
+}
+
+```
+**REPLACE WITH:**
+```javascript
+      {/* EXTERNAL STEP 2: BULK UPLOAD EXCEL COMPONENT */}
+      {activeStep === 2 && entryMethod === "BULK" && (
+        <JournalBulkUpload 
+            selectedVoucher={selectedVoucher} 
+            onBack={handleBack} 
+            onReset={handleResetWizard} 
+            // Triggered automatically when Bulk Excel completes
+            onSuccessSubmit={(batchId) => {
+              setSubmittedBatchId(batchId);
+              setActiveStep(3);
+            }}
+        />
+      )}
+
+      {/* NEW STEP 3: POST-SUBMISSION SUCCESS & SCHEDULING SCREEN */}
+      {activeStep === 3 && (
+        <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '50vh' }}>
+          <Paper elevation={3} sx={{ p: 5, maxWidth: 600, textAlign: 'center', borderRadius: 3 }}>
+            
+            <TaskAltIcon sx={{ fontSize: 80, color: 'success.main', mb: 2 }} />
+            
+            <Typography variant="h5" fontWeight="bold" gutterBottom>
+              Your request has been submitted!
+            </Typography>
+            <Typography variant="body1" color="text.secondary" sx={{ mb: 4 }}>
+              Batch ID <b>{submittedBatchId}</b> is now pending for approvals.
+            </Typography>
+
+            <Divider sx={{ my: 3 }} />
+
+            <Typography variant="h6" fontWeight="bold" color="primary.main" gutterBottom>
+              Do you want to schedule this execution?
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 4 }}>
+              By default, this batch will post immediately after the final approval. You can choose to delay the posting to a specific future date and time.
+            </Typography>
+
+            {!showSchedulePicker ? (
+              <Box sx={{ display: 'flex', gap: 3, justifyContent: 'center' }}>
+                <Button 
+                  variant="outlined" 
+                  size="large" 
+                  onClick={handleResetWizard}
+                  sx={{ px: 4, py: 1.5, fontWeight: 'bold' }}
+                >
+                  Execute Immediately
+                </Button>
+                <Button 
+                  variant="contained" 
+                  size="large" 
+                  startIcon={<ScheduleIcon />}
+                  onClick={() => setShowSchedulePicker(true)}
+                  sx={{ px: 4, py: 1.5, fontWeight: 'bold' }}
+                >
+                  Schedule Execution
+                </Button>
+              </Box>
+            ) : (
+              <Box sx={{ mt: 2, p: 3, backgroundColor: 'action.hover', borderRadius: 2, border: '1px dashed', borderColor: 'divider' }}>
+                <Typography variant="subtitle2" gutterBottom>Select Future Date & Time</Typography>
+                <TextField
+                  type="datetime-local"
+                  size="small"
+                  fullWidth
+                  InputLabelProps={{ shrink: true }}
+                  value={scheduledTime}
+                  onChange={(e) => setScheduledTime(e.target.value)}
+                  inputProps={{ min: new Date().toISOString().slice(0, 16) }}
+                  sx={{ backgroundColor: 'white', mb: 3 }}
+                />
+                <Box sx={{ display: 'flex', gap: 2, justifyContent: 'center' }}>
+                  <Button onClick={() => setShowSchedulePicker(false)} color="inherit" disabled={isApplyingSchedule}>
+                    Cancel
+                  </Button>
+                  <Button 
+                    variant="contained" 
+                    color="primary" 
+                    onClick={handleApplySchedule}
+                    disabled={!scheduledTime || isApplyingSchedule}
+                  >
+                    {isApplyingSchedule ? <CircularProgress size={24} color="inherit" /> : "Confirm Schedule"}
+                  </Button>
+                </Box>
+              </Box>
+            )}
+
+          </Paper>
+        </Box>
+      )}
+
+    </Box>
+  );
+}
+
+```
+### PART 2: Changes in JournalBulkUpload.jsx
+Now, we just need to ensure the Excel Upload passes the batchId back to the parent so it knows to go to Step 3.
+**1. Update the Props**
+**FIND THIS:**
+```javascript
+const JournalBulkUpload = ({ selectedVoucher, onBack, onReset }) => {
+
+```
+**REPLACE WITH:**
+```javascript
+const JournalBulkUpload = ({ selectedVoucher, onBack, onReset, onSuccessSubmit }) => {
+
+```
+**2. Trigger onSuccessSubmit when the API completes**
+**FIND THIS (Inside autoSubmitBatch):**
+```javascript
+      const response = await callApi("/JS/voucher/create-batch-from-cache", payload, "POST");
+      if (response && (response.status === "SUCCESS" || response.batchId)) {
+        showSnackBar("Your Request has been initiated. You will be Notified once the Batch is Created/Failed.", "info");
+        setBatchCreated(true); // Triggers the Download CSV button to appear
+      } else {
+
+```
+**REPLACE WITH:**
+```javascript
+      const response = await callApi("/JS/voucher/create-batch-from-cache", payload, "POST");
+      if (response && (response.status === "SUCCESS" || response.batchId)) {
+        
+        const newBatchId = response.batchId || "N/A";
+        
+        // Push the user to the brand new Schedule Screen (Step 3)!
+        if (onSuccessSubmit) {
+          onSuccessSubmit(newBatchId);
+        } else {
+          setBatchCreated(true);
+        }
+      } else {
+
+```
