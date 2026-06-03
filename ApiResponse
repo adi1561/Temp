@@ -1,99 +1,36 @@
-I understand exactly what you need. You have the helper methods ready, but you need to know exactly *where* to place the triggers inside this massive file to correctly fire the State Machine transitions (ACTIVE -> USED -> ACTIVE or COMPLETED).
-Here are the exact **3 places** you need to add the triggers in your VoucherRequestServiceImpl.java file.
-### Trigger 1: Change to USED (When Batch is Created)
-When a user successfully submits the batch, we must instantly lock the VID so no one else can use it.
-**FIND THIS (Inside createBatchRequest around line 520):**
-```java
-        // 3. Notifications & Audits
-        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under " + workflowCode);
-        sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
+workflow transaction 
 
-        return savedEntities;
 
-```
-**REPLACE WITH:**
-```java
-        // 3. Notifications & Audits
-        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under " + workflowCode);
-        sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
+TRANSITION_ID	NUMBER	No	"FINCORE"."ISEQ$$_81448".nextval	1	
+WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		2	
+CURRENT_STATE	VARCHAR2(50 BYTE)	No		3	
+ACTION_TAKEN	VARCHAR2(50 BYTE)	No		4	
+NEXT_STATE	VARCHAR2(50 BYTE)	No		5	
+CURRENT_ROLE_ID	NUMBER(10,0)	Yes		6	
+IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
+"	7	
+SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		8	
+STEP_DESIGNATION	VARCHAR2(100 BYTE)	Yes		9	
+HOURS	NUMBER(10,0)	Yes		10	
 
-        // ---> TRIGGER 1: LOCK THE VID AS USED <---
-        if (dto.getVid() != null && !dto.getVid().isEmpty()) {
-            updateVidStatus(dto.getVid(), VoucherStatus.USED);
-        }
+this is data for the flow 
 
-        return savedEntities;
+INITIALIZE	CREATE	1	Workflow_3	PENDING_L1	9001	N	Y	Creator	24
+PENDING_L1	ACCEPTED	2	Workflow_3	PENDING_L2	9001	N	N	Verifier	24
+PENDING_L2	ACCEPTED	3	Workflow_3	PENDING_L3	9002	N	N	Reviewer	48
+PENDING_L3	ACCEPTED	4	Workflow_3	POSTED	9002	Y	Y	Approver	0
+INITIALIZE	CREATE	8	Workflow_4	PENDING_L1	9003	N	Y	Creator	24
+PENDING_L1	ACCEPTED	9	Workflow_4	PENDING_L2	9001	N	N	Validator	24
+PENDING_L2	ACCEPTED	10	Workflow_4	PENDING_L3	9001	N	N	Verifier	48
+PENDING_L3	ACCEPTED	11	Workflow_4	PENDING_L4	9002	N	N	Reviewer	48
+PENDING_L4	ACCEPTED	12	Workflow_4	POSTED	9002	Y	Y	Approver	0
 
-```
-### Trigger 2: Change back to ACTIVE (If Rejected)
-If the checker rejects the batch, the workflow dies. We must unlock the VID so it can be selected again and corrected.
-**FIND THIS (Inside processWorkflowAction around line 683):**
-```java
-        // 5. Apply the Rule
-        if ("REJECTED".equals(actionTaken)) {
-            posting.setCurrentStatus(nextState);
-            posting.setNextApprovalRoleId(null);
-            voucherPostingRepository.save(posting);
 
-            logWorkflowAction(batchId, posting.getVidFk(), "REJECTED", executorId, dto.getRemarks(), null);
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
-            jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
-            notificationWriterService.createBatchRejectedNotification(batchId, posting.getCreatedBy(), executorId, dto.getRemarks());
-            return;
-        }
+for the workflow 3 and workflow 4 
 
-```
-**REPLACE WITH:**
-```java
-        // 5. Apply the Rule
-        if ("REJECTED".equals(actionTaken)) {
-            posting.setCurrentStatus(nextState);
-            posting.setNextApprovalRoleId(null);
-            voucherPostingRepository.save(posting);
+now the problem is that flow is not moving forword that stepper not bigger stepper not even the smaller stepper what is this going one i dont know 
+all the comment i can see but i am not able to see that in the moving state 
+it is at normal state only 
+where it start 
 
-            logWorkflowAction(batchId, posting.getVidFk(), "REJECTED", executorId, dto.getRemarks(), null);
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
-            jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
-            notificationWriterService.createBatchRejectedNotification(batchId, posting.getCreatedBy(), executorId, dto.getRemarks());
-            
-            // ---> TRIGGER 2: UNLOCK THE VID BACK TO ACTIVE <---
-            if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
-                updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
-            }
-            
-            return;
-        }
-
-```
-### Trigger 3: Change to COMPLETED (When Final Approved & Posted)
-If the batch is fully approved and posts successfully, the VID's lifecycle is finished. We retire it.
-**FIND THIS (Inside processWorkflowAction around line 711, inside the POSTED block):**
-```java
-            } else {
-                posting.setCurrentStatus("POSTED");
-                posting.setExecutedAt(LocalDateTime.now());
-                posting.setNextApprovalRoleId(null);
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks(), null);
-
-                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-
-```
-**REPLACE WITH:**
-```java
-            } else {
-                posting.setCurrentStatus("POSTED");
-                posting.setExecutedAt(LocalDateTime.now());
-                posting.setNextApprovalRoleId(null);
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks(), null);
-
-                // ---> TRIGGER 3: RETIRE THE VID AS COMPLETED <---
-                if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
-                    updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
-                }
-
-                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-
-```
-### Important Note for Bulk Uploads:
-I noticed your createBatchFromCacheAsync method signature (around line 77) doesn't currently accept the vid.
-If you want Bulk Excel Uploads to also lock the VID, you will need to add the vid parameter to your /create-batch-from-cache REST Controller payload, update the createBatchFromCacheAsync signature to receive it, and add **Trigger 1** there just like we did for manual uploads!
+onther is mini stepper is not dyamic
