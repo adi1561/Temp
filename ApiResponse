@@ -1,360 +1,86 @@
-<React.Fragment key={row.id}>
-  <Grid container spacing={2} alignItems="flex-start">
+This is a perfect use case for a **State Machine** pattern. By tying the VID's lifecycle to the Batch's workflow, you ensure that a single Voucher Configuration cannot be accidentally reused by multiple people at the same time while it's pending approval.
+Since you are using Spring Boot with JdbcTemplate, here is the complete, step-by-step implementation to handle this on the backend.
+### Step 1: Create the Enum
+Create a new Enum class in your Java backend (e.g., in a enums or model package). Note: Since your original SQL query checked for STATUS = 'AVAILABLE', I will use AVAILABLE here, but you can rename it to ACTIVE if you update your database constraints.
+```java
+package com.fincore.journal.enums;
 
-    {/* Branch */}
-    <Grid item xs={12} md={2} sx={{ flexGrow: 1.4 }}>
-      <Autocomplete
-        popupIcon={null}
-        autoHighlight
-        options={branchSearch.options}
-        getOptionLabel={(option) =>
-          option?.code ? `${option.code} - ${option.name}` : ""
+public enum VoucherStatus {
+    AVAILABLE,  // Ready to be selected in the UI
+    USED,       // Selected and submitted, currently stuck in workflow
+    COMPLETED   // Fully approved and posted to the GL
+}
+
+```
+### Step 2: Add Database Helper Methods
+In your VoucherRequestServiceImpl.java, add these two quick helper methods. One updates the status, and the other fetches the VID associated with a specific BATCH_ID (which you will need during approvals and scheduling).
+```java
+    // Helper 1: Update the VID status directly
+    public void updateVidStatus(String vid, VoucherStatus status) {
+        String sql = "UPDATE REQUEST_VOUCHER SET STATUS = ? WHERE VID = ?";
+        jdbcTemplate.update(sql, status.name(), vid);
+    }
+
+    // Helper 2: Get VID by Batch ID
+    public String getVidByBatchId(String batchId) {
+        String sql = "SELECT VID_FK FROM VOUCHER_POSTING WHERE BATCH_ID = ?";
+        return jdbcTemplate.queryForObject(sql, String.class, batchId);
+    }
+
+```
+### Step 3: Trigger -> USED (When Batch is Submitted)
+When the user submits the Manual Entry or Bulk Excel flow, they hit your /create-batch endpoint. Right after you successfully generate the BATCH_ID and insert the rows, lock the VID.
+**Inside your createBatch service method:**
+```java
+        // ... (Your existing code that inserts the batch and rows) ...
+
+        // Lock the VID so no one else can use it while it is in the approval workflow
+        if (payload.getVid() != null && !payload.getVid().isEmpty()) {
+            updateVidStatus(payload.getVid(), VoucherStatus.USED);
         }
-        value={row.branch || null}
-        onChange={(event, newValue) =>
-          handleRowChange(row.id, "branch", newValue)
+        
+        return newBatchId; // Return to frontend
+
+```
+### Step 4: Trigger -> AVAILABLE (If Rejected in Workflow)
+If a Level 1, 2, or 3 approver clicks **Reject**, the batch dies, which means the VID needs to be unlocked and returned to the pool for someone else to correct and resubmit.
+**Inside your Workflow Action method (where they accept/reject):**
+```java
+    public void processWorkflowAction(String batchId, String status, String remarks) {
+        // ... (Your existing workflow logic) ...
+        
+        // If the workflow is terminating due to a rejection
+        if ("REJECTED".equals(status)) {
+            String vid = getVidByBatchId(batchId);
+            if (vid != null) {
+                // Unlock it!
+                updateVidStatus(vid, VoucherStatus.AVAILABLE); 
+            }
         }
-        inputValue={branchInputValues[row.id] || ""}
-        onInputChange={(event, newInputValue, reason) => {
-          if (reason === "input") {
-            const cleanInput = newInputValue
-              .replace(BRANCH_REPLACE_REGEX, "")
-              .substring(0, 5);
+    }
 
-            setBranchInputValues(prev => ({
-              ...prev,
-              [row.id]: cleanInput
-            }));
+```
+### Step 5: Trigger -> COMPLETED (When Executed)
+Finally, when the batch is successfully posted to the core GL (either immediately or via the Spring Scheduler), we permanently retire the VID.
+**Inside your JournalExecutionScheduler.java (or manual execution method):**
+```java
+    private void executeJournalPosting(String batchId) {
+        // 1. Run your accounting validation checks
+        // 2. Insert into final core GL tables
+        
+        // 3. Mark the batch state as POSTED
+        String updateStateSql = "UPDATE VOUCHER_POSTING SET CURRENT_STATUS = 'POSTED', EXECUTED_AT = CURRENT_TIMESTAMP WHERE BATCH_ID = ?";
+        jdbcTemplate.update(updateStateSql, batchId);
 
-            searchBranches(cleanInput, row.id);
-
-          } else {
-
-            setBranchInputValues(prev => ({
-              ...prev,
-              [row.id]: newInputValue
-            }));
-
-          }
-        }}
-        loading={branchSearch.loadingId === row.id}
-        filterOptions={(x) => x}
-        isOptionEqualToValue={(option, value) =>
-          option?.code === value?.code
+        // 4. Retire the VID so it shows as history, but can no longer be selected
+        String vid = getVidByBatchId(batchId);
+        if (vid != null) {
+            updateVidStatus(vid, VoucherStatus.COMPLETED);
         }
-        noOptionsText={
-          (branchInputValues[row.id] || "").length < 3
-            ? "Please enter at least 3 digits"
-            : "No Branch found"
-        }
-        renderInput={(params) => (
-          <Tooltip title="Search by Branch Code">
-            <TextField
-              {...params}
-              label="Branch *"
-              placeholder="Enter branch code..."
-              InputLabelProps={{ shrink: true }}
-
-              sx={{
-                "& input": {
-                  overflowX: "auto",
-                  whiteSpace: "nowrap",
-                  textOverflow: "unset"
-                }
-              }}
-
-              InputProps={{
-                ...params.InputProps,
-                endAdornment: (
-                  <Box>
-
-                    {branchSearch.loadingId === row.id ? (
-                      <CircularProgress size={20} />
-                    ) : null}
-
-                    {params.InputProps.endAdornment}
-
-                  </Box>
-                )
-              }}
-            />
-          </Tooltip>
-        )}
-      />
-
-      <Typography variant="caption"
-        sx={{
-          fontSize: ".65rem",
-          ml: 1.2,
-          mt: .5,
-          display: "block"
-        }}
-      >
-        Min 3 Digits required
-      </Typography>
-
-    </Grid>
-
-
-    {/* Currency */}
-    <Grid item xs={12} md={1}>
-      <TextField
-        select
-        label="Currency *"
-        value={row.currency}
-        fullWidth
-        InputLabelProps={{ shrink: true }}
-
-        onChange={(e) => {
-
-          handleRowChange(
-            row.id,
-            "currency",
-            e.target.value
-          );
-
-          handleRowChange(
-            row.id,
-            "amount",
-            ""
-          );
-
-        }}
-      >
-
-        {currencyOptions.map((c) => (
-
-          <MenuItem
-            key={c}
-            value={c}
-          >
-            {c}
-          </MenuItem>
-
-        ))}
-
-      </TextField>
-    </Grid>
-
-
-    {/* CGL */}
-    <Grid item xs={12} md={2.6} sx={{ flexGrow: 2 }}>
-
-      <Autocomplete
-        popupIcon={null}
-        autoHighlight
-        options={cglSearch.options}
-
-        getOptionLabel={(option) =>
-          option?.cglNumber
-            ? `${option.cglNumber} - ${option.description}`
-            : ""
-        }
-
-        value={row.cgl || null}
-
-        onChange={(event, newValue) =>
-          handleRowChange(
-            row.id,
-            "cgl",
-            newValue
-          )
-        }
-
-        inputValue={cglInputValues[row.id] || ""}
-
-        onInputChange={(event, newInputValue, reason) => {
-
-          if (reason === "input") {
-
-            const cleanInput =
-              newInputValue
-                .replace(CGL_REPLACE_REGEX, "")
-                .substring(0, 10);
-
-            setCglInputValues(prev => ({
-              ...prev,
-              [row.id]: cleanInput
-            }));
-
-            searchCgls(
-              cleanInput,
-              row.id
-            );
-
-          } else {
-
-            setCglInputValues(prev => ({
-              ...prev,
-              [row.id]: newInputValue
-            }));
-
-          }
-
-        }}
-
-        loading={cglSearch.loadingId === row.id}
-
-        filterOptions={(x) => x}
-
-        isOptionEqualToValue={(option, value) =>
-          option?.cglNumber === value?.cglNumber
-        }
-
-        noOptionsText={
-          (cglInputValues[row.id] || "").length < 3
-            ? "Type at least 3 digits"
-            : "CGL not found"
-        }
-
-        renderInput={(params) => (
-
-          <Tooltip title="Search by CGL Number">
-
-            <TextField
-
-              {...params}
-
-              label="CGL *"
-
-              placeholder="Search CGL..."
-
-              InputLabelProps={{
-                shrink: true
-              }}
-
-              sx={{
-                "& input": {
-                  overflowX: "auto",
-                  whiteSpace: "nowrap",
-                  textOverflow: "unset"
-                }
-              }}
-
-              InputProps={{
-                ...params.InputProps,
-
-                endAdornment: (
-
-                  <Box
-                    display="flex"
-                    alignItems="center"
-                  >
-
-                    {row.cgl &&
-                      String(
-                        row.cgl.cglNumber
-                      ).startsWith("5") && (
-
-                        <Chip
-                          label="MEMO"
-                          size="small"
-                          color="warning"
-                          sx={{ mr: 1 }}
-                        />
-
-                      )}
-
-                    {cglSearch.loadingId === row.id
-                      ? <CircularProgress size={20}/>
-                      : null}
-
-                    {params.InputProps.endAdornment}
-
-                  </Box>
-
-                )
-              }}
-
-            />
-
-          </Tooltip>
-
-        )}
-
-      />
-
-    </Grid>
-
-
-    {/* Amount */}
-    <Grid item xs={12} md={2.2}>
-      <TextField
-        label="Amount *"
-        value={row.amount}
-        fullWidth
-        disabled={!row.currency}
-      />
-    </Grid>
-
-
-    {/* Type */}
-    <Grid item xs={12} md={1}>
-      <TextField
-        select
-        label="Type *"
-        value={row.txnType}
-        fullWidth
-      >
-        <MenuItem value="Debit">
-          Debit
-        </MenuItem>
-
-        <MenuItem value="Credit">
-          Credit
-        </MenuItem>
-
-      </TextField>
-    </Grid>
-
-
-    {/* Product Code */}
-    <Grid item xs={12} md={1.3}>
-      <TextField
-        label="Product Code"
-        value={row.productCode}
-        fullWidth
-      />
-    </Grid>
-
-
-    {/* Remarks */}
-    <Grid item xs={12} md={1.4}>
-      <TextField
-        label="Remarks *"
-        value={row.remarks}
-        fullWidth
-      />
-    </Grid>
-
-
-    {/* Delete */}
-    <Grid item xs={12} md={0.5}>
-
-      <IconButton
-        onClick={() =>
-          handleDeleteRow(
-            row.id
-          )
-        }
-      >
-        <DeleteIcon />
-      </IconButton>
-
-    </Grid>
-
-  </Grid>
-
-  {index < rows.length - 1 && (
-
-    <Box
-      sx={{
-        borderBottom: 1,
-        borderColor: "divider",
-        my: 2
-      }}
-    />
-
-  )}
-
-</React.Fragment>
+    }
+
+```
+### Why this is the perfect architecture:
+ 1. **Concurrency Protection:** By instantly switching the status to USED on submission, the VID instantly drops off the AVAILABLE list for all other users logged into the system.
+ 2. **Resilience:** If a batch is rejected, you don't have to create a brand new VID configuration from scratch. It just becomes AVAILABLE again automatically.
+ 3. **Audit Trail:** Your REQUEST_VOUCHER table now tracks the entire lifecycle natively, letting you easily build a dashboard of "Pending Vouchers" vs "Completed Vouchers".
