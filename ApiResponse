@@ -1,36 +1,117 @@
-workflow transaction 
+I know exactly what happened! This is happening because of a variable name mismatch between the Java backend and the React frontend that we accidentally introduced in the last step.
+In your Java backend (getPendingBatchesForChecker), you are putting the CURRENT_STATUS database value into a JSON key called **workflowState**:
+```java
+map.put("workflowState", rs.getString("CURRENT_STATUS")); 
 
+```
+However, in my last message, I told you to change the React code to look for row.currentStatus. Because the frontend was looking for a variable that didn't exist in the JSON, it was returning undefined and defaulting to "PENDING_L1" permanently. That is why your stepper is stuck at the start!
+We will fix this variable mismatch and simultaneously rewrite the **Mini Stepper** to be **100% dynamic** by extracting the number directly from the state (e.g., reading the "3" out of PENDING_L3).
+Here is how to fix both issues perfectly.
+### FIX 1: Unstick the Big Stepper
+Open your JournalAuthorization.jsx file and find the handleOpenViewModal function. We need to revert it so it reads the correct workflowState key from the backend.
+**FIND THIS (around line 348):**
+```javascript
+  const handleOpenViewModal = async (row) => {
+    setViewingBatch(row);
+    setViewingBatchId(row.batchId);
+    setViewingBatchCreatorId(String(row.creatorId));
+    setViewingBatchState(row.currentStatus || "PENDING_L1"); // <-- This is the broken line
 
-TRANSITION_ID	NUMBER	No	"FINCORE"."ISEQ$$_81448".nextval	1	
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		2	
-CURRENT_STATE	VARCHAR2(50 BYTE)	No		3	
-ACTION_TAKEN	VARCHAR2(50 BYTE)	No		4	
-NEXT_STATE	VARCHAR2(50 BYTE)	No		5	
-CURRENT_ROLE_ID	NUMBER(10,0)	Yes		6	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	7	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		8	
-STEP_DESIGNATION	VARCHAR2(100 BYTE)	Yes		9	
-HOURS	NUMBER(10,0)	Yes		10	
+```
+**REPLACE IT WITH:**
+```javascript
+  const handleOpenViewModal = async (row) => {
+    setViewingBatch(row);
+    setViewingBatchId(row.batchId);
+    setViewingBatchCreatorId(String(row.creatorId));
+    setViewingBatchState(row.workflowState || "PENDING_L1"); // <-- Matches Java backend perfectly!
 
-this is data for the flow 
+```
+### FIX 2: Make the Mini-Stepper Dynamic
+Scroll down to your columns array. We are going to replace the broken currentStatus column with a fully dynamic version that reads the workflow code (Workflow_3 vs Workflow_4) and instantly calculates the correct step.
+**FIND THIS ENTIRE COLUMN BLOCK (around line 538):**
+```javascript
+    {
+      field: "currentStatus", 
+      headerName: "Workflow Progress",
+      width: 320,
+      // ... (and all the old hardcoded stepper logic inside it)
 
-INITIALIZE	CREATE	1	Workflow_3	PENDING_L1	9001	N	Y	Creator	24
-PENDING_L1	ACCEPTED	2	Workflow_3	PENDING_L2	9001	N	N	Verifier	24
-PENDING_L2	ACCEPTED	3	Workflow_3	PENDING_L3	9002	N	N	Reviewer	48
-PENDING_L3	ACCEPTED	4	Workflow_3	POSTED	9002	Y	Y	Approver	0
-INITIALIZE	CREATE	8	Workflow_4	PENDING_L1	9003	N	Y	Creator	24
-PENDING_L1	ACCEPTED	9	Workflow_4	PENDING_L2	9001	N	N	Validator	24
-PENDING_L2	ACCEPTED	10	Workflow_4	PENDING_L3	9001	N	N	Verifier	48
-PENDING_L3	ACCEPTED	11	Workflow_4	PENDING_L4	9002	N	N	Reviewer	48
-PENDING_L4	ACCEPTED	12	Workflow_4	POSTED	9002	Y	Y	Approver	0
+```
+**REPLACE THAT ENTIRE COLUMN WITH THIS:**
+```javascript
+    {
+      field: "workflowState", // <-- FIX: Must match the Java map.put("workflowState")
+      headerName: "Workflow Progress",
+      width: 320,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        // FIX: Extract the correct state sent from backend
+        const state = params.row.workflowState || "PENDING_L1";
+        const workflow = params.row.approvalWorkflow || "Workflow_3";
+        const isRejected = state === "REJECTED";
 
+        if (isRejected) {
+          return (
+            <Box sx={{ pl: 2, width: '100%', display: 'flex', justifyContent: 'flex-start' }}>
+              <Chip label="REJECTED" color="error" size="small" variant="filled" sx={{ mt: 1.5, fontWeight: "bold" }} />
+            </Box>
+          );
+        }
 
-for the workflow 3 and workflow 4 
+        // --- NEW: FULLY DYNAMIC MINI STEPPER ---
+        // 1. Determine how many L-levels exist based on the workflow name
+        let totalLevels = 3; 
+        if (workflow.includes("4")) totalLevels = 4;
+        
+        // 2. Build the labels array dynamically: ['L1', 'L2', 'L3', 'Final']
+        let stepLabels = [];
+        for (let i = 1; i <= totalLevels; i++) {
+          stepLabels.push(`L${i}`);
+        }
+        stepLabels.push('Final');
 
-now the problem is that flow is not moving forword that stepper not bigger stepper not even the smaller stepper what is this going one i dont know 
-all the comment i can see but i am not able to see that in the moving state 
-it is at normal state only 
-where it start 
+        // 3. Dynamically calculate active step based on state string
+        let activeStep = 0;
+        if (state.startsWith("PENDING_L")) {
+          // Extracts '2' from 'PENDING_L2' and sets index to 1 (because arrays start at 0)
+          const levelStr = state.replace("PENDING_L", "");
+          const levelNum = parseInt(levelStr, 10);
+          if (!isNaN(levelNum)) {
+            activeStep = levelNum - 1; 
+          }
+        } else if (state === "POSTED" || state === "SCHEDULED" || state === "APPROVED") {
+          activeStep = stepLabels.length; // Fully complete
+        }
 
-onther is mini stepper is not dyamic
+        return (
+          <Box sx={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', pl: 2, height: '100%' }}>
+            <Stepper
+              activeStep={activeStep}
+              alternativeLabel
+              connector={<CustomConnector />}
+              sx={{ width: 'auto', mt: 0.5 }}
+            >
+              {stepLabels.map((label, index) => {
+                const isCompleted = index < activeStep;
+                const isCurrent = index === activeStep;
+
+                return (
+                  <Step key={label} completed={isCompleted} active={isCurrent} sx={{ flex: '0 0 40px', px: 0 }}>
+                    <StepLabel StepIconComponent={CustomWorkflowIcon} sx={{ p: 0, m: 0 }} />
+                  </Step>
+                );
+              })}
+            </Stepper>
+          </Box>
+        );
+      },
+    },
+
+```
+### Why this fixes everything:
+ 1. Both the Big and Mini steppers will now accurately read "workflowState" which is what Java is actually sending over the network.
+ 2. The Mini Stepper no longer relies on hardcoded .includes("L2") statements. If a row is PENDING_L4, the code strips the text, parses the number 4, subtracts 1, and instantly highlights the 3rd index in the stepper perfectly every time.
