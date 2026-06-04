@@ -1,55 +1,123 @@
-I see exactly where it is in the file you provided.
-In your JournalAuthorization.js file, you need to look inside the **fetchBatchDetailsPaginated** function. This is where the frontend takes the data from the backend (req) and maps it to the row object that the table displays.
-Right now, your code maps branch: req.reqBranchCode. If Spring Boot is actually sending branchCode, this results in an empty table cell.
-Here is exactly what to find and replace in the file you just pasted:
-### 1. File: JournalAuthorization.js
-**Find this exact block (inside fetchBatchDetailsPaginated):**
+Now that the backend is fully migrated to the dynamic, order-based workflow, we need to update the React frontend so it understands the new stage names (e.g., "Verifier", "Reviewer") instead of the old "PENDING_L1" format.
+We need to update **two specific places** in your frontend code (JournalPostingStatus.jsx and your Authorization screen if it shares the same logic): the **Mini-Stepper in the DataGrid** and the **Big Stepper in the View Modal**.
+Here are the exact Find & Replace steps.
+### FIX 1: Update the Mini-Stepper in the DataGrid
+We need to remove the hardcoded L1, L2, L3 logic and replace it with a clean array mapping based on your new WORKFLOW_STAGE names.
+**FIND THIS (Inside your columns array):**
 ```javascript
-            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
-            const prefix = String(jId).split("-")[0];
-
-            const amount = parseFloat(req.reqAmount) || 0;
-
-            const row = {
-              ...req,
-              journalPrefix: prefix,
-              amount: Math.abs(amount),
-              transactionType: amount < 0 ? "Credit" : "Debit",
-
-              branch: req.reqBranchCode,
-              currency: req.reqCurrency,
-              cgl: req.reqCgl,
-              remarks: req.reqNarration,
-              product: req.reqProduct,
-              date: req.reqCsvDate
-            };
+    {
+      field: "currentStatus", 
+      headerName: "Workflow Progress",
+      // ... 
+      renderCell: (params) => {
+        // ... (all the old logic parsing PENDING_L1) ...
 
 ```
-**Replace it with this Catch-All block:**
+**REPLACE THAT ENTIRE COLUMN BLOCK WITH THIS:**
 ```javascript
-            // Log the exact response to your browser console to see the true keys!
-            console.log("Backend Row Data in Authorization:", req); 
+    {
+      field: "currentStatus", 
+      headerName: "Workflow Progress",
+      width: 350,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const state = params.value || "Creator"; 
+        const workflow = params.row.approvalWorkflow || "Workflow_3";
+        const isRejected = state === "REJECTED";
 
-            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
-            const prefix = String(jId).split("-")[0];
+        if (isRejected) {
+          return (
+            <Box sx={{ pl: 2, width: '100%', display: 'flex', justifyContent: 'flex-start' }}>
+              <Chip label="REJECTED" color="error" size="small" variant="filled" sx={{ mt: 1.5, fontWeight: "bold" }} />
+            </Box>
+          );
+        }
 
-            // Use 'amount' or 'reqAmount' based on what Spring Boot sends
-            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
+        // 1. Define the arrays matching your new database WORKFLOW_STAGE exactly
+        let stepLabels = [];
+        if (workflow === "Workflow_4") {
+          stepLabels = ["Creator", "Validator", "Verifier", "Reviewer", "Approver", "Executor"];
+        } else {
+          // Default to Workflow 3
+          stepLabels = ["Creator", "Verifier", "Reviewer", "Approver", "Executor"];
+        }
 
-            const row = {
-              ...req,
-              journalPrefix: prefix,
-              amount: Math.abs(amountVal),
-              transactionType: amountVal < 0 ? "Credit" : "Debit",
+        // 2. Find the current step dynamically
+        let activeStep = stepLabels.indexOf(state);
+        
+        // 3. Handle the automatic final execution states
+        if (state === "POSTED" || state === "SCHEDULED") {
+          activeStep = stepLabels.length; // Pushes stepper to 100% complete (All Green)
+        }
 
-              // Bullet-proof catch-all mapping to handle any Java Entity naming convention
-              branch: req.branchCode || req.reqBranchCode || "-",
-              currency: req.currency || req.reqCurrency || "-",
-              cgl: req.cgl || req.reqCgl || "-",
-              remarks: req.narration || req.reqNarration || "-",
-              product: req.productCode || req.reqProduct || "-",
-              date: req.csvDate || req.reqCsvDate || "-"
-            };
+        // Fallback in case of unknown state
+        if (activeStep === -1) activeStep = 0;
+
+        return (
+          <Box sx={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', pl: 2, height: '100%' }}>
+            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={{ width: 'auto', mt: 0.5 }}>
+              {stepLabels.map((label, index) => {
+                const isCompleted = index < activeStep;
+                const isCurrent = index === activeStep;
+                return (
+                  <Step key={label} completed={isCompleted} active={isCurrent} sx={{ flex: '0 0 45px', px: 0 }}>
+                    <StepLabel StepIconComponent={CustomWorkflowIcon} sx={{ p: 0, m: 0 }}>
+                      <Typography variant="caption" sx={{ fontSize: '0.6rem', display: 'block', mt: -0.5 }}>{label}</Typography>
+                    </StepLabel>
+                  </Step>
+                );
+              })}
+            </Stepper>
+          </Box>
+        );
+      },
+    },
 
 ```
-Once you replace that specific block, save the file, refresh your React app, and click the eye icon. If there is still a mismatch, open your browser's Developer Tools Console (F12) and look at the "Backend Row Data in Authorization:" log to see exactly what variable names Spring Boot is sending!
+### FIX 2: Update the Big Stepper in the View Modal
+Because the modal fetches the dynamic steps directly from your new API (/workflow/steps/{workflowCode}), we just need to change how it finds the activeStep using the new string names.
+**FIND THIS (Inside the View Modal JSX, around line 558):**
+```javascript
+            {/* --- BIG WORKFLOW STEPPER TIMELINE --- */}
+            <Box sx={{ p: 4, flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+              {viewingBatchState === "REJECTED" ? (
+                <Typography color="error" variant="subtitle1" fontWeight="bold" textAlign="center" sx={{ mt: 2 }}>
+                  This batch was REJECTED and the workflow has been terminated.
+                </Typography>
+              ) : isFetchingSteps ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
+              ) : dynamicSteps.length > 0 ? (
+                <Stepper
+                  activeStep={(viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED") ? dynamicSteps.length : dynamicSteps.findIndex(s => s.state === viewingBatchState)}
+                  alternativeLabel connector={<CustomConnector />}
+                >
+
+```
+**REPLACE IT WITH THIS:**
+```javascript
+            {/* --- BIG WORKFLOW STEPPER TIMELINE --- */}
+            <Box sx={{ p: 4, flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+              {viewingBatchState === "REJECTED" ? (
+                <Typography color="error" variant="subtitle1" fontWeight="bold" textAlign="center" sx={{ mt: 2 }}>
+                  This batch was REJECTED and the workflow has been terminated.
+                </Typography>
+              ) : isFetchingSteps ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
+              ) : dynamicSteps.length > 0 ? (
+                <Stepper
+                  // Automatically complete all steps if POSTED or SCHEDULED. 
+                  // Otherwise, find the exact index of the current stage (e.g., "Reviewer")
+                  activeStep={(viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED") 
+                    ? dynamicSteps.length 
+                    : dynamicSteps.findIndex(s => s.state === viewingBatchState)}
+                  alternativeLabel connector={<CustomConnector />}
+                >
+
+```
+### Why this is the perfect solution:
+ 1. **No More PENDING_L:** The frontend now directly speaks the same language as your new database table ("Validator", "Reviewer", etc.).
+ 2. **Dynamic Lengths:** The DataGrid mini-stepper instantly adjusts its width and labels (5 dots for Workflow 3, 6 dots for Workflow 4).
+ 3. **Automatic Executor:** When the final approver hits accept, the status changes to POSTED. The React code automatically catches state === "POSTED", forces activeStep = stepLabels.length, and instantly lights up every single circle in the stepper as green, including the final "Executor" step!
