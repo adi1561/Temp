@@ -1,3 +1,96 @@
+
+You have successfully added the new order-based logic! However, there are **two critical mistakes** in the code you pasted that will cause the application to crash or fail to execute final approvals.
+Here is exactly how to fix them.
+### CRITICAL BUG 1: Double WHERE Clause in SQL
+In your getPendingBatchSummaries(Integer userRole) method, you accidentally pasted WHERE p.NEXT_APPROVAL_ROLE_ID = ? twice in a row, which will cause an instant SQL Syntax Error.
+**FIND THIS (Around line 334):**
+```java
+            WHERE p.NEXT_APPROVAL_ROLE_ID = ? 
+              WHERE p.NEXT_APPROVAL_ROLE_ID = ?
+            ORDER BY b.REQ_DATE DESC
+
+```
+**REPLACE WITH:**
+```java
+            WHERE p.NEXT_APPROVAL_ROLE_ID = ? 
+            ORDER BY b.REQ_DATE DESC
+
+```
+### CRITICAL BUG 2: You Deleted the Final Approval Logic!
+In your processWorkflowAction method, you copied my placeholder comment // (Keep your existing Schedule Lapsing & POSTED execution logic here exactly as it is) literally, and you accidentally **deleted all the actual code** that was supposed to go there!
+Because of this, if an Approver clicks "Accept" on the final step, nothing will happen! We need to put the scheduling and execution code back.
+**FIND THIS (Around line 617):**
+```java
+        if ("Y".equals(isFinal)) {
+            // (Keep your existing Schedule Lapsing & POSTED execution logic here exactly as it is)
+            // ...
+
+        } else {
+
+```
+**REPLACE WITH THIS (The fully restored final execution logic):**
+```java
+        if ("Y".equals(isFinal)) {
+            // Schedule Lapsing Logic
+            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null) {
+                if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
+                    if (dto.getOverrideScheduleLapse() == null || !dto.getOverrideScheduleLapse()) {
+                        throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed. Do you want to post immediately or set a new schedule?");
+                    }
+                    if (dto.getNewScheduledTime() != null) {
+                        posting.setScheduledTime(dto.getNewScheduledTime());
+                        posting.setIsScheduleOverride("YES");
+                    } else {
+                        posting.setExecutionScheduled("NO");
+                    }
+                }
+            }
+
+            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+                posting.setCurrentStatus("SCHEDULED");
+                posting.setNextApprovalRoleId(null);
+                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_SCHEDULED", executorId, dto.getRemarks(), posting.getScheduledTime());
+                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'SCHEDULED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
+            } else {
+                posting.setCurrentStatus("POSTED");
+                posting.setExecutedAt(LocalDateTime.now());
+                posting.setNextApprovalRoleId(null);
+                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks(), null);
+
+                // ---> TRIGGER 3: RETIRE THE VID AS COMPLETED <---
+                if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
+                    updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
+                }
+
+                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                execDto.setBatchId(batchId);
+                execDto.setStatus(RequestStatus.ACCEPTED);
+                execDto.setRemarks(dto.getRemarks());
+                this.processBulkRequestsAsync(execDto, executorId, executorRole);
+            }
+            notificationWriterService.createBatchApprovedNotification(batchId, posting.getCreatedBy(), executorId);
+
+        } else {
+
+```
+### Is the rest of the backend correct?
+**Yes!** * The createBatchRequest uses WORKFLOW_ORDER = 1 and WORKFLOW_ORDER = 2 perfectly.
+ * The Stepper API getWorkflowSteps perfectly orders by WORKFLOW_ORDER ASC.
+ * The CURRENT_STATUS is accurately tracking the actual stage name (e.g., "Reviewer") instead of the old "PENDING_L3" format.
+Make those two fixes, restart your Spring Boot server, and your new Order-Based workflow backend is 100% complete. Let me know when you've done this, and we will update the React frontend Stepper so it dynamically reads these new stage names!
+
+
+
+
+
+
+
+
+
+
+
+
+
 Yes, **both of those changes are absolutely 100% still required.** Here is why, especially considering your new rule about the "Executor" step being automatic:
  1. **The Double WHERE Clause:** This is a strict SQL syntax error. If you don't remove the duplicate WHERE, the moment a user opens the checker screen, the Java backend will crash with a java.sql.SQLSyntaxErrorException and the screen will go blank.
  2. **The Deleted Final Approval Logic:** Because the "Executor" step is automatic, the system relies on the "Approver" (IS_FINAL_APPROVAL = 'Y') to trigger the actual accounting background work. If you leave that if ("Y".equals(isFinal)) block empty, the backend will literally do nothing. It won't schedule the job, it won't call the PL/SQL procedure to move the money, and it won't retire the VID.
