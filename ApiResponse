@@ -1,12 +1,71 @@
-Understood. As a Tech Lead, I completely agree—it's much better to understand the specific surgical changes rather than copy-pasting a massive file.
-Here are the **3 exact blocks** you need to change in your JournalPostingStatus.jsx file to align with the new backend logic.
-### 1. Update the Mini-Stepper (Inside your columns array)
-Find the column that renders the workflow progress (previously looking for "PENDING_L1"). We are replacing it with a dynamic array lookup based on the exact WORKFLOW_STAGE names.
-**FIND your currentStatus (or requestStatus) column in the columns array, and REPLACE the renderCell block with this:**
+You make a fantastic point. As a Senior Engineer, you are absolutely right—hardcoding Workflow_3 and Workflow_4 in the frontend entirely defeats the purpose of building that dynamic, order-based table in the database!
+If someone adds a Workflow_5 tomorrow in the DB, the frontend should just automatically draw it without us touching the React code.
+Since we cannot make an API call *inside* a DataGrid column definition (because it renders synchronously for every row), we will fetch the exact workflow steps dynamically as soon as the grid loads, store them in a mapping object, and feed that to the mini-stepper.
+Here are the **3 exact changes** to make the frontend 100% dynamic:
+### 1. Add a State Variable for the Workflow Map
+At the top of your JournalPostingStatus component, right near your rows and loading states, add this new state variable:
+**FIND:**
+```javascript
+  // Grid States
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+```
+**ADD BELOW IT:**
+```javascript
+  // Dynamic Stepper Map (e.g., { "Workflow_3": ["Creator", "Verifier", ...], "Workflow_4": [...] })
+  const [workflowStepsMap, setWorkflowStepsMap] = useState({});
+
+```
+### 2. Update fetchMyBatches to dynamically pull the steps
+We will update the fetch function so that after it gets the rows, it finds all the unique workflow codes, fetches their step definitions from your new API, and saves them in the map.
+**REPLACE your entire fetchMyBatches function with this:**
+```javascript
+  const fetchMyBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      // 1. Fetch the rows
+      const data = await callApi("/JS/ রুমেvoucher/all-requests-summary", null, "GET");
+      const fetchedRows = Array.isArray(data) ? data : [];
+
+      // 2. Extract unique workflow codes (e.g., "Workflow_3", "Workflow_4")
+      const uniqueWorkflows = [...new Set(fetchedRows.map(row => row.approvalWorkflow).filter(Boolean))];
+
+      // 3. Dynamically fetch the step configurations for each unique workflow
+      const stepsMap = {};
+      await Promise.all(
+        uniqueWorkflows.map(async (wfCode) => {
+          try {
+            const steps = await callApi(`/JS/voucher/workflow/steps/${wfCode}`, null, "GET");
+            // Map it to just an array of stage names in correct order
+            stepsMap[wfCode] = steps.map(s => s.designation || s.state);
+          } catch (e) {
+            stepsMap[wfCode] = ["Creator", "Approver"]; // Fallback if API fails
+          }
+        })
+      );
+
+      // 4. Update state safely
+      if (isMounted.current) {
+        setWorkflowStepsMap(stepsMap);
+        setRows(fetchedRows);
+      }
+    } catch (err) {
+      if (isMounted.current && err.name !== "CanceledError")
+        showSnackBar("Failed to load requests", "error");
+    } finally {
+      if (isMounted.current) setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+```
+### 3. Clean up the renderCell in the DataGrid
+Now, we completely remove the hardcoded if (workflow === "Workflow_4") from your column definition and replace it with a simple lookup to our new dynamic map!
+**IN YOUR columns ARRAY, replace the currentStatus column's renderCell block with this:**
 ```javascript
       renderCell: (params) => {
         const state = params.value || "Creator"; 
-        const workflow = params.row.approvalWorkflow || "Workflow_3";
+        const workflow = params.row.approvalWorkflow;
         const isRejected = state === "REJECTED";
 
         if (isRejected) {
@@ -17,16 +76,18 @@ Find the column that renders the workflow progress (previously looking for "PEND
           );
         }
 
-        // 1. Define arrays matching your new database WORKFLOW_STAGE exactly
-        let stepLabels = workflow === "Workflow_4" 
-          ? ["Creator", "Validator", "Verifier", "Reviewer", "Approver", "Executor"]
-          : ["Creator", "Verifier", "Reviewer", "Approver", "Executor"]; // Default to Workflow 3
+        // --- 100% DYNAMIC LOOKUP ---
+        // Reads from the state we fetched on load. If it's still loading, show a safe fallback.
+        const stepLabels = workflowStepsMap[workflow] || ["Creator", "Loading..."];
 
-        // 2. Find current step dynamically
+        // Find the current step dynamically
         let activeStep = stepLabels.indexOf(state);
         
-        // 3. Handle automatic final execution states
-        if (state === "POSTED" || state === "SCHEDULED") activeStep = stepLabels.length; 
+        // Handle automatic final execution states
+        if (state === "POSTED" || state === "SCHEDULED" || state === "C" || state === "S") {
+            activeStep = stepLabels.length; 
+        }
+        
         if (activeStep === -1) activeStep = 0; // Fallback
 
         return (
@@ -36,7 +97,7 @@ Find the column that renders the workflow progress (previously looking for "PEND
                 const isCompleted = index < activeStep;
                 const isCurrent = index === activeStep;
                 return (
-                  <Step key={label} completed={isCompleted} active={isCurrent} sx={{ flex: '0 0 45px', px: 0 }}>
+                  <Step key={`${label}-${index}`} completed={isCompleted} active={isCurrent} sx={{ flex: '0 0 45px', px: 0 }}>
                     <StepLabel StepIconComponent={CustomWorkflowIcon} sx={{ p: 0, m: 0 }}>
                       <Typography variant="caption" sx={{ fontSize: '0.6rem', display: 'block', mt: -0.5 }}>{label}</Typography>
                     </StepLabel>
@@ -49,47 +110,7 @@ Find the column that renders the workflow progress (previously looking for "PEND
       }
 
 ```
-### 2. Update the Delete Button Logic (Inside your actions column)
-Previously, a batch was pending if requestStatus === "PENDING". Now, the backend returns the actual stage name (e.g., "Reviewer"). So, a batch is "Pending" as long as it is NOT Rejected, Posted, or Scheduled.
-**FIND your actions column renderCell, specifically this logic:**
-```javascript
-        // 1. Is it Pending?
-        const isPending = String(params.row.requestStatus).toUpperCase() === "PENDING";
-
-```
-**REPLACE IT WITH THIS:**
-```javascript
-        // 1. Is it Pending? (If it's sitting at a stage like 'Reviewer', it is pending)
-        const state = String(params.row.currentStatus || "").toUpperCase();
-        const isPending = !(state === "REJECTED" || state === "POSTED" || state === "SCHEDULED");
-
-```
-### 3. Update the Big Stepper (Inside the View Modal)
-When viewing a batch's details, the big stepper fetches stages dynamically from the backend. We just need to tell it to highlight the final step if the status is POSTED or SCHEDULED.
-**FIND the <Stepper> tag inside your isViewModalOpen Dialog (around the middle of the Modal code):**
-```javascript
-                <Stepper
-                  activeStep={/* whatever old logic is here */}
-                  alternativeLabel connector={<CustomConnector />}
-                >
-
-```
-**REPLACE that <Stepper> opening tag with this:**
-```javascript
-                <Stepper
-                  activeStep={(viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED") 
-                    ? dynamicSteps.length 
-                    : dynamicSteps.findIndex(s => s.state === viewingBatchState)}
-                  alternativeLabel connector={<CustomConnector />}
-                >
-
-```
-**And inside the .map loop right below it, update the isFullyDone check:**
-```javascript
-                  {dynamicSteps.map((step, index) => {
-                    const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED";
-                    const activeStepIndex = isFullyDone ? dynamicSteps.length : dynamicSteps.findIndex(s => s.state === viewingBatchState);
-                    // ... rest of the step logic stays the same
-
-```
-Make these 3 specific adjustments, and your frontend will be perfectly aligned with the new Order/Stage-based database schema!
+### Why this is enterprise-grade:
+ * **Zero Hardcoding:** The UI doesn't know anything about how many workflows exist.
+ * **Highly Performant:** It uses Promise.all and a Set so that if you have 1,000 rows all using Workflow_3, it only makes **1 single API call** to the backend instead of 1,000.
+ * **Future-Proof:** If your database admin creates a 10-step Workflow_5 tomorrow, the frontend will automatically fetch it and instantly draw a 10-dot stepper.
