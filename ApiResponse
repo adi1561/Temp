@@ -1,33 +1,244 @@
-i want same UI realted changes which i will tell u in that 
-this all changes are mostly realted to the Voucher Authorization
+These UI/UX enhancements will make the authorization screen incredibly polished and professional. By standardizing the icon sizes, adding dynamic hover tooltips, injecting initials, and introducing the orange escalation warning, the user experience will be significantly elevated.
+To make the frontend 100% dynamic for these features, we need to supply the **VID**, **Creator Name**, and **Escalation Time** from the backend.
+Here are the precise, step-by-step changes to implement this.
+### Part 1: Quick Backend Update (VoucherRequestServiceImpl.java)
+Update the SQL query in getPendingBatchesForChecker to fetch the VID, the Creator's full name, and the ESCALATION_TIME.
+**FIND your getPendingBatchesForChecker method and REPLACE it with this:**
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole) {
+        String sql = """
+            SELECT 
+                b.BATCH_ID, p.VID_FK AS VID, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
+                b.TOTAL_ROWS, p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, b.CREATOR_ID) AS CREATOR_NAME
+            FROM JOURNAL_BATCH_MASTER b
+            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON b.CREATOR_ID = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            ORDER BY b.REQ_DATE DESC
+        """;
 
-1) that mini stepper also i want dynamic
-2) what ever name u are showing below the mini stepper show the name the stage where it is pending it also should dyanamic 
-3) other show on hover -> dynamic come form the DB 
-4) inside that circle there should intial letter for that person and now the color accordigly so colors are visible 
-5) check the size of the filled circle green one and that just filled circle which indicate this flow is pending there something like this
- size of the 2nd one is small and first one is big which should loolks same do same for the bigger stepper also 
- 
-6) in the auth screen what ever the creator id u are showing show name as will as u are showing in the eye click page 
-7) i want to add the one more column -> VID where i will show the VID 
-8) in the workflow progress what ever the 
-as u know about this workflow transitions in this there is column called as the ESCALATION_TIME if the pending request is more then this time then
-where the pending request is there make the color orange with exclamation mark indicating attention required dont do over here moderte
-normal profetional looking
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            return map;
+        }, userRole);
+    }
 
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
+```
+### Part 2: Frontend Icon Redesign (JournalAuthorization.jsx)
+We will rewrite the CustomWorkflowIcon so all circles are exactly 28px. It will dynamically render initials, a red cross for rejections, and an orange exclamation mark if the escalation time is breached.
+**FIND your CustomWorkflowIcon component (near the top) and REPLACE it entirely with this:**
+```javascript
+const CustomWorkflowIcon = (props) => {
+  const { statusFlag, iconLetter } = props;
 
+  const baseStyle = {
+    width: 28, height: 28, borderRadius: '50%',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    zIndex: 1, color: '#fff', fontSize: '0.85rem', fontWeight: 'bold'
+  };
 
-9) if the request is reject then show cross there red one and and make it looking like disabled but u can view by clicking on the eye for details 
-remmber size of this should be same for consitency
-10) what ever the history and remarks -> that is renamed to Workflow History (0)
-in this we are not showing the cretors flow we are adding just checker flow
-in the case of the creator we dont have comments but still we can tell timning who create that sceduled or not
+  if (statusFlag === 'COMPLETED') {
+    return <Box sx={{ ...baseStyle, backgroundColor: 'success.main' }}><CheckIcon sx={{ fontSize: 18 }} /></Box>;
+  }
+  if (statusFlag === 'REJECTED') {
+    return <Box sx={{ ...baseStyle, backgroundColor: 'error.main' }}><CloseIcon sx={{ fontSize: 18 }} /></Box>;
+  }
+  if (statusFlag === 'ESCALATED') {
+    return (
+      <Tooltip title="Escalation Time Breached - Attention Required">
+        <Box sx={{ ...baseStyle, backgroundColor: 'warning.main', border: '3px solid #fff3e0', color: '#fff' }}>!</Box>
+      </Tooltip>
+    );
+  }
+  if (statusFlag === 'ACTIVE') {
+    return <Box sx={{ ...baseStyle, backgroundColor: 'primary.main', border: '3px solid #e3f2fd' }}>{iconLetter}</Box>;
+  }
+  
+  // FUTURE / PENDING
+  return <Box sx={{ ...baseStyle, backgroundColor: '#e2e8f0', color: '#64748b' }}>{iconLetter}</Box>;
+};
+
+```
+### Part 3: Update the DataGrid Columns
+We will add the VID column, update the Creator column to show the name, and inject the new Tooltip, Hover, and Escalation logic into the Mini-Stepper.
+**FIND your columns array, and REPLACE the first three columns (batchId, workflowState, creatorId) with this:**
+```javascript
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 140,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "vid",
+      headerName: "VID",
+      width: 140,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => <Typography variant="body2" fontWeight="bold">{p.value || "N/A"}</Typography>
+    },
+    {
+      field: "workflowState",
+      headerName: "Workflow Progress",
+      width: 320,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const state = params.value || "Creator"; 
+        const workflow = params.row.approvalWorkflow;
+        const isRejected = state === "REJECTED";
+
+        const stepLabels = workflowStepsMap[workflow] || ["Creator", "Loading..."];
+        let activeStep = stepLabels.indexOf(state);
+        
+        if (state === "POSTED" || state === "SCHEDULED" || state === "C" || state === "S") {
+            activeStep = stepLabels.length; 
+        }
+        if (activeStep === -1) activeStep = 0; 
+
+        // Escalation Logic Calculation
+        const escalationHours = params.row.escalationTime || 24; // Default fallback
+        const hoursPending = Math.abs(new Date() - new Date(params.row.requestDate)) / 36e5;
+        const isEscalated = !isRejected && (activeStep < stepLabels.length) && (hoursPending > escalationHours);
+
+        return (
+          <Box sx={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', pl: 2, height: '100%' }}>
+            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={{ width: 'auto', mt: 0.5 }}>
+              {stepLabels.map((label, index) => {
+                const isCompleted = index < activeStep;
+                const isCurrent = index === activeStep;
+                
+                let statusFlag = 'PENDING';
+                if (isCompleted) statusFlag = 'COMPLETED';
+                if (isCurrent && isRejected) statusFlag = 'REJECTED';
+                else if (isCurrent && isEscalated) statusFlag = 'ESCALATED';
+                else if (isCurrent) statusFlag = 'ACTIVE';
+
+                return (
+                  <Tooltip title={label} key={`${label}-${index}`} arrow>
+                    <Step completed={isCompleted} active={isCurrent} sx={{ flex: '0 0 45px', px: 0, opacity: (isRejected && index > activeStep) ? 0.3 : 1 }}>
+                      <StepLabel StepIconComponent={() => <CustomWorkflowIcon statusFlag={statusFlag} iconLetter={label.charAt(0).toUpperCase()} />} sx={{ p: 0, m: 0 }}>
+                        {/* Only show the text label for the currently active step */}
+                        {isCurrent && !isRejected && (
+                          <Typography variant="caption" sx={{ fontSize: '0.65rem', display: 'block', mt: -0.5, fontWeight: 'bold', color: isEscalated ? 'warning.main' : 'primary.main' }}>
+                            {label}
+                          </Typography>
+                        )}
+                      </StepLabel>
+                    </Step>
+                  </Tooltip>
+                );
+              })}
+            </Stepper>
+          </Box>
+        );
+      }
+    },
+    {
+      field: "creatorName",
+      headerName: "Creator",
+      width: 220,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => {
+        const name = p.value || p.row.creatorId;
+        const id = p.row.creatorId;
+        return (
+          <Chip icon={<AccountCircleIcon />} label={`${name} (${id})`} size="small" variant="outlined" />
+        );
+      },
+    },
+
+```
+### Part 4: Add Creator to Workflow History
+Inside your View Details Modal, we will inject a dynamic "History Block" for the Creator so their submission details are always tracked as the foundation of the history timeline.
+**FIND the Workflow History section (around line 636) inside your Modal, and REPLACE the block with this:**
+```javascript
+              {/* --- WORKFLOW HISTORY / COMMENTS SECTION --- */}
+              <Box sx={{ p: 4, borderTop: "1px solid", borderColor: "divider" }}>
+                
+                {isFetchingSteps ? (
+                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}><CircularProgress size={24} /></Box>
+                ) : (
+                  <>
+                    <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
+                      Workflow History ({workflowHistory.length + 1})
+                    </Typography>
+
+                    <Stack spacing={2.5}>
+                      {/* 1. SYNTHETIC CREATOR HISTORY BLOCK */}
+                      {vidDetails && (
+                        <Box sx={{ display: 'flex', gap: 2 }}>
+                          <Box>
+                            <Avatar sx={{ bgcolor: 'text.secondary', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>
+                              {(vidDetails.BATCH_CREATED_BY_NAME || "C").charAt(0).toUpperCase()}
+                            </Avatar>
+                          </Box>
+                          <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2.5, borderRadius: 2, border: "1px solid", borderColor: "#e2e8f0", boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)" }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                              <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
+                                {vidDetails.BATCH_CREATED_BY_NAME}
+                              </Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                • {vidDetails.BATCH_CREATED_AT ? new Date(vidDetails.BATCH_CREATED_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "N/A"}
+                              </Typography>
+                            </Box>
+                            <Chip 
+                              label={vidDetails.SCHEDULED_TIME ? "Batch Created & Scheduled" : "Batch Created"} 
+                              size="small" 
+                              sx={{ mb: 1.5, height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9", color: "#475569" }} 
+                            />
+                            <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                              Initial batch creation and submission.
+                            </Typography>
+                          </Box>
+                        </Box>
+                      )}
+
+                      {/* 2. CHECKER ACTION HISTORY */}
+                      {workflowHistory.map((history, idx) => {
+                        const userName = history.ACTION_USER_NAME || "User";
+                        const initial = userName.charAt(0).toUpperCase();
+
+                        return (
+                          <Box key={idx} sx={{ display: 'flex', gap: 2 }}>
+                            <Box><Avatar sx={{ bgcolor: 'primary.main', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>{initial}</Avatar></Box>
+                            <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2.5, borderRadius: 2, border: "1px solid", borderColor: "#e2e8f0", boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)" }}>
+                              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                                <Typography variant="subtitle2" fontWeight="bold" color="text.primary">{userName}</Typography>
+                                <Typography variant="caption" color="text.secondary">• {new Date(history.LAST_ACTION_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</Typography>
+                              </Box>
+                              <Chip label={history.LAST_ACTION || "System Action"} size="small" sx={{ mb: 1.5, height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: history.LAST_ACTION?.includes("Reject") ? "#fee2e2" : "#e0e7ff", color: history.LAST_ACTION?.includes("Reject") ? "#991b1b" : "#3730a3" }} />
+                              <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{history.REMARKS || "No remarks provided."}</Typography>
+                            </Box>
+                          </Box>
+                        );
+                      })}
+                    </Stack>
+                  </>
+                )}
+              </Box>
+
+```
