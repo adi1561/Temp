@@ -1,98 +1,95 @@
-package com.fincore.VoucherService.Service;
+Understood. As a Tech Lead, I completely agree—it's much better to understand the specific surgical changes rather than copy-pasting a massive file.
+Here are the **3 exact blocks** you need to change in your JournalPostingStatus.jsx file to align with the new backend logic.
+### 1. Update the Mini-Stepper (Inside your columns array)
+Find the column that renders the workflow progress (previously looking for "PENDING_L1"). We are replacing it with a dynamic array lookup based on the exact WORKFLOW_STAGE names.
+**FIND your currentStatus (or requestStatus) column in the columns array, and REPLACE the renderCell block with this:**
+```javascript
+      renderCell: (params) => {
+        const state = params.value || "Creator"; 
+        const workflow = params.row.approvalWorkflow || "Workflow_3";
+        const isRejected = state === "REJECTED";
 
-import com.fincore.VoucherService.Models.VoucherPosting;
-import com.fincore.VoucherService.Models.enums.RequestStatus;
-import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
-import com.fincore.VoucherService.Repository.VoucherPostingRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherExecutionScheduler {
-
-    private final VoucherPostingRepository voucherPostingRepository;
-    private final VoucherRequestServiceImpl voucherRequestService;
-    private final StringRedisTemplate stringRedisTemplate;
-
-    /**
-     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
-     * executes the scheduled batches in a distributed environment.
-     */
-    @Scheduled(fixedRate = 60000)
-    @Transactional
-    public void executeScheduledBatches() {
-        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
-        boolean lockAcquired = false;
-
-        try {
-            Boolean acquired = stringRedisTemplate.opsForValue()
-                    .setIfAbsent(lockKey, "LOCKED", 2, TimeUnit.MINUTES);
-            lockAcquired = Boolean.TRUE.equals(acquired);
-
-            if (!lockAcquired) return;
-
-            // Find all SCHEDULED batches where the time is <= NOW
-            List<VoucherPosting> dueBatches = voucherPostingRepository.findAll().stream()
-                    .filter(p -> "S".equals(p.getBatchStatus())  // FIX 1: Look for 'S' (Scheduled) using getBatchStatus()
-                            && p.getScheduledTime() != null
-                            && !p.getScheduledTime().isAfter(LocalDateTime.now()))
-                    .collect(Collectors.toList());
-
-            if (dueBatches.isEmpty()) return;
-
-            log.info("SCHEDULER_WAKEUP | Found {} batches ready for execution.", dueBatches.size());
-
-            for (VoucherPosting posting : dueBatches) {
-                try {
-                    // FIX 2: Update State to 'C' (Completed/Posted)
-                    posting.setBatchStatus("C");
-                    posting.setExecutedAt(LocalDateTime.now());
-                    voucherPostingRepository.save(posting);
-
-                    // Retire the VID since it is officially posted now
-                    if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
-                        voucherRequestService.updateVidStatus(posting.getVidFk(), com.fincore.VoucherService.Models.enums.VoucherStatus.COMPLETED);
-                    }
-
-                    // Write to the workflow history so users see that the System executed it
-                    voucherRequestService.logWorkflowAction(
-                            posting.getBatchId(),
-                            posting.getVidFk(),
-                            "SYSTEM_SCHEDULED_POSTING",
-                            "SYSTEM",
-                            "Executed by System Scheduler",
-                            null
-                    );
-
-                    // Execute Oracle Logic via existing pipeline
-                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-                    execDto.setBatchId(posting.getBatchId());
-                    execDto.setStatus(RequestStatus.ACCEPTED);
-                    execDto.setRemarks("Executed by System Scheduler");
-
-                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 0);
-
-                } catch (Exception e) {
-                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", posting.getBatchId(), e.getMessage());
-                }
-            }
-
-        } finally {
-            if (lockAcquired) {
-                stringRedisTemplate.delete(lockKey);
-            }
+        if (isRejected) {
+          return (
+            <Box sx={{ pl: 2, width: '100%', display: 'flex', justifyContent: 'flex-start' }}>
+              <Chip label="REJECTED" color="error" size="small" variant="filled" sx={{ mt: 1.5, fontWeight: "bold" }} />
+            </Box>
+          );
         }
 
-    }
-}
+        // 1. Define arrays matching your new database WORKFLOW_STAGE exactly
+        let stepLabels = workflow === "Workflow_4" 
+          ? ["Creator", "Validator", "Verifier", "Reviewer", "Approver", "Executor"]
+          : ["Creator", "Verifier", "Reviewer", "Approver", "Executor"]; // Default to Workflow 3
+
+        // 2. Find current step dynamically
+        let activeStep = stepLabels.indexOf(state);
+        
+        // 3. Handle automatic final execution states
+        if (state === "POSTED" || state === "SCHEDULED") activeStep = stepLabels.length; 
+        if (activeStep === -1) activeStep = 0; // Fallback
+
+        return (
+          <Box sx={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', pl: 2, height: '100%' }}>
+            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={{ width: 'auto', mt: 0.5 }}>
+              {stepLabels.map((label, index) => {
+                const isCompleted = index < activeStep;
+                const isCurrent = index === activeStep;
+                return (
+                  <Step key={label} completed={isCompleted} active={isCurrent} sx={{ flex: '0 0 45px', px: 0 }}>
+                    <StepLabel StepIconComponent={CustomWorkflowIcon} sx={{ p: 0, m: 0 }}>
+                      <Typography variant="caption" sx={{ fontSize: '0.6rem', display: 'block', mt: -0.5 }}>{label}</Typography>
+                    </StepLabel>
+                  </Step>
+                );
+              })}
+            </Stepper>
+          </Box>
+        );
+      }
+
+```
+### 2. Update the Delete Button Logic (Inside your actions column)
+Previously, a batch was pending if requestStatus === "PENDING". Now, the backend returns the actual stage name (e.g., "Reviewer"). So, a batch is "Pending" as long as it is NOT Rejected, Posted, or Scheduled.
+**FIND your actions column renderCell, specifically this logic:**
+```javascript
+        // 1. Is it Pending?
+        const isPending = String(params.row.requestStatus).toUpperCase() === "PENDING";
+
+```
+**REPLACE IT WITH THIS:**
+```javascript
+        // 1. Is it Pending? (If it's sitting at a stage like 'Reviewer', it is pending)
+        const state = String(params.row.currentStatus || "").toUpperCase();
+        const isPending = !(state === "REJECTED" || state === "POSTED" || state === "SCHEDULED");
+
+```
+### 3. Update the Big Stepper (Inside the View Modal)
+When viewing a batch's details, the big stepper fetches stages dynamically from the backend. We just need to tell it to highlight the final step if the status is POSTED or SCHEDULED.
+**FIND the <Stepper> tag inside your isViewModalOpen Dialog (around the middle of the Modal code):**
+```javascript
+                <Stepper
+                  activeStep={/* whatever old logic is here */}
+                  alternativeLabel connector={<CustomConnector />}
+                >
+
+```
+**REPLACE that <Stepper> opening tag with this:**
+```javascript
+                <Stepper
+                  activeStep={(viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED") 
+                    ? dynamicSteps.length 
+                    : dynamicSteps.findIndex(s => s.state === viewingBatchState)}
+                  alternativeLabel connector={<CustomConnector />}
+                >
+
+```
+**And inside the .map loop right below it, update the isFullyDone check:**
+```javascript
+                  {dynamicSteps.map((step, index) => {
+                    const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED";
+                    const activeStepIndex = isFullyDone ? dynamicSteps.length : dynamicSteps.findIndex(s => s.state === viewingBatchState);
+                    // ... rest of the step logic stays the same
+
+```
+Make these 3 specific adjustments, and your frontend will be perfectly aligned with the new Order/Stage-based database schema!
