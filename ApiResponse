@@ -1,124 +1,83 @@
+package com.fincore.VoucherService.Service;
+
+import com.fincore.VoucherService.Models.VoucherPosting;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
+import com.fincore.VoucherService.Repository.VoucherPostingRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherExecutionScheduler {
+
+    private final VoucherPostingRepository voucherPostingRepository;
+    private final VoucherRequestServiceImpl voucherRequestService;
+    private final StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
+     * executes the scheduled batches in a distributed environment.
+     */
+    @Scheduled(fixedRate = 60000)
     @Transactional
-    public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
-        String batchId = dto.getBatchId();
+    public void executeScheduledBatches() {
+        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
+        boolean lockAcquired = false;
 
-        VoucherPosting posting = voucherPostingRepository.findById(batchId)
-                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch ID not found in workflow tracking."));
-
-        // 1. Prevent Self-Approval
-        if (executorId.equalsIgnoreCase(posting.getCreatedBy())) {
-            throw new CustomExceptions.InvalidDataException("Security Violation: You cannot approve a batch you created.");
-        }
-
-        // 2. Prevent Duplicate Approvals
-        boolean hasAlreadyApproved = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId)
-                .stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
-        if (hasAlreadyApproved) {
-            throw new CustomExceptions.InvalidDataException("Security Violation: You have already approved this batch at a previous level.");
-        }
-
-        // ==========================================
-        // 3. FETCH CURRENT STEP & DYNAMIC AUTH CHECK
-        // ==========================================
-        Map<String, Object> currentStepData;
         try {
-            // We now query ALLOWED_ROLE_ID directly from the transition table using PENDING_AT
-            currentStepData = jdbcTemplate.queryForMap(
-                    "SELECT WORKFLOW_CODE, WORKFLOW_ORDER, IS_FINAL_APPROVAL, WORKFLOW_STAGE, ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_ID = ?",
-                    posting.getPendingAt()
-            );
-        } catch (EmptyResultDataAccessException e) {
-            throw new CustomExceptions.InvalidDataException("Configuration Error: Current stage not found.");
-        }
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 2, TimeUnit.MINUTES);
+            lockAcquired = Boolean.TRUE.equals(acquired);
 
-        Integer allowedRoleId = currentStepData.get("ALLOWED_ROLE_ID") != null ? ((Number) currentStepData.get("ALLOWED_ROLE_ID")).intValue() : null;
+            if (!lockAcquired) return;
 
-        // Dynamic Authorization Check 
-        if (allowedRoleId != null && !allowedRoleId.equals(executorRole)) {
-            throw new CustomExceptions.InvalidDataException("Unauthorized: You do not have the required Role to approve this step.");
-        }
+            // Find all SCHEDULED batches where the time is <= NOW
+            List<VoucherPosting> dueBatches = voucherPostingRepository.findAll().stream()
+                    .filter(p -> "SCHEDULED".equals(p.getCurrentStatus())
+                            && p.getScheduledTime() != null
+                            && !p.getScheduledTime().isAfter(LocalDateTime.now()))
+                    .collect(Collectors.toList());
 
-        String workflowCode = (String) currentStepData.get("WORKFLOW_CODE");
-        Integer currentOrder = ((Number) currentStepData.get("WORKFLOW_ORDER")).intValue();
-        String isFinal = (String) currentStepData.get("IS_FINAL_APPROVAL");
-        String currentStageName = (String) currentStepData.get("WORKFLOW_STAGE");
+            if (dueBatches.isEmpty()) return;
 
-        // ==========================================
-        // 4. DYNAMIC STATE PROGRESSION
-        // ==========================================
-        String actionTaken = dto.getStatus().toString();
+            log.info("SCHEDULER_WAKEUP | Found {} batches ready for execution.", dueBatches.size());
 
-        if ("REJECTED".equals(actionTaken)) {
-            // Leave PENDING_AT as is, change status to 'R'
-            posting.setBatchStatus("R");
-            voucherPostingRepository.save(posting);
+            for (VoucherPosting posting : dueBatches) {
+                try {
+                    // Update State
+                    posting.setCurrentStatus("POSTED");
+                    posting.setExecutedAt(LocalDateTime.now());
+                    voucherPostingRepository.save(posting);
 
-            logWorkflowAction(batchId, posting.getVidFk(), "REJECTED", executorId, dto.getRemarks(), null);
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
-            jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
-            notificationWriterService.createBatchRejectedNotification(batchId, posting.getCreatedBy(), executorId, dto.getRemarks());
+                    // Execute Oracle Logic via existing pipeline
+                    // Using "SYSTEM" as the executor ID since it's automated
+                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                    execDto.setBatchId(posting.getBatchId());
+                    execDto.setStatus(RequestStatus.ACCEPTED);
+                    execDto.setRemarks("Executed by System Scheduler");
 
-            if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
-                updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
-            }
-            return;
-        }
+                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 0);
 
-        if ("Y".equals(isFinal)) {
-            // Find the Executor Step (Order + 1)
-            Long executorWorkflowId = jdbcTemplate.queryForObject(
-                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?",
-                    Long.class, workflowCode, currentOrder + 1
-            );
-            posting.setPendingAt(executorWorkflowId); 
-
-            // Scheduling Logic
-            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null) {
-                if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
-                    if (dto.getOverrideScheduleLapse() == null || !dto.getOverrideScheduleLapse()) {
-                        throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed.");
-                    }
-                    if (dto.getNewScheduledTime() != null) {
-                        posting.setScheduledTime(dto.getNewScheduledTime());
-                        posting.setIsScheduleOverride("YES");
-                    } else {
-                        posting.setExecutionScheduled("NO");
-                    }
+                } catch (Exception e) {
+                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", posting.getBatchId(), e.getMessage());
                 }
             }
 
-            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
-                posting.setBatchStatus("S"); // 'S' = Scheduled
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_SCHEDULED", executorId, dto.getRemarks(), posting.getScheduledTime());
-                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'SCHEDULED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
-            } else {
-                posting.setBatchStatus("C"); // 'C' = Completed/Posted
-                posting.setExecutedAt(LocalDateTime.now());
-                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks(), null);
-
-                if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
-                    updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
-                }
-
-                // Trigger execution procedure
-                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-                execDto.setBatchId(batchId);
-                execDto.setStatus(RequestStatus.ACCEPTED);
-                execDto.setRemarks(dto.getRemarks());
-                this.processBulkRequestsAsync(execDto, executorId, executorRole);
+        } finally {
+            if (lockAcquired) {
+                stringRedisTemplate.delete(lockKey);
             }
-            notificationWriterService.createBatchApprovedNotification(batchId, posting.getCreatedBy(), executorId);
-
-        } else {
-            // Move to the next approver step
-            Long nextApproverId = jdbcTemplate.queryForObject(
-                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?",
-                    Long.class, workflowCode, currentOrder + 1
-            );
-
-            posting.setPendingAt(nextApproverId);
-            logWorkflowAction(batchId, posting.getVidFk(), "APPROVED_" + currentStageName, executorId, dto.getRemarks(), null);
         }
-
-        voucherPostingRepository.save(posting);
     }
+}
