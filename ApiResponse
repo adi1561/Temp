@@ -1,48 +1,151 @@
-Workflow transitions
+This new table design is a massive improvement. By moving from a "linked-list" approach (CURRENT_STATE -> NEXT_STATE) to an "order-based" State Machine (WORKFLOW_ORDER), you make the workflow infinitely scalable. If you ever need to inject a new approval level, you just update the order numbers instead of rewriting the entire chain.
+Here is the step-by-step implementation for the Java Backend to support this new schema.
+### Step 1: Update Batch Creation (Initialization)
+When a user creates a batch, we no longer look for ACTION_TAKEN = 'CREATE'. We simply find the configuration for WORKFLOW_ORDER = 2 (since Order 1 is the Creator).
+**In VoucherRequestServiceImpl.java, find the createBatchRequest method. Replace the old "DYNAMIC WORKFLOW INITIALIZATION" block with this:**
+```java
+        // ==========================================
+        // 2. DYNAMIC WORKFLOW INITIALIZATION (ORDER-BASED)
+        // ==========================================
+        String workflowCode;
+        try {
+            // Find which workflow this role uses
+            workflowCode = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                    String.class, creatorRole
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
+        }
 
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
+        // Fetch the FIRST approver step (Order = 2)
+        Map<String, Object> nextStep;
+        try {
+            nextStep = jdbcTemplate.queryForMap(
+                    "SELECT WORKFLOW_STAGE, ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS " +
+                            "WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
+                    workflowCode
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
+        }
 
-actual flow data for workflow3 and workflow4 
+        String firstPendingStage = (String) nextStep.get("WORKFLOW_STAGE");
+        Integer firstApproverRoleId = ((Number) nextStep.get("ALLOWED_ROLE_ID")).intValue();
 
-workflow_3	9001	N	Y	Creator	0	1	24
-workflow_3	9001	Y	N	Verifier	45	2	25
-workflow_3	9002	N	N	Reviewer	30	3	26
-workflow_3	9002	N	Y	Approver	15	4	27
-workflow_3		N	N	Executor	0	5	28
-workflow_4	9003	N	Y	Creator	0	1	30
-workflow_4	9001	Y	N	Validator	45	2	31
-workflow_4	9001	N	N	Verifier	30	3	32
-workflow_4	9002	N	N	Reviewer	15	4	33
-workflow_4	9002	N	Y	Approver	0	5	34
-workflow_4		N	N	Executor	0	6	35
+        VoucherPosting posting = new VoucherPosting();
+        posting.setBatchId(batchId);
+        posting.setVidFk(dto.getVid());
+        posting.setCreatedBy(creatorId);
+        posting.setCreatorsRole(String.valueOf(creatorRole)); 
+        posting.setApprovalWorkflow(workflowCode);
+        posting.setCurrentStatus(firstPendingStage); // e.g., "Verifier" or "Validator"
+        posting.setNextApprovalRoleId(firstApproverRoleId);
 
-we did this becaose if we add any element in the table using that next step and all stepper baviour is very wrong so we are using this approach and this refactored table 
+```
+### Step 2: Update Workflow Progression (The Checker Action)
+When a checker approves a batch, we look up their current WORKFLOW_ORDER, add +1, and transition the batch to that next stage.
+**Find the processWorkflowAction method. Replace the old "DYNAMIC STATE PROGRESSION" block with this:**
+```java
+        // ==========================================
+        // 4. DYNAMIC STATE PROGRESSION (ORDER-BASED)
+        // ==========================================
+        String actionTaken = dto.getStatus().toString();
+        
+        // 1. Find the current order of the batch based on its status
+        Integer currentOrder;
+        String isFinal;
+        try {
+            Map<String, Object> currentStepData = jdbcTemplate.queryForMap(
+                "SELECT WORKFLOW_ORDER, IS_FINAL_APPROVAL FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_STAGE = ?",
+                posting.getApprovalWorkflow(), posting.getCurrentStatus()
+            );
+            currentOrder = ((Number) currentStepData.get("WORKFLOW_ORDER")).intValue();
+            isFinal = (String) currentStepData.get("IS_FINAL_APPROVAL");
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: Current stage not found in workflow definition.");
+        }
 
-this is now we have new System Table Design in which i remove the conspet of the next step and all we will WORKFLOW_ORDER , WORKFLOW_STAGE for that so that we have simple logic as any one add anything extra in it we 
-can easly get where we can add the stages / stepper 
+        // 5. Apply the Rule
+        if ("REJECTED".equals(actionTaken)) {
+            posting.setCurrentStatus("REJECTED");
+            posting.setNextApprovalRoleId(null);
+            voucherPostingRepository.save(posting);
 
-below is the table which is as it is we can change the this table according to the above table
-voucher posting
+            logWorkflowAction(batchId, posting.getVidFk(), "REJECTED", executorId, dto.getRemarks(), null);
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
+            jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
+            notificationWriterService.createBatchRejectedNotification(batchId, posting.getCreatedBy(), executorId, dto.getRemarks());
+            
+            if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
+                updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
+            }
+            return;
+        }
 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-CREATORS_ROLE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-CURRENT_STATUS	VARCHAR2(30 BYTE)	Yes		6	
-OLD_NEXT_APPROVAL	VARCHAR2(100 BYTE)	Yes		7	
-EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		8	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		9	
-APPROVAL_WORKFLOW	VARCHAR2(100 BYTE)	Yes		10	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		11	
-EXECUTED_AT	TIMESTAMP(6)	Yes		12	
-NEXT_APPROVAL_ROLE_ID	NUMBER(10,0)	Yes		13	
+        if ("Y".equals(isFinal)) {
+            // (Keep your existing Schedule Lapsing & POSTED execution logic here exactly as it is)
+            // ...
+            
+        } else {
+            // If it is NOT final, move to Current Order + 1
+            Map<String, Object> nextStep = jdbcTemplate.queryForMap(
+                 "SELECT WORKFLOW_STAGE, ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS " +
+                 "WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?", 
+                 posting.getApprovalWorkflow(), currentOrder + 1
+            );
+            
+            String nextStage = (String) nextStep.get("WORKFLOW_STAGE");
+            Integer nextRoleId = ((Number) nextStep.get("ALLOWED_ROLE_ID")).intValue();
 
+            posting.setCurrentStatus(nextStage);
+            posting.setNextApprovalRoleId(nextRoleId);
+            logWorkflowAction(batchId, posting.getVidFk(), "APPROVED_" + posting.getCurrentStatus(), executorId, dto.getRemarks(), null);
+        }
+
+        voucherPostingRepository.save(posting);
+
+```
+### Step 3: Update the Stepper API
+We need to update the endpoint that feeds the React Stepper so it pulls the stages in perfect sequential order (1, 2, 3, 4, etc.).
+**Find the getWorkflowSteps method and update the SQL:**
+```java
+    public List<Map<String, Object>> getWorkflowSteps(String workflowCode) {
+        String sql = """
+            SELECT w.WORKFLOW_STAGE AS state, 
+                   w.WORKFLOW_STAGE AS designation, 
+                   w.ALLOWED_ROLE_ID AS role_id, 
+                   r.ROLE_NAME 
+            FROM WORKFLOW_TRANSITIONS w 
+            LEFT JOIN ROLES r ON w.ALLOWED_ROLE_ID = r.ROLE_ID 
+            WHERE w.WORKFLOW_CODE = ? 
+            ORDER BY w.WORKFLOW_ORDER ASC
+        """;
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> step = new HashMap<>();
+            step.put("state", rs.getString("state"));
+            step.put("designation", rs.getString("designation"));
+            
+            String roleName = rs.getString("ROLE_NAME");
+            step.put("role", roleName != null ? roleName : "System");
+            return step;
+        }, workflowCode);
+    }
+
+```
+### Step 4: Update the Pending Summaries Queries
+Because we changed CURRENT_STATUS from things like PENDING_L1 to pure stage names like Verifier or Reviewer, we need to tweak how the Checker grids fetch their pending items.
+**Find getPendingBatchSummaries(Integer userRole) and change the WHERE clause:**
+```java
+            // OLD: AND p.CURRENT_STATUS LIKE 'PENDING_%'
+            // NEW: Just check if the role matches, because NEXT_APPROVAL_ROLE_ID ensures it's pending for them
+            WHERE p.NEXT_APPROVAL_ROLE_ID = ? 
+
+```
+**Find getPendingBatchesForChecker(Integer userRole) and change the WHERE clause exactly the same way:**
+```java
+            WHERE p.NEXT_APPROVAL_ROLE_ID = ?
+
+```
+Once these Java backend changes are in place, the system is fully migrated to the new database structure. Let me know when you are ready, and we will update the React frontend (specifically the Stepper logic) to handle the new stage names perfectly!
