@@ -1,79 +1,236 @@
-ok before going to the frontend part we need to undersand the changes like 
+This is a brilliant architectural decision! By mapping everything to a single PENDING_AT (which acts as a strict foreign key to WORKFLOW_TRANSITIONS.WORKFLOW_ID), you eliminate redundant data. The BATCH_STATUS ('P' for Pending, 'R' for Rejected, 'S' for Scheduled, 'C' for Completed) gives you the exact state of the batch, while PENDING_AT tells you *where* in the pipeline it is sitting.
+Because we removed APPROVAL_WORKFLOW and CURRENT_STATUS from the VOUCHER_POSTING table, **we will rely entirely on SQL JOINs to fetch the workflow code and stage name dynamically.** Here is the step-by-step backend refactor.
+### Step 1: Update your JPA Entity (VoucherPosting.java)
+Before touching the service layer, you MUST update your Java Entity to match the new columns.
+**Replace the old fields in VoucherPosting.java with these:**
+```java
+    @Column(name = "PENDING_AT")
+    private Long pendingAt;
 
-this is our refactored new voucher posting table
+    @Column(name = "BATCH_STATUS", length = 1)
+    private String batchStatus;
+    
+    // (Ensure you generate getters and setters for these!)
+    // (Remove currentStatus, oldNextApproval, approvalWorkflow, nextApprovalRoleId)
 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-CREATORS_ROLE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-PENDING_AT	NUMBER	Yes		6	
-EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
-EXECUTED_AT	TIMESTAMP(6)	Yes		10	
-BATCH_STATUS	CHAR(1 BYTE)	Yes		11	
+```
+### Step 2: Update Batch Initialization (Manual & Bulk)
+When creating a batch, we look up WORKFLOW_ORDER = 2 and save its WORKFLOW_ID directly into PENDING_AT.
+**In VoucherRequestServiceImpl.java, find createBatchRequest and replace the initialization block:**
+```java
+        // ==========================================
+        // 2. DYNAMIC WORKFLOW INITIALIZATION (FOREIGN KEY BASED)
+        // ==========================================
+        String workflowCode;
+        try {
+            workflowCode = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                    String.class, creatorRole
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
+        }
 
-here the pending at is feilds which is workflow id from the workflow transitions
-workflow_3	9002	N	Y	Approver	15	4	27
-27 is the workflow id from that we can know that 
-workflow stage is -> Approver
+        // Fetch the FIRST approver's WORKFLOW_ID (Order = 2)
+        Long firstApproverWorkflowId;
+        try {
+            firstApproverWorkflowId = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
+                    Long.class, workflowCode
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
+        }
 
-for stages we will use the workflow stage column from the workflow transitions
-i hope u understand what i am saying and 
+        VoucherPosting posting = new VoucherPosting();
+        posting.setBatchId(batchId);
+        posting.setVidFk(dto.getVid());
+        posting.setCreatedBy(creatorId);
+        posting.setCreatorsRole(String.valueOf(creatorRole));
+        
+        // NEW SCHEMA ASSIGNMENTS
+        posting.setPendingAt(firstApproverWorkflowId);
+        posting.setBatchStatus("P"); // 'P' = Pending
 
+```
+### Step 3: Update Workflow Progression (processWorkflowAction)
+We fetch the current stage using PENDING_AT. If approved, we find ORDER + 1 and update PENDING_AT. If rejected, we just change BATCH_STATUS to 'R'.
+**Replace your current processWorkflowAction routing block with this:**
+```java
+        // ==========================================
+        // 4. DYNAMIC STATE PROGRESSION (WORKFLOW_ID BASED)
+        // ==========================================
+        String actionTaken = dto.getStatus().toString();
 
+        // 1. Fetch current step details via PENDING_AT
+        Map<String, Object> currentStepData;
+        try {
+            currentStepData = jdbcTemplate.queryForMap(
+                    "SELECT WORKFLOW_CODE, WORKFLOW_ORDER, IS_FINAL_APPROVAL, WORKFLOW_STAGE FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_ID = ?",
+                    posting.getPendingAt()
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: Current stage not found.");
+        }
 
-2nd change is what ever status we mainting BATCH_STATUS -> like where it is pending at Verifier , Validator etc
+        String workflowCode = (String) currentStepData.get("WORKFLOW_CODE");
+        Integer currentOrder = ((Number) currentStepData.get("WORKFLOW_ORDER")).intValue();
+        String isFinal = (String) currentStepData.get("IS_FINAL_APPROVAL");
+        String currentStageName = (String) currentStepData.get("WORKFLOW_STAGE");
 
-i hope u got the things now 
+        // 5. Apply the Rule
+        if ("REJECTED".equals(actionTaken)) {
+            // Leave PENDING_AT as is (so we know WHERE it was rejected), just change status to 'R'
+            posting.setBatchStatus("R");
+            voucherPostingRepository.save(posting);
 
-below are the tables
-workflow transitions
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
+            logWorkflowAction(batchId, posting.getVidFk(), "REJECTED", executorId, dto.getRemarks(), null);
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
+            jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
+            notificationWriterService.createBatchRejectedNotification(batchId, posting.getCreatedBy(), executorId, dto.getRemarks());
 
+            if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
+                updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
+            }
+            return;
+        }
 
-voucher posting 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-CREATORS_ROLE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-PENDING_AT	NUMBER	Yes		6	
-EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
-EXECUTED_AT	TIMESTAMP(6)	Yes		10	
-BATCH_STATUS	CHAR(1 BYTE)	Yes		11	
+        if ("Y".equals(isFinal)) {
+            // Find the Executor Step (Order + 1)
+            Long executorWorkflowId = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?",
+                    Long.class, workflowCode, currentOrder + 1
+            );
+            posting.setPendingAt(executorWorkflowId); // Move it to the final Executor step
 
+            // Scheduling Logic
+            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null) {
+                if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
+                    if (dto.getOverrideScheduleLapse() == null || !dto.getOverrideScheduleLapse()) {
+                        throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed.");
+                    }
+                    if (dto.getNewScheduledTime() != null) {
+                        posting.setScheduledTime(dto.getNewScheduledTime());
+                        posting.setIsScheduleOverride("YES");
+                    } else {
+                        posting.setExecutionScheduled("NO");
+                    }
+                }
+            }
 
-journal request 
-REQ_ID	NUMBER	No		1	
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	3	The date when maker created the journal
-CREATOR_ID	VARCHAR2(12 CHAR)	No		4	
-EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		5	User ID of the person who processed this specific row.
-EXECUTION_DATE	DATE	Yes		6	Timestamp when this checker acted upon the journal
-EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks provided by the executor applied to this specific row.
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		8	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		9	Unique identifier for the individual request.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		10	Remarks inherited from the batch creation process.
-REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		11	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		12	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 CHAR)	Yes		13	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		14	Raw requested amount 
-POSTING_DATE	DATE	Yes		15	The transaction date for which txn to be posted
-REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		16	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		17	The product  code requested.
-CREATOR_ROLE	NUMBER(10,0)	Yes		18	
+            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+                posting.setBatchStatus("S"); // 'S' = Scheduled
+                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_SCHEDULED", executorId, dto.getRemarks(), posting.getScheduledTime());
+                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'SCHEDULED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
+            } else {
+                posting.setBatchStatus("C"); // 'C' = Completed/Posted
+                posting.setExecutedAt(LocalDateTime.now());
+                logWorkflowAction(batchId, posting.getVidFk(), "FINAL_APPROVED_POSTED", executorId, dto.getRemarks(), null);
 
+                if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
+                    updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
+                }
 
-now tell mi backend changes for this
+                // Trigger execution procedure
+                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                execDto.setBatchId(batchId);
+                execDto.setStatus(RequestStatus.ACCEPTED);
+                execDto.setRemarks(dto.getRemarks());
+                this.processBulkRequestsAsync(execDto, executorId, executorRole);
+            }
+            notificationWriterService.createBatchApprovedNotification(batchId, posting.getCreatedBy(), executorId);
+
+        } else {
+            // Move to the next approver step
+            Long nextApproverId = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?",
+                    Long.class, workflowCode, currentOrder + 1
+            );
+            
+            posting.setPendingAt(nextApproverId);
+            logWorkflowAction(batchId, posting.getVidFk(), "APPROVED_" + currentStageName, executorId, dto.getRemarks(), null);
+        }
+
+        voucherPostingRepository.save(posting);
+
+```
+### Step 4: Update the Checker Grids (Approver View)
+The checker should only see batches where BATCH_STATUS = 'P' AND where WORKFLOW_TRANSITIONS.ALLOWED_ROLE_ID matches their role.
+**Update getPendingBatchesForChecker(Integer userRole) (and do the same for getPendingBatchSummaries):**
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole) {
+        String sql = """
+            SELECT 
+                b.BATCH_ID, p.VID_FK, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
+                b.TOTAL_ROWS, p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, w.WORKFLOW_CODE
+            FROM JOURNAL_BATCH_MASTER b
+            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            ORDER BY b.REQ_DATE DESC
+        """;
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            
+            // Map SQL columns directly to frontend expectation
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE")); 
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            return map;
+        }, userRole);
+    }
+
+```
+### Step 5: Update the Universal Status Grid (getAllRequestsSummary)
+This powers your main tracking screen. We join the tables to dynamically fetch the Stage Name and format it so the React frontend still understands it perfectly.
+**Replace getAllRequestsSummary() with this:**
+```java
+    @Override
+    public List<Map<String, Object>> getAllRequestsSummary() {
+        String sql = """
+            SELECT 
+                b.BATCH_ID, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
+                b.TOTAL_ROWS, b.TOTAL_DEBIT, b.TOTAL_CREDIT, 
+                p.BATCH_STATUS, w.WORKFLOW_STAGE, w.WORKFLOW_CODE
+            FROM JOURNAL_BATCH_MASTER b
+            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
+            LEFT JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            ORDER BY b.REQ_DATE DESC
+        """;
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
+            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            
+            // Format BATCH_STATUS for the Frontend React Stepper
+            String bStatus = rs.getString("BATCH_STATUS");
+            if ("R".equals(bStatus)) {
+                map.put("currentStatus", "REJECTED");
+            } else if ("C".equals(bStatus)) {
+                map.put("currentStatus", "POSTED");
+            } else if ("S".equals(bStatus)) {
+                map.put("currentStatus", "SCHEDULED");
+            } else {
+                // If 'P', just use the actual stage name (e.g., 'Reviewer')
+                map.put("currentStatus", rs.getString("WORKFLOW_STAGE"));
+            }
+            
+            return map;
+        });
+    }
+
+```
+Because we formatted currentStatus perfectly in Step 5, **you do not need to make any changes to your React frontend!** The frontend will receive "Reviewer", "POSTED", or "REJECTED" exactly as it did before, and the mini-steppers will work flawlessly.
