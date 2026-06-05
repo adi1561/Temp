@@ -1,13 +1,110 @@
-WorkFlow_Transitions
+You are 100% correct. Relying on string matching (like looking for the exact word "Creator" or "Creation") is a fragile way to build a UI. If a database administrator updates the name of a stage tomorrow, your entire frontend stepper breaks because indexOf("Creator") returns -1!
+As you smartly suggested, we can completely eliminate this hardcoding by using the **WORKFLOW_ORDER** number instead of the stage name. If the order is 3, the active step index is simply 3 - 1 = 2. The UI will never break again, no matter what you name the stages!
+Here are the precise changes to make your stepper mathematically bulletproof based on the order.
+### 1. Backend: Pass WORKFLOW_ORDER to the Frontend
+We need to add w.WORKFLOW_ORDER to your SQL queries so React knows the exact number of the current step.
+**In VoucherRequestServiceImpl.java, UPDATE getPendingBatchesForChecker:**
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole) {
+        String sql = """
+            SELECT 
+                b.BATCH_ID, p.VID_FK AS VID, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
+                b.TOTAL_ROWS, p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME, w.IS_FINAL_APPROVAL, w.WORKFLOW_ORDER,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, b.CREATOR_ID) AS CREATOR_NAME
+            FROM JOURNAL_BATCH_MASTER b
+            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON b.CREATOR_ID = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            ORDER BY b.REQ_DATE DESC
+        """;
 
-workflow_3	9001	N	Y	Creation	0	1	24
-workflow_3	9001	Y	N	Verification	45	2	25
-workflow_3	9002	N	N	Review	30	3	26
-workflow_3	9002	N	Y	Approval	15	4	27
-workflow_3		N	N	Execution	0	5	28
-workflow_4	9003	N	Y	Creation	0	1	30
-workflow_4	9001	Y	N	Validation	45	2	31
-workflow_4	9001	N	N	Verification	30	3	32
-workflow_4	9002	N	N	Review	15	4	33
-workflow_4	9002	N	Y	Approval	0	5	34
-workflow_4		N	N	Execution	0	6	35
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER")); // <-- ADD THIS
+            return map;
+        }, userRole);
+    }
+
+```
+*(Do the exact same thing for getAllRequestsSummary if you want your main Tracking screen to also be immune to naming changes).*
+### 2. Frontend: Add a State for the Order
+We need to track the numerical order when the modal opens.
+**At the top of JournalAuthorization.jsx, add this new state:**
+```javascript
+  const [viewingBatchOrder, setViewingBatchOrder] = useState(1);
+
+```
+**Inside handleOpenViewModal (around line 435), capture the order from the row:**
+```javascript
+  const handleOpenViewModal = async (row) => {
+    setViewingBatch(row);
+    setViewingBatchId(row.batchId);
+    setViewingBatchCreatorId(String(row.creatorId));
+    setViewingBatchState(row.workflowState || ""); 
+    setViewingBatchOrder(row.currentOrder || 1); // <-- ADD THIS
+
+    // ... rest of the function stays the same
+
+```
+### 3. Frontend: Make the Mini-Stepper completely Number-Based
+We will remove the string-matching logic and calculate the active step strictly by doing currentOrder - 1 (since arrays start at index 0).
+**FIND the <Stepper> logic inside your columns array (around line 695) and REPLACE the variables before the return statement with this:**
+```javascript
+        const state = params.value || ""; 
+        const workflow = params.row.approvalWorkflow;
+        const isRejected = state === "REJECTED" || params.row.batchStatus === "R";
+
+        const stepLabels = workflowStepsMap[workflow] || ["Step 1", "Loading..."];
+        
+        // --- BULLETPROOF ORDER LOGIC ---
+        // If currentOrder is 3, index is 2. Fallback to 0.
+        let activeStep = params.row.currentOrder ? params.row.currentOrder - 1 : 0;
+
+        if (state === "POSTED" || state === "SCHEDULED" || state === "C" || state === "S") {
+          activeStep = stepLabels.length;
+        }
+
+        // --- NEW: Escalation Calculation ---
+
+```
+### 4. Frontend: Make the Big Modal Stepper completely Number-Based
+Finally, we apply the exact same mathematical logic to the Big Stepper inside the view modal.
+**FIND your Big Stepper section in the View Modal (around line 1150), and REPLACE the <Stepper> and .map initialization variables with this:**
+```javascript
+                  <Stepper
+                    activeStep={
+                      (viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "C" || viewingBatchState === "S")
+                        ? dynamicSteps.length
+                        : (viewingBatchOrder - 1) // <-- Use Order instead of string match!
+                    }
+                    alternativeLabel
+                    connector={<BigConnector />}
+                  >
+                    {dynamicSteps.map((step, index) => {
+                      const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "C" || viewingBatchState === "S";
+                      
+                      // Calculate the target index using the mathematical order
+                      const activeStepIndex = isFullyDone ? dynamicSteps.length : (viewingBatchOrder - 1);
+
+                      const isCompleted = index < activeStepIndex;
+                      const isCurrent = index === activeStepIndex;
+
+                      // Escalation Calculation ...
+
+```
+### Why this fixes the issue forever:
+Because your backend API /JS/voucher/workflow/steps/{workflowCode} fetches the array of stages ordered perfectly by WORKFLOW_ORDER ASC, the React frontend array will *always* align with the WORKFLOW_ORDER numbers from the database.
+If you rename "Creator" to "Creation" or "Initiator", the string doesn't matter anymore. React just says, *"The database says this batch is at Order 2, so I will highlight the 2nd circle in the stepper."* Perfectly dynamic!
