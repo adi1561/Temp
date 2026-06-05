@@ -1,35 +1,119 @@
-u are doing greate but now theere is one problem like 
+You are absolutely right. If a Final Approver overrides the schedule, the original schedule requested by the Creator is lost from the main table, and we lose the audit trail of *who* scheduled *what* and *when*.
+Because your VOUCHER_WORKFLOW table already has a SCHEDULED_TIME column, we can use it to track every schedule change! We will log the new time into the workflow history and properly update the IS_SCHEDULE_OVERRIDE flag in the main table.
+Here are the **3 exact surgical changes** required to finish this.
+### 1. Backend: Update Final Approval & Override Logic
+We need to cleanly separate the "Override" action from the "Keep Original" action in your backend, update the IS_SCHEDULE_OVERRIDE flag, and pass the specific times into the workflow logger.
+**Open VoucherRequestServiceImpl.java, find the processWorkflowAction method, and REPLACE the entire if ("Y".equals(isFinal)) block (around line 600) with this:**
+```java
+        if ("Y".equals(isFinal)) {
+            // Find the Executor Step (Order + 1)
+            Long executorWorkflowId = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?",
+                    Long.class, workflowCode, currentOrder + 1
+            );
+            posting.setPendingAt(executorWorkflowId); 
 
-voucher workflow table in this table we are not creating the entry for the SCHEDULED_TIME it will be like tracking for every entry works as history
-if final approval override it then we just have latest override SCHEDULED_TIME we dont have the past time for that  
-we need to make entry here in this table also 
-voucher workflow 
+            // 1. Process Override / Scheduling Logic
+            boolean isOverride = Boolean.TRUE.equals(dto.getOverrideScheduleLapse());
+            if (isOverride) {
+                posting.setIsScheduleOverride("YES"); // Set the flag dynamically!
+                if (dto.getNewScheduledTime() != null) {
+                    posting.setExecutionScheduled("YES");
+                    posting.setScheduledTime(dto.getNewScheduledTime());
+                } else {
+                    posting.setExecutionScheduled("NO");
+                    posting.setScheduledTime(null);
+                }
+            } else {
+                // Keep Original: Check for lapse
+                if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null) {
+                    if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
+                        throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed.");
+                    }
+                }
+            }
 
+            // 2. Decide if it goes to SCHEDULED ('S') or POSTED ('C') immediately
+            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+                posting.setBatchStatus("S"); 
+                
+                // Change the Action Name so it's obvious in the history it was overridden
+                String actionLog = isOverride ? "FINAL_APPROVED_WITH_OVERRIDE" : "FINAL_APPROVED_SCHEDULED";
+                
+                logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), posting.getScheduledTime());
+                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'SCHEDULED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
+            } else {
+                posting.setBatchStatus("C"); 
+                posting.setExecutedAt(LocalDateTime.now());
+                
+                String actionLog = isOverride ? "FINAL_APPROVED_IMMEDIATE_OVERRIDE" : "FINAL_APPROVED_POSTED";
+                
+                logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), null);
 
-WORKFLOW_ID	NUMBER	No	"FINCORE"."ISEQ$$_81239".nextval	1	
-BATCH_ID_FK	VARCHAR2(50 BYTE)	No		2	
-VID_FK	VARCHAR2(20 BYTE)	No		3	
-LAST_ACTION	VARCHAR2(30 BYTE)	Yes		4	
-LAST_ACTION_BY	VARCHAR2(100 BYTE)	Yes		5	
-LAST_ACTION_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	
-REMARKS	VARCHAR2(500 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
+                if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
+                    updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
+                }
 
-voucher posting 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-CREATORS_ROLE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-PENDING_AT	NUMBER	Yes		6	
-EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
-EXECUTED_AT	TIMESTAMP(6)	Yes		10	
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
+                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                execDto.setBatchId(batchId);
+                execDto.setStatus(RequestStatus.ACCEPTED);
+                execDto.setRemarks(dto.getRemarks());
+                this.processBulkRequestsAsync(execDto, executorId, executorRole);
+            }
+            notificationWriterService.createBatchApprovedNotification(batchId, posting.getCreatedBy(), executorId);
 
-from this table also we need to change the flag IS_SCHEDULE_OVERRIDE after overriding 
+        } else {
 
+```
+### 2. Backend: Fetch Scheduled Time in Workflow History
+Right now, the API that feeds the frontend history doesn't return the SCHEDULED_TIME column from the workflow table. We need to add it to the SQL SELECT.
+**Find the getWorkflowHistory method (around line 770) and UPDATE the SQL query:**
+```java
+    @Override
+    public List<Map<String, Object>> getWorkflowHistory(String batchId) {
+        String sql = """
+            SELECT 
+                w.LAST_ACTION_BY, 
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, w.LAST_ACTION_BY) AS ACTION_USER_NAME, 
+                w.LAST_ACTION, 
+                w.LAST_ACTION_AT, 
+                w.REMARKS,
+                w.SCHEDULED_TIME   -- <-- Added this line to fetch the time!
+            FROM VOUCHER_WORKFLOW w 
+            LEFT JOIN USERS u ON w.LAST_ACTION_BY = u.USER_ID
+            WHERE w.BATCH_ID_FK = ? 
+            ORDER BY w.LAST_ACTION_AT ASC
+        """;
 
+        return jdbcTemplate.queryForList(sql, batchId);
+    }
 
+```
+### 3. Frontend: Display Scheduled Time in History Blocks
+Now that the backend is sending the history of schedules to the frontend, we can visually inject it into the action cards inside the modal!
+**Open JournalAuthorization.jsx, find the "CHECKER ACTION HISTORY" mapping loop (around line 1055), and REPLACE the <Box sx={{ flexGrow: 1... block with this:**
+```javascript
+                            <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2.5, borderRadius: 2, border: "1px solid", borderColor: "#e2e8f0", boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)" }}>
+                              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                                <Typography variant="subtitle2" fontWeight="bold" color="text.primary">{userName}</Typography>
+                                <Typography variant="caption" color="text.secondary">• {new Date(history.LAST_ACTION_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</Typography>
+                              </Box>
+                              
+                              <Chip label={history.LAST_ACTION || "System Action"} size="small" sx={{ mb: 1, height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: history.LAST_ACTION?.includes("Reject") ? "#fee2e2" : "#e0e7ff", color: history.LAST_ACTION?.includes("Reject") ? "#991b1b" : "#3730a3" }} />
+                              
+                              {/* --- NEW: Show what time this specific user scheduled it for --- */}
+                              {history.SCHEDULED_TIME && (
+                                <Typography variant="caption" color="primary.main" fontWeight="bold" sx={{ display: 'block', mb: 1 }}>
+                                  ⏰ Scheduled Execution: {new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
+                                </Typography>
+                              )}
 
+                              <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{history.REMARKS || "No remarks provided."}</Typography>
+                            </Box>
+
+```
+### What this accomplishes:
+ 1. When the Creator initializes it, it logs their time in the History.
+ 2. When the Final Approver clicks Accept and selects "Override Schedule", the backend changes IS_SCHEDULE_OVERRIDE to 'YES' in the DB.
+ 3. The Final Approver's *new* time gets saved into VOUCHER_WORKFLOW.
+ 4. Anyone looking at the batch details will see *both* history blocks, showing exactly what time the Creator requested, and what time the Approver overrode it to!
