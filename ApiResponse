@@ -1,2 +1,47 @@
-2026-06-05T17:45:08.292+05:30 ERROR 20952 --- [VoucherService] [nio-9999-exec-5] c.f.V.Exception.GlobalExceptionHandler   : DATABASE_FAULT | Path: /api/voucher/workflow/action | ErrorCode: ORA-12899 | Real Message: could not execute statement [ORA-12899: value too large for column "FINCORE"."VOUCHER_WORKFLOW"."LAST_ACTION" (actual: 36, maximum: 30)
-] [insert into VOUCHER_WORKFLOW (BATCH_ID_FK,LAST_ACTION,LAST_ACTION_AT,LAST_ACTION_BY,REMARKS,SCHEDULED_TIME,VID_FK,WORKFLOW_ID) values (?,?,?,?,?,?,?,default)]
+Ah, the classic ORA-12899! I apologize for that.
+When I gave you those clean logging strings earlier, one of them ("Final Approval (Schedule Overridden)") was **36 characters** long. However, your database table VOUCHER_WORKFLOW strictly limits the LAST_ACTION column to **30 characters** (VARCHAR2(30)), which caused Oracle to reject the insert.
+Here is the 2-step fix. We will shorten the strings to look nice, and we will add a permanent safeguard in your logger so this error *never* crashes your app again.
+### 1. Update the Logger (The Permanent Safeguard)
+We will add a quick .substring(0, 30) to your logWorkflowAction method. This guarantees that no matter what string is passed in the future, it will safely fit in the database without crashing the transaction.
+Find your **logWorkflowAction** method and replace it with this:
+```java
+    public void logWorkflowAction(String batchId, String vid, String action, String executorId, String remarks, LocalDateTime scheduledTime) {
+        VoucherWorkflow wf = new VoucherWorkflow();
+        wf.setBatchIdFk(batchId);
+        wf.setVidFk(vid != null ? vid : "UNKNOWN");
+        
+        // SAFEGUARD: Truncate to 30 characters to prevent ORA-12899 errors
+        wf.setLastAction(action != null && action.length() > 30 ? action.substring(0, 30) : action);
+        
+        wf.setLastActionBy(executorId);
+        wf.setLastActionAt(LocalDateTime.now());
+        wf.setRemarks(remarks);
+        wf.setScheduledTime(scheduledTime);
+        voucherWorkflowRepository.save(wf);
+    }
+
+```
+### 2. Shorten the Action Strings
+To make sure the history looks clean and doesn't just awkwardly chop words in half, let's update the strings in processWorkflowAction to naturally fit under 30 characters.
+Find the **Execution Routing** section inside processWorkflowAction (around line 990) and update the two actionLog lines:
+```java
+            // --- EXECUTION ROUTING ---
+            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+                posting.setBatchStatus("S");
+
+                // Fits within 30 chars: "Final Apprvl(Sch. Override)" (27)
+                String actionLog = isOverride ? "Final Apprvl(Sch. Override)" : "Final Approval(Scheduled)";
+                logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), posting.getScheduledTime());
+                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'SCHEDULED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
+            } else {
+                posting.setBatchStatus("C");
+                posting.setExecutedAt(LocalDateTime.now());
+
+                // Fits within 30 chars: "Final Apprvl(Imm. Override)" (27)
+                String actionLog = isOverride ? "Final Apprvl(Imm. Override)" : "Final Approval(Posted)";
+                logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), null);
+
+                // ... (rest of the code stays the same)
+
+```
+With the safeguard in place and the shorter strings, the batch will now successfully save to the database!
