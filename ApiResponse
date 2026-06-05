@@ -1,38 +1,232 @@
-ok i have one more change or we can addon like when ever the creator is SCHEDULED_TIME it should come in this table in this SCHEDULED_TIME column 
+This is a brilliant UX decision. Modals on top of modals are a nightmare for users. Transitioning the content within the same modal to a dedicated "Scheduling Review" screen is exactly how enterprise applications should behave.
+To achieve this, we need to pass the IS_FINAL_APPROVAL flag to the frontend, log the creator's schedule into the VOUCHER_WORKFLOW table, and build the sleek transition UI in React.
+Here are the exact step-by-step changes for both the backend and frontend.
+### Part 1: Backend Changes
+**1. Pass IS_FINAL_APPROVAL to the Frontend**
+We need the React app to know if the person currently looking at the batch is the final approver so it can trigger the scheduling screen.
+Find your getPendingBatchesForChecker method in VoucherRequestServiceImpl.java and update the SQL query and mapper:
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole) {
+        String sql = """
+            SELECT 
+                b.BATCH_ID, p.VID_FK AS VID, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
+                b.TOTAL_ROWS, p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME, w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, b.CREATOR_ID) AS CREATOR_NAME
+            FROM JOURNAL_BATCH_MASTER b
+            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON b.CREATOR_ID = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            ORDER BY b.REQ_DATE DESC
+        """;
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL")); // <-- ADD THIS
+            return map;
+        }, userRole);
+    }
+
+```
+**2. Log the Creator's Schedule to VOUCHER_WORKFLOW**
+Currently, we only log actions for checkers. We need to explicitly log the creator's initialization into the workflow table so the scheduled time is captured from the very beginning.
+Find the createBatchRequest method. Right at the bottom, just before return savedEntities;, add this line:
+```java
+        // Insert the creator's action into the workflow history table
+        logWorkflowAction(batchId, dto.getVid(), "CREATED", creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
+
+        return savedEntities;
+
+```
+### Part 2: Frontend Changes (JournalAuthorization.jsx)
+**1. Add the New States**
+At the top of your component, where your other useState hooks are, add these three lines:
+```javascript
+  const [isSchedulingMode, setIsSchedulingMode] = useState(false);
+  const [scheduleOverrideType, setScheduleOverrideType] = useState("KEEP"); // "KEEP" or "OVERRIDE"
+  const [finalScheduleTime, setFinalScheduleTime] = useState("");
+
+```
+**2. Update the Accept Button Logic**
+We need a custom handler for the Accept button. If the user is the final approver, we switch the UI to scheduling mode instead of submitting immediately.
+Add this function right above your handleSubmitAction:
+```javascript
+  const handleInitiateAccept = () => {
+    if (viewingBatch?.isFinalApproval === 'Y') {
+      // It is the final step! Hide the main modal content and show the Scheduling UI
+      setIsSchedulingMode(true);
+      
+      // Pre-fill the datetime picker with the creator's time if it exists
+      if (vidDetails?.SCHEDULED_TIME) {
+         const dateObj = new Date(vidDetails.SCHEDULED_TIME);
+         // Format for datetime-local input: YYYY-MM-DDThh:mm
+         dateObj.setMinutes(dateObj.getMinutes() - dateObj.getTimezoneOffset());
+         setFinalScheduleTime(dateObj.toISOString().slice(0, 16));
+      } else {
+         setFinalScheduleTime("");
+      }
+    } else {
+      // Normal checker, just submit
+      handleSubmitAction("ACCEPTED");
+    }
+  };
+
+```
+**3. Update handleCloseViewModal**
+Ensure that when the modal is closed, the scheduling screen is reset.
+```javascript
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setViewingBatchCreatorId(null);
+    setIsDescExpanded(false);
+    setIsSchedulingMode(false); // <-- Reset this
+    setScheduleOverrideType("KEEP"); // <-- Reset this
+    fetchPendingBatches();
+  };
+
+```
+**4. Build the Scheduling Transition UI in the Modal**
+We will wrap your current modal content so it hides when isSchedulingMode is true, and instead displays the beautiful final override screen.
+Find your <DialogContent dividers> tag and update the structure like this:
+```javascript
+          <DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc" }}>
+            
+            {/* --- STATE 1: STANDARD VIEW (Hidden if in Scheduling Mode) --- */}
+            <Box sx={{ display: isSchedulingMode ? "none" : "flex", flexDirection: "column" }}>
+              {/* ... KEEP ALL YOUR EXISTING HEADER CARDS AND TIMELINE HERE EXACTLY AS THEY ARE ... */}
+            </Box>
 
 
-voucher workflow 
+            {/* --- STATE 2: FINAL APPROVER SCHEDULING SCREEN --- */}
+            {isSchedulingMode && (
+              <Box sx={{ p: 5, minHeight: 400, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", animation: "fadeIn 0.3s ease-in-out" }}>
+                
+                <CheckIcon sx={{ fontSize: 64, color: "success.main", mb: 2, opacity: 0.2 }} />
+                <Typography variant="h5" fontWeight="bold" gutterBottom>
+                  Final Approval & Execution Routing
+                </Typography>
+                <Typography variant="body1" color="text.secondary" textAlign="center" sx={{ mb: 4, maxWidth: 500 }}>
+                  You are the final approver for Batch <strong>{viewingBatchId}</strong>. Please confirm when this batch should be executed in the core system.
+                </Typography>
 
-WORKFLOW_ID	NUMBER	No	"FINCORE"."ISEQ$$_81239".nextval	1	
-BATCH_ID_FK	VARCHAR2(50 BYTE)	No		2	
-VID_FK	VARCHAR2(20 BYTE)	No		3	
-LAST_ACTION	VARCHAR2(30 BYTE)	Yes		4	
-LAST_ACTION_BY	VARCHAR2(100 BYTE)	Yes		5	
-LAST_ACTION_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	
-REMARKS	VARCHAR2(500 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
+                <Paper elevation={0} sx={{ p: 4, width: '100%', maxWidth: 600, border: "1px solid", borderColor: "divider", borderRadius: 3, backgroundColor: "white" }}>
+                  
+                  {/* Creator's Original Request Box */}
+                  <Box sx={{ p: 2, mb: 3, backgroundColor: "#f8fafc", borderRadius: 2, borderLeft: "4px solid", borderColor: "primary.main" }}>
+                    <Typography variant="caption" color="text.secondary" fontWeight="bold" display="block">
+                      REQUESTED BY CREATOR ({vidDetails?.BATCH_CREATED_BY_NAME})
+                    </Typography>
+                    <Typography variant="body1" fontWeight="bold" color={vidDetails?.SCHEDULED_TIME ? "primary.main" : "text.primary"}>
+                      {vidDetails?.SCHEDULED_TIME 
+                        ? `Scheduled for: ${new Date(vidDetails.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "long", timeStyle: "short" })}` 
+                        : "Immediate Execution upon Final Approval"}
+                    </Typography>
+                  </Box>
 
+                  {/* Override Options */}
+                  <Stack spacing={2}>
+                    <Box 
+                      onClick={() => setScheduleOverrideType("KEEP")}
+                      sx={{ p: 2, borderRadius: 2, border: "2px solid", borderColor: scheduleOverrideType === "KEEP" ? "success.main" : "divider", backgroundColor: scheduleOverrideType === "KEEP" ? "#f0fdf4" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", gap: 2, transition: "all 0.2s" }}
+                    >
+                      <Box sx={{ width: 20, height: 20, borderRadius: "50%", border: "6px solid", borderColor: scheduleOverrideType === "KEEP" ? "success.main" : "divider", backgroundColor: "white" }} />
+                      <Box>
+                        <Typography variant="subtitle2" fontWeight="bold">Keep Original Routing</Typography>
+                        <Typography variant="caption" color="text.secondary">Proceed with the execution time requested by the creator.</Typography>
+                      </Box>
+                    </Box>
 
-now the change is like there is requirement like who ever the final approval is he have also authrity to SCHEDULED_TIME if he SCHEDULED_TIME then
-over ride the SCHEDULED_TIME with creator one as creator as also option of the SCHEDULED_TIME
+                    <Box 
+                      onClick={() => setScheduleOverrideType("OVERRIDE")}
+                      sx={{ p: 2, borderRadius: 2, border: "2px solid", borderColor: scheduleOverrideType === "OVERRIDE" ? "warning.main" : "divider", backgroundColor: scheduleOverrideType === "OVERRIDE" ? "#fffbeb" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", gap: 2, transition: "all 0.2s" }}
+                    >
+                      <Box sx={{ width: 20, height: 20, borderRadius: "50%", border: "6px solid", borderColor: scheduleOverrideType === "OVERRIDE" ? "warning.main" : "divider", backgroundColor: "white" }} />
+                      <Box>
+                        <Typography variant="subtitle2" fontWeight="bold">Override Schedule</Typography>
+                        <Typography variant="caption" color="text.secondary">Force a new future execution time.</Typography>
+                      </Box>
+                    </Box>
+                  </Stack>
 
-and when he click on the approve button then the content from that model replace or minimized and he should see like 
-this is the SCHEDULED_TIME by name (id) u want to override something like this 
-i dont want to add model on above model which is wrong 
+                  {/* Date Picker (Only shows if Override is selected) */}
+                  {scheduleOverrideType === "OVERRIDE" && (
+                    <Box sx={{ mt: 3, animation: "fadeIn 0.3s ease-in-out" }}>
+                      <TextField
+                        fullWidth
+                        label="New Execution Date & Time"
+                        type="datetime-local"
+                        value={finalScheduleTime}
+                        onChange={(e) => setFinalScheduleTime(e.target.value)}
+                        InputLabelProps={{ shrink: true }}
+                        inputProps={{ min: new Date().toISOString().slice(0, 16) }}
+                        required
+                      />
+                    </Box>
+                  )}
+                </Paper>
+              </Box>
+            )}
+          </DialogContent>
 
-to check that is the final approval we can check ->IS_FINAL_APPROVAL (Y , N)
-from this table 
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
+```
+**5. Update the Bottom Action Bar**
+Finally, we change the bottom buttons so that if we are in scheduling mode, it shows "Back" and "Confirm Execution".
+Find your <DialogActions> block at the bottom, and update the right side of it:
+```javascript
+                  {/* Right Side: Action Buttons */}
+                  <Stack direction="row" spacing={2} alignItems="center">
+                    
+                    {/* If in scheduling mode, show Back button. Otherwise show Reject */}
+                    {isSchedulingMode ? (
+                      <Button onClick={() => setIsSchedulingMode(false)} sx={{ fontWeight: 'bold' }}>
+                        Back to Details
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="contained"
+                        color="error"
+                        disabled={isActionDisabled || !isRemarksValid(executorRemarks) || isSubmitting}
+                        onClick={() => handleSubmitAction("REJECTED")}
+                        sx={{ minWidth: 120, fontWeight: 'bold' }}
+                      >
+                        {submittingAction === "REJECTED" ? <CircularProgress size={20} color="inherit" /> : "Reject"}
+                      </Button>
+                    )}
 
-design this very profetionally and create the stanning design for this 
+                    {/* Accept / Confirm Button */}
+                    <Button
+                      variant="contained"
+                      color="success"
+                      disabled={isActionDisabled || !isRemarksValid(executorRemarks) || isSubmitting || (scheduleOverrideType === "OVERRIDE" && !finalScheduleTime)}
+                      // If NOT in scheduling mode, trigger handleInitiateAccept. If IN scheduling mode, trigger handleSubmitAction and pass the new time.
+                      onClick={() => {
+                        if (isSchedulingMode) {
+                          // Submit with override data
+                          const isOverriding = scheduleOverrideType === "OVERRIDE";
+                          // You will need to briefly update your handleSubmitAction to accept the new time directly
+                          handleSubmitAction("ACCEPTED", isOverriding, isOverriding ? finalScheduleTime : null); 
+                        } else {
+                          handleInitiateAccept();
+                        }
+                      }}
+                      sx={{ minWidth: 120, fontWeight: 'bold' }}
+                    >
+                      {submittingAction === "ACCEPTED" ? <CircularProgress size={20} color="inherit" /> : (isSchedulingMode ? "Confirm & Authorize" : "Accept")}
+                    </Button>
+                  </Stack>
 
-tell mi what are the backend and frontend changes required for this 
-
+```
+*(Note: Ensure your handleSubmitAction function signature accepts the extra parameters so it can pass the finalScheduleTime into your API call payload).*
