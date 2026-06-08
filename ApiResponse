@@ -1,47 +1,91 @@
-### Issue 3: UI Height Fluctuation
+I understand you perfectly now. You are right: the PENDING_AT column is a direct foreign key to the WORKFLOW_ID, and the IS_FINAL_APPROVAL flag on that specific row is the source of truth. My previous attempt to "calculate" it was overcomplicating a design that you have already simplified.
+By using the **JOIN** between VOUCHER_POSTING and WORKFLOW_TRANSITIONS, we get the exact stage state for the current batch without any math or assumptions.
+Here is the refined, dynamic implementation based on your schema.
+### 1. Updated Backend: processWorkflowAction
+This approach relies entirely on the joined IS_FINAL_APPROVAL flag. It is dynamic, simple, and perfectly reflects your database schema.
+```java
+@Transactional
+public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
+    String batchId = dto.getBatchId();
 
-what ever u give in last changes from that only this issue 3 i change 
-i can see u are not understand how we can find out how is final approval 
-i will explain u 
+    // 1. Fetch data with a JOIN to get current stage details
+    Map<String, Object> stepDetails;
+    try {
+        stepDetails = jdbcTemplate.queryForMap("""
+            SELECT 
+                p.PENDING_AT, 
+                w.WORKFLOW_CODE, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL, 
+                w.WORKFLOW_STAGE, 
+                w.ALLOWED_ROLE_ID,
+                p.CREATED_BY
+            FROM VOUCHER_POSTING p
+            JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            WHERE p.BATCH_ID = ?
+            """, batchId);
+    } catch (EmptyResultDataAccessException e) {
+        throw new CustomExceptions.InvalidDataException("Batch ID not found or workflow stage invalid.");
+    }
 
-as u know this table
-workflow transitions
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
+    // 2. Security Checks
+    if (executorId.equalsIgnoreCase((String) stepDetails.get("CREATED_BY"))) {
+        throw new CustomExceptions.InvalidDataException("Security Violation: You cannot approve a batch you created.");
+    }
+    
+    // ... (Keep your Duplicate Approval check) ...
 
-voucher posting
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-CREATORS_ROLE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-PENDING_AT	NUMBER	Yes		6	
-EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
-EXECUTED_AT	TIMESTAMP(6)	Yes		10	
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
+    // 3. Logic based on Join data
+    boolean isFinalStep = "Y".equalsIgnoreCase((String) stepDetails.get("IS_FINAL_APPROVAL"));
+    String workflowCode = (String) stepDetails.get("WORKFLOW_CODE");
+    Integer currentOrder = ((Number) stepDetails.get("WORKFLOW_ORDER")).intValue();
+    
+    // ... (Use isFinalStep to determine logic) ...
+}
 
-as we can see in the case of voucher pending we have column called as PENDING_AT	NUMBER	Yes		6	
-in this we are store the WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
-from the workflow transitions 
+```
+### 2. Updated UI (JournalAuthorization.jsx)
+Since you are using the join, the isFinalApproval flag comes directly from the backend summary. Your React code now just reacts to the field sent by the API:
+```javascript
+// Inside your View Modal
+{viewingBatch?.isFinalApproval === 'Y' && (
+   // Show scheduling UI
+)}
 
-i will explain with real entry 
-0008435	VID-2605-00033	9001	7875730	05-06-26 06:34:19.103071000 PM	28	YES	26-06-26 09:02:00.000000000 AM	YES		S
-this is entry is in the voucher posting table 
-see pending at u can see 28 
-lets see in the workflow transition table 
-workflow_3		N	N	Execution	0	5	28
-this is entry as we can see is final approval is N so we can check like this 
-using joins
-we can check this perfectly i hope u undestand perfectly now 
+```
+### 3. Solving the UI Fluctuation (The "Jump" Fix)
+To stop the modal from changing height, we need to ensure the **Container Height** and **Internal Flex Layout** are locked. Since you are using a Dialog, make these changes in your JournalAuthorization.jsx:
+ 1. **Fixed Height Container:** In the DialogContent for your isViewModalOpen dialog:
+   ```jsx
+   <DialogContent dividers sx={{ 
+       p: 0, 
+       backgroundColor: "#f8fafc", 
+       height: '75vh', // Lock the modal height!
+       display: 'flex', 
+       flexDirection: 'column' 
+   }}>
+   
+   ```
+ 2. **Flexible Content Area:** Ensure your Box containing the Action screen has flexGrow: 1. This tells it to fill all available space, so when content is added or removed, the box itself doesn't shrink—it just changes what it shows inside.
+ 3. **Prevent Collapse:** For the Action Screen specifically, add minHeight: 500 to the Box wrapper and the inner Paper. This ensures that even when the user clicks "Reject" and the scheduling box disappears, the container maintains a consistent size:
+```jsx
+{isActionMode && (
+  <Box sx={{ 
+    p: 5, 
+    flexGrow: 1, // Fills the 75vh
+    minHeight: 500, // Hard lock the height
+    display: "flex", 
+    flexDirection: "column", 
+    alignItems: "center", 
+    justifyContent: "center", 
+    overflowY: "auto" 
+  }}>
+    <Paper sx={{ minHeight: 480, ... }}> {/* Hard lock the card size */}
+      {/* ... */}
+    </Paper>
+  </Box>
+)}
 
-
-this is just example i want everything should dynamic
+```
+**Why this fixes the fluctuation:**
+By setting height: '75vh' on the DialogContent and flexGrow: 1 on your inner views, you have created a "fixed-window" layout. The modal container never changes size again. The internal content simply replaces itself within the same reserved rectangle. When you toggle "Reject", the content changes, but the container stays exactly as tall as it was before.
