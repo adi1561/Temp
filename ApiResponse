@@ -1,66 +1,4 @@
-i renamed the tables and i also delete the same columns accordingly tell mi what should i do change to be sync with table backend changes and 
-frontend changes 
-
-journal posting to voucher posting DATA
-
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	1	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	2	The date when maker created the journal
-CREATOR_ID	VARCHAR2(12 CHAR)	No		3	
-EXECUTION_DATE	DATE	Yes		4	Timestamp when this checker acted upon the journal
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		5	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		6	Unique identifier for the individual request.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks inherited from the batch creation process.
-REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		8	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		9	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 CHAR)	Yes		10	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		11	Raw requested amount 
-POSTING_DATE	DATE	Yes		12	The transaction date for which txn to be posted
-REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		13	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		14	The product  code requested.
-CREATOR_ROLE	NUMBER(10,0)	Yes		15	
-
-
-voucher posting ->
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-WORKFLOW_CODE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-PENDING_AT	NUMBER	Yes		6	
-IS_EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
-EXECUTED_AT	TIMESTAMP(6)	Yes		10	
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
-RECORDS_COUNT	NUMBER	Yes		12	
-
-
-voucher workflow ->
-
-WORKFLOW_ID	NUMBER	No	"FINCORE"."ISEQ$$_81239".nextval	1	
-BATCH_ID_FK	VARCHAR2(50 BYTE)	No		2	
-VID_FK	VARCHAR2(20 BYTE)	No		3	
-LAST_ACTION	VARCHAR2(30 BYTE)	Yes		4	
-LAST_ACTION_BY	VARCHAR2(100 BYTE)	Yes		5	
-LAST_ACTION_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	
-REMARKS	VARCHAR2(500 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-
-workflow transitions->
-
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
-
-
-change the PROCEDURE 
-create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+CREATE OR REPLACE PROCEDURE PROCESS_JOURNAL_BATCH (
     p_batch_id      IN VARCHAR2,
     p_executor_id   IN VARCHAR2,
     p_remarks       IN VARCHAR2,
@@ -68,11 +6,8 @@ create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
     o_cursor        OUT SYS_REFCURSOR
 ) AS
     v_missing_rates NUMBER;
-    v_txn_count     NUMBER; 
 BEGIN
-    -- ==============================================================================
     -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
-    -- ==============================================================================
     SELECT COUNT(*) INTO v_missing_rates
     FROM (
         SELECT DISTINCT REQ_CURRENCY FROM JOURNAL_REQUEST
@@ -87,22 +22,14 @@ BEGIN
         RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
     END IF;
 
-    -- ==============================================================================
-    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
-    -- ==============================================================================
-    SELECT COUNT(*) INTO v_txn_count
-    FROM JOURNAL_REQUEST
-    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
-
-    -- ==============================================================================
     -- 1. Insert GL_TRANSACTIONS
-    -- ==============================================================================
     INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
         TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
         BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
     )
     SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
         GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        -- Mapping to new schema column names
         NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
         REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
         CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
@@ -112,9 +39,7 @@ BEGIN
     FROM JOURNAL_REQUEST
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-    -- ==============================================================================
     -- 2. Insert MASTER_JOURNAL
-    -- ==============================================================================
     INSERT /*+ PARALLEL(MASTER_JOURNAL, 8) */ INTO MASTER_JOURNAL (
         JOURNAL_ID, JOURNAL_AMT, AR_FLAG, BATCH_ID, JOURNAL_BRANCH,
         JOURNAL_CGL, COMMON_BATCH_REMARKS, CURRENCY, JOURNAL_ID_REF,
@@ -123,21 +48,16 @@ BEGIN
     SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
         MASTER_JOURNAL_SEQ.nextval, ABS(REQ_AMOUNT), 'A', BATCH_ID,
         REQ_BRANCH_CODE, REQ_CGL, 
-        SUBSTR(p_remarks, 1, 30), -- Defensive substring to prevent ORA-12899
+        SUBSTR(p_remarks, 1, 30),
         REQ_CURRENCY, JOURNAL_ID,
         NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), REQ_PRODUCT, REQ_NARRATION,
-        
-        -- FIX: Adjusted to perfectly fit the VARCHAR2(3) schema limit
         CASE WHEN REQ_AMOUNT > 0 THEN 'DR'
              WHEN REQ_AMOUNT < 0 THEN 'CR'
              ELSE 'NIL' END
-             
     FROM JOURNAL_REQUEST
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-    -- ==============================================================================
     -- 3. Merge GL Balances
-    -- ==============================================================================
     MERGE INTO GL_BALANCE target
     USING (
         SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
@@ -163,9 +83,7 @@ BEGIN
                 source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
                 (source.TXN_AMOUNT * source.EXCH_RATE));
 
-    -- ==============================================================================
-    -- 4. Capture Sync Data for HDFS (Data Lake)
-    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Renamed column mapping)
     OPEN o_cursor FOR
     SELECT
         j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
@@ -181,9 +99,7 @@ BEGIN
         AND g.CGL = j.REQ_CGL
         AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
 
-    -- ==============================================================================
     -- 5. Finalize Batch Status
-    -- ==============================================================================
     UPDATE JOURNAL_REQUEST
     SET REQ_STATUS = p_status,
         EXECUTOR_ID = p_executor_id,
@@ -196,3 +112,4 @@ EXCEPTION
         ROLLBACK;
         RAISE;
 END;
+/
