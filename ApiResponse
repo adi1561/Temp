@@ -1,38 +1,81 @@
+Got it! Let's simplify and strip out the verbose full-text statuses. If your business logic only uses the single-character codes, we should align everything to just **P**, **A**, and **R**.
+Here is how the streamlined lifecycle looks for **VOUCHER_POSTING.BATCH_STATUS**:
+ * **P** (Pending): The batch is created and currently routing through the checker stages.
+ * **A** (Accepted/Approved): The final approver has confirmed it, the Oracle procedure has successfully run, and balances are updated.
+ * **R** (Rejected): A checker rejected the batch, terminating the workflow.
+### Critical Updates Required for this Streamlined Status Flow
+Since we are strictly using **P**, **A**, and **R**, we need to modify the Java code and the stored procedure where we previously used text like 'QUEUED', 'ACCEPTED', or 'REJECTED'.
+#### 1. Update processBulkRequestsAsync (Java Locking)
+We need to remove the check for verbose statuses and only lock batches that are currently **P** (Pending):
+```java
+    @Override
+    @Transactional
+    public void processBulkRequestsAsync(BulkProcessVoucherPostingDto dto, String executorId, Integer executorRole) {
+        // Lock the target batch using ONLY the single character 'P'
+        String lockSql = "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS = 'P'";
+        int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
+
+        if (updated == 0) {
+            log.warn("APPROVAL_LOCK_FAIL | Batch: {} | Status: Already processing or not Pending", dto.getBatchId());
+            throw new IllegalStateException("Batch is already being processed or is not in Pending status.");
+        }
+
+        progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
+        self.executeAsyncBatchProcessing(dto, executorId);
+    }
+
+```
+#### 2. Update executeApprovalInTransaction (Java Post-Execution Status)
+When the Oracle core processing finishes successfully, we mark the batch as **A** instead of 'ACCEPTED'. If rejected, we mark it as **R**:
+```java
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            // ... (Your existing stored procedure call) ...
+
+            // FIX: Mark explicitly as 'A' for Approved/Accepted
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'A', EXECUTED_AT = SYSTIMESTAMP WHERE BATCH_ID = ?",
+                    batchId);
+
+            // ... (HDFS sync logic) ...
+            progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
+
+        } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING_DATA SET REQ_STATUS = 'R' WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
+                    batchId);
+            
+            // FIX: Mark explicitly as 'R' for Rejected
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R', EXECUTED_AT = SYSTIMESTAMP WHERE BATCH_ID = ?",
+                    batchId);
+
+            progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
+        }
+
+```
+#### 3. Update PURGE_JOURNAL_BATCH (Oracle Stored Procedure)
+We must also change the deletion safety gate condition inside your purge procedure to check for **P** instead of text strings:
+```sql
 CREATE OR REPLACE PROCEDURE PURGE_JOURNAL_BATCH(
     p_batch_id IN VARCHAR2,
     p_user_id  IN VARCHAR2
 ) AS
     v_status VARCHAR2(20);
 BEGIN
-    -- 1. Security + Ownership Check using VOUCHER_POSTING
-    BEGIN
-        SELECT BATCH_STATUS INTO v_status
-        FROM VOUCHER_POSTING
-        WHERE BATCH_ID = p_batch_id 
-          AND UPPER(TRIM(CREATED_BY)) = UPPER(TRIM(p_user_id));
-    EXCEPTION
-        WHEN NO_DATA_FOUND THEN
-            RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
-    END;
+    SELECT BATCH_STATUS INTO v_status
+    FROM VOUCHER_POSTING
+    WHERE BATCH_ID = p_batch_id 
+      AND UPPER(TRIM(CREATED_BY)) = UPPER(TRIM(p_user_id));
 
-    -- Standardized checks for your new short-status codes ('P' = Pending, 'QUEUED', 'ERROR')
-    IF v_status NOT IN ('P', 'PENDING', 'QUEUED', 'ERROR') THEN
+    -- FIX: Only allow purging if the status is strictly 'P' (Pending) or 'QUEUED'
+    IF v_status NOT IN ('P', 'QUEUED') THEN
         RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
     END IF;
 
-    -- 2. Delete lines from your new row-level table VOUCHER_POSTING_DATA
-    DELETE FROM VOUCHER_POSTING_DATA
-    WHERE BATCH_ID = p_batch_id
-      AND REQ_STATUS IN ('P', 'R');
-
-    -- 3. Delete Parent Batch Record from VOUCHER_POSTING
+    DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
     DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = p_batch_id;
-
-    -- NO EXPLICIT COMMIT — Spring @Transactional handles it
-
-EXCEPTION
-    WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
 END;
 /
+
+```
+This simplifies your workflow rules, keeps the database extremely clean, and uses the exact same single-character status mapping on both your parent tracking table and child item data rows!
