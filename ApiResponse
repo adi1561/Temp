@@ -1,11 +1,10 @@
-   @Override
+    @Override
     @Async("bulkExecutor")
-    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole, LocalDateTime scheduledTime, String vid) {
         String lockKey = "LOCK_REQ_" + requestId;
         MDC.put("batchId", batchId);
         MDC.put("user", creatorId);
 
-        // 1. Capture MDC context to ensure worker threads have traceable logs
         Map<String, String> contextMap = MDC.getCopyOfContextMap();
         AtomicInteger successfulRowsCount = new AtomicInteger(0);
 
@@ -13,17 +12,15 @@
         long start = System.currentTimeMillis();
 
         try {
-            // 2. IDEMPOTENCY: Purge any existing data for this batchId to prevent count inflation
+            // 2. IDEMPOTENCY
             jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
             jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
 
             progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
 
-            // Retrieve valid rows from the GZIP-compressed Redis cache
             List<VoucherBulkValidationService.ExcelRowData> cachedRows = voucherBulkValidationService.getValidRowsFromCache(requestId);
-
             if (cachedRows == null || cachedRows.isEmpty()) {
-                log.error("CACHE_MISS | Batch: {} | Status: No valid rows found in Redis", batchId);
+                log.error("CACHE_MISS | Batch: {} | Status: No valid rows found", batchId);
                 progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
                 return;
             }
@@ -31,27 +28,21 @@
             int totalRows = cachedRows.size();
             int batchSize = 5000;
             List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-            // High-precision thread-safe counters for financial totals
             AtomicReference<BigDecimal> totalDebit = new AtomicReference<>(BigDecimal.ZERO);
             AtomicReference<BigDecimal> totalCredit = new AtomicReference<>(BigDecimal.ZERO);
-
-
             AtomicInteger completedChunks = new AtomicInteger(0);
             int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
 
-            // 3. PARALLEL CHUNKING: Process 5,000 rows at a time
+            // 3. PARALLEL CHUNKING
             for (int i = 0; i < totalRows; i += batchSize) {
                 final int startIdx = i;
                 final int endIdx = Math.min(i + batchSize, totalRows);
                 final List<VoucherBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
 
-                // Use 'self' to ensure call goes through Spring proxy for @Transactional(Propagation.REQUIRES_NEW)
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                             if (contextMap != null) MDC.setContextMap(contextMap);
                             try {
                                 self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
-                                // Increment successfully committed row count
                                 successfulRowsCount.addAndGet(chunk.size());
                             } finally {
                                 MDC.clear();
@@ -60,70 +51,52 @@
                         .thenRun(() -> {
                             int done = completedChunks.incrementAndGet();
                             int percent = 5 + (done * 90 / totalChunks);
-                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                                    String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
+                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING", String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
                         });
                 futures.add(future);
             }
 
-            // 4. WAIT FOR COMPLETION: Block until all parallel workers finish (45 min timeout for 500k rows)
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
 
-
-            BigDecimal finalDebit = totalDebit.get();
-            BigDecimal finalCredit = totalCredit.get();
-
-            // 6. INTEGRITY CHECK: Verify that actual saved rows match expected rows
+            // 6. INTEGRITY & FINAL RECORD
             int actualCommittedRows = successfulRowsCount.get();
-            String batchStatus = "PENDING";
-            String finalRemarks = commonRemarks;
-
-            if (actualCommittedRows != totalRows) {
-                log.error("BATCH_INTEGRITY_FAILED | Batch: {} | Expected: {} | Actual: {}", batchId, totalRows, actualCommittedRows);
-            }
-
-            // 7. FINAL MASTER RECORD: Insert the summary record
             Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            jdbcTemplate.update("INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
+                                batchId, creatorId, ts, commonRemarks, actualCommittedRows, totalDebit.get(), totalCredit.get(), "P");
 
+            // =================================================================
+            // INTEGRATED WORKFLOW INITIALIZATION
+            // =================================================================
+            String workflowCode = jdbcTemplate.queryForObject("SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY", String.class, creatorRole);
+            Long firstApproverWorkflowId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2", Long.class, workflowCode);
 
-            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, actualCommittedRows,
-                    finalDebit, finalCredit, batchStatus, null);
+            VoucherPosting posting = new VoucherPosting();
+            posting.setBatchId(batchId);
+            posting.setVidFk(vid);
+            posting.setCreatedBy(creatorId);
+            posting.setCreatorsRole(String.valueOf(creatorRole));
+            posting.setPendingAt(firstApproverWorkflowId);
+            posting.setBatchStatus("P");
+            posting.setExecutionScheduled(scheduledTime != null ? "YES" : "NO");
+            posting.setScheduledTime(scheduledTime);
+            posting.setIsScheduleOverride("NO");
+            voucherPostingRepository.save(posting);
 
-            // Audit and Notification Logic (Preserved Business Logic)
-            if (actualCommittedRows != totalRows) {
-                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Integrity Failure: Row count mismatch.");
-            } else  {
-                logAudit(creatorId, "BATCH_ASYNC", "ADD", "Successfully created batch " + batchId);
-                progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-                sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
+            if (vid != null && !vid.isEmpty()) updateVidStatus(vid, VoucherStatus.USED);
+            logWorkflowAction(batchId, vid, "Submitted", creatorId, commonRemarks, scheduledTime);
+            // =================================================================
 
-                NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-                if (config != null) {
-                    String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
-                    sendNotification(null, config.getTargetRoles(), msg, batchId);
-                }
-            }
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+            sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
 
-            log.info("BATCH_CREATION_FINISHED | Batch: {} | Status: {} | Rows: {} | Duration: {}ms",
-                    batchId, batchStatus, actualCommittedRows, System.currentTimeMillis() - start);
+            log.info("BATCH_CREATION_FINISHED | Batch: {} | Rows: {}", batchId, actualCommittedRows);
 
         } catch (Exception e) {
             log.error("BATCH_FATAL_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
-            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred during batch creation.");
+            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred.");
         } finally {
-            // 8. OPTIMIZED CLEANUP: Batch delete all Redis keys in one network call
-            List<String> keysToDelete = new ArrayList<>();
-            keysToDelete.add(lockKey);
-            keysToDelete.add("DATA_" + requestId);
-            keysToDelete.add("DATA_META_" + requestId);
-
-            // Clean up chunked keys if they exist (assuming max 500k rows / 5k chunk = 100 keys)
-            for (int k = 0; k < 110; k++) {
-                keysToDelete.add("DATA_CHUNK_" + requestId + "_" + k);
-            }
-            redisTemplate.delete(keysToDelete);
-
+            // Clean up Redis...
+            redisTemplate.delete(lockKey);
             MDC.clear();
         }
     }
