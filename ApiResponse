@@ -1,53 +1,4 @@
-To make your final approval check dynamic, clean, and perfectly aligned with your schema, we will move away from complex math and rely on the **Database's IS_FINAL_APPROVAL flag** (the source of truth) via a join.
-Here are the corrected, professional-grade methods for your VoucherRequestServiceImpl.java. Replace your existing versions with these:
-### 1. The Dynamic "Pending Batches" Query
-This method now includes the NOT EXISTS check (to stop ghost requests) and retrieves the IS_FINAL_APPROVAL flag directly from the join.
-```java
-    @Override
-    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId) {
-        String sql = """
-            SELECT 
-                b.BATCH_ID, p.VID_FK AS VID, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
-                b.TOTAL_ROWS, p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME, w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, b.CREATOR_ID) AS CREATOR_NAME
-            FROM JOURNAL_BATCH_MASTER b
-            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
-            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON b.CREATOR_ID = u.USER_ID
-            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
-            
-            -- FIX 1: Hide batches already approved by this user
-            AND NOT EXISTS (
-                SELECT 1 FROM VOUCHER_WORKFLOW vw 
-                WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
-            )
-            ORDER BY b.REQ_DATE DESC
-        """;
-
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-            // FIX 2: Use the flag defined in the specific transition row
-            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL")); 
-            return map;
-        }, userRole, userId);
-    }
-
-```
-### 2. The Dynamic "Action Processing" Logic
-This logic is now fully dynamic: it ignores complex math and purely obeys the IS_FINAL_APPROVAL column in your WORKFLOW_TRANSITIONS table.
-```java
-    @Transactional
+@Transactional
     public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
         String batchId = dto.getBatchId();
 
@@ -61,6 +12,7 @@ This logic is now fully dynamic: it ignores complex math and purely obeys the IS
             WHERE p.BATCH_ID = ?
             """, batchId);
 
+
         // 2. Validate Authorization
         Integer allowedRoleId = ((Number) stepData.get("ALLOWED_ROLE_ID")).intValue();
         if (!allowedRoleId.equals(executorRole)) {
@@ -70,6 +22,7 @@ This logic is now fully dynamic: it ignores complex math and purely obeys the IS
             throw new CustomExceptions.InvalidDataException("Security Violation: You cannot approve your own batch.");
         }
 
+
         // 3. Dynamic Logic Extraction
         String workflowCode = (String) stepData.get("WORKFLOW_CODE");
         Integer currentOrder = ((Number) stepData.get("WORKFLOW_ORDER")).intValue();
@@ -77,31 +30,136 @@ This logic is now fully dynamic: it ignores complex math and purely obeys the IS
         boolean isFinalStep = "Y".equalsIgnoreCase((String) stepData.get("IS_FINAL_APPROVAL"));
 
         VoucherPosting posting = voucherPostingRepository.findById(batchId)
-                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch ID not found."));
+                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch ID not found in workflow tracking."));
 
-        // 4. Handle Progression
-        if ("REJECTED".equals(dto.getStatus().toString())) {
-            // ... (Keep your rejection logic here) ...
+        // 1. Prevent Self-Approval
+        if (executorId.equalsIgnoreCase(posting.getCreatedBy())) {
+            throw new CustomExceptions.InvalidDataException("Security Violation: You cannot approve a batch you created.");
+        }
+
+        // 2. Prevent Duplicate Approvals
+        boolean hasAlreadyApproved = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId)
+                .stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
+        if (hasAlreadyApproved) {
+            throw new CustomExceptions.InvalidDataException("Security Violation: You have already approved this batch at a previous level.");
+        }
+
+        // ==========================================
+        // 3. SECURE FETCH BASED ON PENDING_AT
+        // ==========================================
+        Map<String, Object> currentStepData;
+        try {
+            currentStepData = jdbcTemplate.queryForMap(
+                    "SELECT WORKFLOW_CODE, WORKFLOW_ORDER, IS_FINAL_APPROVAL, WORKFLOW_STAGE, ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_ID = ?",
+                    posting.getPendingAt()
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: Current stage not found.");
+        }
+
+        Integer allowedRoleId = currentStepData.get("ALLOWED_ROLE_ID") != null ? ((Number) currentStepData.get("ALLOWED_ROLE_ID")).intValue() : null;
+
+        if (allowedRoleId != null && !allowedRoleId.equals(executorRole)) {
+            throw new CustomExceptions.InvalidDataException("Unauthorized: You do not have the required Role to approve this step.");
+        }
+
+        String workflowCode = (String) currentStepData.get("WORKFLOW_CODE");
+        Integer currentOrder = ((Number) currentStepData.get("WORKFLOW_ORDER")).intValue();
+        String currentStageName = (String) currentStepData.get("WORKFLOW_STAGE");
+        String explicitIsFinal = (String) currentStepData.get("IS_FINAL_APPROVAL");
+
+        // Use the exact flag from the database stage
+        boolean isFinalStep = "Y".equalsIgnoreCase(explicitIsFinal);
+
+        // ==========================================
+        // 4. DYNAMIC STATE PROGRESSION & CLEAN LOGGING
+        // ==========================================
+        String actionTaken = dto.getStatus().toString();
+
+        if ("REJECTED".equals(actionTaken)) {
+            posting.setBatchStatus("R");
+            voucherPostingRepository.save(posting);
+
+            String actionLog = "Rejected (" + currentStageName + ")";
+            logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), null);
+            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
+            jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
+            notificationWriterService.createBatchRejectedNotification(batchId, posting.getCreatedBy(), executorId, dto.getRemarks());
+
+            if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
+                updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
+            }
             return;
         }
 
         if (isFinalStep) {
-            // Logic for Final Execution (Posting, Scheduling, etc.)
-            // ... (Keep your Final Approval logic block) ...
-        } else {
-            // Move to next step dynamically using the next order
-            Long nextApproverId = jdbcTemplate.queryForObject(
-                "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?",
-                Long.class, workflowCode, currentOrder + 1
+            // Find the Executor Step (Order + 1)
+            Long executorWorkflowId = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?",
+                    Long.class, workflowCode, currentOrder + 1
             );
+            posting.setPendingAt(executorWorkflowId);
+
+            // --- SCHEDULING OVERRIDE LOGIC ---
+            boolean isOverride = Boolean.TRUE.equals(dto.getOverrideScheduleLapse());
+            if (isOverride) {
+                posting.setIsScheduleOverride("YES"); // Set the flag in main table
+                if (dto.getNewScheduledTime() != null) {
+                    posting.setExecutionScheduled("YES");
+                    posting.setScheduledTime(dto.getNewScheduledTime());
+                } else {
+                    posting.setExecutionScheduled("NO");
+                    posting.setScheduledTime(null);
+                }
+            } else {
+                // Keep Original: Check for lapse
+                if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null) {
+                    if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
+                        throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed.");
+                    }
+                }
+            }
+
+            // --- EXECUTION ROUTING ---
+            if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+                posting.setBatchStatus("S");
+
+                // Fits within 30 chars: "Final Apprvl(Sch. Override)" (27)
+                String actionLog = isOverride ? "Final Apprvl(Sch. Override)" : "Final Approval(Scheduled)";
+                logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), posting.getScheduledTime());
+                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'SCHEDULED', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
+            } else  {
+                posting.setBatchStatus("C");
+                posting.setExecutedAt(LocalDateTime.now());
+
+                // Fits within 30 chars: "Final Apprvl(Imm. Override)" (27)
+                String actionLog = isOverride ? "Final Apprvl(Imm. Override)" : "Final Approval(Posted)";
+                logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), null);
+
+                if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
+                    updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
+                }
+
+                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                execDto.setBatchId(batchId);
+                execDto.setStatus(RequestStatus.ACCEPTED);
+                execDto.setRemarks(dto.getRemarks());
+                this.processBulkRequestsAsync(execDto, executorId, executorRole);
+            }
+            notificationWriterService.createBatchApprovedNotification(batchId, posting.getCreatedBy(), executorId);
+
+        } else {
+            // Move to the next approver step
+            Long nextApproverId = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?",
+                    Long.class, workflowCode, currentOrder + 1
+            );
+
             posting.setPendingAt(nextApproverId);
-            logWorkflowAction(batchId, (String)stepData.get("VID_FK"), "Approved (" + currentStageName + ")", executorId, dto.getRemarks(), null);
+
+            String actionLog = "Approved (" + currentStageName + ")";
+            logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), null);
         }
+
         voucherPostingRepository.save(posting);
     }
-
-```
-### Why this fixes your issues:
- 1. **"Pending Request still there":** By adding AND NOT EXISTS(...) to the SQL query, even if the role matches, the system excludes the batch because the database history already shows that specific user approved it.
- 2. **"Final Execution Routing shows for wrong users":** Because we no longer try to calculate the "final" step via code, we trust the IS_FINAL_APPROVAL column. If it's 'Y', it's final. If it's 'N', it's not. It is now strictly data-driven.
- 3. **Dynamic:** The PENDING_AT foreign key ensures that no matter what your workflow looks like, the system always knows exactly which row in WORKFLOW_TRANSITIONS defines the current behavior.
