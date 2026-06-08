@@ -1,137 +1,131 @@
-I completely understand. Double scrollbars are a classic CSS headache, and having the loading spinner on *both* buttons at the same time is definitely bad UX. Also, putting the remarks field inline with the buttons is a much smarter use of screen real estate for a 30-character limit.
-Here are the precise, step-by-step changes to fix all 5 issues perfectly.
-### 1. Fix the Loading Spinner State
-We need a new state to track *which* button was clicked so we only spin that specific button.
-**FIND your state declarations at the top of the component and add this one:**
-```javascript
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submittingAction, setSubmittingAction] = useState(null); // <-- ADD THIS NEW STATE
+Yes, exactly! **VOUCHER_POSTING is now officially your Master Table.** It controls the lifecycle, workflow routing, and summary data of the entire batch, while VOUCHER_POSTING_DATA acts purely as the child table holding the thousands of line items.
+By moving batch-level metadata back into VOUCHER_POSTING, we eliminate the need for the database to scan millions of child rows just to load a summary screen. This provides a massive performance boost (reducing query times from potentially seconds to milliseconds).
+Here is your exact action plan to optimize the database and refactor the Java methods for peak performance.
+### 1. Database Schema Fixes (Execute in Oracle)
+Run these commands to properly normalize your tables:
+```sql
+-- 1. Add missing Master attributes to VOUCHER_POSTING
+ALTER TABLE VOUCHER_POSTING ADD COMMON_BATCH_REMARKS VARCHAR2(50 CHAR);
+ALTER TABLE VOUCHER_POSTING ADD CREATOR_ROLE NUMBER(10,0);
+ALTER TABLE VOUCHER_POSTING ADD EXECUTOR_ID VARCHAR2(100 BYTE);
+
+-- 2. Drop the redundant column from the Data table
+ALTER TABLE VOUCHER_POSTING_DATA DROP COLUMN CREATOR_ROLE;
 
 ```
-**FIND your handleSubmitAction function. Right below setIsSubmitting(true);, add this line:**
-```javascript
-    setIsSubmitting(true);
-    setSubmittingAction(statusToSubmit); // <-- ADD THIS
+### 2. Performance Boost 1: getPendingBatchesForChecker
+We can now rip out that heavy (SELECT MAX(...) FROM VOUCHER_POSTING_DATA) subquery. The database simply reads the single master row.
+**Update your method in VoucherRequestServiceImpl.java:**
+```java
+    @Override
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId) {
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK AS VID, 
+                p.CREATED_BY AS CREATOR_ID, 
+                p.CREATED_AT AS REQ_DATE, 
+                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS, -- ✨ PERF BOOST: Direct column read
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE, 
+                w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
+            FROM VOUCHER_POSTING p
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            AND NOT EXISTS (
+                SELECT 1 FROM VOUCHER_WORKFLOW vw 
+                WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
+            )
+            ORDER BY p.CREATED_AT DESC
+        """;
 
-```
-**And in the finally block of that same function, reset it:**
-```javascript
-    } finally {
-      setIsSubmitting(false);
-      setSubmittingAction(null); // <-- ADD THIS
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS")); 
+            map.put("requestCount", rs.getLong("TOTAL_ROWS")); 
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            return map;
+        }, userRole, userId);
     }
 
 ```
-### 2. Fix the Double Scrollbar & Add "Workflow Progress" Title
-The double scrollbar happens because both the <DialogContent> and the <Box> inside it are trying to manage scrolling. We will remove the scrolling from the <Box>. We will also drop the "Workflow Progress" title right above your stepper.
-**FIND the start of your <DialogContent> inside the View Modal (around line 940) and REPLACE the wrapper Box and the Stepper Box with this:**
-```javascript
-          <DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc" }}>
-            {/* FIXED: Removed maxHeight and overflowY so DialogContent handles the 1 single scrollbar */}
-            <Box sx={{ display: "flex", flexDirection: "column" }}>
+### 3. Performance Boost 2: getBatchSummaryDetails
+We remove the second heavy subquery that was fetching the role from the data table.
+**Update your method:**
+```java
+    @Override
+    public Map<String, Object> getBatchSummaryDetails(String batchId) {
+        String sql = """
+            SELECT 
+                vp.VID_FK AS VID,
+                vp.CREATED_BY AS BATCH_CREATOR_ID,
+                COALESCE(bu.FIRST_NAME || ' ' || bu.LAST_NAME, vp.CREATED_BY) AS BATCH_CREATED_BY_NAME,
+                vp.CREATED_AT AS BATCH_CREATED_AT,
+                vp.CREATOR_ROLE AS CREATORS_ROLE, -- ✨ PERF BOOST: Direct column read
+                vp.SCHEDULED_TIME,
+                vp.EXECUTED_AT,
+                vc.CATEGORY_NAME,
+                rv.CREATED_BY AS VID_CREATOR_ID,
+                COALESCE(vu.FIRST_NAME || ' ' || vu.LAST_NAME, rv.CREATED_BY) AS VID_CREATED_BY_NAME,
+                rv.CREATED_AT AS VID_CREATED_AT,
+                rv.DESCRIPTION
+            FROM VOUCHER_POSTING vp
+            LEFT JOIN REQUEST_VOUCHER rv ON vp.VID_FK = rv.VID
+            LEFT JOIN VOUCHER_CATEGORY vc ON rv.CATEGORY_ID = vc.ID
+            LEFT JOIN USERS bu ON vp.CREATED_BY = bu.USER_ID
+            LEFT JOIN USERS vu ON rv.CREATED_BY = vu.USER_ID
+            WHERE vp.BATCH_ID = ?
+        """;
 
-              {/* ... KEEP YOUR HEADER CARDS (Voucher Request ID & Voucher Details) EXACTLY AS THEY ARE ... */}
-
-```
-*(Now scroll down just past the header cards to the Horizontal Timeline section)*
-```javascript
-              {/* --- HORIZONTAL TIMELINE --- */}
-              <Box sx={{ p: 4, flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-                
-                {/* NEW: Added Workflow Progress Title */}
-                <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
-                  Workflow Progress
-                </Typography>
-
-                {viewingBatchState === "REJECTED" ? (
-
-```
-### 3. Make Both Header Cards Full-Width
-In your current code, the grid items still have md={6} (which forces them to be 50% width on desktop). We need to delete md={6} so they naturally take up 100% of the space.
-**FIND the Grid item for Section 1 (Voucher Request ID):**
-```javascript
-<Grid item xs={12} md={6}>
-
-```
-**REPLACE with:**
-```javascript
-<Grid item xs={12}>
-
-```
-**FIND the Grid item for Section 2 (Voucher Details):**
-```javascript
-<Grid item xs={12} md={6}>
+        try {
+            return jdbcTemplate.queryForMap(sql, batchId);
+        } catch (EmptyResultDataAccessException e) {
+            return new HashMap<>();
+        }
+    }
 
 ```
-**REPLACE with:**
-```javascript
-<Grid item xs={12}>
+### 4. Audit Trail Fix: executeApprovalInTransaction
+Now that we have EXECUTOR_ID back in the master table, we need to stamp it when the final approval happens so your audit logs are complete.
+**Find this specific block inside executeApprovalInTransaction and add the executor update:**
+```java
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            // ... (Your Oracle procedure call is here) ...
+
+            // ✨ AUDIT FIX: Stamp the EXECUTOR_ID onto the Master table upon successful execution
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'A', EXECUTED_AT = SYSTIMESTAMP, EXECUTOR_ID = ? WHERE BATCH_ID = ?",
+                    executorId, batchId);
+
+            // ... (HDFS sync logic) ...
+        } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING_DATA SET REQ_STATUS = 'R' WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
+                    batchId);
+            
+            // ✨ AUDIT FIX: Stamp the EXECUTOR_ID upon rejection as well
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R', EXECUTED_AT = SYSTIMESTAMP, EXECUTOR_ID = ? WHERE BATCH_ID = ?",
+                    executorId, batchId);
+            // ...
+        }
 
 ```
-### 4. Inline Action Remarks & Button Layout
-We will change the bottom action bar from a stacked column into a single horizontal row, and shrink the text box back to a normal, single-line input.
-**FIND your entire <DialogActions> block at the very bottom of the Modal (around line 1250) and REPLACE IT ENTIRELY with this:**
-```javascript
-          {/* --- STICKY BOTTOM ACTION BAR (INLINE DESIGN) --- */}
-          <DialogActions sx={{ p: 3, backgroundColor: "#f8fafc", borderTop: "1px solid", borderColor: "divider", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            {(() => {
-              const isWorkflowFinished = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "REJECTED";
-              const isActionDisabled = isViewingSelfCreated || isWorkflowFinished;
-
-              return (
-                <>
-                  {/* Left Side: Security Notice OR Remarks Input */}
-                  <Box sx={{ flexGrow: 1, mr: 4 }}>
-                    {isViewingSelfCreated && !isWorkflowFinished ? (
-                      <Typography variant="body2" color="error.main" fontWeight="bold">
-                        * Security Violation: You cannot approve or reject your own request.
-                      </Typography>
-                    ) : isWorkflowFinished ? (
-                      <Typography variant="body2" color="text.secondary" fontWeight="bold">
-                        * Workflow processing is complete for this batch.
-                      </Typography>
-                    ) : (
-                      <TextField
-                        fullWidth
-                        size="small"
-                        required
-                        label="Action Remarks (Max 30 chars)"
-                        placeholder="Type remarks here..."
-                        value={executorRemarks}
-                        onChange={(e) => handleRemarksChange(e, setExecutorRemarks)}
-                        disabled={isSubmitting}
-                        inputProps={{ maxLength: 30 }}
-                        error={executorRemarks.length > 0 && !isRemarksValid(executorRemarks)}
-                        sx={{ backgroundColor: 'white', maxWidth: 400 }} // Restricts width so it doesn't look overly stretched
-                      />
-                    )}
-                  </Box>
-
-                  {/* Right Side: Action Buttons */}
-                  <Stack direction="row" spacing={2} alignItems="center">
-                    <Button
-                      variant="contained"
-                      color="error"
-                      disabled={isActionDisabled || !isRemarksValid(executorRemarks) || isSubmitting}
-                      onClick={() => handleSubmitAction("REJECTED")}
-                      sx={{ minWidth: 120, fontWeight: 'bold' }}
-                    >
-                      {submittingAction === "REJECTED" ? <CircularProgress size={20} color="inherit" /> : "Reject"}
-                    </Button>
-
-                    <Button
-                      variant="contained"
-                      color="success"
-                      disabled={isActionDisabled || !isRemarksValid(executorRemarks) || isSubmitting}
-                      onClick={() => handleSubmitAction("ACCEPTED")}
-                      sx={{ minWidth: 120, fontWeight: 'bold' }}
-                    >
-                      {submittingAction === "ACCEPTED" ? <CircularProgress size={20} color="inherit" /> : "Accept"}
-                    </Button>
-                  </Stack>
-                </>
-              );
-            })()}
-          </DialogActions>
-
-```
+### 5. Final Step: Batch Creation Updates
+You will also need to make sure that when a new batch is created (in both createBatchRequest for Manual Entry and executeAsyncBatchCreation for Bulk Uploads), your VoucherPosting entity saves commonBatchRemarks and creatorRole to the database.
+Do you have your VoucherPosting.java entity class handy so we can quickly verify the JPA mappings for these three new fields?
