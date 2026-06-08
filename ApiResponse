@@ -1,15 +1,63 @@
+The 500 Internal Server Error with Batch ID not found or update failed occurs because the VoucherPosting record for your bulk-uploaded batch **does not exist yet** when you try to update the schedule.
+When you create a batch via **Bulk Upload**, it runs as an @Async process. If you trigger the "Schedule" API before the executeAsyncBatchCreation method has finished saving the record to the VOUCHER_POSTING table, the update query fails.
+Here is how to fix this for both the backend and the frontend:
+### 1. Backend: Make the Update "UPSERT" or "Wait"
+Instead of throwing a runtime exception if the batch isn't found yet, the system should allow the update to wait or retry if the record is currently being created. However, for a quick fix, let's update your service to be more robust.
+**Update updateBatchSchedule in VoucherRequestServiceImpl.java:**
+```java
+    @Override
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        // Use a simple count check first
+        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
+        
+        if (exists == 0) {
+            // If the record isn't there, log a warning instead of crashing
+            log.warn("SCHEDULE_UPDATE_FAIL | Batch {} not yet created in DB. Retrying or waiting...", batchId);
+            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
+        }
 
-java.lang.RuntimeException: Batch ID not found or update failed.
-{timestamp: "2026-06-08T10:00:30.319+00:00", status: 500, error: "Internal Server Error",…}
-error
-: 
-"Internal Server Error"
-path
-: 
-"/api/voucher/update-schedule"
-status
-: 
-500
-timestamp
-: 
-"2026-06-08T10:00:30.319+00:00"
+        String sql = "UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'YES', EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?";
+        jdbcTemplate.update(sql, scheduledTime, batchId);
+    }
+
+```
+### 2. Frontend: How to support "Scheduling" for Bulk Uploads
+Now we need to connect the JournalBulkUpload.jsx to the scheduling logic. You need to capture the scheduledTime and vid in your JournalBulkUpload component and send them when initiating the batch creation.
+**In JournalBulkUpload.jsx:**
+ 1. **Add State:**
+   ```javascript
+   const [scheduledTime, setScheduledTime] = useState(null);
+   
+   ```
+ 2. **Add a Schedule Picker:** (Use the same DateTimePicker as you did in JournalPosting.jsx).
+ 3. **Update the API Call:**
+   When you call the API to create the batch from cache, include the two new fields:
+```javascript
+const handleCreateBatch = async () => {
+    // ... other logic
+    const payload = {
+        requestId: currentRequestId,
+        commonBatchRemarks: remarks,
+        scheduledTime: scheduledTime ? scheduledTime.format('YYYY-MM-DD HH:mm:ss') : null,
+        vid: selectedVoucher?.VID
+    };
+
+    try {
+        const response = await callApi("/api/voucher/create-batch-from-cache", payload, "POST");
+        // ... success logic
+    } catch (e) {
+        // ... error logic
+    }
+};
+
+```
+### 3. The "Why" behind the logic flow
+To prevent that 500 error entirely, follow this architectural flow:
+ 1. **User uploads file** → Frontend sends scheduledTime + VID to backend.
+ 2. **createBatchFromCacheAsync** → Saves these values into a DTO.
+ 3. **executeAsyncBatchCreation** → **This is the critical step.** It *must* insert these values into the VOUCHER_POSTING table immediately after the master record is created (as we did in the last step).
+ 4. **Completion** → By the time the user's batch is "Completed" on the status screen, the VOUCHER_POSTING record already contains the correct schedule.
+**Action Item:**
+ 1. Update your VoucherRequestServiceImpl.java with the robust updateBatchSchedule fix above.
+ 2. Ensure your JournalBulkUpload.jsx is passing the scheduledTime and vid in the JSON payload.
+ 3. If you do this, you won't even need to call update-schedule after the fact—the batch will be scheduled correctly at the moment of creation!
