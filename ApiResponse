@@ -1,44 +1,47 @@
-voucher posting
+    @Override
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId) {
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK AS VID, 
+                p.CREATED_BY AS CREATOR_ID, 
+                p.CREATED_AT AS REQ_DATE, 
+                (SELECT MAX(COMMON_BATCH_REMARKS) FROM VOUCHER_POSTING_DATA vpd WHERE vpd.BATCH_ID = p.BATCH_ID) AS BATCH_REMARKS,
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE, 
+                w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
+            FROM VOUCHER_POSTING p
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            
+            -- FIX: Hide batches already approved by this user
+            AND NOT EXISTS (
+                SELECT 1 FROM VOUCHER_WORKFLOW vw 
+                WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
+            )
+            ORDER BY p.CREATED_AT DESC
+        """;
 
-
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-WORKFLOW_CODE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-PENDING_AT	NUMBER	Yes		6	
-IS_EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
-EXECUTED_AT	TIMESTAMP(6)	Yes		10	
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
-RECORDS_COUNT	NUMBER	Yes		12	
-
-voucher posting data 
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	1	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	2	The date when maker created the journal
-CREATOR_ID	VARCHAR2(12 CHAR)	No		3	
-EXECUTION_DATE	DATE	Yes		4	Timestamp when this checker acted upon the journal
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		5	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		6	Unique identifier for the individual request.
-COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		7	Remarks inherited from the batch creation process.
-REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		8	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		9	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 CHAR)	Yes		10	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		11	Raw requested amount 
-POSTING_DATE	DATE	Yes		12	The transaction date for which txn to be posted
-REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		13	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		14	The product  code requested.
-CREATOR_ROLE	NUMBER(10,0)	Yes		15	
-REQ_ID	NUMBER(19,0)	Yes		16	
-
-
-voucher workflow 
-WORKFLOW_ID	NUMBER	No	"FINCORE"."ISEQ$$_81239".nextval	1	
-BATCH_ID_FK	VARCHAR2(50 BYTE)	No		2	
-VID_FK	VARCHAR2(20 BYTE)	No		3	
-LAST_ACTION	VARCHAR2(30 BYTE)	Yes		4	
-LAST_ACTION_BY	VARCHAR2(100 BYTE)	Yes		5	
-LAST_ACTION_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	
-REMARKS	VARCHAR2(500 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS")); // Mapped from the subquery
+            map.put("requestCount", rs.getLong("TOTAL_ROWS")); // Mapped from p.RECORDS_COUNT
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            return map;
+        }, userRole, userId);
+    }
