@@ -1,434 +1,47 @@
-These are three excellent catches. As a workflow system gets more complex, these exact edge cases always appear. Let's solve all three of them permanently.
-### Issue 1: "Ghost" Pending Requests After Approval
-**Why it happens:** In sequential workflows, if Step 1 (Maker) and Step 2 (Checker) share the same ROLE_ID (e.g., Role 9001), the database correctly moves the batch to Step 2, but because you *also* have Role 9001, the SQL query still pulls it into your pending list!
-**The Fix:** We must update the SQL query to actively filter out any batches where your userId already exists in the VOUCHER_WORKFLOW history table for that specific batch.
-### Issue 2: Final Routing showing for multiple users
-**Why it happens:** In a previous step, we trusted the database's IS_FINAL_APPROVAL column directly using a join. However, if your database has Y in multiple rows for the same workflow (e.g., due to a typo or misconfiguration), the UI will show the scheduling screen to multiple users.
-**The Fix:** We will use a foolproof SQL CASE statement that mathematically guarantees only the *absolute last human step* gets the 'Y'.
-Here is the combined backend fix for **Issue 1 & 2**.
-#### Step 1: Update VoucherPostingController.java
-Find your getPendingApprovals method and pass the userId into the service.
-```java
-    @GetMapping("/checker/pending-approvals")
-    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        String userId = jwtUtil.getUserIdFromToken(token); // <-- ADD THIS
-        
-        // Pass both role and userId
-        return ResponseEntity.ok(voucherRequestService.getPendingBatchesForChecker(userRole, userId));
-    }
-
-```
-#### Step 2: Update VoucherRequestService.java (The Interface)
-Update the method signature in the interface to accept the String.
-```java
-List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId);
-
-```
-#### Step 3: Update VoucherRequestServiceImpl.java
-Find your getPendingBatchesForChecker method and **replace it entirely** with this. This fixes the ghost requests (using NOT EXISTS) and the duplicate final screens (using SAFE_FINAL_APPROVAL).
-```java
-    @Override
-    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId) {
-        String sql = """
-            SELECT 
-                b.BATCH_ID, p.VID_FK AS VID, b.CREATOR_ID, b.REQ_DATE, b.BATCH_REMARKS, 
-                b.TOTAL_ROWS, p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME, w.WORKFLOW_ORDER,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, b.CREATOR_ID) AS CREATOR_NAME,
-                
-                -- ISSUE 2 FIX: Mathematically guarantee only the LAST step is 'Y'
-                CASE 
-                    WHEN w.IS_FINAL_APPROVAL = 'Y' AND w.WORKFLOW_ORDER = (
-                        SELECT MAX(wt.WORKFLOW_ORDER) 
-                        FROM WORKFLOW_TRANSITIONS wt 
-                        WHERE wt.WORKFLOW_CODE = w.WORKFLOW_CODE AND wt.ALLOWED_ROLE_ID IS NOT NULL
-                    ) THEN 'Y'
-                    ELSE 'N'
-                END AS SAFE_FINAL_APPROVAL
-                
-            FROM JOURNAL_BATCH_MASTER b
-            INNER JOIN VOUCHER_POSTING p ON b.BATCH_ID = p.BATCH_ID
-            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON b.CREATOR_ID = u.USER_ID
-            
-            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
-            
-            -- ISSUE 1 FIX: Prevent "Ghost" Requests by hiding batches this user already acted upon
-            AND NOT EXISTS (
-                SELECT 1 FROM VOUCHER_WORKFLOW vw 
-                WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
-            )
-            
-            ORDER BY b.REQ_DATE DESC
-        """;
-
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER")); 
-            map.put("isFinalApproval", rs.getString("SAFE_FINAL_APPROVAL")); // Mapped the safe flag
-            return map;
-        }, userRole, userId); // <-- Passed both parameters
-    }
-
-```
 ### Issue 3: UI Height Fluctuation
-**Why it happens:** In your code, you currently have <Box sx={{ maxHeight: '75vh' ...}}>. Because it says *max*Height, the modal shrinks itself to wrap whatever is inside it. When you click "Proceed", the content becomes smaller, so the modal collapses.
-**The Fix:** We must change maxHeight to a hardcoded height: '75vh' on the wrapper, and apply minHeight: 480px to the Paper card.
-**In your JournalAuthorization.jsx, FIND your <DialogContent> wrapper (around line 692) and REPLACE everything down to the Bottom Action bar with this exact block:**
-```javascript
-        {/* ADDED: height: '75vh' explicitly locks the modal size so it NEVER jumps */}
-        <DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc", height: '75vh', display: 'flex', flexDirection: 'column' }}>
 
-            {/* --- STATE 1: STANDARD DETAILS (Hidden if Final Approver is scheduling) --- */}
-            {/* ADDED: flexGrow: 1 and overflowY: auto so the inside scrolls, not the modal */}
-            <Box sx={{ display: isActionMode ? "none" : "flex", flexDirection: "column", flexGrow: 1, overflowY: "auto" }}>
+what ever u give in last changes from that only this issue 3 i change 
+i can see u are not understand how we can find out how is final approval 
+i will explain u 
 
-              {/* ---  HEADER CARDS --- */}
-              <Box sx={{ p: 4, backgroundColor: "white", borderBottom: "1px solid", borderColor: "divider" }}>
+as u know this table
+workflow transitions
+WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
+ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
+IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
+"	3	
+SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
+WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
+ESCALATION_TIME	NUMBER(10,0)	Yes		6	
+WORKFLOW_ORDER	NUMBER(3,0)	No		7	
+WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
 
-                {/* --- DYNAMIC DETAILS GRIDS --- */}
-                {isFetchingVid ? (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress size={24} /></Box>
-                ) : vidDetails && vidDetails.VID ? (
+voucher posting
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	
+VID_FK	VARCHAR2(20 BYTE)	No		2	
+CREATORS_ROLE	VARCHAR2(100 BYTE)	Yes		3	
+CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
+CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
+PENDING_AT	NUMBER	Yes		6	
+EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
+SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
+IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
+EXECUTED_AT	TIMESTAMP(6)	Yes		10	
+BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
 
-                  <Stack spacing={3} sx={{ width: '100%' }}>
+as we can see in the case of voucher pending we have column called as PENDING_AT	NUMBER	Yes		6	
+in this we are store the WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
+from the workflow transitions 
 
-                    {/* SECTION 1: VOUCHER DETAILS + EMBEDDED DESCRIPTION */}
-                    <Paper elevation={0} sx={{ p: 3, borderRadius: 2, width: '100%', border: "1px solid", borderColor: "divider", display: 'flex', flexDirection: 'column' }}>
-                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
-                        Voucher Request ID : {vidDetails.VID}
-                      </Typography>
+i will explain with real entry 
+0008435	VID-2605-00033	9001	7875730	05-06-26 06:34:19.103071000 PM	28	YES	26-06-26 09:02:00.000000000 AM	YES		S
+this is entry is in the voucher posting table 
+see pending at u can see 28 
+lets see in the workflow transition table 
+workflow_3		N	N	Execution	0	5	28
+this is entry as we can see is final approval is N so we can check like this 
+using joins
+we can check this perfectly i hope u undestand perfectly now 
 
-                      <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Voucher Description</Typography>
-                      <Box sx={{ maxHeight: 90, mb: "24px", overflowY: "auto", pr: 1 }}>
-                        <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-                          {vidDetails.DESCRIPTION || "No description provided."}
-                        </Typography>
-                      </Box>
 
-                      <Grid container spacing={3}>
-                        <Grid item xs={12} sm={4}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
-                          <Typography variant="body1" fontWeight="500">{vidDetails.CATEGORY_NAME}</Typography>
-                        </Grid>
-                        <Grid item xs={12} sm={4}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created By</Typography>
-                          <Stack direction="row" spacing={1} alignItems="center">
-                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
-                            <Typography variant="body1" fontWeight="500">
-                              {vidDetails.VID_CREATED_BY_NAME} <Typography component="span" variant="caption" color="text.secondary">({vidDetails.VID_CREATOR_ID})</Typography>
-                            </Typography>
-                          </Stack>
-                        </Grid>
-                        <Grid item xs={12} sm={4}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created At</Typography>
-                          <Typography variant="body1" fontWeight="500">
-                            {vidDetails.VID_CREATED_AT ? new Date(vidDetails.VID_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
-                          </Typography>
-                        </Grid>
-                      </Grid>
-                    </Paper>
-
-                    {/* SECTION 2: BATCH EXECUTION DETAILS + DOWNLOAD BUTTON */}
-                    <Paper elevation={0} sx={{ p: 3, borderRadius: 2, width: '100%', border: "1px solid", borderColor: "divider", display: 'flex', flexDirection: 'column' }}>
-                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
-                        Voucher Details
-                      </Typography>
-
-                      <Grid container spacing={3} alignItems="center">
-                        <Grid item xs={12} sm={3}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created By</Typography>
-                          <Stack direction="row" spacing={1} alignItems="center">
-                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
-                            <Typography variant="body1" fontWeight="500">
-                              {vidDetails.BATCH_CREATED_BY_NAME} <Typography component="span" variant="caption" color="text.secondary">({vidDetails.BATCH_CREATOR_ID})</Typography>
-                            </Typography>
-                          </Stack>
-                        </Grid>
-
-                        <Grid item xs={12} sm={2}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created At</Typography>
-                          <Typography variant="body1" fontWeight="500">
-                            {vidDetails.BATCH_CREATED_AT ? new Date(vidDetails.BATCH_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
-                          </Typography>
-                        </Grid>
-
-                        <Grid item xs={12} sm={2}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>No. of Entries</Typography>
-                          <Typography variant="body1" fontWeight="600" color="primary.main">
-                            {viewingBatch?.requestCount || 0} Records
-                          </Typography>
-                        </Grid>
-
-                        <Grid item xs={12} sm={3}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Is Execution Scheduled?</Typography>
-                          <Typography variant="body1" fontWeight="500" color={vidDetails.SCHEDULED_TIME ? "info.main" : "text.primary"}>
-                            {vidDetails.SCHEDULED_TIME ? `Yes (${new Date(vidDetails.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })})` : "No"}
-                          </Typography>
-                        </Grid>
-
-                        <Grid item xs={12} sm={2}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Download Voucher Batch</Typography>
-                          <Button
-                            variant="outlined"
-                            size="small"
-                            startIcon={<FileDownloadIcon />}
-                            onClick={handleDownloadExcel}
-                            disabled={!viewingBatchId}
-                            sx={{ borderColor: "#217346", color: "#217346", "&:hover": { backgroundColor: "#e8f5e9", borderColor: "#1e6b40" } }}
-                          >
-                            Download Batch
-                          </Button>
-                        </Grid>
-                      </Grid>
-                    </Paper>
-                  </Stack>
-                ) : null}
-              </Box>
-
-              {/* --- HORIZONTAL TIMELINE --- */}
-              <Box sx={{ p: 4, flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-                <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
-                  Workflow Progress
-                </Typography>
-                {viewingBatchState === "REJECTED" ? (
-                  <Alert severity="error" variant="filled" sx={{ mt: 2, fontWeight: "bold" }}>
-                    This batch was REJECTED and the workflow has been terminated.
-                  </Alert>
-                ) : isFetchingSteps ? (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
-                ) : dynamicSteps.length > 0 ? (
-                  <Stepper
-                    activeStep={
-                      (viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "C" || viewingBatchState === "S")
-                        ? dynamicSteps.length
-                        : (viewingBatchOrder - 1)
-                    }
-                    alternativeLabel
-                    connector={<BigConnector />}
-                  >
-                    {dynamicSteps.map((step, index) => {
-                      const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "C" || viewingBatchState === "S";
-                      const activeStepIndex = isFullyDone ? dynamicSteps.length : (viewingBatchOrder - 1);
-                      const isCompleted = index < activeStepIndex;
-                      const isCurrent = index === activeStepIndex;
-
-                      const escalationHours = viewingBatch?.escalationTime || 24;
-                      const hoursPending = viewingBatch ? Math.abs(new Date() - new Date(viewingBatch.requestDate)) / 36e5 : 0;
-                      const isEscalated = viewingBatchState !== "REJECTED" && (activeStepIndex < dynamicSteps.length) && (hoursPending > escalationHours);
-
-                      let statusFlag = 'PENDING';
-                      if (isCompleted) statusFlag = 'COMPLETED';
-                      if (isCurrent && viewingBatchState === "REJECTED") statusFlag = 'REJECTED';
-                      else if (isCurrent && isEscalated) statusFlag = 'ESCALATED';
-                      else if (isCurrent) statusFlag = 'ACTIVE';
-
-                      return (
-                        <Step key={step.state} completed={isCompleted} active={isCurrent} sx={{ opacity: (viewingBatchState === "REJECTED" && index > activeStepIndex) ? 0.3 : 1 }}>
-                          <StepLabel StepIconComponent={() => <BigWorkflowIcon statusFlag={statusFlag} label={step.designation} />}>
-                            <Chip
-                              label={getRoleDisplayName(step.role)}
-                              size="small"
-                              variant={isCurrent ? "filled" : "outlined"}
-                              color={isCurrent ? "primary" : "default"}
-                              sx={{ mt: 1, height: 22, fontSize: "0.65rem", fontWeight: "bold" }}
-                            />
-                            {isCurrent && viewingBatchState !== "REJECTED" && (
-                              <Typography variant="caption" display="block" color={isEscalated ? "warning.main" : "text.secondary"} fontWeight="bold" sx={{ mt: 1 }}>
-                                Pending: {calculateTimeElapsed(viewingBatch?.requestDate)}
-                              </Typography>
-                            )}
-                          </StepLabel>
-                        </Step>
-                      );
-                    })}
-                  </Stepper>
-                ) : (
-                  <Alert severity="info" sx={{ mt: 2 }}>Workflow configuration not found.</Alert>
-                )}
-              </Box>
-
-              {/* --- WORKFLOW HISTORY --- */}
-              <Box sx={{ p: 4, borderTop: "1px solid", borderColor: "divider" }}>
-                {isFetchingSteps ? (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}><CircularProgress size={24} /></Box>
-                ) : (
-                  <>
-                    <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
-                      Workflow History ({workflowHistory.length})
-                    </Typography>
-
-                    <Stack spacing={2.5}>
-                      {workflowHistory.map((history, idx) => {
-                        const userName = history.ACTION_USER_NAME || "User";
-                        const initial = userName.charAt(0).toUpperCase();
-                        const isOverrideAction = history.LAST_ACTION?.toUpperCase().includes("OVERRIDE");
-
-                        return (
-                          <Box key={idx} sx={{ display: 'flex', gap: 2 }}>
-                            <Box><Avatar sx={{ bgcolor: 'primary.main', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>{initial}</Avatar></Box>
-                            <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2.5, borderRadius: 2, border: "1px solid", borderColor: "#e2e8f0", boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)" }}>
-                              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
-                                <Typography variant="subtitle2" fontWeight="bold" color="text.primary">{userName}</Typography>
-                                <Typography variant="caption" color="text.secondary">• {new Date(history.LAST_ACTION_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</Typography>
-                              </Box>
-                              
-                              <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5, flexWrap: 'wrap', gap: 1 }}>
-                                <Chip label={history.LAST_ACTION || "System Action"} size="small" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: history.LAST_ACTION?.includes("Reject") ? "#fee2e2" : "#e0e7ff", color: history.LAST_ACTION?.includes("Reject") ? "#991b1b" : "#3730a3" }} />
-                                
-                                {history.SCHEDULED_TIME && (
-                                  <Chip 
-                                    label={isOverrideAction ? `🔄 Schedule Overridden to: ${new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}` : `⏰ Scheduled for: ${new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}`}
-                                    size="small"
-                                    color={isOverrideAction ? "warning" : "info"}
-                                    variant="outlined"
-                                    sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }}
-                                  />
-                                )}
-                              </Stack>
-                              
-                              <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{history.REMARKS || "No remarks provided."}</Typography>
-                            </Box>
-                          </Box>
-                        );
-                      })}
-                    </Stack>
-                  </>
-                )}
-              </Box>
-            </Box>
-
-            {/* --- STATE 2: UNIVERSAL ACTION SCREEN --- */}
-            {/* ADDED: flexGrow: 1 and overflowY: auto so it fills the 75vh box perfectly */}
-            {isActionMode && (
-              <Box sx={{ p: 5, flexGrow: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", animation: "fadeIn 0.3s ease-in-out", backgroundColor: "#f8fafc", overflowY: "auto" }}>
-
-                <Typography variant="h5" fontWeight="bold" gutterBottom>
-                  Process Workflow Action
-                </Typography>
-                <Typography variant="body1" color="text.secondary" textAlign="center" sx={{ mb: 4, maxWidth: 500 }}>
-                  You are reviewing Batch <strong>{viewingBatchId}</strong>. Please select your decision and provide remarks below.
-                </Typography>
-
-                {/* ADDED: minHeight: 480 prevents the card from collapsing when "Reject" hides the scheduling inputs */}
-                <Paper elevation={0} sx={{ p: 4, width: '100%', maxWidth: 650, minHeight: 480, border: "1px solid", borderColor: "divider", borderRadius: 3, backgroundColor: "white", boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)" }}>
-
-                  {/* 1. DECISION TOGGLE */}
-                  <Typography variant="subtitle2" fontWeight="bold" color="text.primary" gutterBottom>
-                    Decision
-                  </Typography>
-                  <ToggleButtonGroup
-                    value={actionSelection}
-                    exclusive
-                    onChange={(e, newVal) => { if (newVal) setActionSelection(newVal); }}
-                    fullWidth
-                    sx={{ mb: 4, height: 48 }}
-                  >
-                    <ToggleButton
-                      value="ACCEPTED"
-                      sx={{
-                        fontWeight: 'bold',
-                        color: actionSelection === 'ACCEPTED' ? 'white !important' : 'success.main',
-                        backgroundColor: actionSelection === 'ACCEPTED' ? 'success.main !important' : 'transparent',
-                        borderColor: 'success.main',
-                        '&:hover': { backgroundColor: actionSelection === 'ACCEPTED' ? 'success.dark !important' : '#e8f5e9' }
-                      }}
-                    >
-                      <CheckIcon sx={{ mr: 1, fontSize: 20 }} /> Accept
-                    </ToggleButton>
-                    <ToggleButton
-                      value="REJECTED"
-                      sx={{
-                        fontWeight: 'bold',
-                        color: actionSelection === 'REJECTED' ? 'white !important' : 'error.main',
-                        backgroundColor: actionSelection === 'REJECTED' ? 'error.main !important' : 'transparent',
-                        borderColor: 'error.main',
-                        '&:hover': { backgroundColor: actionSelection === 'REJECTED' ? 'error.dark !important' : '#ffebee' }
-                      }}
-                    >
-                      <CloseIcon sx={{ mr: 1, fontSize: 20 }} /> Reject
-                    </ToggleButton>
-                  </ToggleButtonGroup>
-
-                  {/* 2. REMARKS INPUT */}
-                  <Typography variant="subtitle2" fontWeight="bold" color="text.primary" gutterBottom>
-                    Action Remarks <Typography component="span" color="error">*</Typography>
-                  </Typography>
-                  <TextField
-                    fullWidth
-                    multiline
-                    rows={2}
-                    placeholder="Enter compulsory remarks here (2-30 chars)..."
-                    value={executorRemarks}
-                    onChange={(e) => handleRemarksChange(e, setExecutorRemarks)}
-                    disabled={isSubmitting}
-                    error={executorRemarks.length > 0 && !isRemarksValid(executorRemarks)}
-                    helperText={executorRemarks.length > 0 && !isRemarksValid(executorRemarks) ? "Remarks must be 2-30 alphanumeric characters." : " "}
-                    sx={{ mb: 2 }}
-                  />
-
-                  {/* 3. CONDITIONAL SCHEDULING (FINAL APPROVAL ONLY) */}
-                  {viewingBatch?.isFinalApproval === 'Y' && (
-                    <Box sx={{ mt: 2, pt: 3, borderTop: "1px solid", borderColor: "divider" }}>
-                      <Typography variant="subtitle2" fontWeight="bold" color="text.primary" gutterBottom>
-                        Final Execution Routing
-                      </Typography>
-
-                      {actionSelection === 'REJECTED' ? (
-                        <Alert severity="info" sx={{ mt: 1, py: 0 }}>
-                          Execution scheduling is not applicable for Rejected batches.
-                        </Alert>
-                      ) : (
-                        <Box sx={{ mt: 2 }}>
-                          <Box sx={{ p: 2, mb: 3, backgroundColor: "#f8fafc", borderRadius: 2, borderLeft: "4px solid", borderColor: "primary.main" }}>
-                            <Typography variant="caption" color="text.secondary" fontWeight="bold" display="block">
-                              REQUESTED BY CREATOR ({vidDetails?.BATCH_CREATED_BY_NAME})
-                            </Typography>
-                            <Typography variant="body2" fontWeight="bold" color={vidDetails?.SCHEDULED_TIME ? "primary.main" : "text.primary"}>
-                              {vidDetails?.SCHEDULED_TIME
-                                ? `Scheduled for: ${new Date(vidDetails.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "long", timeStyle: "short" })}`
-                                : "Immediate Execution"}
-                            </Typography>
-                          </Box>
-
-                          <Stack spacing={2}>
-                            <Box onClick={() => setScheduleOverrideType("KEEP")} sx={{ p: 2, borderRadius: 2, border: "2px solid", borderColor: scheduleOverrideType === "KEEP" ? "success.main" : "divider", backgroundColor: scheduleOverrideType === "KEEP" ? "#f0fdf4" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", gap: 2, transition: '0.2s' }}>
-                              <Box sx={{ width: 18, height: 18, borderRadius: "50%", border: "5px solid", borderColor: scheduleOverrideType === "KEEP" ? "success.main" : "divider", backgroundColor: "white" }} />
-                              <Box>
-                                <Typography variant="subtitle2" fontWeight="bold">Keep Original Routing</Typography>
-                              </Box>
-                            </Box>
-                            <Box onClick={() => setScheduleOverrideType("OVERRIDE")} sx={{ p: 2, borderRadius: 2, border: "2px solid", borderColor: scheduleOverrideType === "OVERRIDE" ? "warning.main" : "divider", backgroundColor: scheduleOverrideType === "OVERRIDE" ? "#fffbeb" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", gap: 2, transition: '0.2s' }}>
-                              <Box sx={{ width: 18, height: 18, borderRadius: "50%", border: "5px solid", borderColor: scheduleOverrideType === "OVERRIDE" ? "warning.main" : "divider", backgroundColor: "white" }} />
-                              <Box>
-                                <Typography variant="subtitle2" fontWeight="bold">Override Schedule</Typography>
-                              </Box>
-                            </Box>
-                          </Stack>
-
-                          {scheduleOverrideType === "OVERRIDE" && (
-                            <Box sx={{ mt: 3, animation: "fadeIn 0.2s ease-in-out" }}>
-                              <TextField fullWidth size="small" label="New Execution Date & Time" type="datetime-local" value={finalScheduleTime} onChange={(e) => setFinalScheduleTime(e.target.value)} InputLabelProps={{ shrink: true }} inputProps={{ min: new Date().toISOString().slice(0, 16) }} required />
-                            </Box>
-                          )}
-                        </Box>
-                      )}
-                    </Box>
-                  )}
-                </Paper>
-              </Box>
-            )}
-
-          </DialogContent>
-
-```
+this is just example i want everything should dynamic
