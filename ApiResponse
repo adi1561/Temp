@@ -1,102 +1,36 @@
-    @Override
-    @Async("bulkExecutor")
-    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole, LocalDateTime scheduledTime, String vid) {
+ @Override
+    @Transactional
+    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, LocalDateTime scheduledTime, String vid) {
         String lockKey = "LOCK_REQ_" + requestId;
-        MDC.put("batchId", batchId);
-        MDC.put("user", creatorId);
-
-        Map<String, String> contextMap = MDC.getCopyOfContextMap();
-        AtomicInteger successfulRowsCount = new AtomicInteger(0);
-
-        log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
-        long start = System.currentTimeMillis();
+        Boolean acquired;
 
         try {
-            // 2. IDEMPOTENCY
-            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-            jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
+            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
 
-            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+        } catch (DataAccessException e) {
+            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", requestId);
+            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
+        }
 
-            List<VoucherBulkValidationService.ExcelRowData> cachedRows = voucherBulkValidationService.getValidRowsFromCache(requestId);
-            if (cachedRows == null || cachedRows.isEmpty()) {
-                log.error("CACHE_MISS | Batch: {} | Status: No valid rows found", batchId);
-                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
-                return;
-            }
+        if (Boolean.FALSE.equals(acquired)) {
+            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", requestId);
+            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
+        }
 
-            int totalRows = cachedRows.size();
-            int batchSize = 5000;
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            AtomicReference<BigDecimal> totalDebit = new AtomicReference<>(BigDecimal.ZERO);
-            AtomicReference<BigDecimal> totalCredit = new AtomicReference<>(BigDecimal.ZERO);
-            AtomicInteger completedChunks = new AtomicInteger(0);
-            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+        try {
+            String batchId = sequenceService.getNextBatchId(); // e.g., 0002356
+            String journalPrefix = sequenceService.getNextJournalIdPrefix(); // e.g., 0004977
 
-            // 3. PARALLEL CHUNKING
-            for (int i = 0; i < totalRows; i += batchSize) {
-                final int startIdx = i;
-                final int endIdx = Math.min(i + batchSize, totalRows);
-                final List<VoucherBulkValidationService.ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
+            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
 
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                            if (contextMap != null) MDC.setContextMap(contextMap);
-                            try {
-                                self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
-                                successfulRowsCount.addAndGet(chunk.size());
-                            } finally {
-                                MDC.clear();
-                            }
-                        }, chunkWorkerExecutor)
-                        .thenRun(() -> {
-                            int done = completedChunks.incrementAndGet();
-                            int percent = 5 + (done * 90 / totalChunks);
-                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING", String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
-                        });
-                futures.add(future);
-            }
+            // Pass BOTH down!
+            self.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole);
 
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
-
-            // 6. INTEGRITY & FINAL RECORD
-            int actualCommittedRows = successfulRowsCount.get();
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            jdbcTemplate.update("INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
-                                batchId, creatorId, ts, commonRemarks, actualCommittedRows, totalDebit.get(), totalCredit.get(), "P");
-
-            // =================================================================
-            // INTEGRATED WORKFLOW INITIALIZATION
-            // =================================================================
-            String workflowCode = jdbcTemplate.queryForObject("SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY", String.class, creatorRole);
-            Long firstApproverWorkflowId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2", Long.class, workflowCode);
-
-            VoucherPosting posting = new VoucherPosting();
-            posting.setBatchId(batchId);
-            posting.setVidFk(vid);
-            posting.setCreatedBy(creatorId);
-            posting.setCreatorsRole(String.valueOf(creatorRole));
-            posting.setPendingAt(firstApproverWorkflowId);
-            posting.setBatchStatus("P");
-            posting.setExecutionScheduled(scheduledTime != null ? "YES" : "NO");
-            posting.setScheduledTime(scheduledTime);
-            posting.setIsScheduleOverride("NO");
-            voucherPostingRepository.save(posting);
-
-            if (vid != null && !vid.isEmpty()) updateVidStatus(vid, VoucherStatus.USED);
-            logWorkflowAction(batchId, vid, "Submitted", creatorId, commonRemarks, scheduledTime);
-            // =================================================================
-
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-            sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
-
-            log.info("BATCH_CREATION_FINISHED | Batch: {} | Rows: {}", batchId, actualCommittedRows);
-
-        } catch (Exception e) {
-            log.error("BATCH_FATAL_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
-            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred.");
-        } finally {
-            // Clean up Redis...
+            return batchId;
+        }
+        catch (DataAccessException e) {
             redisTemplate.delete(lockKey);
-            MDC.clear();
+            log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
+            throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
         }
     }
