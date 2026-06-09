@@ -1,0 +1,87 @@
+This bulk flow is the real beast of the application. Because it has to process files with potentially hundreds of thousands of rows without crashing the JVM, it is heavily asynchronous, relies deeply on Redis for temporary state/storage, and uses thread pools to parallelize work.
+
+Here is the step-by-step chronological flow of exactly how a bulk Excel upload goes from a file on the user's computer to the Oracle Database and HDFS Data Lake.
+
+---
+
+### Phase 1: Upload & Validation (The "Maker" Uploads)
+
+**1. The Entry Point: Uploading the File**
+
+* **API Endpoint:** `POST /api/voucher/bulk-validate-init`
+* **Controller:** `VoucherPostingController`
+* **Method:** `initiateValidation()`
+* **Responsibility:** It receives the Multipart Excel file. It strictly checks the file extension, saves the file to a temporary disk path, generates a unique `requestId`, creates an initial status object in Redis (`PROCESSING`), and instantly fires off a background thread (`processAsync`). It returns the `requestId` to the frontend so the UI can start polling for progress.
+
+**2. The Validation Engine (Background Thread)**
+
+* **Service:** `VoucherBulkValidationService`
+* **Method:** `processAsync()` (running on `bulkExecutor` thread pool)
+* **Responsibility:** This is where the heavy validation happens.
+* **Parsing:** It streams the Excel file using Apache POI (`parseExcelStream`). Streaming prevents loading a 50MB file directly into RAM.
+* **Stage 1 (Format):** `runFormatCheck()` uses parallel streams to check regex patterns, ensure amounts are positive, and verify lengths (e.g., CGL is 10 digits).
+* **Stage 2 (Database):** `runDbCheck()` compares branches, currencies, and CGLs against in-memory HashSets loaded by the `ValidationMasterService` to ensure the master data is active.
+* **Stage 3 (Balance):** `runBalanceCheck()` uses thread-safe math (`AtomicReference<BigDecimal>`) to ensure that Debits and Credits match perfectly for every branch in the file.
+
+
+
+**3. State Caching (Success or Failure)**
+
+* **Failure Path:** If any stage fails, it stops, generates an Error Excel file highlighting the bad cells (`generateErrorExcelFast`), saves that file to Redis, and updates the status to `ERROR`.
+* **Success Path:** If validation passes, it takes the valid rows, **compresses them into 5,000-row chunks using GZIP**, and stores them in Redis (`saveRowsToRedis`). It updates the status to `SUCCESS` and provides a tiny JSON preview for the frontend.
+
+---
+
+### Phase 2: Committing the Batch (The "Maker" Submits)
+
+Once the file is perfectly validated and sitting in Redis, the Maker clicks "Submit".
+
+**1. The Trigger**
+
+* **API Endpoint:** `POST /api/voucher/create-batch-from-cache`
+* **Method:** `createBatchFromCacheAsync()` (`VoucherRequestServiceImpl`)
+* **Responsibility:** This method uses a Redis Lock (`setIfAbsent`) to prevent double-clicks. It fetches the sequence IDs (`BATCH_ID`, `JRNL_ID`), calculates the workflow routing (who approves it), locks the `VID` so nobody else can use it, and creates the parent `VOUCHER_POSTING` record in Oracle with a status of `P` (Pending). It then hands off the actual data insertion to a background thread.
+
+**2. Raw Data Insertion (Background Thread)**
+
+* **Method:** `executeAsyncBatchCreation()` and `processChunkRaw()`
+* **Responsibility:** It pulls the GZIP compressed chunks back out of Redis. It submits these chunks to a massive worker pool (`chunkWorkerExecutor`).
+* **The Big Optimization:** It bypasses Hibernate entirely. It uses `jdbcTemplate.batchUpdate()` to execute native `INSERT INTO VOUCHER_POSTING_DATA` queries in massive blocks.
+* **Notification:** Once all chunks are written, `progressService` blasts a 100% completion message over WebSockets/Redis to the UI, and a notification is sent to the Maker.
+
+---
+
+### Phase 3: Approval & Execution (The "Checker" Approves)
+
+Now the batch is sitting in Oracle, waiting in the Checker's queue.
+
+**1. The Approval Trigger**
+
+* **API Endpoint:** `POST /api/voucher/process-bulk`
+* **Method:** `processBulkRequestsAsync()` (`VoucherRequestServiceImpl`)
+* **Responsibility:** The Checker clicks "Approve". The service instantly issues a pessimistic SQL lock: `UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'A' WHERE BATCH_ID = ? AND BATCH_STATUS = 'P'`. If it gets the lock, it sends the task to the background.
+
+**2. The Database Execution**
+
+* **Method:** `executeApprovalInTransaction()`
+* **Responsibility:** It checks to ensure the Maker isn't trying to approve their own batch (Security Violation). Then, it calls an **Oracle PL/SQL Procedure:** `{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}`.
+* *Why PL/SQL?* Because applying 100,000 journal entries to a live GL balance table requires locking rows. Doing this inside the database engine is exponentially faster and safer than moving the data back and forth to the Java application.
+
+
+
+**3. The Data Lake Sync**
+
+* **Service:** `HdfsSyncService`
+* **Method:** `syncToDataLake()`
+* **Responsibility:** The Oracle PL/SQL procedure returns a list of the newly updated GL Balances (`HdfsSyncDto`). The application immediately takes those balances and executes a native `MERGE INTO` (Upsert) against the downstream Hive/Delta Lake via `hiveJdbcTemplate`.
+* *(If HDFS fails, it writes the batch to `HDFS_SYNC_RETRY_QUEUE` where the `HdfsRecoveryService` scheduled cron job will try again later).*
+
+**4. Finalization**
+
+* The parent `VOUCHER_POSTING` record is marked as Executed/Approved, the `VID` is marked as `COMPLETED`, and final notifications are broadcast.
+
+---
+
+This architecture is built entirely around minimizing Java Heap usage (Streaming, Redis GZIP caching) and minimizing database network bottlenecks (PL/SQL, JDBC batching).
+
+Are you looking to trace a specific production bug within this flow, or should we look at the scheduled execution layer next?
