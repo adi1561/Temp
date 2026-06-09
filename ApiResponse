@@ -1,27 +1,57 @@
-2026-06-09T11:17:06.746+05:30  WARN 40180 --- [VoucherService] [   scheduling-1] c.f.V.Service.VoucherRequestServiceImpl  : APPROVAL_LOCK_FAIL | Batch: 0008472 | Status: Already processing or not Pending
-2026-06-09T11:17:06.746+05:30 ERROR 40180 --- [VoucherService] [   scheduling-1] c.f.V.Service.VoucherExecutionScheduler  : SCHEDULER_FAIL | Batch: 0008472 | Error: Batch is already being processed or is not in Pending status.
-2026-06-09T11:17:06.775+05:30 ERROR 40180 --- [VoucherService] [   scheduling-1] o.s.s.s.TaskUtils$LoggingErrorHandler    : Unexpected error occurred in scheduled task
+Ah, I see exactly what happened here! We tightened the security locks a bit *too* much in our last update.
+When we streamlined the statuses, we changed the locking query in processBulkRequestsAsync to only accept batches with BATCH_STATUS = 'P'.
+However, your VoucherExecutionScheduler picks up batches that were scheduled for the future. Those batches have a status of **'S'** (Scheduled), not 'P'.
+When the scheduler calls processBulkRequestsAsync, the SQL query looks for 'P', finds nothing, updates 0 rows, and throws the IllegalStateException. Because Spring @Transactional is active, throwing that exception marks the entire transaction as "Rollback Only", which causes the scheduler to crash with that UnexpectedRollbackException.
+Here is how to fix this immediately.
+### 1. Fix the Lock Query (VoucherRequestServiceImpl.java)
+We need to allow the execution engine to grab batches that are either 'P' (immediate execution after checker approval) OR 'S' (picked up by the scheduler).
+**Update your processBulkRequestsAsync method to include 'S' in the IN clause:**
+```java
+    @Override
+    @Transactional
+    public void processBulkRequestsAsync(BulkProcessVoucherPostingDto dto, String executorId, Integer executorRole) {
+        // ✨ FIX: Allow the engine to lock both 'P' (Pending) and 'S' (Scheduled) batches
+        String lockSql = "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS IN ('P', 'S')";
+        int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
 
-org.springframework.transaction.UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only
-	at org.springframework.transaction.support.AbstractPlatformTransactionManager.processCommit(AbstractPlatformTransactionManager.java:804) ~[spring-tx-6.1.8.jar:6.1.8]
-	at org.springframework.transaction.support.AbstractPlatformTransactionManager.commit(AbstractPlatformTransactionManager.java:758) ~[spring-tx-6.1.8.jar:6.1.8]
-	at org.springframework.transaction.interceptor.TransactionAspectSupport.commitTransactionAfterReturning(TransactionAspectSupport.java:676) ~[spring-tx-6.1.8.jar:6.1.8]
-	at org.springframework.transaction.interceptor.TransactionAspectSupport.invokeWithinTransaction(TransactionAspectSupport.java:426) ~[spring-tx-6.1.8.jar:6.1.8]
-	at org.springframework.transaction.interceptor.TransactionInterceptor.invoke(TransactionInterceptor.java:119) ~[spring-tx-6.1.8.jar:6.1.8]
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184) ~[spring-aop-6.1.8.jar:6.1.8]
-	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768) ~[spring-aop-6.1.8.jar:6.1.8]
-	at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:720) ~[spring-aop-6.1.8.jar:6.1.8]
-	at com.fincore.VoucherService.Service.VoucherExecutionScheduler$$SpringCGLIB$$0.executeScheduledBatches(<generated>) ~[classes/:na]
-	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103) ~[na:na]
-	at java.base/java.lang.reflect.Method.invoke(Method.java:580) ~[na:na]
-	at org.springframework.scheduling.support.ScheduledMethodRunnable.runInternal(ScheduledMethodRunnable.java:130) ~[spring-context-6.1.8.jar:6.1.8]
-	at org.springframework.scheduling.support.ScheduledMethodRunnable.lambda$run$2(ScheduledMethodRunnable.java:124) ~[spring-context-6.1.8.jar:6.1.8]
-	at io.micrometer.observation.Observation.observe(Observation.java:499) ~[micrometer-observation-1.13.0.jar:1.13.0]
-	at org.springframework.scheduling.support.ScheduledMethodRunnable.run(ScheduledMethodRunnable.java:124) ~[spring-context-6.1.8.jar:6.1.8]
-	at org.springframework.scheduling.support.DelegatingErrorHandlingRunnable.run(DelegatingErrorHandlingRunnable.java:54) ~[spring-context-6.1.8.jar:6.1.8]
-	at java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:572) ~[na:na]
-	at java.base/java.util.concurrent.FutureTask.runAndReset(FutureTask.java:358) ~[na:na]
-	at java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:305) ~[na:na]
-	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144) ~[na:na]
-	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642) ~[na:na]
-	at java.base/java.lang.Thread.run(Thread.java:1570) ~[na:na]
+        if (updated == 0) {
+            log.warn("APPROVAL_LOCK_FAIL | Batch: {} | Status: Already processing or invalid status", dto.getBatchId());
+            throw new IllegalStateException("Batch is already being processed or is not in a valid state for execution.");
+        }
+
+        progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
+        self.executeAsyncBatchProcessing(dto, executorId);
+    }
+
+```
+### 2. Fix the Scheduler Transaction (VoucherExecutionScheduler.java)
+The UnexpectedRollbackException happens because your executeScheduledBatches method (or the loop inside it) is likely marked with @Transactional.
+In Spring, if you have a loop processing multiple batches, and **one** batch throws an exception, Spring marks the *entire* overarching transaction as tainted (rollback-only). When the loop finishes, Spring tries to commit, realizes it's tainted, and throws the error you saw.
+**To fix this, ensure your Scheduler method is NOT @Transactional:**
+```java
+    // ✨ FIX: Remove @Transactional from this method if it exists!
+    // @Scheduled(cron = "...")
+    public void executeScheduledBatches() {
+        // Find scheduled batches...
+        List<String> scheduledBatchIds = jdbcTemplate.queryForList(
+            "SELECT BATCH_ID FROM VOUCHER_POSTING WHERE BATCH_STATUS = 'S' AND SCHEDULED_TIME <= SYSTIMESTAMP", 
+            String.class
+        );
+
+        for (String batchId : scheduledBatchIds) {
+            try {
+                BulkProcessVoucherPostingDto dto = new BulkProcessVoucherPostingDto();
+                dto.setBatchId(batchId);
+                dto.setStatus(RequestStatus.ACCEPTED); 
+                
+                // The transaction starts and stops cleanly inside this service call
+                voucherRequestService.processBulkRequestsAsync(dto, "SYSTEM", 9001); 
+            } catch (Exception e) {
+                log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+                // The loop continues to the next batch even if this one fails!
+            }
+        }
+    }
+
+```
+By adding 'S' back to the allowed locking statuses and letting the Service class handle the transactions (rather than the Scheduler class), your scheduled jobs will run perfectly without rolling each other back!
