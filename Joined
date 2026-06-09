@@ -1,1 +1,260 @@
-https://www.codingshuttle.com/blogs/top-10-spring-boot-projects-to-destroy-the-competition/?srsltid=AfmBOopArXFbBt5Nl0PWTlI02RVEN7R9BeVwuLad27fZE0kwcFHBYWKc
+
+
+**File:** `Service/VoucherBulkValidationService.java`
+
+* **Remove:** `parseCsvStream()` — Delete this entire method.
+* **Remove:** `generateSuccessCsv()` — Delete this entire method.
+* **Refactor:** `initiateValidation()` — Remove the `.csv` and `.txt` extensions from the allowed file types check.
+
+public String initiateValidation(InputStream fileStream, String filename, LocalDate postingDate ) throws IOException {
+
+        String reqId = UUID.randomUUID().toString();
+        // Removed .csv and .txt checks. Strictly enforcing Excel formats.
+        if (filename == null || (!filename.toLowerCase().endsWith(".xlsx") && !filename.toLowerCase().endsWith(".xls"))) {
+            log.error("UPLOAD_SECURITY_DENIED | Status: Invalid file extension");
+            throw new CustomExceptions.FileProcessingException("Unsupported file type. Only Excel files are allowed.");
+        }
+
+        String requestId = UUID.randomUUID().toString();
+        Path tempFile = Files.createTempFile("UPLOAD_" + requestId + "_", ".tmp");
+
+        try {
+            Files.copy(fileStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            log.error("TEMP_FILE_CREATE_FAIL | ReqID: {} | Status: Disk IO failure", requestId);
+            throw new CustomExceptions.FileProcessingException("Failed to secure uploaded file on disk.");
+        }
+
+        BulkUploadStateDto state = new BulkUploadStateDto();
+        state.setRequestId(requestId);
+        state.setStatus("PROCESSING");
+        state.setCurrentStage(1);
+        state.setMessage("Initializing Upload...");
+        state.setTotalRows(0);
+        saveStatusToRedis(requestId, state);
+
+        log.info("VALIDATION_INIT | ReqID: {} | Status: Temporary storage allocated", requestId);
+        self.processAsync(requestId, tempFile.toString(), filename, postingDate);
+        return requestId;
+    }
+
+
+
+
+
+
+* **Refactor:** `processAsync()` — Remove the `isCsv` boolean flag. Delete the ternary operator `parsingResult = isCsv ? parseCsvStream(...) : parseExcelStream(...)` and just directly call `parseExcelStream(is, postingDate)`.
+
+
+@Async("bulkExecutor")
+    public void processAsync(String requestId, String tempFilePath, String filename, LocalDate postingDate) {
+        MDC.put("requestId", requestId);
+        long startTime = System.currentTimeMillis();
+        File tempFile = new File(tempFilePath);
+
+        try {
+            updateState(requestId, s -> s.setMessage("Parsing File..."));
+            ParsingResult parsingResult;
+            
+            try (InputStream is = new FileInputStream(tempFile)) {
+                // Directly parse as Excel
+                parsingResult = parseExcelStream(is, postingDate);
+            }
+
+            List<ExcelRowData> parsedRows = parsingResult.rows;
+            if (parsedRows == null || parsedRows.isEmpty()) {
+                throw new CustomExceptions.InvalidDataException("File data is empty. No transaction rows found.");
+            }
+
+            updateState(requestId, s -> {
+                s.setTotalRows(parsedRows.size());
+                s.setMessage("Validating Formats...");
+            });
+
+            // STAGE 1: FORMAT CHECK (Preserved Logic)
+            runFormatCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                failRequest(requestId, parsedRows, "Format Validation Failed", 1, parsingResult.hasProductColumn);
+                return;
+            }
+
+            // STAGE 2: DATABASE CHECK (Preserved Logic)
+            updateState(requestId, s -> {
+                s.setCurrentStage(2);
+                s.setMessage("Checking Database...");
+            });
+            runDbCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                failRequest(requestId, parsedRows, "Database Validation Failed", 2, parsingResult.hasProductColumn);
+                return;
+            }
+
+            // STAGE 3: BALANCE CHECK (Preserved Logic)
+            updateState(requestId, s -> {
+                s.setCurrentStage(3);
+                s.setMessage("Checking Balances...");
+            });
+            runBalanceCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3, parsingResult.hasProductColumn);
+                return;
+            }
+
+            log.info("VALIDATION_SUCCESS | ReqID: {} | Duration: {}ms", requestId, (System.currentTimeMillis() - startTime));
+            
+            // Removed isCsv flag from the method call
+            completeRequest(requestId, parsedRows, postingDate, parsingResult.hasProductColumn);
+
+        }
+        // --- ALL ORIGINAL CATCH BLOCKS RESTORED EXACTLY ---
+        catch (CustomExceptions.InvalidDataException e) {
+            log.warn("EMPTY_DATA_REJECTED | ReqID: {} | Reason: {}", requestId, e.getMessage());
+            handleAsyncCrash(requestId, e.getMessage());
+        }
+        catch (FileNotFoundException e) {
+            handleAsyncCrash(requestId, "System Error: File not found in temporary storage.");
+        } catch (IOException e) {
+            handleAsyncCrash(requestId, "System Error: Failed to read file content.");
+        } catch (DateTimeParseException e) {
+            log.error("DATE_PARSING_FAIL | ReqID: {} | Status: Invalid row date format", requestId);
+            handleAsyncCrash(requestId, "Validation Failed: Incorrect date format detected in rows.");
+        } catch (NumberFormatException e) {
+            log.error("AMOUNT_PARSING_FAIL | ReqID: {} | Status: Numeric format error", requestId);
+            handleAsyncCrash(requestId, "Validation Failed: Non-numeric values found in amount column.");
+        } catch (DataAccessException e) {
+            log.error("REDIS_OR_DB_UNAVAILABLE | ReqID: {} | Status: Backend connection failure", requestId);
+            handleAsyncCrash(requestId, "System temporarily unavailable. Please try again later.");
+        } catch (NullPointerException | ArrayIndexOutOfBoundsException e) {
+            log.error("INTERNAL_LOGIC_ERROR | ReqID: {} | Type: {}", requestId, e.getClass().getSimpleName());
+            handleAsyncCrash(requestId, "Internal system failure during processing.");
+        }
+        catch (Throwable t) {
+            log.error("FATAL_SYSTEM_ERROR | ReqID: {} | Type: {}", requestId, t.getClass().getSimpleName(), t);
+            handleAsyncCrash(requestId, "A critical system error occurred during processing.");
+        }
+        finally {
+            if (tempFile.exists() && !tempFile.delete()) {
+                log.warn("CLEANUP_WARN | Path: {} | Status: Temp file purge failed", tempFilePath);
+            }
+            MDC.clear();
+        }
+    }
+
+
+
+
+
+* **Refactor:** `completeRequest()` — Remove the `isCsv` parameter. Delete the `if (!isCsv)` check and the call to `generateSuccessCsv()`, as well as the Redis caching for the success file if it's no longer needed for Excel.
+
+
+private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean hasProductColumn) throws IOException {
+        saveRowsToRedis(reqId, rows);
+        
+        // Removed success CSV generation and Redis caching completely
+
+        List<Map<String, Object>> preview = rows.stream().limit(2000).map(this::mapToPreview).collect(Collectors.toList());
+        
+        updateState(reqId, s -> {
+            s.setCurrentStage(4);
+            s.setStatus("SUCCESS");
+            s.setMessage("Validation Successful");
+            s.setHasSuccessFile(false); // No longer generating success files
+            s.setHasProductColumn(hasProductColumn);
+            try {
+                s.setPreviewDataJson(objectMapper.writeValueAsString(preview));
+            } catch (JsonProcessingException ignored) {}
+        });
+    }
+
+
+
+
+
+### 2. Dropping Dead & Unimplemented APIs
+
+Several endpoints are either entirely commented out or have service implementations that literally return empty arrays or `Optional.empty()`. These are useless.
+
+**File:** `Controllers/VoucherPostingController.java`
+
+* **Remove Endpoints:**
+* `@GetMapping("/my-requests")`
+* `@PatchMapping("/update-request")`
+* `@GetMapping("/status")`
+* Delete the commented-out `// @GetMapping("/pending-requests-summary")` (the one without arguments).
+* Delete the commented-out `// @GetMapping("/all-requests-summary")`.
+
+
+
+**File:** `Service/VoucherRequestServiceImpl.java` & `Service/VoucherRequestService.java`
+
+* **Remove Methods (they currently do nothing):**
+* `getMyRequests()` (returns `new ArrayList<>()`)
+* `getJournalRequestStatusList()` (returns `new ArrayList<>()`)
+* `updateRequestStatus()` (returns `Optional.empty()`)
+* `getPendingBatchSummaries()` (the overloaded version that takes NO arguments—it queries the dead `JOURNAL_BATCH_MASTER` table).
+
+
+
+### 3. Eradicating Old Table References
+
+Because you renamed `JOURNAL_REQUEST` to `VOUCHER_POSTING_DATA` and dropped `JOURNAL_BATCH_MASTER` entirely, several native SQL queries will instantly crash the app in production.
+
+**File:** `Repository/JournalRequestRepository.java`
+
+* **Delete Method:** `findPendingBatchSummariesNative()` — It explicitly queries `FROM JOURNAL_REQUEST` and groups by `BATCH_ID`. You already have a replacement for this in the service (`getPendingBatchSummaries(Integer userRole)`).
+* **Delete Method:** `findAllBatchSummariesNative()` — It queries `FROM JOURNAL_REQUEST`. You already have `getAllRequestsSummary()` in the service layer using `VOUCHER_POSTING`.
+* **Refactor:** `deleteBatchNative()` — It tries to `DELETE FROM JOURNAL_REQUEST`. This needs to be updated to `VOUCHER_POSTING_DATA`.
+
+**File:** `Service/VoucherRequestServiceImpl.java`
+
+* **Refactor:** In the `executeAsyncBatchCancellation()` method, the `catch` block tries to revert a failure by executing:
+
+
+@Override
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCancellation(String batchId, String userId) {
+        MDC.put("batchId", batchId);
+        MDC.put("user", userId);
+        long start = System.currentTimeMillis();
+
+        try {
+            progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Data Rows...");
+            
+            // EXACT SAME LOGIC: Calls the Oracle PL/SQL procedure to handle massive deletes safely
+            jdbcTemplate.execute("{call PURGE_JOURNAL_BATCH(?, ?)}", (CallableStatementCallback<Object>) cs -> {
+                cs.setString(1, batchId);
+                cs.setString(2, userId);
+                cs.execute();
+                return null;
+            });
+            
+            logAudit(userId, "CANCEL_SUCCESS", "DELETE", "Purged Batch " + batchId);
+            progressService.sendProgress(batchId, userId, 100, "COMPLETED", "Batch Deleted");
+            sendNotification(userId, null, "Batch " + batchId + " deleted successfully.", batchId);
+            
+            log.info("BATCH_PURGE_COMPLETE | Batch: {} | Duration: {}ms", batchId, System.currentTimeMillis() - start);
+            
+        } catch (DataAccessException e) {
+            log.error("PURGE_DB_ERROR | Batch: {} | Status: SQL operation failed", batchId);
+            
+            // CRITICAL FIX: Updated table from JOURNAL_BATCH_MASTER to VOUCHER_POSTING.
+            // Keeping the status revert logic exactly as it was designed.
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', EXECUTOR_REMARKS = NULL WHERE BATCH_ID = ?", batchId);
+            
+            progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: System error");
+        } finally {
+            MDC.clear();
+        }
+    }
+
+
+* `UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'PENDING'...`
+* *Fix:* Change `JOURNAL_BATCH_MASTER` to `VOUCHER_POSTING` so the rollback doesn't crash.
+
+
+
+---
+
+Once you rip these pieces out, the `VoucherRequestServiceImpl` will shrink significantly, and the core flow (Upload -> Parse -> Approve -> Execute) will be much easier to trace.
+
+Before we dive into the core logic of the Async approval flow or the validation engine to track down your production issue, what do you want to do with the manual batch creation (`createBatchRequest`)? It still uses the old `JournalRequest` mapping, so we either need to update it to use `VoucherPostingData` or delete it if manual entry is also a dead use case.
