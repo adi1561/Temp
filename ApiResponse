@@ -1,108 +1,17 @@
-You hit the nail on the head. This is a classic race condition caused by asynchronous threading.
-When the user clicks "Submit" for a bulk upload, your backend spins up a background thread to build the batch and instantly returns the batchId to React so the UI doesn't freeze. However, React is so fast that by the time the user clicks "Confirm Schedule" on the success screen, the background thread is still inserting the 10,000 line items and hasn't gotten around to creating the VOUCHER_POSTING master record yet!
-Your intuition is exactly right: we need to create the master VOUCHER_POSTING record *synchronously* before returning the batchId to the frontend. Then, the background thread can take its time inserting the child rows into VOUCHER_POSTING_DATA.
-Here is how to split the logic to perfectly fix this issue.
-### 1. Make Master Record Creation Synchronous
-Find your createBatchFromCacheAsync method in VoucherRequestServiceImpl.java and replace it with this. This grabs the row count from Redis instantly, saves the master record, and *then* fires the background thread.
-```java
-    @Override
-    @Transactional
-    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid) {
-        String lockKey = "LOCK_REQ_" + requestId;
-        Boolean acquired;
+2026-06-09T14:49:00.952+05:30  INFO 41920 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.SequenceService            : SEQUENCE_GENERATED | Type: BATCH_ID | Value: 0008480
+2026-06-09T14:49:00.976+05:30  INFO 41920 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.SequenceService            : SEQUENCE_GENERATED | Type: JRNL_ID | Value: 0005177
+2026-06-09T14:49:01.067+05:30 ERROR 41920 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.VoucherRequestServiceImpl  : SEQUENCE_GEN_FAIL | ReqID: 8670f66f-99ef-418c-924f-b9e7a148e395 | Status: Failed to generate sequence
+2026-06-09T14:49:01.090+05:30 ERROR 41920 --- [VoucherService] [io-9999-exec-10] c.f.V.Exception.GlobalExceptionHandler   : DB_INTEGRITY_VIOLATION | Path: /api/voucher/create-batch-from-cache | Type: Constraint violation
 
-        try {
-            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
-        } catch (DataAccessException e) {
-            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
-        }
 
-        if (Boolean.FALSE.equals(acquired)) {
-            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", requestId);
-            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
-        }
+{
+    "timestamp": "2026-06-09T14:49:01.0957201",
+    "status": 409,
+    "error": "Data Integrity Error",
+    "message": "Constraint violation or duplicate entry.",
+    "path": "/api/voucher/create-batch-from-cache",
+    "validationErrors": null
+}
 
-        try {
-            String batchId = sequenceService.getNextBatchId(); 
-            String journalPrefix = sequenceService.getNextJournalIdPrefix(); 
 
-            // ✨ 1. Fetch total rows from Redis synchronously (takes 1 millisecond)
-            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
-            long totalRows = 0;
-            if (metaBytes != null) {
-                try {
-                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
-                    totalRows = ((Number) meta.get("totalRows")).longValue();
-                } catch (Exception ignored) {}
-            }
-
-            // ✨ 2. Create the Master Record synchronously BEFORE returning to the UI
-            String workflowCode = jdbcTemplate.queryForObject("SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY", String.class, creatorRole);
-            Long firstApproverWorkflowId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2", Long.class, workflowCode);
-
-            VoucherPosting posting = new VoucherPosting();
-            posting.setBatchId(batchId);
-            posting.setVidFk(vid);
-            posting.setCommonBatchRemarks(commonRemarks);
-            posting.setCreatorRole(creatorRole);
-            posting.setCreatedBy(creatorId);
-            posting.setWorkflowCode(workflowCode); // Fixed mapping
-            posting.setPendingAt(firstApproverWorkflowId);
-            posting.setBatchStatus("P");
-            posting.setIS_EXECUTION_SCHEDULED("NO");
-            posting.setScheduledTime(null);
-            posting.setIsScheduleOverride("NO");
-            posting.setRecordsCount(totalRows);
-            voucherPostingRepository.save(posting);
-
-            if (vid != null && !vid.isEmpty()) updateVidStatus(vid, VoucherStatus.USED);
-            logWorkflowAction(batchId, vid, "Submitted", creatorId, commonRemarks, null);
-
-            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
-
-            // ✨ 3. Pass down to async thread to handle the heavy line-item insertion
-            self.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole, vid);
-
-            // Now guaranteed to exist in the database for the schedule API!
-            return batchId; 
-        }
-        catch (DataAccessException e) {
-            redisTemplate.delete(lockKey);
-            log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
-        }
-    }
-
-```
-### 2. Clean Up the Async Thread
-Because we moved the master record creation into the synchronous method above, we must remove it from the async thread so it doesn't try to create it twice.
-Find your executeAsyncBatchCreation method and make these two specific deletions:
-**A. Remove the Idempotency Delete for the Master Record:**
-Around line 118, change the idempotency block to ONLY delete from the data table:
-```java
-        try {
-            // 2. IDEMPOTENCY
-            jdbcTemplate.update("DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ?", batchId);
-            // ✨ DELETED: jdbcTemplate.update("DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId);
-            
-            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
-
-```
-**B. Remove the Master Record Creation Block at the bottom:**
-Around line 160 (right after the CompletableFuture.allOf...get() line), completely **delete** the block that initializes the workflow and saves the VoucherPosting record. Keep the completion notifications:
-```java
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
-
-            // ✨ DELETED: The entire "INTEGRATED WORKFLOW INITIALIZATION" block 
-            // (String workflowCode = ... down to logWorkflowAction(...) )
-
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-            sendNotification(creatorId, null, "Batch created Successfully with Batch ID : " + batchId, batchId);
-
-            log.info("BATCH_CREATION_FINISHED | Batch: {} | Rows: {}", batchId);
-
-        } catch (Exception e) {
-
-```
-By doing this, the UI can immediately hit the /update-schedule endpoint without crashing, while the background thread quietly finishes writing the chunked data rows.
+what is this i am getting this error
