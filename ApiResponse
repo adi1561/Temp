@@ -1,4 +1,46 @@
-ok now the main problem is like IS_SCHEDULE_OVERRIDE is comming yes which is wrong
-IS_SCHEDULE_OVERRIDE this yes only in the case if last person is reschudeld the timing
+### 1. The Mystery of IS_SCHEDULE_OVERRIDE Solved
+I found exactly why it is turning into "YES". It has nothing to do with the initial creation logic!
+Look at your frontend React code for the Stepper (Step 3). When the Maker successfully submits a batch and then clicks **"Confirm Schedule"** on that final success screen, the frontend makes a separate API call to /JS/voucher/update-schedule.
+Now look at your Java implementation for that endpoint:
+```java
+    @Override
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        // ...
+        // ❌ THE BUG IS HERE: It hardcodes IS_SCHEDULE_OVERRIDE = 'YES'
+        String sql = "UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'YES', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?";
+        jdbcTemplate.update(sql, scheduledTime, batchId);
+    }
 
-onther dout is like i can now delete the COMMON_BATCH_REMARKS from the voucher posting data table
+```
+Because this endpoint is used by the **Maker** right after creating the batch, it is technically the *original* schedule, not an override. Overrides only happen when the Checker changes it during processWorkflowAction.
+**The Fix:**
+Change that SQL string in updateBatchSchedule to set the override to 'NO':
+```java
+    @Override
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
+
+        if (exists == 0) {
+            log.warn("SCHEDULE_UPDATE_FAIL | Batch {} not yet created in DB. Retrying or waiting...", batchId);
+            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
+        }
+
+        // ✨ FIX: Set IS_SCHEDULE_OVERRIDE to 'NO' since the maker is setting the initial schedule
+        String sql = "UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?";
+        jdbcTemplate.update(sql, scheduledTime, batchId);
+    }
+
+```
+### 2. Deleting COMMON_BATCH_REMARKS from the Data Table
+**Yes, absolutely.** You can and should delete it now.
+Because we successfully updated the Java INSERT statement in processChunkRaw to skip this column, the backend is no longer trying to write to it. Keeping it in the database is now just wasting disk space for every line item.
+Run these two commands in your Oracle SQL client to permanently clean up the data table:
+```sql
+-- Remove the redundant remarks column
+ALTER TABLE VOUCHER_POSTING_DATA DROP COLUMN COMMON_BATCH_REMARKS;
+
+-- Remove the redundant role column (since we also moved this to the master table)
+ALTER TABLE VOUCHER_POSTING_DATA DROP COLUMN CREATOR_ROLE;
+
+```
+Once you run those, your schema is perfectly normalized. VOUCHER_POSTING will act as the pure master record, and VOUCHER_POSTING_DATA will act purely as the high-speed line-item ledger.
