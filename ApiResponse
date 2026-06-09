@@ -1,93 +1,122 @@
-To unify the **Status Screen** with the **Authorization Screen**, we need to move the Delete trigger into the View Modal and properly inject the Stepper and History components.
-Here are the replacements to make your status screen match the Auth screen's UI and functionality.
-### 1. Update the View Modal's Content
-Replace your current DialogContent (lines 1148-1212) with this complete structure. This adds the Stepper, the History log, and moves the Delete button inside.
-```javascript
-<DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc", height: '75vh', display: 'flex', flexDirection: 'column' }}>
-  <Box sx={{ flexGrow: 1, overflowY: "auto" }}>
-    
-    {/* --- HEADER CARDS (Voucher & Batch Details) --- */}
-    <Box sx={{ p: 4, backgroundColor: "white", borderBottom: "1px solid", borderColor: "divider" }}>
-      {isFetchingVid ? (
-        <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress size={24} /></Box>
-      ) : vidDetails && vidDetails.VID ? (
-        <Stack spacing={3} sx={{ width: '100%' }}>
-          <Paper elevation={0} sx={{ p: 3, borderRadius: 2, border: "1px solid", borderColor: "divider" }}>
-            <Typography variant="subtitle1" fontWeight="bold" sx={{ borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
-              Voucher Request ID : {vidDetails.VID}
-            </Typography>
-            <Grid container spacing={3}>
-              <Grid item xs={4}><Typography variant="caption" color="text.secondary">Category</Typography><Typography variant="body1">{vidDetails.CATEGORY_NAME}</Typography></Grid>
-              <Grid item xs={4}><Typography variant="caption" color="text.secondary">Created By</Typography><Typography variant="body1">{vidDetails.VID_CREATED_BY_NAME} ({vidDetails.VID_CREATOR_ID})</Typography></Grid>
-              <Grid item xs={4}><Typography variant="caption" color="text.secondary">Created At</Typography><Typography variant="body1">{new Date(vidDetails.VID_CREATED_AT).toLocaleString()}</Typography></Grid>
-            </Grid>
-          </Paper>
+package com.fincore.VoucherService.Service;
 
-          <Paper elevation={0} sx={{ p: 3, borderRadius: 2, border: "1px solid", borderColor: "divider" }}>
-             <Typography variant="subtitle1" fontWeight="bold" sx={{ borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>Batch Details</Typography>
-             <Grid container spacing={3}>
-                <Grid item xs={4}><Typography variant="caption" color="text.secondary">Created By</Typography><Typography variant="body1">{vidDetails.BATCH_CREATED_BY_NAME}</Typography></Grid>
-                <Grid item xs={4}><Typography variant="caption" color="text.secondary">No. of Entries</Typography><Typography variant="body1" color="primary" fontWeight="bold">{viewingBatchRequestCount} Records</Typography></Grid>
-                <Grid item xs={4}><Typography variant="caption" color="text.secondary">Scheduled Time</Typography><Typography variant="body1">{vidDetails.SCHEDULED_TIME ? new Date(vidDetails.SCHEDULED_TIME).toLocaleString() : "Immediate"}</Typography></Grid>
-             </Grid>
-          </Paper>
-        </Stack>
-      ) : null}
-    </Box>
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
 
-    {/* --- WORKFLOW PROGRESS STEPPER --- */}
-    <Box sx={{ p: 4, borderBottom: "1px solid", borderColor: "divider" }}>
-      <Typography variant="subtitle1" fontWeight="bold" sx={{ mb: 3 }}>Workflow Progress</Typography>
-      {isFetchingSteps ? <CircularProgress /> : (
-        <Stepper activeStep={dynamicSteps.findIndex(s => s.state === viewingBatchState) + 1} alternativeLabel connector={<BigConnector />}>
-          {dynamicSteps.map((step, index) => (
-             <Step key={step.state}><StepLabel StepIconComponent={() => <BigWorkflowIcon statusFlag={index < dynamicSteps.findIndex(s => s.state === viewingBatchState) ? 'COMPLETED' : 'ACTIVE'} label={step.designation} />} /></Step>
-          ))}
-        </Stepper>
-      )}
-    </Box>
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
-    {/* --- HISTORY LOG --- */}
-    <Box sx={{ p: 4 }}>
-      <Typography variant="subtitle1" fontWeight="bold" sx={{ mb: 3 }}>Action History</Typography>
-      <Stack spacing={2}>
-        {workflowHistory.map((history, idx) => (
-          <Paper key={idx} sx={{ p: 2, border: "1px solid #e2e8f0" }}>
-            <Typography variant="subtitle2" fontWeight="bold">{history.ACTION_USER_NAME}</Typography>
-            <Typography variant="body2">{history.LAST_ACTION} - {history.REMARKS}</Typography>
-          </Paper>
-        ))}
-      </Stack>
-    </Box>
-  </Box>
-</DialogContent>
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherExecutionScheduler {
 
-```
-### 2. Update the Footer Actions
-Replace the DialogActions inside the isViewModalOpen Dialog. This puts the **Delete** button inside the view modal.
-```javascript
-<DialogActions sx={{ p: 3, borderTop: "1px solid", borderColor: "divider" }}>
-  <Button onClick={handleCloseViewModal}>Close</Button>
-  
-  {/* The Delete logic is now INSIDE the modal */}
-  {(viewingBatchState === 'PENDING' || viewingBatchState === 'P') && isViewingSelfCreated && (
-    <Button
-      variant="contained"
-      color="error"
-      startIcon={<DeleteIcon />}
-      onClick={() => {
-        setIsViewModalOpen(false); // Close view
-        handleOpenModal({ batchId: viewingBatchId }); // Open confirm delete
-      }}
-    >
-      Delete Batch
-    </Button>
-  )}
-</DialogActions>
+    private final JdbcTemplate jdbcTemplate;
+    private final VoucherRequestServiceImpl voucherRequestService;
+    private final StringRedisTemplate stringRedisTemplate;
 
-```
-### Summary of what was fixed:
- 1. **Moved Delete:** The Delete button is no longer a separate floating action; it is now inside the View Modal footer, exactly like the Auth screen.
- 2. **UI parity:** I added the BigWorkflowIcon stepper and Stack based history log so the "View" modal looks and feels exactly like the Authorization screen.
- 3. **Visual Structure:** I cleaned up the DialogContent so that the Header + Stepper + History flow logically and scroll together.
-Now, when you click the eye icon, you get the full-featured, professional workflow view.
+    /**
+     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
+     * executes the scheduled batches in a distributed environment.
+     */
+    @Scheduled(fixedRate = 60000)
+    public void executeScheduledBatches() {
+        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
+        boolean lockAcquired = false;
+
+        try {
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 2, TimeUnit.MINUTES);
+            lockAcquired = Boolean.TRUE.equals(acquired);
+
+            if (!lockAcquired) return;
+
+            String sql = "SELECT BATCH_ID FROM VOUCHER_POSTING " +
+                    "WHERE BATCH_STATUS = 'P' " +
+                    "AND IS_EXECUTION_SCHEDULED = 'YES' " +
+                    "AND SCHEDULED_TIME <= SYSTIMESTAMP";
+
+            List<String> dueBatches = jdbcTemplate.queryForList(sql, String.class);
+
+            if (dueBatches.isEmpty()) return;
+
+            log.info("SCHEDULER_WAKEUP | Found {} batches ready for execution.", dueBatches.size());
+
+            for (String batchId : dueBatches) {
+                try {
+                    // 2. TRIGGER FIX: We let the existing pipeline handle the status changes and logging.
+                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                    execDto.setBatchId(batchId);
+                    execDto.setStatus(RequestStatus.ACCEPTED);
+                    execDto.setRemarks("Executed by System Scheduler");
+
+                    // 9001 is a fallback system role ID.
+                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
+
+                } catch (Exception e) {
+                    // 3. ISOLATION FIX: A failure here only affects this single batch.
+                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+                }
+            }
+
+        } finally {
+            if (lockAcquired) {
+                stringRedisTemplate.delete(lockKey);
+            }
+        }
+    }
+}
+
+
+
+voucher posting 
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	
+VID_FK	VARCHAR2(20 BYTE)	No		2	
+WORKFLOW_CODE	VARCHAR2(100 BYTE)	Yes		3	
+CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
+CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
+PENDING_AT	NUMBER	Yes		6	
+IS_EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
+SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
+IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
+EXECUTED_AT	TIMESTAMP(6)	Yes		10	
+BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
+RECORDS_COUNT	NUMBER	Yes		12	
+COMMON_BATCH_REMARKS	VARCHAR2(30 CHAR)	Yes		13	
+CREATOR_ROLE	NUMBER(10,0)	Yes		14	
+EXECUTOR_ID	VARCHAR2(10 BYTE)	Yes		15	
+
+voucher posting data 
+REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	1	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
+REQ_DATE	DATE	No	SYSDATE 	2	The date when maker created the journal
+CREATOR_ID	VARCHAR2(12 CHAR)	No		3	
+EXECUTION_DATE	DATE	Yes		4	Timestamp when this checker acted upon the journal
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		5	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		6	Unique identifier for the individual request.
+REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		7	The branch code requested for the transaction.
+REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		8	The 3-character currency code requested.
+REQ_CGL	VARCHAR2(50 CHAR)	Yes		9	The 10-digit CGL account code requested.
+REQ_AMOUNT	NUMBER(25,4)	Yes		10	Raw requested amount 
+POSTING_DATE	DATE	Yes		11	The transaction date for which txn to be posted
+REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		12	remarks from the uploaded file.
+REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		13	The product  code requested.
+REQ_ID	NUMBER(19,0)	Yes		14	
+
+
+
+voucher workflow 
+WORKFLOW_ID	NUMBER	No	"FINCORE"."ISEQ$$_81239".nextval	1	
+BATCH_ID_FK	VARCHAR2(50 BYTE)	No		2	
+VID_FK	VARCHAR2(20 BYTE)	No		3	
+LAST_ACTION	VARCHAR2(30 BYTE)	Yes		4	
+LAST_ACTION_BY	VARCHAR2(100 BYTE)	Yes		5	
+LAST_ACTION_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	
+REMARKS	VARCHAR2(500 BYTE)	Yes		7	
+SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
+
