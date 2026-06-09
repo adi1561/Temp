@@ -1,31 +1,936 @@
-Ah! I know exactly why this is happening.
-Because we completely decoupled the scheduling logic and moved it to **Step 3**, the initial batch creation (Manual or Bulk) always saves with a null schedule. That means the "Submitted" entry in the VOUCHER_WORKFLOW history table gets written with SCHEDULED_TIME = null.
-When the user clicks "Confirm Schedule" on the success screen, it calls your /update-schedule API. Right now, that API is only updating the VOUCHER_POSTING master table, but completely ignoring the VOUCHER_WORKFLOW history table!
-We need to update the /update-schedule backend method to inject that timestamp into the workflow history row as well.
-### The Fix
-Find your **updateBatchSchedule** method in **VoucherRequestServiceImpl.java** (around line 900) and replace it with this:
-```java
-    @Override
-    @Transactional
-    public void updateBatchSchedule(String batchId, String scheduledTime) {
-        // Use a simple count check first
-        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+  TablePagination,
+  Stepper,
+  Step,
+  StepLabel,
+  StepConnector,
+  stepConnectorClasses,
+  styled,
+  Avatar
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  DeleteSweep as DeleteSweepIcon,
+  Visibility as VisibilityIcon,
+  FileDownload as FileDownloadIcon,
 
-        if (exists == null || exists == 0) {
-            // If the record isn't there, log a warning instead of crashing
-            log.warn("SCHEDULE_UPDATE_FAIL | Batch {} not yet created in DB. Retrying or waiting...", batchId);
-            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import CheckIcon from '@mui/icons-material/Check';
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import DeleteIcon from "@mui/icons-material/Delete";
+import { alpha } from "@mui/material/styles";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+const styles = {
+  mainContainer: {
+    padding: 3,
+    height: "100%",
+    width: "100%",
+  },
+  dataGridContainer: {
+    height: 600,
+    width: "100%",
+    backgroundColor: "background.paper",
+    boxShadow: 2,
+    borderRadius: 2,
+    border: 1,
+    borderColor: "divider",
+    "& .MuiDataGrid-columnHeaders": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+      fontWeight: "bold",
+      fontSize: "0.95rem",
+    },
+    "& .MuiDataGrid-row:hover": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
+    },
+  },
+  tableContainer: {
+    maxHeight: 450,
+    overflowY: "auto",
+    border: 1,
+    borderColor: "divider",
+    mt: 1
+  },
+  fixedContentBox: {
+    minHeight: 400,
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+  },
+  tableHeaderCell: {
+    fontWeight: "bold",
+    backgroundColor: "#f5f6f8",
+    color: "text.primary",
+    whiteSpace: "nowrap",
+    zIndex: 10,
+  },
+  stickyHeaderColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    top: 0,
+    zIndex: 20,
+    backgroundColor: "background.paper",
+    borderBottom: 1,
+    borderRight: 1,
+    borderColor: "divider",
+    fontWeight: "bold",
+  }),
+  stickyBodyColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    zIndex: 5,
+    backgroundColor: "background.paper",
+    borderRight: 1,
+    borderColor: "divider",
+  }),
+  dialogTitle: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    pb: 1,
+  },
+  dialogActions: { p: 2, borderTop: 1, borderColor: "divider" },
+  loadingContainer: {
+    height: "100%",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+};
+const formatCurrency = (val) => {
+  if (val === null || val === undefined || val === "") return "0.0000";
+  const strVal = String(val).trim();
+  const parts = strVal.split(".");
+  let intPart = parts[0];
+  let decPart = (parts[1] || "").padEnd(4, "0").substring(0, 4);
+  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${intPart}.${decPart}`;
+};
+const getStatusChipColor = (status) => {
+  switch (status) {
+    case "ACCEPTED":
+      return "success";
+    case "REJECTED":
+      return "error";
+    default:
+      return "warning";
+  }
+};
+const getTxnTypeColor = (txnType) =>
+  txnType === "Credit" ? "error" : "success";
+
+const CustomConnector = styled(StepConnector)(({ theme }) => ({
+  [`&.${stepConnectorClasses.alternativeLabel}`]: {
+    top: 12,
+    left: 'calc(-50% + 12px)',
+    right: 'calc(50% + 12px)',
+  },
+  [`&.${stepConnectorClasses.active}`]: {
+    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
+  },
+  [`&.${stepConnectorClasses.completed}`]: {
+    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
+  },
+  [`& .${stepConnectorClasses.line}`]: {
+    borderColor: theme.palette.divider,
+    borderTopWidth: 2,
+    borderRadius: 1,
+  },
+}));
+
+
+const CustomWorkflowIcon = (props) => {
+  const { active, completed } = props;
+  if (completed) {
+    return (
+      <Box sx={{ width: 24, height: 24, borderRadius: '50%', backgroundColor: 'success.main', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1 }}>
+        <CheckIcon sx={{ color: '#fff', fontSize: 16, strokeWidth: 1 }} />
+      </Box>
+    );
+  }
+  if (active) {
+    return (
+      // Unfilled with Yellow/Warning border
+      <Box sx={{ width: 24, height: 24, borderRadius: '50%', backgroundColor: 'white', border: '3px solid', borderColor: 'warning.main', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1 }} />
+    );
+  }
+  return (
+    <Box sx={{ width: 12, height: 12, borderRadius: '50%', backgroundColor: 'text.disabled', zIndex: 1, m: '6px' }} />
+  );
+};
+
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      {" "}
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />{" "}
+      <Typography variant="h6">No Requests Found</Typography>{" "}
+    </Stack>
+  );
+}
+
+export default function JournalPostingStatus() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+
+  // View/Paginate States
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchState, setViewingBatchState] = useState("");
+  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
+  const [viewingBatchRequestDate, setViewingBatchRequestDate] = useState(null);
+  const [viewingBatchRequestCount, setViewingBatchRequestCount] = useState(0);
+    const [workflowStepsMap, setWorkflowStepsMap] = useState({}); 
+  const [vidDetails, setVidDetails] = useState(null);
+  const [dynamicSteps, setDynamicSteps] = useState([]);
+  const [workflowHistory, setWorkflowHistory] = useState([]);
+  const [isFetchingVid, setIsFetchingVid] = useState(false);
+  const [isFetchingSteps, setIsFetchingSteps] = useState(false);
+  const [isDescExpanded, setIsDescExpanded] = useState(false);
+  const [dbRoleMap, setDbRoleMap] = useState({});
+
+
+  useEffect(() => {
+    const fetchRoles = async () => {
+      try {
+        const rolesData = await callApi("/JS/voucher/active-roles", null, "GET");
+        if (rolesData && isMounted.current) setDbRoleMap(rolesData);
+      } catch (err) { }
+    };
+    fetchRoles();
+  }, [callApi]);
+
+  const getRoleDisplayName = (roleValue) => {
+    if (!roleValue || roleValue === "null" || roleValue === "System") return "System Execution";
+    return dbRoleMap[String(roleValue)] || roleValue;
+  };
+
+  const handleDownloadExcel = async () => {
+    if (!viewingBatchId) return;
+
+    try {
+      showSnackBar("Downloading Excel...", "info");
+
+      const response = await callApi(
+        `/JS/voucher/download-batch/${viewingBatchId}`,
+        null,
+        "GET",
+        "blob",
+        null,
+        {},
+        false
+      );
+
+
+      
+      const blobData = response.data || response;
+      if (!blobData) throw new Error("No data received");
+
+      const blob = new Blob([blobData], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = window.URL.createObjectURL(blob);
+
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", `Batch_${viewingBatchId}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+
+      showSnackBar("Download complete.", "success");
+    } catch (e) {
+      console.error("Download failed:", e);
+      showSnackBar("Failed to download Excel file.", "error");
+    }
+  };
+
+  // --- SAFE AUTH CHECK ---
+  useEffect(() => {
+    isMounted.current = true;
+    try {
+      const auth =
+        sessionStorage.getItem("persist:auth") ||
+        localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        console.log(user);
+        // Force string to ensure match
+        if (user?.userId) setCurrentUserId(String(user.userId));
+      }
+    } catch (e) { }
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  const fetchMyBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      console.log("1. Starting API call to /JS/voucher/all-requests-summary");
+      const response = await callApi("/JS/voucher/all-requests-summary", null, "GET");
+      console.log("2. Raw API Response:", response);
+
+      // DEFENSIVE EXTRACTION: Handles raw arrays, {data: []}, or {content: []}
+      let fetchedRows = [];
+      if (Array.isArray(response)) {
+        fetchedRows = response;
+      } else if (response && Array.isArray(response.data)) {
+        fetchedRows = response.data;
+      } else if (response && Array.isArray(response.content)) {
+        fetchedRows = response.content;
+      }
+      
+      console.log("3. Extracted Rows:", fetchedRows);
+
+      // SAFE MAPPING: Prevent crashes if approvalWorkflow is missing or null
+      const uniqueWorkflows = [...new Set(fetchedRows.map(row => row?.approvalWorkflow).filter(Boolean))];
+      console.log("4. Unique Workflows to fetch steps for:", uniqueWorkflows);
+
+      const stepsMap = {};
+      await Promise.all(
+        uniqueWorkflows.map(async (wfCode) => {
+          try {
+            const stepsResponse = await callApi(`/JS/voucher/workflow/steps/${wfCode}`, null, "GET");
+            // Defensively extract steps array
+            const steps = Array.isArray(stepsResponse) ? stepsResponse : (stepsResponse?.data || []);
+            stepsMap[wfCode] = steps.map(s => s?.designation || s?.state || "Unknown");
+          } catch (e) {
+            console.warn(`Failed to fetch steps for ${wfCode}`, e);
+            stepsMap[wfCode] = ["Creator", "Approver"]; // Fallback
+          }
+        })
+      );
+
+      console.log("5. Final Steps Map:", stepsMap);
+
+      if (isMounted.current) {
+        setWorkflowStepsMap(stepsMap);
+        setRows(fetchedRows);
+      }
+    } catch (err) {
+      console.error("CATCH BLOCK TRIGGERED. Full Error Object:", err);
+      console.error("Error Message:", err.message);
+      
+      if (isMounted.current && err.name !== "CanceledError") {
+        showSnackBar(`Failed to load: ${err.message || "Unknown JS Error"}`, "error");
+      }
+    } finally {
+      if (isMounted.current) setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+    useEffect(() => {
+    fetchMyBatches();
+  }, [fetchMyBatches]);
+
+  const handleOpenModal = (batch) => {
+    setSelectedBatch(batch);
+    setIsModalOpen(true);
+  };
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleSubmitBatchCancel = async () => {
+    setIsSubmitting(true);
+    const targetBatchId = selectedBatch.batchId; // Store it before modal closes
+
+    try {
+      await callApi(
+        `/JS/voucher/my-requests/by-batch/${targetBatchId}`,
+        null,
+        "DELETE"
+      );
+      showSnackBar(`Batch ${targetBatchId} deletion process started.`, "success");
+
+      setRows((prevRows) => prevRows.filter((row) => row.batchId !== targetBatchId));
+
+      handleCloseModal();
+
+      setTimeout(() => {
+        fetchMyBatches();
+      }, 1500);
+
+    } catch (error) {
+      showSnackBar("Failed to delete batch", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+  const handleOpenViewModal = async (row) => {
+    setViewingBatchId(row.batchId);
+    setViewingBatchState(row.currentStatus || "PENDING_L1");
+    setViewingBatchCreatorId(row.creatorId);
+    setViewingBatchRequestDate(row.requestDate);
+    setViewingBatchRequestCount(row.requestCount || 0);
+    setIsViewModalOpen(true);
+    setIsFetchingSteps(true);
+    setIsFetchingVid(true);
+
+    try {
+      const workflowCode = row.approvalWorkflow || "Workflow_3";
+
+      const [stepsData, summaryData, historyData] = await Promise.all([
+        callApi(`/JS/voucher/workflow/steps/${workflowCode}`, null, "GET"),
+        callApi(`/JS/voucher/batch-summary/${row.batchId}`, null, "GET"),
+        callApi(`/JS/voucher/workflow-history/${row.batchId}`, null, "GET")
+      ]);
+
+      setDynamicSteps(Array.isArray(stepsData) ? stepsData : []);
+      setVidDetails(summaryData);
+      setWorkflowHistory(Array.isArray(historyData) ? historyData : []);
+    } catch (err) {
+      showSnackBar("Failed to load batch details.", "error");
+    } finally {
+      setIsFetchingSteps(false);
+      setIsFetchingVid(false);
+    }
+  };
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setViewingBatchId(null);
+    setIsDescExpanded(false);
+  };
+  const handleDetailPageChange = (event, newPage) => {
+    setDetailPage(newPage);
+    fetchDetailRows(viewingBatchId, newPage, detailRowsPerPage);
+  };
+  const handleDetailRowsPerPageChange = (event) => {
+    const newSize = parseInt(event.target.value, 10);
+    setDetailRowsPerPage(newSize);
+    setDetailPage(0);
+    fetchDetailRows(viewingBatchId, 0, newSize);
+  };
+
+
+  const handleCancelSelectedJournals = async () => {
+    if (selectedJournalPrefixes.length === 0) {
+      showSnackBar("Select at least one entry.", "warning");
+      return;
+    }
+    setIsPartialSubmitting(true);
+    try {
+      await callApi(
+        "/JS/voucher/my-requests/by-journal-list",
+        selectedJournalPrefixes,
+        "DELETE"
+      );
+      showSnackBar("Selected entries deleted successfully.", "success");
+      handleCloseViewModal();
+    } catch (error) {
+      showSnackBar("Failed to delete selection", "error");
+      setIsPartialSubmitting(false);
+    }
+  };
+
+  const handleSelectAllClick = (event) => {
+    if (event.target.checked)
+      setSelectedJournalPrefixes(batchDetails.map((g) => g[0].journalPrefix));
+    else setSelectedJournalPrefixes([]);
+  };
+  const handleRowCheckboxClick = (event, prefix) => {
+    if (event) event.stopPropagation();
+    const index = selectedJournalPrefixes.indexOf(prefix);
+    let newSelected = [];
+    if (index === -1) newSelected = [...selectedJournalPrefixes, prefix];
+    else newSelected = selectedJournalPrefixes.filter((p) => p !== prefix);
+    setSelectedJournalPrefixes(newSelected);
+  };
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "currentStatus",
+      headerName: "Workflow Progress",
+      width: 300,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const state = params.value || "PENDING_L1";
+        const workflow = params.row.approvalWorkflow || "Workflow_3";
+        const isRejected = state === "REJECTED";
+
+        if (isRejected) {
+          return (
+            <Box sx={{ pl: 2, width: '100%', display: 'flex', justifyContent: 'flex-start' }}>
+              <Chip label="REJECTED" color="error" size="small" variant="filled" sx={{ mt: 1.5, fontWeight: "bold" }} />
+            </Box>
+          );
         }
 
-        // 1. Update the Master Record
-        String sql = "UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?";
-        jdbcTemplate.update(sql, scheduledTime, batchId);
+        let totalLevels = 3;
+        if (workflow.includes("4")) totalLevels = 4;
 
-        // ✨ 2. FIX: Update the Workflow History so the initial "Submitted" action displays the schedule!
-        String wfSql = "UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'";
-        jdbcTemplate.update(wfSql, scheduledTime, batchId);
-    }
+        let stepLabels = [];
+        for (let i = 1; i <= totalLevels; i++) {
+          stepLabels.push(`L${i}`);
+        }
+        stepLabels.push('Final');
 
-```
-**(Don't forget to add @Transactional to the top of the method if it isn't there already, so both tables update safely together.)**
-By adding that second jdbcTemplate.update(wfSql...) command, the backend will retroactively stamp the chosen schedule time onto the Maker's "Submitted" step in the history log, and it will immediately show up properly in your workflow timeline UI!
+        let activeStep = 0;
+        if (state.startsWith("PENDING_L")) {
+          const levelNum = parseInt(state.replace("PENDING_L", ""), 10);
+          if (!isNaN(levelNum)) activeStep = levelNum - 1;
+        } else if (state === "POSTED" || state === "SCHEDULED" || state === "APPROVED") {
+          activeStep = stepLabels.length;
+        }
+
+        return (
+          <Box sx={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', pl: 2, height: '100%' }}>
+            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={{ width: 'auto', mt: 0.5 }}>
+              {stepLabels.map((label, index) => {
+                const isCompleted = index < activeStep;
+                const isCurrent = index === activeStep;
+                return (
+                  <Step key={label} completed={isCompleted} active={isCurrent} sx={{ flex: '0 0 40px', px: 0 }}>
+                    <StepLabel StepIconComponent={CustomWorkflowIcon} sx={{ p: 0, m: 0 }} />
+                  </Step>
+                );
+              })}
+            </Stepper>
+          </Box>
+        );
+      },
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Chip icon={<AccountCircleIcon />} label={p.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) =>
+        new Date(p.value).toLocaleString("en-IN", {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }),
+    },
+
+    {
+      field: "requestCount",
+      headerName: "No. of Entries",
+      width: 120,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      width: 220, // Expanded width
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 220, // Expanded width
+      align: "right",
+      headerAlign: "right",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography variant="body2" sx={{ mt: 1.5, fontWeight: 500 }}>
+          {formatCurrency(p.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 0.8,
+      minWidth: 130,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        // --- LOGIC: ENABLE DELETE ---
+        // 1. Is it Pending?
+        const isPending =
+          String(params.row.requestStatus).toUpperCase() === "PENDING";
+        // 2. Did *I* create it? 
+        const creator = String(params.row.creatorId || "")
+          .trim()
+          .toUpperCase();
+        console.log("d" + creator);
+        const me = String(currentUserId || "")
+          .trim()
+          .toUpperCase();
+        const isMyBatch = creator === me;
+
+        const canDelete = isPending && isMyBatch;
+
+        return (
+          <Stack direction="row" spacing={1} justifyContent="center">
+            <Tooltip title="View Details">
+              {" "}
+              <IconButton
+                onClick={() => handleOpenViewModal(params.row)}
+                color="primary"
+              >
+                {" "}
+                <VisibilityIcon />{" "}
+              </IconButton>{" "}
+            </Tooltip>
+            <Tooltip
+              title={
+                !isMyBatch
+                  ? "You cannot delete other user's requests"
+                  : !isPending
+                    ? "Cannot delete processed batch"
+                    : "Delete Batch"
+              }
+            >
+              <span>
+                {" "}
+                <IconButton
+                  onClick={() => handleOpenModal(params.row)}
+                  color="error"
+                  disabled={!canDelete}
+                >
+                  {" "}
+                  <DeleteIcon />{" "}
+                </IconButton>{" "}
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Box sx={styles.mainContainer}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize
+        rowHeight={52}
+        initialState={{
+          pagination: { paginationModel: { page: 0, pageSize: 10 } },
+        }}
+        slots={{ noRowsOverlay: CustomNoRowsOverlay }}
+        sx={styles.dataGridContainer}
+      />
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        {" "}
+        <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
+          {" "}
+          <DeleteSweepIcon sx={{ mr: 1, color: "error.main" }} /> Confirm
+          Deletion{" "}
+        </DialogTitle>{" "}
+        <DialogContent>
+          {" "}
+          <DialogContentText>
+            {" "}
+            Are you sure you want to delete batch{" "}
+            <strong>{selectedBatch?.batchId}</strong>? This action cannot be
+            undone.{" "}
+          </DialogContentText>{" "}
+        </DialogContent>{" "}
+        <DialogActions sx={styles.dialogActions}>
+          {" "}
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
+            Back
+          </Button>{" "}
+          <Button
+            onClick={handleSubmitBatchCancel}
+            variant="contained"
+            color="error"
+            disabled={isSubmitting}
+          >
+            {" "}
+            {isSubmitting ? (
+              <CircularProgress size={24} color="inherit" />
+            ) : (
+              "Confirm Delete"
+            )}{" "}
+          </Button>{" "}
+        </DialogActions>{" "}
+      </Dialog>
+
+      {/* --- WORKFLOW DETAILS MODAL --- */}
+      <Dialog open={isViewModalOpen} onClose={handleCloseViewModal} fullWidth maxWidth="md">
+        <DialogTitle sx={styles.dialogTitle}>
+          <Typography variant="h6" fontWeight="bold">Batch Workflow Details: {viewingBatchId}</Typography>
+          <IconButton onClick={handleCloseViewModal}><CloseIcon /></IconButton>
+        </DialogTitle>
+
+        <DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc" }}>
+         <Box sx={{ height: '75vh', overflowY: 'auto', display: "flex", flexDirection: "column" }}>
+
+            {/* --- HEADER CARDS (Voucher & Batch Details) --- */}
+            <Box sx={{ p: 4, backgroundColor: "white", borderBottom: "1px solid", borderColor: "divider" }}>
+              {isFetchingVid ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress size={24} /></Box>
+              ) : vidDetails && vidDetails.VID ? (
+                <Grid container spacing={4}>
+                  {/* Voucher Origin Details */}
+                  <Grid item xs={12}>
+                    <Paper elevation={0} sx={{ p: 3, backgroundColor: "#f8fafc", borderRadius: 2, border: "1px solid", borderColor: "divider" }}>
+                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
+                        Voucher (VID: {vidDetails.VID})
+                      </Typography>
+                      <Grid container spacing={3} sx={{ mb: 3 }}>
+                        <Grid item xs={12} sm={4}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
+                          <Typography variant="body1" fontWeight="500">{vidDetails.CATEGORY_NAME}</Typography>
+                        </Grid>
+                        <Grid item xs={12} sm={4}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Origin Created At</Typography>
+                          <Typography variant="body1" fontWeight="500">
+                            {vidDetails.VID_CREATED_AT ? new Date(vidDetails.VID_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
+                          </Typography>
+                        </Grid>
+                        <Grid item xs={12} sm={4}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Origin Created By</Typography>
+                          <Stack direction="row" spacing={1} alignItems="center">
+                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
+                            <Typography variant="body1" fontWeight="500">
+                              {vidDetails.VID_CREATED_BY_NAME} <Typography component="span" variant="caption" color="text.secondary">({vidDetails.VID_CREATOR_ID})</Typography>
+                            </Typography>
+                          </Stack>
+                        </Grid>
+                      </Grid>
+                      <Box sx={{ backgroundColor: "background.paper", p: 2, borderRadius: 1, border: "1px solid", borderColor: "divider" }}>
+                        <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Voucher Description</Typography>
+                        <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                          {vidDetails.DESCRIPTION && vidDetails.DESCRIPTION.length > 250 && !isDescExpanded
+                            ? `${vidDetails.DESCRIPTION.substring(0, 250)}...` : (vidDetails.DESCRIPTION || "No description provided.")}
+                        </Typography>
+                        {vidDetails.DESCRIPTION && vidDetails.DESCRIPTION.length > 250 && (
+                          <Box sx={{ mt: 1 }}>
+                            <Button variant="text" color="primary" disableRipple onClick={() => setIsDescExpanded(!isDescExpanded)} sx={{ textTransform: 'none', p: 0, fontWeight: 'bold' }}>
+                              {isDescExpanded ? "Show Less" : "Show More"}
+                            </Button>
+                          </Box>
+                        )}
+                      </Box>
+                    </Paper>
+                  </Grid>
+
+                  {/* Batch Execution Details */}
+                  <Grid item xs={12}>
+                    <Paper elevation={0} sx={{ p: 3, backgroundColor: "#f8fafc", borderRadius: 2, border: "1px solid", borderColor: "divider" }}>
+                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
+                        Batch Execution Details
+                      </Typography>
+                      <Grid container spacing={3}>
+                        <Grid item xs={12} sm={3}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created By</Typography>
+                          <Stack direction="row" spacing={1} alignItems="center">
+                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
+                            <Typography variant="body1" fontWeight="500">
+                              {vidDetails.BATCH_CREATED_BY_NAME} <Typography component="span" variant="caption" color="text.secondary">({vidDetails.BATCH_CREATOR_ID})</Typography>
+                            </Typography>
+                          </Stack>
+                        </Grid>
+                        <Grid item xs={12} sm={3}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created At</Typography>
+                          <Typography variant="body1" fontWeight="500">
+                            {vidDetails.BATCH_CREATED_AT ? new Date(vidDetails.BATCH_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
+                          </Typography>
+                        </Grid>
+
+                         {/* No. of Entries Column */}
+                        <Grid item xs={12} sm={2}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>No. of Entries</Typography>
+                          <Typography variant="body1" fontWeight="600" color="primary.main">
+                            {viewingBatchRequestCount} Records
+                          </Typography>
+                        </Grid>
+                        <Grid item xs={12} sm={3}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Scheduled Time</Typography>
+                          <Typography variant="body1" fontWeight="500" color={vidDetails.SCHEDULED_TIME ? "info.main" : "text.primary"}>
+                            {vidDetails.SCHEDULED_TIME ? new Date(vidDetails.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "Immediate"}
+                          </Typography>
+                        </Grid>
+                        {vidDetails.EXECUTED_AT && (
+                          <Grid item xs={12} sm={3}>
+                            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Executed At</Typography>
+                            <Typography variant="body1" fontWeight="500" color="success.main">
+                              {new Date(vidDetails.EXECUTED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}
+                            </Typography>
+                          </Grid>
+                        )}
+                      </Grid>
+                      <Box sx={{ mt: 3, pt: 2, borderTop: "1px solid", borderColor: "divider", display: "flex", justifyContent: "flex-end" }}>
+                        <Button variant="outlined" startIcon={<FileDownloadIcon />} onClick={handleDownloadExcel} disabled={!viewingBatchId} sx={{ borderColor: "#217346", color: "#217346", "&:hover": { backgroundColor: "#e8f5e9", borderColor: "#1e6b40" } }}>
+                          Download Full Batch Report
+                        </Button>
+                      </Box>
+                    </Paper>
+                  </Grid>
+                </Grid>
+              ) : null}
+            </Box>
+
+            {/* --- BIG WORKFLOW STEPPER TIMELINE --- */}
+            <Box sx={{ p: 4, flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+              {viewingBatchState === "REJECTED" ? (
+                <Typography color="error" variant="subtitle1" fontWeight="bold" textAlign="center" sx={{ mt: 2 }}>
+                  This batch was REJECTED and the workflow has been terminated.
+                </Typography>
+              ) : isFetchingSteps ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
+              ) : dynamicSteps.length > 0 ? (
+                <Stepper
+                  activeStep={(viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED") ? dynamicSteps.length : dynamicSteps.findIndex(s => s.state === viewingBatchState)}
+                  alternativeLabel connector={<CustomConnector />}
+                >
+                  {dynamicSteps.map((step, index) => {
+                    const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED";
+                    const activeStepIndex = isFullyDone ? dynamicSteps.length : dynamicSteps.findIndex(s => s.state === viewingBatchState);
+                    const isCompleted = index < activeStepIndex;
+                    const isCurrent = index === activeStepIndex;
+
+                    return (
+                      <Step key={step.state} completed={isCompleted} active={isCurrent}>
+                        <StepLabel StepIconComponent={CustomWorkflowIcon}>
+                          <Typography variant="subtitle2" sx={{ fontWeight: isCurrent ? 'bold' : 'normal', color: isCurrent ? 'primary.main' : 'text.primary', mt: 1 }}>{step.designation}</Typography>
+                          <Chip label={getRoleDisplayName(step.role)} size="small" variant={isCurrent ? "filled" : "outlined"} color={isCurrent ? "primary" : "default"} sx={{ mt: 1, height: 22, fontSize: "0.65rem", fontWeight: "bold" }} />
+                        </StepLabel>
+                      </Step>
+                    );
+                  })}
+                </Stepper>
+              ) : null}
+            </Box>
+
+            {/* --- WORKFLOW ACTION HISTORY --- */}
+            <Box sx={{ p: 4, borderTop: "1px solid", borderColor: "divider" }}>
+              <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
+                Action History & Remarks ({workflowHistory.length})
+              </Typography>
+
+              {isFetchingSteps ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}><CircularProgress size={24} /></Box>
+              ) : workflowHistory.length === 0 ? (
+                <Typography color="text.secondary">No action history found for this batch.</Typography>
+              ) : (
+                <Stack spacing={2.5}>
+                 {workflowHistory.map((history, idx) => {
+                    const userName = history.ACTION_USER_NAME || "User";
+                    const initial = userName.charAt(0).toUpperCase();
+                    // Check if this action was an override
+                    const isOverrideAction = history.LAST_ACTION?.toUpperCase().includes("OVERRIDE");
+
+                    return (
+                      <Box key={idx} sx={{ display: 'flex', gap: 2 }}>
+                         <Box><Avatar sx={{ bgcolor: 'primary.main', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>{initial}</Avatar></Box>
+                         <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2.5, borderRadius: 2, border: "1px solid", borderColor: "#e2e8f0", boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)" }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                              <Typography variant="subtitle2" fontWeight="bold" color="text.primary">{userName}</Typography>
+                              <Typography variant="caption" color="text.secondary">• {new Date(history.LAST_ACTION_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</Typography>
+                            </Box>
+                            
+                            <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5, flexWrap: 'wrap', gap: 1 }}>
+                              <Chip label={history.LAST_ACTION || "System Action"} size="small" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: history.LAST_ACTION?.includes("Reject") ? "#fee2e2" : "#e0e7ff", color: history.LAST_ACTION?.includes("Reject") ? "#991b1b" : "#3730a3" }} />
+                              
+                              {/* Display active routing alerts when schedules are loaded or changed */}
+                              {history.SCHEDULED_TIME && (
+                                <Chip 
+                                  label={isOverrideAction ? `?? Schedule Overridden to: ${new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}` : `? Scheduled for: ${new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}`}
+                                  size="small"
+                                  color={isOverrideAction ? "warning" : "info"}
+                                  variant="outlined"
+                                  sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }}
+                                />
+                              )}
+                            </Stack>
+
+                            <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{history.REMARKS || "No remarks provided."}</Typography>
+                         </Box>
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              )}
+            </Box>
+          </Box>
+        </DialogContent>
+      </Dialog>
+    </Box>
+  );
+}
+
+
+data is there stepper are not working
+and one more thing is in auth what we additionally we do there do here for better user experiance
