@@ -1,17 +1,105 @@
-2026-06-09T14:49:00.952+05:30  INFO 41920 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.SequenceService            : SEQUENCE_GENERATED | Type: BATCH_ID | Value: 0008480
-2026-06-09T14:49:00.976+05:30  INFO 41920 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.SequenceService            : SEQUENCE_GENERATED | Type: JRNL_ID | Value: 0005177
-2026-06-09T14:49:01.067+05:30 ERROR 41920 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.VoucherRequestServiceImpl  : SEQUENCE_GEN_FAIL | ReqID: 8670f66f-99ef-418c-924f-b9e7a148e395 | Status: Failed to generate sequence
-2026-06-09T14:49:01.090+05:30 ERROR 41920 --- [VoucherService] [io-9999-exec-10] c.f.V.Exception.GlobalExceptionHandler   : DB_INTEGRITY_VIOLATION | Path: /api/voucher/create-batch-from-cache | Type: Constraint violation
+    @Override
+    @Transactional
+    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid) {
+        String lockKey = "LOCK_REQ_" + requestId;
+        Boolean acquired;
 
+        try {
+            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
+        } catch (DataAccessException e) {
+            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", requestId);
+            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
+        }
 
-{
-    "timestamp": "2026-06-09T14:49:01.0957201",
-    "status": 409,
-    "error": "Data Integrity Error",
-    "message": "Constraint violation or duplicate entry.",
-    "path": "/api/voucher/create-batch-from-cache",
-    "validationErrors": null
-}
+        if (Boolean.FALSE.equals(acquired)) {
+            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", requestId);
+            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
+        }
 
+        try {
+            // 1. GENERATE IDs
+            String batchId = sequenceService.getNextBatchId(); 
+            String journalPrefix = sequenceService.getNextJournalIdPrefix(); 
 
-what is this i am getting this error
+            // 2. FETCH ROW COUNT
+            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
+            long totalRows = 0;
+            if (metaBytes != null) {
+                try {
+                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
+                    totalRows = ((Number) meta.get("totalRows")).longValue();
+                } catch (Exception ignored) {}
+            }
+
+            // 3. WORKFLOW ROUTING (With proper exception handling!)
+            String workflowCode;
+            try {
+                workflowCode = jdbcTemplate.queryForObject(
+                        "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                        String.class, creatorRole
+                );
+            } catch (EmptyResultDataAccessException e) {
+                throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
+            }
+
+            Long firstApproverWorkflowId;
+            try {
+                firstApproverWorkflowId = jdbcTemplate.queryForObject(
+                        "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
+                        Long.class, workflowCode
+                );
+            } catch (EmptyResultDataAccessException e) {
+                throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
+            }
+
+            // 4. SYNCHRONOUS MASTER RECORD CREATION
+            VoucherPosting posting = new VoucherPosting();
+            posting.setBatchId(batchId);
+            
+            // ✨ FIX: Missing VID check. If this is null, the DB throws an Integrity Violation.
+            if (vid == null || vid.trim().isEmpty()) {
+                throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
+            }
+            posting.setVidFk(vid);
+            
+            posting.setCommonBatchRemarks(commonRemarks);
+            posting.setCreatorRole(creatorRole);
+            posting.setCreatedBy(creatorId);
+            
+            // ✨ FIX: This was incorrectly set to journalPrefix (0005177) earlier, causing FK violations!
+            posting.setWorkflowCode(workflowCode); 
+            
+            posting.setPendingAt(firstApproverWorkflowId);
+            posting.setBatchStatus("P");
+            
+            posting.setIS_EXECUTION_SCHEDULED("NO");
+            posting.setScheduledTime(null);
+            posting.setIsScheduleOverride("NO");
+            posting.setRecordsCount(totalRows);
+            
+            // This line is now perfectly safe and won't throw 409s
+            voucherPostingRepository.save(posting);
+
+            // 5. UPDATE DEPENDENCIES
+            updateVidStatus(vid, VoucherStatus.USED);
+            logWorkflowAction(batchId, vid, "Submitted", creatorId, commonRemarks, null);
+
+            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
+
+            // 6. ASYNC HANDOFF
+            self.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole, vid);
+
+            return batchId; 
+        }
+        // ✨ NEW CATCH BLOCK: Catches constraint violations instantly and logs exactly what failed
+        catch (org.springframework.dao.DataIntegrityViolationException e) {
+            redisTemplate.delete(lockKey);
+            log.error("DB_CONSTRAINT_FAIL | ReqID: {} | Error: {}", requestId, e.getRootCause() != null ? e.getRootCause().getMessage() : e.getMessage());
+            throw new CustomExceptions.InvalidDataException("Database constraint failed. Missing required fields or invalid mapping.");
+        }
+        catch (DataAccessException e) {
+            redisTemplate.delete(lockKey);
+            log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
+            throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
+        }
+    }
