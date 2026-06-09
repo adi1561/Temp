@@ -1,82 +1,38 @@
-package com.fincore.VoucherService.Service;
-
-import com.fincore.VoucherService.Models.enums.RequestStatus;
-import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
-
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherExecutionScheduler {
-
-    private final JdbcTemplate jdbcTemplate;
-    private final VoucherRequestServiceImpl voucherRequestService;
-    private final StringRedisTemplate stringRedisTemplate;
-
-    /**
-     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
-     * executes the scheduled batches in a distributed environment.
-     */
-    @Scheduled(fixedRate = 60000)
-    public void executeScheduledBatches() {
-        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
-        boolean lockAcquired = false;
-
-        try {
-            // 1. Distributed lock so only one server pod runs this at a time
-            Boolean acquired = stringRedisTemplate.opsForValue()
-                    .setIfAbsent(lockKey, "LOCKED", 50, TimeUnit.SECONDS);
-            lockAcquired = Boolean.TRUE.equals(acquired);
-
-            if (!lockAcquired) return;
-
-            // 2. Query for pending ('P') scheduled batches whose time has arrived
-            // ✨ FIX: Joined with WORKFLOW_TRANSITIONS to ensure IS_FINAL_APPROVAL = 'Y'
-            String sql = "SELECT p.BATCH_ID FROM VOUCHER_POSTING p " +
-                    "INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID " +
-                    "WHERE p.BATCH_STATUS = 'P' " +
-                    "AND p.IS_EXECUTION_SCHEDULED = 'YES' " +
-                    "AND p.SCHEDULED_TIME <= ? " +
-                    "AND w.IS_FINAL_APPROVAL = 'Y'";
-
-            List<String> dueBatches = jdbcTemplate.queryForList(sql, String.class, LocalDateTime.now());
-
-            if (dueBatches.isEmpty()) return;
-
-            log.info("SCHEDULER_WAKEUP | Found {} batches ready for execution.", dueBatches.size());
-
-            for (String batchId : dueBatches) {
-                try {
-                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-                    execDto.setBatchId(batchId);
-                    execDto.setStatus(RequestStatus.ACCEPTED);
-                    execDto.setRemarks("Executed by System Scheduler");
-
-                    // 3. Process the batch
-                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
-                    
-                    log.info("SCHEDULER_TRIGGERED | Batch: {} executed successfully.", batchId);
-
-                } catch (Exception e) {
-                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-                }
-            }
-
-        } catch (Exception e) {
-            log.error("SCHEDULER_CRITICAL_ERROR | {}", e.getMessage());
-        } finally {
-            if (lockAcquired) {
-                stringRedisTemplate.delete(lockKey);
-            }
+   const autoSubmitBatch = async (reqId) => {
+    setIsCreatingBatch(true);
+    try {
+      const payload = {
+        requestId: reqId,
+        commonBatchRemarks: `Bulk Upload - ${selectedDate.format("YYYY-MM-DD")}`,
+        postingDate: selectedDate.format("DD/MM/YYYY"),
+        vid: selectedVoucher?.VID || selectedVoucher?.vid 
+      };
+      
+      const response = await callApi("/JS/voucher/create-batch-from-cache", payload, "POST");
+      
+      if (response && (response.status === "SUCCESS" || response.batchId)) {
+        showSnackBar("Batch compiled and submitted successfully!", "success");
+        
+        // ✨ FIX: Take him directly to the Status Screen view/tab
+        // If your parent layout changes screens via a callback prop (e.g., setViewMode("STATUS") or setTab(1))
+        if (props.setViewTab) {
+          props.setViewTab("STATUS"); 
+        } else if (onSuccessSubmit) {
+          // Alternative: Use your existing routing completion handler if it modifies global layout state
+          onSuccessSubmit(response.batchId, "GO_TO_STATUS");
+        } else {
+          setBatchCreated(true);
         }
+      } else {
+        throw new Error(response.message || "Failed.");
+      }
+    } catch (e) {
+      let msg = e.message || "Unknown error";
+      if (e.response && e.response.data && e.response.data.message) {
+        msg = e.response.data.message;
+      }
+      showSnackBar("Failed to submit batch: " + msg, "error");
+    } finally {
+      setIsCreatingBatch(false);
     }
-}
+  };
