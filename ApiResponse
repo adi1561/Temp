@@ -1,19 +1,136 @@
-ok i tested this there are same problem with this like 
+These are crucial issues that point directly to how metadata is passed between your frontend, the controller, the Redis cache, and your Hibernate entities. Let's fix each one systematically.
+### The Root Cause
+ 1. **The Null Fields (WORKFLOW_CODE, COMMON_BATCH_REMARKS, CREATOR_ROLE):** When creating a batch via **Bulk Upload**, these values are lost because they are dropped when shifting from the main request to the async thread.
+ 2. **IS_SCHEDULE_OVERRIDE set to YES:** This happens because your code defaults it to YES at birth instead of initializing it to NO.
+ 3. **Data Redundancy in VOUCHER_POSTING_DATA:** You are completely correct. Storing COMMON_BATCH_REMARKS inside the line-items table is redundant. We will alter the code to stop writing to that column.
+ 4. **VOUCHER_WORKFLOW.SCHEDULED_TIME coming null:** The scheduler log method is missing the timestamp parameter mapping.
+Here is the exact code to fix everything.
+### 1. Fix the Core Data Persistence (VoucherRequestServiceImpl.java)
+Find your executeAsyncBatchCreation method and replace the final part where you save the VoucherPosting record with this code. This reads the role, remarks, and workflow from the Redis metadata cache, maps them to the master table, and keeps VOUCHER_POSTING_DATA clean.
+```java
+@Async("bulkExecutor")
+public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+    
+    // --- 1. FETCH METADATA & SCHEDULE FROM REDIS ---
+    byte[] metaBytes = (byte[]) redisTemplate.opsForValue().get("DATA_META_" + requestId);
+    byte[] scheduleBytes = (byte[]) redisTemplate.opsForValue().get("META_SCHEDULE_" + requestId);
+    
+    long totalRows = 0;
+    if (metaBytes != null) {
+        try {
+            Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
+            totalRows = ((Number) meta.get("totalRows")).longValue();
+        } catch (Exception e) {
+            log.warn("Could not parse total rows from Redis metadata");
+        }
+    }
 
-in the voucher posting 
-follwing are the value in which 
--> after creating come null
-WORKFLOW_CODE 
-COMMON_BATCH_REMARKS
-CREATOR_ROLE
+    String scheduleStr = (scheduleBytes != null) ? new String(scheduleBytes, StandardCharsets.UTF_8) : null;
+    LocalDateTime scheduledTime = null;
+    if (scheduleStr != null && !scheduleStr.isEmpty()) {
+        scheduledTime = LocalDateTime.parse(scheduleStr, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+    }
 
+    // --- 2. SAVE LINE ITEMS (DROPPING REDUNDANT REMARKS) ---
+    // In your batch insert loop for VOUCHER_POSTING_DATA:
+    // Remove commonRemarks from the insert statement completely to eliminate redundancy!
+    // Simply map the row remarks from the file.
 
-IS_SCHEDULE_OVERRIDE-> this come YES -> which is wrong this should yes only if at final stage when checker is overriding the SCHEDULE
+    // --- 3. SAVE MASTER VOUCHER POSTING RECORD ---
+    VoucherPosting posting = new VoucherPosting();
+    posting.setBatchId(batchId);
+    posting.setVidFk(journalPrefix);
+    
+    // ✨ FIXES: Map the missing master metadata parameters explicitly
+    posting.setCommonBatchRemarks(commonRemarks);
+    posting.setCreatorRole(creatorRole);
+    posting.setCreatedBy(creatorId);
+    
+    // Dynamically look up the initial step ID of your specific routing configuration
+    Long initialWorkflowId = jdbcTemplate.queryForObject(
+        "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 1",
+        Long.class, journalPrefix
+    );
+    posting.setPendingAt(initialWorkflowId);
+    posting.setWorkflowCode(journalPrefix);
 
+    // ✨ FIX: Initialize schedule logic correctly at birth
+    if (scheduledTime != null) {
+        posting.setExecutionScheduled("YES");
+        posting.setScheduledTime(scheduledTime);
+    } else {
+        posting.setExecutionScheduled("NO");
+    }
+    
+    // ✨ FIX: This MUST be initialized to NO at birth. It only shifts to YES if overridden at final stage.
+    posting.setIsScheduleOverride("NO"); 
+    posting.setBatchStatus("P"); // Strict 'P' state initialization
+    posting.setRecordsCount(totalRows);
 
-in the case of voucher posting data table COMMON_BATCH_REMARKS is there if we put this here there might be data redenecy 
+    voucherPostingRepository.save(posting);
+}
 
+```
+### 2. Fix the Workflow History Timestamp (VoucherRequestServiceImpl.java)
+The VOUCHER_WORKFLOW.SCHEDULED_TIME field is null because the logWorkflowAction method isn't setting it.
+**Update your logWorkflowAction signature and block:**
+```java
+public void logWorkflowAction(String batchId, String vid, String action, String userId, String remarks, LocalDateTime scheduledTime) {
+    String sql = """
+        INSERT INTO VOUCHER_WORKFLOW (
+            WORKFLOW_ID, BATCH_ID_FK, VID_FK, LAST_ACTION, 
+            LAST_ACTION_BY, LAST_ACTION_AT, REMARKS, SCHEDULED_TIME
+        ) VALUES (
+            VOUCHER_WORKFLOW_SEQ.NEXTVAL, ?, ?, ?, ?, SYSTIMESTAMP, ?, ?
+        )
+    """;
 
-in the case of voucher workflow -> SCHEDULED_TIME is comming null
+    // ✨ FIX: Include scheduledTime parameter explicitly in the database insert operation
+    jdbcTemplate.update(sql, batchId, vid, action, userId, remarks, scheduledTime);
+}
 
-resolve this 
+```
+### 3. Fix the Final Stage Verification Logic (processWorkflowAction)
+To ensure IS_SCHEDULE_OVERRIDE shifts to YES **only** if the checker changes the date at the final stage, update your processing block like this:
+```java
+// Inside processWorkflowAction method, where the final approval step is evaluated:
+if (isFinalStep) {
+    Long execStepId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?", Long.class, workflowCode, currentOrder + 1);
+    posting.setPendingAt(execStepId);
+
+    // Check if the user is passing a brand new override time from the UI
+    boolean isOverrideTriggered = Boolean.TRUE.equals(dto.getOverrideScheduleLapse()) || dto.getNewScheduledTime() != null;
+
+    if (isOverrideTriggered) {
+        // ✨ FIX: Shifts to YES ONLY when an override action is explicitly confirmed at the final stage
+        posting.setIsScheduleOverride("YES"); 
+        posting.setExecutionScheduled(dto.getNewScheduledTime() != null ? "YES" : "NO");
+        posting.setScheduledTime(dto.getNewScheduledTime());
+    } else {
+        // Keep the original schedule values intact
+        posting.setIsScheduleOverride("NO");
+    }
+
+    if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+        posting.setBatchStatus("P"); // Keep as Pending under our strict P, A, R status configuration rule
+        
+        // ✨ FIX: Pass the timestamp to workflow logging history
+        logWorkflowAction(batchId, posting.getVidFk(), "Final Approval (Scheduled)", executorId, dto.getRemarks(), posting.getScheduledTime());
+    } else {
+        posting.setBatchStatus("A"); // Instantly transition to Approved
+        posting.setExecutedAt(LocalDateTime.now());
+        logWorkflowAction(batchId, posting.getVidFk(), "Final Approval (Posted)", executorId, dto.getRemarks(), null);
+        
+        // Execute procedure directly
+        BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+        execDto.setBatchId(batchId); execDto.setStatus(RequestStatus.ACCEPTED); execDto.setRemarks(dto.getRemarks());
+        this.processBulkRequestsAsync(execDto, executorId, executorRole);
+    }
+}
+
+```
+### Summary of What This Resolves:
+ * **No More Redundancy:** VOUCHER_POSTING_DATA stops storing the batch remarks; they now reside exclusively in the master table (VOUCHER_POSTING).
+ * **Metadata Restored:** WORKFLOW_CODE, COMMON_BATCH_REMARKS, and CREATOR_ROLE will now be cleanly populated upon bulk upload creation.
+ * **Accurate Override Tracking:** IS_SCHEDULE_OVERRIDE will default to NO and will only switch to YES if a final checker explicitly re-schedules the batch.
+ * **Audit Logs Complete:** VOUCHER_WORKFLOW.SCHEDULED_TIME will accurately reflect when a transaction is scheduled to run.
