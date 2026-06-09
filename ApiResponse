@@ -1,102 +1,100 @@
-Got it. Let's enforce the strict **P**, **A**, **R** rule across the board, and get that RECORDS_COUNT populated correctly.
-Here is exactly how to fix both issues.
-### 1. Enforcing Strict Statuses (P, A, R Only)
-Since we are strictly dropping 'S' (Scheduled) and 'QUEUED', we must use **P** for everything that hasn't finished, **A** for everything that succeeds, and **R** for everything rejected.
-**Fix A: processWorkflowAction**
-When a checker schedules a batch, do NOT change the status to 'S'. Keep it as 'P'. The system will know it is scheduled because the IS_EXECUTION_SCHEDULED column is 'YES'.
-```java
-// Inside processWorkflowAction (Approval block)
-if ("YES".equalsIgnoreCase(posting.getExecutionScheduled()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
-    
-    // ✨ FIX: Keep it 'P' (Pending) while it waits for the scheduler
-    posting.setBatchStatus("P"); 
-    logWorkflowAction(batchId, posting.getVidFk(), "Final Approval(Scheduled)", executorId, dto.getRemarks(), posting.getScheduledTime());
-    jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+package com.fincore.VoucherService.Service;
 
-} else {
-    // ... immediate execution logic
-}
+import com.fincore.VoucherService.Models.VoucherPosting;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
+import com.fincore.VoucherService.Repository.VoucherPostingRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-```
-**Fix B: The Scheduler Query (VoucherExecutionScheduler.java)**
-Update your scheduler to hunt for 'P' batches that have a schedule time in the past.
-```java
-    public void executeScheduledBatches() {
-        // ✨ FIX: Look for 'P' batches that are scheduled and due
-        String sql = "SELECT BATCH_ID FROM VOUCHER_POSTING WHERE BATCH_STATUS = 'P' " +
-                     "AND IS_EXECUTION_SCHEDULED = 'YES' " +
-                     "AND SCHEDULED_TIME <= SYSTIMESTAMP";
-        
-        List<String> scheduledBatchIds = jdbcTemplate.queryForList(sql, String.class);
-        // ... (loop and execute)
-    }
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
-```
-**Fix C: The Async Lock (processBulkRequestsAsync)**
-Since we cannot use 'QUEUED' as a temporary lock, we will lock the row by immediately marking it as 'A' (Accepted). If the Oracle procedure fails, the error handler will safely roll it back to 'P'.
-```java
-    @Override
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherExecutionScheduler {
+
+    private final VoucherPostingRepository voucherPostingRepository;
+    private final VoucherRequestServiceImpl voucherRequestService;
+    private final StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
+     * executes the scheduled batches in a distributed environment.
+     */
+    @Scheduled(fixedRate = 60000)
     @Transactional
-    public void processBulkRequestsAsync(BulkProcessVoucherPostingDto dto, String executorId, Integer executorRole) {
-        // ✨ FIX: Lock by moving directly from P -> A. No temporary 'QUEUED' state.
-        String lockSql = "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'A' WHERE BATCH_ID = ? AND BATCH_STATUS = 'P'";
-        int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
+    public void executeScheduledBatches() {
+        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
+        boolean lockAcquired = false;
 
-        if (updated == 0) {
-            throw new IllegalStateException("Batch is already processing or is not Pending.");
-        }
-        
-        self.executeAsyncBatchProcessing(dto, executorId);
-    }
+        try {
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 2, TimeUnit.MINUTES);
+            lockAcquired = Boolean.TRUE.equals(acquired);
 
-```
-### 2. Fixing RECORDS_COUNT Insertion
-The RECORDS_COUNT column is blank because the Java code that inserts the initial VOUCHER_POSTING row isn't explicitly setting it. You need to map the count during batch creation.
-**Fix A: For Manual Entry (createBatchRequest)**
-Find your createBatchRequest method in VoucherRequestServiceImpl.java. Right before you call voucherPostingRepository.save(posting), add the count of the rows submitted from the frontend:
-```java
-    // Inside createBatchRequest
-    VoucherPosting posting = new VoucherPosting();
-    posting.setBatchId(batchId);
-    // ... other mappings ...
+            if (!lockAcquired) return;
 
-    // ✨ FIX: Set the records count based on the incoming UI grid rows
-    if (dto.getRows() != null) {
-        posting.setRecordsCount((long) dto.getRows().size());
-    }
+            // Find all SCHEDULED batches where the time is <= NOW
+            List<VoucherPosting> dueBatches = voucherPostingRepository.findAll().stream()
+                    .filter(p -> "S".equals(p.getBatchStatus())  // FIX 1: Look for 'S' (Scheduled) using getBatchStatus()
+                            && p.getScheduledTime() != null
+                            && !p.getScheduledTime().isAfter(LocalDateTime.now()))
+                    .collect(Collectors.toList());
 
-    voucherPostingRepository.save(posting);
+            if (dueBatches.isEmpty()) return;
 
-```
-**Fix B: For Bulk Upload (executeAsyncBatchCreation)**
-During bulk upload, the parser saves the total row count in Redis metadata. You need to pull it out and save it to the master table.
-```java
-    @Async("bulkExecutor")
-    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-        
-        // 1. Fetch metadata from Redis (you might already have this block for the schedule)
-        byte[] metaBytes = (byte[]) redisTemplate.opsForValue().get("DATA_META_" + requestId);
-        long totalRows = 0;
-        
-        if (metaBytes != null) {
-            try {
-                Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
-                totalRows = ((Number) meta.get("totalRows")).longValue();
-            } catch (Exception e) {
-                log.warn("Could not parse total rows from Redis metadata");
+            log.info("SCHEDULER_WAKEUP | Found {} batches ready for execution.", dueBatches.size());
+
+            for (VoucherPosting posting : dueBatches) {
+                try {
+                    // FIX 2: Update State to 'C' (Completed/Posted)
+                    posting.setBatchStatus("C");
+                    posting.setExecutedAt(LocalDateTime.now());
+                    voucherPostingRepository.save(posting);
+
+                    // Retire the VID since it is officially posted now
+                    if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
+                        voucherRequestService.updateVidStatus(posting.getVidFk(), com.fincore.VoucherService.Models.enums.VoucherStatus.COMPLETED);
+                    }
+
+                    // Write to the workflow history so users see that the System executed it
+                    voucherRequestService.logWorkflowAction(
+                            posting.getBatchId(),
+                            posting.getVidFk(),
+                            "SYSTEM_SCHEDULED_POSTING",
+                            "SYSTEM",
+                            "Executed by System Scheduler",
+                            null
+                    );
+
+                    // Execute Oracle Logic via existing pipeline
+                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                    execDto.setBatchId(posting.getBatchId());
+                    execDto.setStatus(RequestStatus.ACCEPTED);
+                    execDto.setRemarks("Executed by System Scheduler");
+
+                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 0);
+
+                } catch (Exception e) {
+                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", posting.getBatchId(), e.getMessage());
+                }
+            }
+
+        } finally {
+            if (lockAcquired) {
+                stringRedisTemplate.delete(lockKey);
             }
         }
 
-        // ... (Your validation & insertion logic) ...
-
-        VoucherPosting posting = new VoucherPosting();
-        // ... (other fields)
-        
-        // ✨ FIX: Set the records count from the Excel parsed metadata
-        posting.setRecordsCount(totalRows); 
-        
-        voucherPostingRepository.save(posting);
     }
+}
 
-```
-Implement these, and your table will perfectly populate the RECORDS_COUNT, allowing your UI to render the count immediately without any heavy SQL subqueries.
+this is old file in which i dont understand what changes should i do in this file can u tell mi and give mi complate updated file for this 
