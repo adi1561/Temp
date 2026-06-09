@@ -1,13 +1,111 @@
-ok i think u are not understanding properly 
-what model size and all in the JournalAuthorization screen do exectly same as that and 
-what ever u did for the VID and Creator that is not working
-0008485
-null
-Verification
-R
-A
-E
-7875730 (7875730)
-9 Jun 2026, 3:50 pm
-2
-something like this data come
+I understand completely now. You are getting null or raw IDs in the UI because the **getAllRequestsSummary** SQL query in your VoucherRequestServiceImpl.java is still joined to the old JOURNAL_BATCH_MASTER table, and it is **missing the VID_FK column** and the USERS join for the creator name.
+To get the exact same look and data as the Authorization screen, we need to update that specific SQL query.
+### 1. Update the Backend SQL (VoucherRequestServiceImpl.java)
+**FIND getAllRequestsSummary (around line 720) and REPLACE it with this exact code:**
+```java
+    public List<Map<String, Object>> getAllRequestsSummary() {
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK,
+                p.CREATED_BY AS CREATOR_ID, 
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
+                p.CREATED_AT AS REQ_DATE, 
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.BATCH_STATUS, 
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE
+            FROM VOUCHER_POSTING p
+            LEFT JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            ORDER BY p.CREATED_AT DESC
+        """;
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID_FK")); // Added VID
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME")); // Added Name
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE")); // Added for Stepper
+
+            String bStatus = rs.getString("BATCH_STATUS");
+            if ("R".equals(bStatus)) map.put("currentStatus", "REJECTED");
+            else if ("A".equals(bStatus) || "C".equals(bStatus)) map.put("currentStatus", "POSTED");
+            else map.put("currentStatus", rs.getString("WORKFLOW_STAGE") || "PENDING");
+
+            return map;
+        });
+    }
+
+```
+### 2. Update the Frontend Columns (JournalPostingStatus.jsx)
+Now that the backend is sending vid and creatorName, update your grid columns to display them correctly, matching your Authorization screen.
+**REPLACE your current columns array with this:**
+```javascript
+  const columns = [
+    { field: "batchId", headerName: "Batch ID", width: 110, align: "center", headerAlign: "center" },
+    { 
+      field: "vid", 
+      headerName: "VID", 
+      width: 170, 
+      align: "center", 
+      headerAlign: "center",
+      renderCell: (p) => <Typography variant="body2" fontWeight="bold">{p.value}</Typography>
+    },
+    {
+      field: "workflowState",
+      headerName: "Workflow Progress",
+      width: 440,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => {
+        const state = params.row.currentStatus;
+        const workflow = params.row.approvalWorkflow;
+        const isRejected = state === "REJECTED";
+        
+        // This logic now matches your Auth screen exactly
+        const stepLabels = workflowStepsMap[workflow] || ["Step 1", "Step 2", "Final"];
+        let activeStep = stepLabels.findIndex(l => l === state);
+        if (state === "POSTED") activeStep = stepLabels.length;
+
+        return (
+            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />}>
+              {stepLabels.map((label, index) => (
+                <Step key={index} completed={index < activeStep} active={index === activeStep}>
+                  <StepLabel StepIconComponent={() => <CustomWorkflowIcon statusFlag={index < activeStep ? 'COMPLETED' : (index === activeStep ? 'ACTIVE' : 'PENDING')} iconLetter={label.charAt(0)} label={label} isMini={true} />} />
+                </Step>
+              ))}
+            </Stepper>
+        );
+      }
+    },
+    {
+      field: "creatorName",
+      headerName: "Creator",
+      width: 250,
+      renderCell: (p) => (
+        <Chip icon={<AccountCircleIcon />} label={`${p.row.creatorName || 'N/A'} (${p.row.creatorId})`} size="small" variant="outlined" />
+      ),
+    },
+    { field: "requestDate", headerName: "Submitted On", width: 200, renderCell: (p) => new Date(p.value).toLocaleString() },
+    { field: "requestCount", headerName: "No. of Entries", width: 120, align: "center" },
+    {
+      field: "actions",
+      headerName: "Actions",
+      width: 120,
+      renderCell: (params) => (
+        <IconButton onClick={() => handleOpenViewModal(params.row)} color="primary"><VisibilityIcon /></IconButton>
+      ),
+    },
+  ];
+
+```
+### Why this fixes it:
+ 1. **Name Sync:** By adding COALESCE(u.FIRST_NAME || ...) to the SQL, the backend now returns creatorName, which the grid column was looking for.
+ 2. **VID Sync:** The backend now maps VID_FK to vid, and the grid has a dedicated column for it.
+ 3. **Workflow Sync:** The grid now uses the same workflowStepsMap and CustomWorkflowIcon logic as the Authorization screen, ensuring the stepper works identically.
+Try this backend SQL change and the updated column definitions—it will align perfectly with your Authorization screen.
