@@ -1,27 +1,23 @@
 package com.fincore.VoucherService.Service;
 
-import com.fincore.VoucherService.Models.VoucherPosting;
 import com.fincore.VoucherService.Models.enums.RequestStatus;
 import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
-import com.fincore.VoucherService.Repository.VoucherPostingRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class VoucherExecutionScheduler {
 
-    private final VoucherPostingRepository voucherPostingRepository;
+    private final JdbcTemplate jdbcTemplate;
     private final VoucherRequestServiceImpl voucherRequestService;
     private final StringRedisTemplate stringRedisTemplate;
 
@@ -30,7 +26,6 @@ public class VoucherExecutionScheduler {
      * executes the scheduled batches in a distributed environment.
      */
     @Scheduled(fixedRate = 60000)
-    @Transactional
     public void executeScheduledBatches() {
         String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
         boolean lockAcquired = false;
@@ -42,49 +37,33 @@ public class VoucherExecutionScheduler {
 
             if (!lockAcquired) return;
 
-            // Find all SCHEDULED batches where the time is <= NOW
-            List<VoucherPosting> dueBatches = voucherPostingRepository.findAll().stream()
-                    .filter(p -> "S".equals(p.getBatchStatus())  // FIX 1: Look for 'S' (Scheduled) using getBatchStatus()
-                            && p.getScheduledTime() != null
-                            && !p.getScheduledTime().isAfter(LocalDateTime.now()))
-                    .collect(Collectors.toList());
+            // 1. PERFORMANCE & STATUS FIX: Fetch only the specific Batch IDs directly via SQL.
+            // We look for 'P' (Pending) batches that have 'YES' for scheduled execution and are due.
+            String sql = "SELECT BATCH_ID FROM VOUCHER_POSTING " +
+                         "WHERE BATCH_STATUS = 'P' " +
+                         "AND IS_EXECUTION_SCHEDULED = 'YES' " +
+                         "AND SCHEDULED_TIME <= SYSTIMESTAMP";
+
+            List<String> dueBatches = jdbcTemplate.queryForList(sql, String.class);
 
             if (dueBatches.isEmpty()) return;
 
             log.info("SCHEDULER_WAKEUP | Found {} batches ready for execution.", dueBatches.size());
 
-            for (VoucherPosting posting : dueBatches) {
+            for (String batchId : dueBatches) {
                 try {
-                    // FIX 2: Update State to 'C' (Completed/Posted)
-                    posting.setBatchStatus("C");
-                    posting.setExecutedAt(LocalDateTime.now());
-                    voucherPostingRepository.save(posting);
-
-                    // Retire the VID since it is officially posted now
-                    if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) {
-                        voucherRequestService.updateVidStatus(posting.getVidFk(), com.fincore.VoucherService.Models.enums.VoucherStatus.COMPLETED);
-                    }
-
-                    // Write to the workflow history so users see that the System executed it
-                    voucherRequestService.logWorkflowAction(
-                            posting.getBatchId(),
-                            posting.getVidFk(),
-                            "SYSTEM_SCHEDULED_POSTING",
-                            "SYSTEM",
-                            "Executed by System Scheduler",
-                            null
-                    );
-
-                    // Execute Oracle Logic via existing pipeline
+                    // 2. TRIGGER FIX: We let the existing pipeline handle the status changes and logging.
                     BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-                    execDto.setBatchId(posting.getBatchId());
+                    execDto.setBatchId(batchId);
                     execDto.setStatus(RequestStatus.ACCEPTED);
                     execDto.setRemarks("Executed by System Scheduler");
 
-                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 0);
+                    // 9001 is a fallback system role ID.
+                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
 
                 } catch (Exception e) {
-                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", posting.getBatchId(), e.getMessage());
+                    // 3. ISOLATION FIX: A failure here only affects this single batch.
+                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
                 }
             }
 
@@ -93,8 +72,5 @@ public class VoucherExecutionScheduler {
                 stringRedisTemplate.delete(lockKey);
             }
         }
-
     }
 }
-
-this is old file in which i dont understand what changes should i do in this file can u tell mi and give mi complate updated file for this 
