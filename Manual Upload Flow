@@ -1,0 +1,69 @@
+The manual upload (or manual batch creation) flow is significantly more straightforward than the bulk Excel upload. Because the data payload is smaller and comes directly from a frontend form, it bypasses the complex GZIP chunking and Redis caching used in the bulk flow. It handles data mapping, persistence, and workflow initialization synchronously.
+
+Here is the exact, step-by-step breakdown of how a manual voucher is created, which methods are invoked, and their responsibilities.
+
+### 1. The Entry Point: The Controller
+
+**API Endpoint:** `POST /api/voucher/create-batch`
+**File:** `Controllers/VoucherPostingController.java`
+**Method:** `createBatchRequest()`
+
+* **Responsibility:** Acts as the gateway. It receives a `BatchPostingDto` (which contains common remarks, the `vid`, and a list of individual `JournalRequestRow` line items).
+* **Security:** It extracts the user's ID and Role from the JWT token so the backend knows exactly who is acting as the "Maker."
+* **Handoff:** It immediately delegates the heavy lifting to the service layer by calling `voucherRequestService.createBatchRequest()`.
+
+### 2. The Core Logic: The Service Layer
+
+**File:** `Service/VoucherRequestServiceImpl.java`
+**Method:** `createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole)`
+
+This single method orchestrates the entire database transaction. Here is the exact chronological flow inside it:
+
+#### Step A: Identifier Generation
+
+* **Method Called:** `sequenceService.getNextBatchId()` and `sequenceService.getNextJournalIdPrefix()`
+* **Responsibility:** Hits the Oracle database to fetch the next safe, unique IDs using native sequences (`BATCH_SEQ` and `JRNL_SEQ`). This ensures no two batches ever get the same ID, even if multiple users submit a form at the exact same millisecond.
+
+#### Step B: Building the Line Items (The "Data" Rows)
+
+* **Action:** The system loops through every row in the DTO payload.
+* **Responsibility:** It maps the incoming DTO data to the `JournalRequest` entity.
+* *Note on the naming:* Even though the class is named `JournalRequest`, if you look at the model file, it is explicitly mapped to your new table: `@Table(name = "VOUCHER_POSTING_DATA")`.
+
+
+* **Validation:** It enforces a hard rule here: `if (amount.compareTo(BigDecimal.ZERO) == 0)`, it immediately throws an `InvalidDataException`.
+* **Persistence:** It saves all the row items to the database in one shot using `journalRequestRepository.saveAll(entities)`.
+
+#### Step C: Dynamic Workflow Routing
+
+* **Action:** Executes raw SQL via `JdbcTemplate` against the `WORKFLOW_TRANSITIONS` table.
+* **Responsibility:** The system doesn't hardcode who approves what. Instead, it looks up the specific `WORKFLOW_CODE` assigned to the Maker's role (`creatorRole`). It then looks up the `WORKFLOW_ID` of the very next step (where `WORKFLOW_ORDER = 2`). This determines exactly whose queue this batch will land in for checking.
+
+#### Step D: Creating the Master Batch Record
+
+* **Action:** Instantiates a new `VoucherPosting` entity.
+* **Responsibility:** This represents the "Parent" record of the batch. It ties everything together.
+* **State Management:** * Sets `BatchStatus` to `"P"` (Pending).
+* Attaches the `VidFk` (Voucher ID).
+* Sets the `PendingAt` field to the ID of the workflow step calculated in Step C.
+* Evaluates scheduling logic: If the user provided a `ScheduledTime`, it flags `IS_EXECUTION_SCHEDULED` as `"YES"`.
+
+
+* **Persistence:** Saves this master record using `voucherPostingRepository.save(posting)`.
+
+#### Step E: State Finalization, Audit, and Alerts
+
+Once the data is safely committed, the service fires off several auxiliary functions to update the rest of the system:
+
+1. **`logAudit(...)`:** Writes a record to the `AUDIT_LOG` table tracking that a manual batch was created.
+2. **`sendNotification(...)`:** Triggers the `NotificationWriterService`, which persists an alert to the database and broadcasts it via Redis Pub/Sub so the frontend UI can update instantly.
+3. **`updateVidStatus(...)`:** Locks the selected Voucher ID (`VID`) by setting its status in the `REQUEST_VOUCHER` table to `USED`. This is a critical state change that prevents another user from grabbing the same VID for a different batch.
+4. **`logWorkflowAction(...)`:** Writes a historical breadcrumb to the `VOUCHER_WORKFLOW` table indicating that the batch has officially entered the "Submitted" state.
+
+### Summary of Repositories Used in this Flow:
+
+* **`JournalRequestRepository`:** Saves the individual line items to `VOUCHER_POSTING_DATA`.
+* **`VoucherPostingRepository`:** Saves the parent batch record to `VOUCHER_POSTING`.
+* **`VoucherLogRepository`:** Saves the security audit log.
+* **`VoucherWorkflowRepository`:** Saves the workflow history trail.
+* **`JdbcTemplate`:** Used directly for high-speed reads against the workflow routing and configuration tables.
