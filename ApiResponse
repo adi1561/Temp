@@ -1,20 +1,82 @@
-ok there is one more condition is there 
-that scadular is only execute if that is approved by final approval
+package com.fincore.VoucherService.Service;
 
-i will tell u logic for this like if in the voucher posting table we have that pending at column we need to join that and te the data for from the workflow transitions from that WORKFLOW_ID is there
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
 
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherExecutionScheduler {
 
+    private final JdbcTemplate jdbcTemplate;
+    private final VoucherRequestServiceImpl voucherRequestService;
+    private final StringRedisTemplate stringRedisTemplate;
 
-and check that is final approval ?? 
+    /**
+     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
+     * executes the scheduled batches in a distributed environment.
+     */
+    @Scheduled(fixedRate = 60000)
+    public void executeScheduledBatches() {
+        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
+        boolean lockAcquired = false;
 
-this condtion and that timning condtion which we have currently if this are true then only execute
+        try {
+            // 1. Distributed lock so only one server pod runs this at a time
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 50, TimeUnit.SECONDS);
+            lockAcquired = Boolean.TRUE.equals(acquired);
+
+            if (!lockAcquired) return;
+
+            // 2. Query for pending ('P') scheduled batches whose time has arrived
+            // ✨ FIX: Joined with WORKFLOW_TRANSITIONS to ensure IS_FINAL_APPROVAL = 'Y'
+            String sql = "SELECT p.BATCH_ID FROM VOUCHER_POSTING p " +
+                    "INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID " +
+                    "WHERE p.BATCH_STATUS = 'P' " +
+                    "AND p.IS_EXECUTION_SCHEDULED = 'YES' " +
+                    "AND p.SCHEDULED_TIME <= ? " +
+                    "AND w.IS_FINAL_APPROVAL = 'Y'";
+
+            List<String> dueBatches = jdbcTemplate.queryForList(sql, String.class, LocalDateTime.now());
+
+            if (dueBatches.isEmpty()) return;
+
+            log.info("SCHEDULER_WAKEUP | Found {} batches ready for execution.", dueBatches.size());
+
+            for (String batchId : dueBatches) {
+                try {
+                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                    execDto.setBatchId(batchId);
+                    execDto.setStatus(RequestStatus.ACCEPTED);
+                    execDto.setRemarks("Executed by System Scheduler");
+
+                    // 3. Process the batch
+                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
+                    
+                    log.info("SCHEDULER_TRIGGERED | Batch: {} executed successfully.", batchId);
+
+                } catch (Exception e) {
+                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("SCHEDULER_CRITICAL_ERROR | {}", e.getMessage());
+        } finally {
+            if (lockAcquired) {
+                stringRedisTemplate.delete(lockKey);
+            }
+        }
+    }
+}
