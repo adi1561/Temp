@@ -1,5 +1,31 @@
-CREATE SEQUENCE VOUCHER_POSTING_DATA_SEQ 
-START WITH 1 
-INCREMENT BY 1 
-NOCACHE 
-NOCYCLE;
+Ah! I know exactly why this is happening.
+Because we completely decoupled the scheduling logic and moved it to **Step 3**, the initial batch creation (Manual or Bulk) always saves with a null schedule. That means the "Submitted" entry in the VOUCHER_WORKFLOW history table gets written with SCHEDULED_TIME = null.
+When the user clicks "Confirm Schedule" on the success screen, it calls your /update-schedule API. Right now, that API is only updating the VOUCHER_POSTING master table, but completely ignoring the VOUCHER_WORKFLOW history table!
+We need to update the /update-schedule backend method to inject that timestamp into the workflow history row as well.
+### The Fix
+Find your **updateBatchSchedule** method in **VoucherRequestServiceImpl.java** (around line 900) and replace it with this:
+```java
+    @Override
+    @Transactional
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        // Use a simple count check first
+        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
+
+        if (exists == null || exists == 0) {
+            // If the record isn't there, log a warning instead of crashing
+            log.warn("SCHEDULE_UPDATE_FAIL | Batch {} not yet created in DB. Retrying or waiting...", batchId);
+            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
+        }
+
+        // 1. Update the Master Record
+        String sql = "UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?";
+        jdbcTemplate.update(sql, scheduledTime, batchId);
+
+        // ✨ 2. FIX: Update the Workflow History so the initial "Submitted" action displays the schedule!
+        String wfSql = "UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'";
+        jdbcTemplate.update(wfSql, scheduledTime, batchId);
+    }
+
+```
+**(Don't forget to add @Transactional to the top of the method if it isn't there already, so both tables update safely together.)**
+By adding that second jdbcTemplate.update(wfSql...) command, the backend will retroactively stamp the chosen schedule time onto the Maker's "Submitted" step in the history log, and it will immediately show up properly in your workflow timeline UI!
