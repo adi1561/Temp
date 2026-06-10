@@ -1,93 +1,65 @@
-It is an absolute golden rule of backend engineering: **never trust the frontend.** Even if you lock down the date picker in React, a user could still bypass it by intercepting the API request or using tools like Postman.
-To enforce this at the database level, we will create a centralized validation method inside your VoucherRequestServiceImpl.java and apply it wherever a schedule time is processed.
-### 1. Add the Validation Helper Method
-Add this private helper method anywhere inside **VoucherRequestServiceImpl.java**.
-*Note: I am applying a small 2-minute "network latency buffer" (checking for 28 mins instead of 30). If a user selects exactly 30 minutes in the UI and their internet is slow, the backend would receive it at 29 minutes and 59 seconds, causing a frustrating error. This buffer prevents that.*
+To change the Redis TTL from a fixed 1-hour limit to a **"cleanup-on-completion"** strategy, you need to shift from using a hard-coded TTL (1, TimeUnit.HOURS) to a model where the data is explicitly deleted by the application once the batch process reaches a terminal state (Success or Failure).
+Here is how to modify your VoucherBulkValidationService to implement this.
+### 1. Remove TTLs from saveRowsToRedis
+Currently, you use TimeUnit.HOURS when saving chunks. Remove the TTL so the data persists until you explicitly decide to kill it.
+**In VoucherBulkValidationService.java -> saveRowsToRedis:**
 ```java
-    /**
-     * Validates that the scheduled time is between 30 minutes and 24 hours from now.
-     * Includes a 2-minute network buffer to prevent strict boundary rejections.
-     */
-    private void validateScheduledTime(LocalDateTime scheduledTime) {
-        if (scheduledTime == null) return;
+// OLD: redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 1, TimeUnit.HOURS);
 
-        LocalDateTime minTime = LocalDateTime.now().plusMinutes(28); 
-        LocalDateTime maxTime = LocalDateTime.now().plusHours(24).plusMinutes(2); 
+// NEW: Remove the TTL argument entirely
+redisTemplate.opsForValue().set(chunkKey, baos.toByteArray());
 
-        if (scheduledTime.isBefore(minTime)) {
-            throw new CustomExceptions.InvalidDataException("Scheduled time must be at least 30 minutes from the current time.");
-        }
-        
-        if (scheduledTime.isAfter(maxTime)) {
-            throw new CustomExceptions.InvalidDataException("Scheduled time cannot exceed 24 hours from the current time.");
-        }
+// Do the same for metaBytes
+// OLD: redisTemplate.opsForValue().set("DATA_META_" + requestId, metaBytes, 1, TimeUnit.HOURS);
+// NEW:
+redisTemplate.opsForValue().set("DATA_META_" + requestId, metaBytes);
+
+```
+### 2. Implement the "Vanish" Logic
+You must now call a cleanup method in every possible terminal path of your validation and processing flow. Create this helper method:
+```java
+private void cleanupBulkData(String requestId) {
+    log.info("CLEANUP_REDIS_DATA | ReqID: {}", requestId);
+    // Delete meta
+    redisTemplate.delete("DATA_META_" + requestId);
+    
+    // Delete chunks (Use a pattern scan or keep track of the number of chunks)
+    // If you don't know the exact count, use a pattern delete:
+    Set<String> keys = redisTemplate.keys("DATA_CHUNK_" + requestId + "_*");
+    if (keys != null && !keys.isEmpty()) {
+        redisTemplate.delete(keys);
     }
+}
 
 ```
-### 2. Secure the Manual Batch Creation
-Find the createBatchRequest method in **VoucherRequestServiceImpl.java**. Scroll down to where the Maker scheduling is handled, and inject the validation:
+### 3. Trigger Cleanup at Terminal States
+You need to call cleanupBulkData(requestId) in the following places:
+ * **In completeRequest():** After the success state is saved, but only **after** the data has been successfully pushed to the database (or if you don't need the cached data anymore).
+ * **In failRequest():** Always call this. If the validation fails, the user needs to re-upload anyway, so there is no point in keeping the bad data.
+ * **In executeAsyncBatchCreation() (Success & Failure paths):** This is the most critical. Once processChunkRaw finishes and the batch is committed to Oracle, the Redis cache is officially dead weight.
+**Example in executeAsyncBatchCreation:**
 ```java
-        // Handle Maker Scheduling
-        if (dto.getScheduledTime() != null) {
-            // --> INJECT VALIDATION HERE <--
-            validateScheduledTime(dto.getScheduledTime());
-            
-            posting.setIS_EXECUTION_SCHEDULED("YES");
-            posting.setScheduledTime(dto.getScheduledTime());
-            posting.setIsScheduleOverride("NO");
-        } else {
-            posting.setIS_EXECUTION_SCHEDULED("NO");
-            posting.setIsScheduleOverride("NO");
-        }
+try {
+    // ... all your existing chunk processing logic ...
+    
+    progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+} catch (Exception e) {
+    handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred.");
+} finally {
+    // TRIGGER CLEANUP HERE
+    voucherBulkValidationService.cleanupBulkData(requestId); 
+    redisTemplate.delete(lockKey);
+    MDC.clear();
+}
 
 ```
-### 3. Secure the Workflow Approval (Checker Rescheduling)
-Find the processWorkflowAction method in **VoucherRequestServiceImpl.java**. Scroll down to the "YES".equalsIgnoreCase((String) stepData.get("IS_FINAL_APPROVAL")) logic where the checker overrides the schedule:
+### Important Warning:
+By removing the TTL, you introduce a risk: **if your server crashes or the finally block is never reached, the data will sit in Redis forever and consume memory.**
+To mitigate this, you should keep a **"Safety TTL"** that is much longer than a normal batch process (e.g., 24 hours), just in case the application crashes mid-process.
+**Use a "Safety" TTL instead of removing it entirely:**
 ```java
-        // 5. Handle APPROVAL / PROGRESSION
-        if (isFinalStep) {
-            // Move to Execution Step (Order + 1)
-            Long execStepId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?", Long.class, workflowCode, currentOrder + 1);
-            posting.setPendingAt(execStepId);
-
-            boolean isOverride = Boolean.TRUE.equals(dto.getOverrideScheduleLapse());
-            if (isOverride) {
-                // --> INJECT VALIDATION HERE <--
-                if (dto.getNewScheduledTime() != null) {
-                    validateScheduledTime(dto.getNewScheduledTime());
-                }
-                
-                posting.setIsScheduleOverride("YES");
-                posting.setIS_EXECUTION_SCHEDULED(dto.getNewScheduledTime() != null ? "YES" : "NO");
-                posting.setScheduledTime(dto.getNewScheduledTime());
-            }
+// Set to 24 hours just in case of a crash, but expect the app to delete it sooner
+redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 24, TimeUnit.HOURS);
 
 ```
-### 4. Secure the Direct Update API
-Find the updateBatchSchedule method in **VoucherRequestServiceImpl.java**. Because the frontend payload sends the time as a String, we need to parse it to a LocalDateTime first so we can run our validation before touching the database.
-```java
-    @Override
-    @Transactional
-    public void updateBatchSchedule(String batchId, String scheduledTime) {
-        // Use a simple count check first
-        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
-
-        if (exists == null || exists == 0) {
-            log.warn("SCHEDULE_UPDATE_FAIL | Batch {} not yet created in DB. Retrying or waiting...", batchId);
-            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
-        }
-
-        // --> PARSE AND VALIDATE BEFORE UPDATING DB <--
-        if (scheduledTime != null && !scheduledTime.isEmpty()) {
-            LocalDateTime parsedTime = LocalDateTime.parse(scheduledTime, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-            validateScheduledTime(parsedTime);
-        }
-
-        String sql = "UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?";
-        jdbcTemplate.update(sql, scheduledTime, batchId);
-        
-        String wfSql = "UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'";
-        jdbcTemplate.update(wfSql, scheduledTime, batchId);
-    }
-
-```
+Does this "Explicit Delete" approach work for your current workflow, or do you need the data to stay in Redis longer for some other UI feature?
