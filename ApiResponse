@@ -1,55 +1,93 @@
-Here are the exact changes you need to make to your React components to implement both of these requirements.
-### 1. Restrict Scheduling Time (Min 30 mins, Max 24 hours)
-In your **JournalPosting** component (or wherever you are creating the request), you are currently using dayjs() for the minimum time. You just need to use .add() to enforce the 30-minute and 24-hour rules.
-Find the DateTimePicker inside **JournalPosting** and replace it with this:
-```javascript
-<DateTimePicker
-  value={scheduledTime}
-  onChange={(newValue) => setScheduledTime(newValue)}
-  minDateTime={dayjs().add(30, 'minute')} // At least 30 minutes from now
-  maxDateTime={dayjs().add(24, 'hour')}   // Maximum 24 hours from now
-  slotProps={{
-    textField: {
-      size: 'small',
-      fullWidth: true,
-      sx: { backgroundColor: 'white', mb: 3 },
-      helperText: "Scheduling is only allowed between 30 minutes and 24 hours from current time."
+It is an absolute golden rule of backend engineering: **never trust the frontend.** Even if you lock down the date picker in React, a user could still bypass it by intercepting the API request or using tools like Postman.
+To enforce this at the database level, we will create a centralized validation method inside your VoucherRequestServiceImpl.java and apply it wherever a schedule time is processed.
+### 1. Add the Validation Helper Method
+Add this private helper method anywhere inside **VoucherRequestServiceImpl.java**.
+*Note: I am applying a small 2-minute "network latency buffer" (checking for 28 mins instead of 30). If a user selects exactly 30 minutes in the UI and their internet is slow, the backend would receive it at 29 minutes and 59 seconds, causing a frustrating error. This buffer prevents that.*
+```java
+    /**
+     * Validates that the scheduled time is between 30 minutes and 24 hours from now.
+     * Includes a 2-minute network buffer to prevent strict boundary rejections.
+     */
+    private void validateScheduledTime(LocalDateTime scheduledTime) {
+        if (scheduledTime == null) return;
+
+        LocalDateTime minTime = LocalDateTime.now().plusMinutes(28); 
+        LocalDateTime maxTime = LocalDateTime.now().plusHours(24).plusMinutes(2); 
+
+        if (scheduledTime.isBefore(minTime)) {
+            throw new CustomExceptions.InvalidDataException("Scheduled time must be at least 30 minutes from the current time.");
+        }
+        
+        if (scheduledTime.isAfter(maxTime)) {
+            throw new CustomExceptions.InvalidDataException("Scheduled time cannot exceed 24 hours from the current time.");
+        }
     }
-  }}
-/>
 
 ```
-### 2. Update the Grammatically Correct "Lapsed Schedule" Message
-In your **JournalAuthorization** component, you already have a Dialog that opens when isScheduleLapseModalOpen is true. We will update the <Alert> and <Typography> inside that modal to dynamically show the Scheduled Time, Batch ID, and Creator Name with professional grammar.
-Find this section in **JournalAuthorization**:
-```javascript
-{/* --- Schedule Lapsed Edge Case Modal --- */}
-<Dialog open={isScheduleLapseModalOpen} onClose={() => setIsScheduleLapseModalOpen(false)} maxWidth="sm" fullWidth > 
-  <DialogTitle sx={{ color: "error.main", fontWeight: "bold" }}> Schedule Lapsed </DialogTitle> 
-  <DialogContent> 
-    <Alert severity="warning" sx={{ mb: 3 }}> 
-      The original scheduled execution time for this batch has passed.
-    </Alert> 
-    <Typography variant="body1" gutterBottom> 
-      Do you want to post this batch <strong>immediately</strong>, or set a <strong>new future schedule</strong>?
-    </Typography> 
+### 2. Secure the Manual Batch Creation
+Find the createBatchRequest method in **VoucherRequestServiceImpl.java**. Scroll down to where the Maker scheduling is handled, and inject the validation:
+```java
+        // Handle Maker Scheduling
+        if (dto.getScheduledTime() != null) {
+            // --> INJECT VALIDATION HERE <--
+            validateScheduledTime(dto.getScheduledTime());
+            
+            posting.setIS_EXECUTION_SCHEDULED("YES");
+            posting.setScheduledTime(dto.getScheduledTime());
+            posting.setIsScheduleOverride("NO");
+        } else {
+            posting.setIS_EXECUTION_SCHEDULED("NO");
+            posting.setIsScheduleOverride("NO");
+        }
 
 ```
-**Replace it with this updated code:**
-```javascript
-{/* --- Schedule Lapsed Edge Case Modal --- */}
-<Dialog open={isScheduleLapseModalOpen} onClose={() => setIsScheduleLapseModalOpen(false)} maxWidth="sm" fullWidth > 
-  <DialogTitle sx={{ color: "error.main", fontWeight: "bold" }}> Schedule Lapsed </DialogTitle> 
-  <DialogContent> 
-    <Alert severity="warning" sx={{ mb: 3 }}> 
-      The originally scheduled execution time <strong>{vidDetails?.SCHEDULED_TIME ? new Date(vidDetails.SCHEDULED_TIME).toLocaleString() : "N/A"}</strong> for Batch ID <strong>{viewingBatchId}</strong> (Created by <strong>{viewingBatch?.creatorName || viewingBatchCreatorId}</strong>) has already passed.
-    </Alert> 
-    <Typography variant="body1" gutterBottom> 
-      Would you like to reschedule this batch for a future time, or would you prefer to post it immediately?
-    </Typography> 
+### 3. Secure the Workflow Approval (Checker Rescheduling)
+Find the processWorkflowAction method in **VoucherRequestServiceImpl.java**. Scroll down to the "YES".equalsIgnoreCase((String) stepData.get("IS_FINAL_APPROVAL")) logic where the checker overrides the schedule:
+```java
+        // 5. Handle APPROVAL / PROGRESSION
+        if (isFinalStep) {
+            // Move to Execution Step (Order + 1)
+            Long execStepId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?", Long.class, workflowCode, currentOrder + 1);
+            posting.setPendingAt(execStepId);
+
+            boolean isOverride = Boolean.TRUE.equals(dto.getOverrideScheduleLapse());
+            if (isOverride) {
+                // --> INJECT VALIDATION HERE <--
+                if (dto.getNewScheduledTime() != null) {
+                    validateScheduledTime(dto.getNewScheduledTime());
+                }
+                
+                posting.setIsScheduleOverride("YES");
+                posting.setIS_EXECUTION_SCHEDULED(dto.getNewScheduledTime() != null ? "YES" : "NO");
+                posting.setScheduledTime(dto.getNewScheduledTime());
+            }
 
 ```
-### Why this works:
- 1. **dayjs().add(30, 'minute')** instantly blocks the user from picking any time closer than 30 minutes from the second they open the picker.
- 2. **dayjs().add(24, 'hour')** grays out any dates/times that go beyond tomorrow at the exact same time.
- 3. **The Lapsed Modal** dynamically pulls the SCHEDULED_TIME from your vidDetails state, the viewingBatchId, and the Creator's Name directly from the batch context you already have saved in state.
+### 4. Secure the Direct Update API
+Find the updateBatchSchedule method in **VoucherRequestServiceImpl.java**. Because the frontend payload sends the time as a String, we need to parse it to a LocalDateTime first so we can run our validation before touching the database.
+```java
+    @Override
+    @Transactional
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        // Use a simple count check first
+        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
+
+        if (exists == null || exists == 0) {
+            log.warn("SCHEDULE_UPDATE_FAIL | Batch {} not yet created in DB. Retrying or waiting...", batchId);
+            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
+        }
+
+        // --> PARSE AND VALIDATE BEFORE UPDATING DB <--
+        if (scheduledTime != null && !scheduledTime.isEmpty()) {
+            LocalDateTime parsedTime = LocalDateTime.parse(scheduledTime, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            validateScheduledTime(parsedTime);
+        }
+
+        String sql = "UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?";
+        jdbcTemplate.update(sql, scheduledTime, batchId);
+        
+        String wfSql = "UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'";
+        jdbcTemplate.update(wfSql, scheduledTime, batchId);
+    }
+
+```
