@@ -7,9 +7,17 @@ create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
 ) AS
     v_missing_rates NUMBER;
     v_txn_count     NUMBER; 
+    v_users_date    DATE; -- Local variable to store the business date from FINCORE_DATE
 BEGIN
     -- ==============================================================================
-    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- 0. FETCH OPERATIONAL SYSTEM BUSINESS DATE
+    -- ==============================================================================
+    SELECT USERS_DATE INTO v_users_date 
+    FROM FINCORE_DATE 
+    WHERE ROWNUM = 1;
+
+    -- ==============================================================================
+    -- 0.1. PRE-CHECK: EXCHANGE RATE INTEGRITY
     -- ==============================================================================
     SELECT COUNT(*) INTO v_missing_rates
     FROM (
@@ -33,7 +41,7 @@ BEGIN
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
     -- ==============================================================================
-    -- 1. Insert GL_TRANSACTIONS
+    -- 1. Insert GL_TRANSACTIONS (Using FINCORE_DATE for POST_DATE)
     -- ==============================================================================
     INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
         TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
@@ -41,7 +49,8 @@ BEGIN
     )
     SELECT /*+ PARALLEL(voucher_posting_data, 8) */
         GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
-        NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
+        TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), -- System entry timestamp date
+        v_users_date,                                        -- Assigned business date from FINCORE_DATE
         REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
         CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
         CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
@@ -51,18 +60,18 @@ BEGIN
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
     -- ==============================================================================
-    -- 3. Merge GL Balances
+    -- 3. Merge GL Balances (Removed POSTING_DATE tracking & Grouping)
     -- ==============================================================================
     MERGE INTO GL_BALANCE target
     USING (
         SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
-               NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) as BAL_DATE,
+               v_users_date as BAL_DATE, -- Uses forced global business day
                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
                CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
         FROM voucher_posting_data j
         LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
         WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
-        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.POSTING_DATE
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL
     ) source
     ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
         AND target.CURRENCY = source.REQ_CURRENCY
@@ -79,29 +88,29 @@ BEGIN
                 (source.TXN_AMOUNT * source.EXCH_RATE));
 
     -- ==============================================================================
-    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- 4. Capture Sync Data for HDFS (Data Lake - Removed POSTING_DATE reference)
     -- ==============================================================================
     OPEN o_cursor FOR
     SELECT
         j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
-        NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) AS BAL_DATE,
+        v_users_date AS BAL_DATE,
         g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
     FROM (
-        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, POSTING_DATE
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL
         FROM voucher_posting_data WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
     ) j
     JOIN GL_BALANCE g
         ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
         AND g.CURRENCY = j.REQ_CURRENCY
         AND g.CGL = j.REQ_CGL
-        AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
+        AND g.BALANCE_DATE = v_users_date;
 
     -- ==============================================================================
     -- 5. Finalize Batch Status
     -- ==============================================================================
     UPDATE voucher_posting_data
     SET REQ_STATUS = p_status,
-        EXECUTION_DATE = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' -- Fixed trailing comma syntax error
+        EXECUTION_DATE = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
 EXCEPTION
@@ -109,46 +118,4 @@ EXCEPTION
         ROLLBACK;
         RAISE;
 END;
-
-
-create or replace PROCEDURE PURGE_JOURNAL_BATCH(
-    p_batch_id IN VARCHAR2,
-    p_user_id  IN VARCHAR2
-) AS
-    v_status VARCHAR2(20);
-BEGIN
-    SELECT BATCH_STATUS INTO v_status
-    FROM VOUCHER_POSTING
-    WHERE BATCH_ID = p_batch_id 
-      AND UPPER(TRIM(CREATED_BY)) = UPPER(TRIM(p_user_id));
-
-    -- FIX: Only allow purging if the status is strictly 'P' (Pending) or 'QUEUED'
-    IF v_status NOT IN ('P', 'QUEUED') THEN
-        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
-    END IF;
-
-    DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
-    DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = p_batch_id;
-END;
-
-
-this are the 2 PROCEDURE in which i want change like first of all we table called as FINCORE_DATE in which column is there called as 
-USERS_DATE when we  make entry in the GL_TRANSACTIONS we need to pick date from here and put it for that batch in the GL_TRANSACTIONS table for the colulmn name POST_DATE
-when ever we accept the batch this runs when this runs we do this 
-
-from the voucher_posting_data table we will remove this column POSTING_DATE
-
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	1	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	2	The date when maker created the journal
-CREATOR_ID	VARCHAR2(12 CHAR)	No		3	
-EXECUTION_DATE	DATE	Yes		4	Timestamp when this checker acted upon the journal
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		5	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		6	Unique identifier for the individual request.
-REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		7	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		8	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 CHAR)	Yes		9	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		10	Raw requested amount 
-POSTING_DATE	DATE	Yes		11	The transaction date for which txn to be posted
-REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		12	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		13	The product  code requested.
-REQ_ID	NUMBER(19,0)	Yes		14	
+/
