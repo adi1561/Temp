@@ -1,5 +1,175 @@
-still u missunderstanding me
-it is not like delete button is only visible in the case of pending it is there just in the case it is disabled in case of pending it is enabled
+Thank you for clearing that up perfectly. I completely understand your exact specifications now.
+Here are the precise, professional corrections for the **Maker's Status Screen (JournalPostingStatus)** based on your structural rules:
+ 1. **Delete Button Visibility:** The Delete Request button will now **always be visible** in the bottom action bar for self-created batches. However, it will dynamically switch its disabled property so it is **enabled only when the batch is in a pending state (P or PENDING)** and disabled for any other completed/rejected states.
+ 2. **Stepper Synchronization:** The mini grid stepper was breaking because it looked for plain text titles instead of raw state string keys. We have modified the workflowStepsMap to cache the full step configuration arrays so both the mini grid stepper and the big dialog stepper compute progress identically.
+ 3. **Execution Badges:** The ⚡ Immediate Execution fallback badge will now be suppressed for intermediate checkers, displaying strictly on **Submission** or **Final Approval** steps.
+Here are the precise code block updates for your file:
+### Update 1: Refactoring the Data Fetching Pipeline (fetchMyBatches)
+To let the mini grid stepper compute its active index identically to the big stepper, update your fetchMyBatches method to store the raw array of step objects instead of stripping them into single text strings.
+**Find your fetchMyBatches method definition and replace the uniqueWorkflows.map block with this:**
+```javascript
+      const stepsMap = {};
+      await Promise.all(
+        uniqueWorkflows.map(async (wfCode) => {
+          try {
+            const stepsResponse = await callApi(
+              `/JS/voucher/workflow/steps/${wfCode}`,
+              null,
+              "GET"
+            );
+            // Defensively extract steps array
+            const steps = Array.isArray(stepsResponse)
+              ? stepsResponse
+              : stepsResponse?.data || [];
+              
+            // FIX: Store the raw step objects instead of mapping to string titles
+            stepsMap[wfCode] = steps; 
+          } catch (e) {
+            console.warn(`Failed to fetch steps for ${wfCode}`, e);
+            stepsMap[wfCode] = [
+              { state: "P", designation: "Creator" },
+              { state: "APPROVED", designation: "Approver" }
+            ]; // Fallback structure
+          }
+        })
+      );
 
-and most imp is in the mini stepper and the bigger stepper they are not in the sync check that i think the bigger stepper is correct outer stepper 
-which we are showing in the grid that is not correct 
+```
+### Update 2: Syncing the Grid Stepper (columns Definition)
+Now that workflowStepsMap holds the full raw metadata objects, we align the cell renderer to parse the positions exactly like the larger display component.
+**Replace your currentStatus column object inside the columns definition array with this:**
+```javascript
+    {
+      field: "currentStatus",
+      headerName: "Workflow Progress",
+      width: 440,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const state = params.value || "";
+        const workflow = params.row.approvalWorkflow;
+        const isRejected = state === "REJECTED" || params.row.batchStatus === "R";
+
+        // Fetch step objects array
+        const steps = workflowStepsMap[workflow] || [];
+
+        // FIX: Match index calculations precisely with the big stepper logic
+        let activeStep = (state === "POSTED" || state === "SCHEDULED" || state === "APPROVED" || state === "C" || state === "S")
+          ? steps.length
+          : steps.findIndex(s => s.state === state) + 1;
+
+        if (activeStep <= 0) activeStep = 0; // Safe fallback boundary
+
+        const escalationHours = params.row.escalationTime || 24;
+        const hoursPending = Math.abs(new Date() - new Date(params.row.requestDate)) / 36e5;
+        const isEscalated = !isRejected && activeStep < steps.length && hoursPending > escalationHours;
+
+        return (
+          <Box sx={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "flex-start", pl: 2, height: "100%" }}>
+            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={{ width: "100%", mt: 0.5 }}>
+              {steps.map((step, index) => {
+                const isCompleted = index < activeStep;
+                const isCurrent = index === activeStep;
+
+                let statusFlag = "PENDING";
+                if (isCompleted) statusFlag = "COMPLETED";
+                if (isCurrent && isRejected) statusFlag = "REJECTED";
+                else if (isCurrent && isEscalated) statusFlag = "ESCALATED";
+                else if (isCurrent) statusFlag = "ACTIVE";
+
+                const label = step?.designation || step?.state || "Unknown";
+
+                return (
+                  <Tooltip title={label} key={`${label}-${index}`} arrow>
+                    <Step completed={isCompleted} active={isCurrent} sx={{ px: 0, opacity: isRejected && index > activeStep ? 0.3 : 1 }}>
+                      <StepLabel
+                        StepIconComponent={() => (
+                          <CustomWorkflowIcon statusFlag={statusFlag} iconLetter={label.charAt(0).toUpperCase()} label={label} isMini={true} />
+                        )}
+                        sx={{ p: 0, m: 0 }}
+                      />
+                    </Step>
+                  </Tooltip>
+                );
+              })}
+            </Stepper>
+          </Box>
+        );
+      },
+    },
+
+```
+### Update 3: Fine-Tuning Workflow History Badges
+This implementation limits the execution status elements so that intermediate checking events are ignored unless they specify timestamp limits.
+**Find your workflow history map block inside the Dialog container and replace its tracking content with this:**
+```javascript
+    <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5, flexWrap: "wrap", gap: 1 }}>
+      <Chip
+        label={history.LAST_ACTION || "System Action"}
+        size="small"
+        sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: history.LAST_ACTION?.includes("Reject") ? "#fee2e2" : "#e0e7ff", color: history.LAST_ACTION?.includes("Reject") ? "#991b1b" : "#3730a3" }}
+      />
+
+      {history.SCHEDULED_TIME ? (
+        <Chip
+          label={isOverrideAction ? `⏳ Schedule Overridden to: ${new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}` : `🕒 Scheduled for: ${new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}`}
+          size="small"
+          color={isOverrideAction ? "warning" : "info"}
+          variant="outlined"
+          sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }}
+        />
+      ) : (
+        // FIX: Restrict immediate badge rendering exclusively to submission or final approval scopes
+        (history.LAST_ACTION?.toUpperCase().includes("SUBMIT") || 
+         history.LAST_ACTION?.toUpperCase().includes("FINAL") || 
+         history.LAST_ACTION?.toUpperCase().includes("ACCEPT")) && (
+          <Chip
+            label="⚡ Immediate Execution"
+            size="small"
+            color="default"
+            variant="outlined"
+            sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }}
+          />
+        )
+      )}
+    </Stack>
+
+```
+### Update 4: Persistent Delete Button Logic (Bottom Action Bar)
+This removes conditional structural dismounting from the view template. The button stays statically locked into the layout, using a clear evaluation rule to manage interactions.
+**Find the DialogActions component block at the absolute bottom of your file and replace it with this integrated structural design:**
+```javascript
+        {/* --- STICKY BOTTOM ACTION BAR (Always Visible for Maker, Conditional Disabled State) --- */}
+        <DialogActions sx={{ p: 3, borderTop: "1px solid", borderColor: "divider", backgroundColor: "white", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <Box sx={{ flexGrow: 1 }}>
+            {/* Left aligned spacing element anchor */}
+          </Box>
+          <Stack direction="row" spacing={2} alignItems="center">
+            
+            <Button onClick={handleCloseViewModal} sx={{ fontWeight: 'bold', color: 'text.secondary' }}>
+              Close Details
+            </Button>
+
+            {/* FIX: Always rendered for the creator, explicitly enabled ONLY if the batch is Pending */}
+            {isViewingSelfCreated && (
+              <Button
+                variant="contained"
+                color="error"
+                startIcon={<DeleteIcon />}
+                disabled={!(viewingBatchState?.trim().toUpperCase() === "PENDING" || viewingBatchState?.trim().toUpperCase() === "P")}
+                onClick={() => {
+                  setIsViewModalOpen(false); // Dismount detail modal view
+                  handleOpenModal({ batchId: viewingBatchId }); // Initialize confirmation dialog box stages
+                }}
+                sx={{ minWidth: 160, fontWeight: 'bold', py: 1 }}
+              >
+                Delete Request
+              </Button>
+            )}
+
+          </Stack>
+        </DialogActions>
+
+```
