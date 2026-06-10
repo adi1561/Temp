@@ -7,7 +7,7 @@ create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
 ) AS
     v_missing_rates NUMBER;
     v_txn_count     NUMBER; 
-    v_users_date    DATE; -- Local variable to store the business date from FINCORE_DATE
+    v_users_date    DATE; -- Store business date from FINCORE_DATE
 BEGIN
     -- ==============================================================================
     -- 0. FETCH OPERATIONAL SYSTEM BUSINESS DATE
@@ -41,7 +41,7 @@ BEGIN
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
     -- ==============================================================================
-    -- 1. Insert GL_TRANSACTIONS (Using FINCORE_DATE for POST_DATE)
+    -- 1. Insert GL_TRANSACTIONS (FINCORE_DATE -> TRANSACTION_DATE, System -> POST_DATE)
     -- ==============================================================================
     INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
         TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
@@ -49,8 +49,8 @@ BEGIN
     )
     SELECT /*+ PARALLEL(voucher_posting_data, 8) */
         GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
-        TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), -- System entry timestamp date
-        v_users_date,                                        -- Assigned business date from FINCORE_DATE
+        v_users_date,                                        -- FIXED: Business date goes here now
+        CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',       -- FIXED: Auto-generated real system time
         REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
         CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
         CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
@@ -60,12 +60,12 @@ BEGIN
     WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
     -- ==============================================================================
-    -- 3. Merge GL Balances (Removed POSTING_DATE tracking & Grouping)
+    -- 3. Merge GL Balances
     -- ==============================================================================
     MERGE INTO GL_BALANCE target
     USING (
         SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
-               v_users_date as BAL_DATE, -- Uses forced global business day
+               v_users_date as BAL_DATE, -- Stays anchored to the business day baseline
                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
                CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
         FROM voucher_posting_data j
@@ -88,7 +88,7 @@ BEGIN
                 (source.TXN_AMOUNT * source.EXCH_RATE));
 
     -- ==============================================================================
-    -- 4. Capture Sync Data for HDFS (Data Lake - Removed POSTING_DATE reference)
+    -- 4. Capture Sync Data for HDFS (Data Lake)
     -- ==============================================================================
     OPEN o_cursor FOR
     SELECT
