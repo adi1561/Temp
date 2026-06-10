@@ -1,33 +1,221 @@
-  const autoSubmitBatch = async (reqId) => {
-    setIsCreatingBatch(true);
-    try {
-      const payload = {
-        requestId: reqId,
-        commonBatchRemarks: `Bulk Upload - ${selectedDate.format("YYYY-MM-DD")}`,
-        postingDate: selectedDate.format("DD/MM/YYYY"),
-        vid: selectedVoucher?.VID || selectedVoucher?.vid 
-      };
-      
-      const response = await callApi("/JS/voucher/create-batch-from-cache", payload, "POST");
-      
-      if (response && (response.status === "SUCCESS" || response.batchId)) {
-        // ✨ FIX: Safely call the success handler to trigger Step 3 in JournalPosting
-        if (onSuccessSubmit) {
-          const newBatchId = response.batchId || "N/A";
-          onSuccessSubmit(newBatchId); // This moves the screen to activeStep === 3
-        } else {
-          setBatchCreated(true);
+package com.fincore.VoucherService.Service;
+
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherExecutionScheduler {
+
+    private final JdbcTemplate jdbcTemplate;
+    private final VoucherRequestServiceImpl voucherRequestService;
+    private final StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
+     * executes the scheduled batches in a distributed environment.
+     */
+    @Scheduled(fixedRate = 60000)
+    public void executeScheduledBatches() {
+        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
+        boolean lockAcquired = false;
+
+        try {
+            // 1. Distributed lock so only one server pod runs this at a time
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 50, TimeUnit.SECONDS);
+            lockAcquired = Boolean.TRUE.equals(acquired);
+
+            if (!lockAcquired) return;
+
+            String sql = "SELECT p.BATCH_ID FROM VOUCHER_POSTING p " +
+                    "INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID " +
+                    "WHERE p.BATCH_STATUS = 'P' " +
+                    "AND p.IS_EXECUTION_SCHEDULED = 'YES' " +
+                    "AND p.SCHEDULED_TIME <= ? " +
+                    "AND w.IS_FINAL_APPROVAL = 'Y'";
+
+            List<String> dueBatches = jdbcTemplate.queryForList(sql, String.class, LocalDateTime.now());
+
+            if (dueBatches.isEmpty()) return;
+
+            log.info("SCHEDULER_WAKEUP | Found {} batches ready for execution.", dueBatches.size());
+
+            for (String batchId : dueBatches) {
+                try {
+                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                    execDto.setBatchId(batchId);
+                    execDto.setStatus(RequestStatus.ACCEPTED);
+                    execDto.setRemarks("Executed by System Scheduler");
+
+                    // 3. Process the batch
+                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
+
+                    log.info("SCHEDULER_TRIGGERED | Batch: {} executed successfully.", batchId);
+
+                } catch (Exception e) {
+                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("SCHEDULER_CRITICAL_ERROR | {}", e.getMessage());
+        } finally {
+            if (lockAcquired) {
+                stringRedisTemplate.delete(lockKey);
+            }
         }
-      } else {
-        throw new Error(response.message || "Failed.");
-      }
-    } catch (e) {
-      let msg = e.message || "Unknown error";
-      if (e.response && e.response.data && e.response.data.message) {
-        msg = e.response.data.message;
-      }
-      showSnackBar("Failed to submit batch: " + msg, "error");
-    } finally {
-      setIsCreatingBatch(false);
     }
-  };
+	
+	this scadular not working not even triggerning and as we know for accepting the batch we have we are using the procdures
+	
+	but in this we are not calling proccedures and not even the method which call this 
+	
+	create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2,
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+    v_txn_count     NUMBER; 
+BEGIN
+    -- ==============================================================================
+    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
+
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
+
+    -- ==============================================================================
+    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_txn_count
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+    -- ==============================================================================
+    -- 1. Insert GL_TRANSACTIONS
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT /*+ PARALLEL(voucher_posting_data, 8) */
+        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
+        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
+        'J' ,
+        '1' 
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+    -- ==============================================================================
+    -- 3. Merge GL Balances
+    -- ==============================================================================
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) as BAL_DATE,
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM voucher_posting_data j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.POSTING_DATE
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
+
+    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- ==============================================================================
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, POSTING_DATE
+        FROM voucher_posting_data WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
+
+    -- ==============================================================================
+    -- 5. Finalize Batch Status
+    -- ==============================================================================
+    UPDATE voucher_posting_data
+    SET REQ_STATUS = p_status,
+        EXECUTION_DATE = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' -- Fixed trailing comma syntax error
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
+	
+}
+
+
+create or replace PROCEDURE PURGE_JOURNAL_BATCH(
+    p_batch_id IN VARCHAR2,
+    p_user_id  IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+BEGIN
+    SELECT BATCH_STATUS INTO v_status
+    FROM VOUCHER_POSTING
+    WHERE BATCH_ID = p_batch_id 
+      AND UPPER(TRIM(CREATED_BY)) = UPPER(TRIM(p_user_id));
+
+    -- FIX: Only allow purging if the status is strictly 'P' (Pending) or 'QUEUED'
+    IF v_status NOT IN ('P', 'QUEUED') THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+    END IF;
+
+    DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = p_batch_id;
+END;
+
+
+anaylise deeply and tell me how can this works properly
