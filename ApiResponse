@@ -63,3 +63,55 @@ redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 24, TimeUnit.HOURS
 
 ```
 Does this "Explicit Delete" approach work for your current workflow, or do you need the data to stay in Redis longer for some other UI feature?
+
+
+
+
+
+
+To ensure that the data is cleaned up correctly regardless of how the process ends (success or failure), you need to integrate the cleanup logic into the VoucherRequestServiceImpl.java and VoucherBulkValidationService.java files.
+Here is the exact mapping of where you must trigger the cleanup.
+### 1. In VoucherBulkValidationService.java
+You need to ensure that if a request is "failed" or finished, the temporary state and the data chunks are marked for deletion.
+ * **In failRequest():** Since this method is called when validation fails (Stage 1, 2, or 3), you **must** trigger the cleanup here.
+   ```java
+   private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage, boolean hasProductColumn) throws IOException {
+       // ... (Existing logic) ...
+   
+       // ADD THIS:
+       cleanupBulkData(reqId); 
+   }
+   
+   ```
+### 2. In VoucherRequestServiceImpl.java (The Critical Path)
+This is where the heavy lifting happens. You must ensure cleanup happens after the async background task finishes, whether it succeeds or crashes.
+ * **In executeAsyncBatchCreation():** Use the finally block. This is the **most important** location because it covers the "Success" path (when processChunkRaw finishes) and the "Failure" path (if any exception occurs during chunk processing).
+```java
+    @Override
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCreation(...) {
+        // ...
+        try {
+            // ... (Your parallel chunking logic) ...
+            
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+        } catch (Exception e) {
+            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred.");
+        } finally {
+            // TRIGGER CLEANUP HERE
+            voucherBulkValidationService.cleanupBulkData(requestId); 
+            redisTemplate.delete(lockKey);
+            MDC.clear();
+        }
+    }
+
+```
+### Summary of Cleanup Locations:
+| Process Stage | Method | Action |
+|---|---|---|
+| **Validation Failed** | VoucherBulkValidationService.failRequest() | Call cleanupBulkData(reqId) |
+| **Success/Fatal Crash** | VoucherRequestServiceImpl.executeAsyncBatchCreation() | Call cleanupBulkData(reqId) in finally |
+| **Cancellation** | VoucherRequestServiceImpl.executeAsyncBatchCancellation() | Call cleanupBulkData(reqId) if deleting orphaned cache |
+### One Final Tip:
+Since you are using redisTemplate in two different services (VoucherBulkValidationService and VoucherRequestServiceImpl), make sure cleanupBulkData is **public** in VoucherBulkValidationService so that VoucherRequestServiceImpl can access it.
+**Does your current architecture have any other edge cases where a user might abandon an upload (e.g., closing the browser), or are you confident that the finally blocks will catch all termination scenarios?**
