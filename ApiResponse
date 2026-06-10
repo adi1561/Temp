@@ -1,178 +1,154 @@
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.apache.poi.xssf.usermodel.XSSFRichTextString;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2,
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+    v_txn_count     NUMBER; 
+BEGIN
+    -- ==============================================================================
+    -- 0. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
-public byte[] generateExcelTemplateWithGuidelines() throws IOException {
-    try (Workbook workbook = new XSSFWorkbook()) {
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
 
-        // ==============================================================================
-        // SHEET 1: GUIDELINES & VALIDATION STAGES
-        // ==============================================================================
-        Sheet guidelineSheet = workbook.createSheet("Upload Guidelines");
-        guidelineSheet.setColumnWidth(0, 10000); // Stage Name Column
-        guidelineSheet.setColumnWidth(1, 35000); // Details Column
+    -- ==============================================================================
+    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_txn_count
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        // --- 1. Define Professional Fonts & Colors ---
-        Font headerFont = workbook.createFont();
-        headerFont.setBold(true);
-        headerFont.setColor(IndexedColors.WHITE.getIndex());
-        headerFont.setFontHeightInPoints((short) 11);
+    -- ==============================================================================
+    -- 1. Insert GL_TRANSACTIONS
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT /*+ PARALLEL(voucher_posting_data, 8) */
+        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        NVL(POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
+        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
+        'J' ,
+        '1' 
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        Font boldRed = workbook.createFont();
-        boldRed.setBold(true);
-        boldRed.setColor(IndexedColors.DARK_RED.getIndex());
+    -- ==============================================================================
+    -- 3. Merge GL Balances
+    -- ==============================================================================
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) as BAL_DATE,
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM voucher_posting_data j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.POSTING_DATE
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
 
-        Font boldGreen = workbook.createFont();
-        boldGreen.setBold(true);
-        boldGreen.setColor(IndexedColors.DARK_GREEN.getIndex());
+    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- ==============================================================================
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, POSTING_DATE
+        FROM voucher_posting_data WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = NVL(j.POSTING_DATE, TRUNC(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
 
-        Font boldBlue = workbook.createFont();
-        boldBlue.setBold(true);
-        boldBlue.setColor(IndexedColors.DARK_BLUE.getIndex());
+    -- ==============================================================================
+    -- 5. Finalize Batch Status
+    -- ==============================================================================
+    UPDATE voucher_posting_data
+    SET REQ_STATUS = p_status,
+        EXECUTION_DATE = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' -- Fixed trailing comma syntax error
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-        // --- 2. Define Cell Styles (With Borders for a clean look) ---
-        CellStyle headerStyle = workbook.createCellStyle();
-        headerStyle.setFillForegroundColor(IndexedColors.DARK_BLUE.getIndex());
-        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-        headerStyle.setFont(headerFont);
-        headerStyle.setAlignment(HorizontalAlignment.LEFT);
-        headerStyle.setVerticalAlignment(VerticalAlignment.CENTER);
-        headerStyle.setBorderBottom(BorderStyle.MEDIUM);
-        headerStyle.setBorderTop(BorderStyle.MEDIUM);
-        headerStyle.setBorderLeft(BorderStyle.MEDIUM);
-        headerStyle.setBorderRight(BorderStyle.MEDIUM);
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
 
-        CellStyle bodyStyle = workbook.createCellStyle();
-        bodyStyle.setWrapText(true);
-        bodyStyle.setVerticalAlignment(VerticalAlignment.TOP);
-        bodyStyle.setBorderBottom(BorderStyle.THIN);
-        bodyStyle.setBorderTop(BorderStyle.THIN);
-        bodyStyle.setBorderLeft(BorderStyle.THIN);
-        bodyStyle.setBorderRight(BorderStyle.THIN);
 
-        // --- 3. Build Guidelines Header ---
-        Row titleRow = guidelineSheet.createRow(0);
-        titleRow.setHeightInPoints(26);
-        Cell titleCellA = titleRow.createCell(0);
-        Cell titleCellB = titleRow.createCell(1);
-        titleCellA.setCellValue("VALIDATION STAGE");
-        titleCellB.setCellValue("STAGE REQUIREMENTS & COLUMN-WISE FORMAT DETAILS");
-        titleCellA.setCellStyle(headerStyle);
-        titleCellB.setCellStyle(headerStyle);
+create or replace PROCEDURE PURGE_JOURNAL_BATCH(
+    p_batch_id IN VARCHAR2,
+    p_user_id  IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+BEGIN
+    SELECT BATCH_STATUS INTO v_status
+    FROM VOUCHER_POSTING
+    WHERE BATCH_ID = p_batch_id 
+      AND UPPER(TRIM(CREATED_BY)) = UPPER(TRIM(p_user_id));
 
-        // --- 4. Stage 1: Dynamic Rich Text Generation ---
-        Row stage1Row = guidelineSheet.createRow(1);
-        stage1Row.setHeightInPoints(180); // Fixed height to fit all text beautifully
-        
-        Cell s1Title = stage1Row.createCell(0);
-        s1Title.setCellValue("Stage 1: Format Validation\n(Pre-Database Check)");
-        s1Title.setCellStyle(bodyStyle);
+    -- FIX: Only allow purging if the status is strictly 'P' (Pending) or 'QUEUED'
+    IF v_status NOT IN ('P', 'QUEUED') THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+    END IF;
 
-        String stage1Text = 
-            "Verifies structural and data-type integrity before hitting the core database. Every cell must comply:\n\n" +
-            " • Branch* - Mandatory. String format. Clean, numeric branch code identifier (strictly 4-digits, e.g., '1001').\n" +
-            " • Currency* - Mandatory. String format. Standard 3-letter alphabetic ISO code (e.g., 'INR', 'USD').\n" +
-            " • CGL* - Mandatory. String format. Core General Ledger identifier. Exactly a 10-digit numerical string.\n" +
-            " • Amount* - Mandatory. Numeric layout. Valid non-zero amount. No commas or text (e.g., '55000.00').\n" +
-            " • Type* - Mandatory. Single-character marker. Strictly 'D' (Debit) or 'C' (Credit).\n" +
-            " • Product Code - Optional. Alphanumeric string. Max 20 characters length.\n" +
-            " • Remarks* - Mandatory. Text string for business narration. Min 3, Max 255 characters.";
+    DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = p_batch_id;
+END;
 
-        XSSFRichTextString richText = new XSSFRichTextString(stage1Text);
 
-        // Dynamic Highlighting Helper (Finds all occurrences automatically)
-        applyHighlighting(richText, stage1Text, "Mandatory", boldRed);
-        applyHighlighting(richText, stage1Text, "Optional", boldGreen);
-        applyHighlighting(richText, stage1Text, "Branch*", boldBlue);
-        applyHighlighting(richText, stage1Text, "Currency*", boldBlue);
-        applyHighlighting(richText, stage1Text, "CGL*", boldBlue);
-        applyHighlighting(richText, stage1Text, "Amount*", boldBlue);
-        applyHighlighting(richText, stage1Text, "Type*", boldBlue);
-        applyHighlighting(richText, stage1Text, "Product Code", boldBlue);
-        applyHighlighting(richText, stage1Text, "Remarks*", boldBlue);
+this are the 2 PROCEDURE in which i want change like first of all we table called as FINCORE_DATE in which column is there called as 
+USERS_DATE when we  make entry in the GL_TRANSACTIONS we need to pick date from here and put it for that batch in the GL_TRANSACTIONS table for the colulmn name POST_DATE
+when ever we accept the batch this runs when this runs we do this 
 
-        Cell s1Desc = stage1Row.createCell(1);
-        s1Desc.setCellValue(richText);
-        s1Desc.setCellStyle(bodyStyle);
+from the voucher_posting_data table we will remove this column POSTING_DATE
 
-        // --- 5. Stage 2 & 3 Setup ---
-        Row stage2Row = guidelineSheet.createRow(2);
-        stage2Row.setHeightInPoints(40);
-        createStyledCell(stage2Row, 0, "Stage 2: Database Integrity Check", bodyStyle);
-        createStyledCell(stage2Row, 1, "Cross-references record fields against active system reference masters. Validates that the requested Branch Code, Currency Identifier, and CGL exist and are active in the database.", bodyStyle);
-
-        Row stage3Row = guidelineSheet.createRow(3);
-        stage3Row.setHeightInPoints(40);
-        createStyledCell(stage3Row, 0, "Stage 3: Balance Verification", bodyStyle);
-        createStyledCell(stage3Row, 1, "Applies balanced ledger control rules. Aggregates values row-by-row ensuring total active Debits equal total Credits exactly prior to allowing final scheduling submission.", bodyStyle);
-
-        // ==============================================================================
-        // SHEET 2: EXCEL JOURNAL TEMPLATE
-        // ==============================================================================
-        Sheet templateSheet = workbook.createSheet("Journal Template");
-        templateSheet.createFreezePane(0, 1); // FREEZES THE HEADER ROW!
-
-        String[] headers = {"Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Product Code", "Remarks*"};
-        
-        Row templateHeaderRow = templateSheet.createRow(0);
-        templateHeaderRow.setHeightInPoints(24);
-        for (int i = 0; i < headers.length; i++) {
-            Cell cell = templateHeaderRow.createCell(i);
-            cell.setCellValue(headers[i]);
-            cell.setCellStyle(headerStyle);
-            templateSheet.setColumnWidth(i, 5500); 
-        }
-
-        // --- Professional Sample Data Row ---
-        CellStyle sampleStyle = workbook.createCellStyle();
-        Font italicFont = workbook.createFont();
-        italicFont.setItalic(true);
-        italicFont.setColor(IndexedColors.GREY_50_PERCENT.getIndex());
-        sampleStyle.setFont(italicFont);
-        sampleStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
-        sampleStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-
-        Row sampleRow = templateSheet.createRow(1);
-        createStyledCell(sampleRow, 0, "1001", sampleStyle);
-        createStyledCell(sampleRow, 1, "INR", sampleStyle);
-        createStyledCell(sampleRow, 2, "1102003001", sampleStyle);
-        
-        Cell amtCell = sampleRow.createCell(3);
-        amtCell.setCellValue(55000.00); 
-        amtCell.setCellStyle(sampleStyle);
-        
-        createStyledCell(sampleRow, 4, "D", sampleStyle);
-        createStyledCell(sampleRow, 5, "PRD099", sampleStyle);
-        createStyledCell(sampleRow, 6, "Sample bulk upload entry row (Overwrite this)", sampleStyle);
-
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        workbook.write(bos);
-        return bos.toByteArray();
-    }
-}
-
-// ==============================================================================
-// HELPER METHODS (Add these directly below your main method in the same class)
-// ==============================================================================
-
-/**
- * Dynamically finds every occurrence of a target word and applies the specified font.
- */
-private void applyHighlighting(XSSFRichTextString richText, String fullText, String targetWord, Font font) {
-    int index = 0;
-    while ((index = fullText.indexOf(targetWord, index)) != -1) {
-        richText.applyFont(index, index + targetWord.length(), font);
-        index += targetWord.length();
-    }
-}
-
-/**
- * Utility to quickly create a cell with a string value and style.
- */
-private void createStyledCell(Row row, int column, String value, CellStyle style) {
-    Cell cell = row.createCell(column);
-    cell.setCellValue(value);
-    cell.setCellStyle(style);
-}
+REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	1	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
+REQ_DATE	DATE	No	SYSDATE 	2	The date when maker created the journal
+CREATOR_ID	VARCHAR2(12 CHAR)	No		3	
+EXECUTION_DATE	DATE	Yes		4	Timestamp when this checker acted upon the journal
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		5	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		6	Unique identifier for the individual request.
+REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		7	The branch code requested for the transaction.
+REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		8	The 3-character currency code requested.
+REQ_CGL	VARCHAR2(50 CHAR)	Yes		9	The 10-digit CGL account code requested.
+REQ_AMOUNT	NUMBER(25,4)	Yes		10	Raw requested amount 
+POSTING_DATE	DATE	Yes		11	The transaction date for which txn to be posted
+REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		12	remarks from the uploaded file.
+REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		13	The product  code requested.
+REQ_ID	NUMBER(19,0)	Yes		14	
