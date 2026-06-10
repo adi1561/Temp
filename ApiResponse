@@ -1,117 +1,2601 @@
-To change the Redis TTL from a fixed 1-hour limit to a **"cleanup-on-completion"** strategy, you need to shift from using a hard-coded TTL (1, TimeUnit.HOURS) to a model where the data is explicitly deleted by the application once the batch process reaches a terminal state (Success or Failure).
-Here is how to modify your VoucherBulkValidationService to implement this.
-### 1. Remove TTLs from saveRowsToRedis
-Currently, you use TimeUnit.HOURS when saving chunks. Remove the TTL so the data persists until you explicitly decide to kill it.
-**In VoucherBulkValidationService.java -> saveRowsToRedis:**
-```java
-// OLD: redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 1, TimeUnit.HOURS);
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Grid,
+  TextField,
+  Button,
+  Paper,
+  IconButton,
+  MenuItem,
+  CircularProgress,
+  Autocomplete,
+  Tooltip,
+  Checkbox,
+  FormControlLabel,
+  Chip,
+  FormHelperText,
+  Divider,
+  Card,
+  CardActionArea,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  TablePagination,
+  Collapse,
+  Radio,
+} from "@mui/material";
+import AddIcon from "@mui/icons-material/Add";
+import TaskAltIcon from "@mui/icons-material/TaskAlt";
+import DeleteIcon from "@mui/icons-material/Delete";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import KeyboardArrowUpIcon from "@mui/icons-material/KeyboardArrowUp";
+import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
+import ScheduleIcon from "@mui/icons-material/Schedule";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
+import DateRangeTwoToneIcon from "@mui/icons-material/DateRangeTwoTone";
+import EditNoteIcon from "@mui/icons-material/EditNote";
+import UploadFileIcon from "@mui/icons-material/UploadFile";
+import TableChartIcon from "@mui/icons-material/TableChart";
+import { debounce } from "lodash";
+import useApi from "../../hooks/useApi";
+import JournalBulkUpload from "./JournalBulkUpload";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+import dayjs from "dayjs";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { DateTimePicker } from "@mui/x-date-pickers/DateTimePicker";
+const initialRowState = {
+  id: Date.now(),
+  branch: null,
+  currency: "",
+  cgl: null,
+  amount: "",
+  txnType: "",
+  remarks: "",
+  productCode: "",
+};
 
-// NEW: Remove the TTL argument entirely
-redisTemplate.opsForValue().set(chunkKey, baos.toByteArray());
+const formatBigIntForDisplay = (val) => {
+  if (typeof val !== "bigint") {
+    val = BigInt(val || 0);
+  }
+  const str = val.toString().padStart(5, "0");
+  const integer = str.slice(0, -4);
+  const fractional = str.slice(-4);
+  return `${integer || "0"}.${fractional}`;
+};
+export default function JournalPosting() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
 
-// Do the same for metaBytes
-// OLD: redisTemplate.opsForValue().set("DATA_META_" + requestId, metaBytes, 1, TimeUnit.HOURS);
-// NEW:
-redisTemplate.opsForValue().set("DATA_META_" + requestId, metaBytes);
+  // --- INTERNAL WIZARD STATE ---
+  const [activeStep, setActiveStep] = useState(0);
+  const [entryMethod, setEntryMethod] = useState("MANUAL");
 
-```
-### 2. Implement the "Vanish" Logic
-You must now call a cleanup method in every possible terminal path of your validation and processing flow. Create this helper method:
-```java
-private void cleanupBulkData(String requestId) {
-    log.info("CLEANUP_REDIS_DATA | ReqID: {}", requestId);
-    // Delete meta
-    redisTemplate.delete("DATA_META_" + requestId);
-    
-    // Delete chunks (Use a pattern scan or keep track of the number of chunks)
-    // If you don't know the exact count, use a pattern delete:
-    Set<String> keys = redisTemplate.keys("DATA_CHUNK_" + requestId + "_*");
-    if (keys != null && !keys.isEmpty()) {
-        redisTemplate.delete(keys);
-    }
-}
+  const [submittedBatchId, setSubmittedBatchId] = useState(null);
+  const [showSchedulePicker, setShowSchedulePicker] = useState(false);
+  const [isApplyingSchedule, setIsApplyingSchedule] = useState(false);
 
-```
-### 3. Trigger Cleanup at Terminal States
-You need to call cleanupBulkData(requestId) in the following places:
- * **In completeRequest():** After the success state is saved, but only **after** the data has been successfully pushed to the database (or if you don't need the cached data anymore).
- * **In failRequest():** Always call this. If the validation fails, the user needs to re-upload anyway, so there is no point in keeping the bad data.
- * **In executeAsyncBatchCreation() (Success & Failure paths):** This is the most critical. Once processChunkRaw finishes and the batch is committed to Oracle, the Redis cache is officially dead weight.
-**Example in executeAsyncBatchCreation:**
-```java
-try {
-    // ... all your existing chunk processing logic ...
-    
-    progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-} catch (Exception e) {
-    handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred.");
-} finally {
-    // TRIGGER CLEANUP HERE
-    voucherBulkValidationService.cleanupBulkData(requestId); 
-    redisTemplate.delete(lockKey);
-    MDC.clear();
-}
+  // --- VOUCHER TABLE STATE ---
+  const [voucherList, setVoucherList] = useState([]);
+  const [selectedVoucher, setSelectedVoucher] = useState(null);
+  const [expandedRow, setExpandedRow] = useState(null); // Tracks which row is clicked open
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(5);
 
-```
-### Important Warning:
-By removing the TTL, you introduce a risk: **if your server crashes or the finally block is never reached, the data will sit in Redis forever and consume memory.**
-To mitigate this, you should keep a **"Safety TTL"** that is much longer than a normal batch process (e.g., 24 hours), just in case the application crashes mid-process.
-**Use a "Safety" TTL instead of removing it entirely:**
-```java
-// Set to 24 hours just in case of a crash, but expect the app to delete it sooner
-redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 24, TimeUnit.HOURS);
+  const isMounted = useRef(true);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  // --- STEPPER & WIZARD STATE ---
+  const steps = ["Select Voucher", "Entry Method", "Data Entry"];
 
-```
-Does this "Explicit Delete" approach work for your current workflow, or do you need the data to stay in Redis longer for some other UI feature?
+  const [groupedVouchers, setGroupedVouchers] = useState({});
+  const [scheduledTime, setScheduledTime] = useState(null);
 
+  const [rows, setRows] = useState([initialRowState]);
 
+  const [currencyOptions, setCurrencyOptions] = useState([]);
 
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
+  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
+  const [postingDate, setPostingDate] = useState("");
 
+  const [checked, setChecked] = useState(false);
 
-To ensure that the data is cleaned up correctly regardless of how the process ends (success or failure), you need to integrate the cleanup logic into the VoucherRequestServiceImpl.java and VoucherBulkValidationService.java files.
-Here is the exact mapping of where you must trigger the cleanup.
-### 1. In VoucherBulkValidationService.java
-You need to ensure that if a request is "failed" or finished, the temporary state and the data chunks are marked for deletion.
- * **In failRequest():** Since this method is called when validation fails (Stage 1, 2, or 3), you **must** trigger the cleanup here.
-   ```java
-   private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage, boolean hasProductColumn) throws IOException {
-       // ... (Existing logic) ...
-   
-       // ADD THIS:
-       cleanupBulkData(reqId); 
-   }
-   
-   ```
-### 2. In VoucherRequestServiceImpl.java (The Critical Path)
-This is where the heavy lifting happens. You must ensure cleanup happens after the async background task finishes, whether it succeeds or crashes.
- * **In executeAsyncBatchCreation():** Use the finally block. This is the **most important** location because it covers the "Success" path (when processChunkRaw finishes) and the "Failure" path (if any exception occurs during chunk processing).
-```java
-    @Override
-    @Async("bulkExecutor")
-    public void executeAsyncBatchCreation(...) {
-        // ...
-        try {
-            // ... (Your parallel chunking logic) ...
-            
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-        } catch (Exception e) {
-            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred.");
-        } finally {
-            // TRIGGER CLEANUP HERE
-            voucherBulkValidationService.cleanupBulkData(requestId); 
-            redisTemplate.delete(lockKey);
-            MDC.clear();
+  const [isPageLoading, setIsPageLoading] = useState(true);
+  const [isEodRunning, setIsEodRunning] = useState(false);
+
+  // Replaces anything that is NOT an alphabet, number, or space
+  const REMARKS_REPLACE_REGEX = /[^a-zA-Z0-9 ]/g;
+
+  // Replaces anything that is NOT a digit (CGL is strictly digits)
+  const CGL_REPLACE_REGEX = /[^0-9]/g;
+
+  // Replaces anything that is NOT alphanumeric (Branch is strictly alphanumeric)
+  const BRANCH_REPLACE_REGEX = /[^0-9]/g;
+
+  const [currentRoleId, setCurrentRoleId] = useState(null);
+
+  // Track input values to prevent empty dropdown tray on focus
+  const [branchInputValues, setBranchInputValues] = useState({});
+  const [cglInputValues, setCglInputValues] = useState({});
+
+  const [branchSearch, setBranchSearch] = useState({
+    loadingId: null,
+    options: [],
+  });
+  const [cglSearch, setCglSearch] = useState({
+    loadingId: null,
+    options: [],
+  });
+
+  useEffect(() => {
+    isMounted.current = true;
+    try {
+      const auth =
+        sessionStorage.getItem("persist:auth") ||
+        localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+        // Assuming your auth object holds the role ID. Adjust the property name if needed.
+        if (user?.roleId) setCurrentRoleId(user.roleId);
+      }
+    } catch (e) {}
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        setIsPageLoading(true);
+
+        const roleToFetch = currentRoleId || 9001;
+        const vouchersResponse = await callApi(
+          `/JS/voucher/active?roleId=${roleToFetch}`,
+          null,
+          "GET"
+        );
+
+        if (vouchersResponse && Array.isArray(vouchersResponse)) {
+          setVoucherList(vouchersResponse);
         }
+
+        // 1. FIRST: Check the EOD Status from your new API
+        const eodResponse = await callApi(
+          "/JS/voucher/eod_status",
+          null,
+          "GET"
+        );
+
+        // The API returns an array: [{ "eodStatus": 0 }]
+        if (
+          eodResponse &&
+          Array.isArray(eodResponse) &&
+          eodResponse.length > 0
+        ) {
+          if (eodResponse[0].eodStatus === 1) {
+            setIsEodRunning(true);
+            setIsPageLoading(false);
+            return; // STOP loading everything else, block the screen
+          }
+        }
+
+        // 2. IF EOD IS NOT RUNNING: Continue loading the normal page data
+        const dateResponse = await callApi(
+          "/JS/voucher/current-posting-date",
+          null,
+          "GET"
+        );
+
+        if (dateResponse) {
+          try {
+            const [year, month, day] = dateResponse.split("-");
+            const formattedDate = `${day}-${month}-${year}`;
+            setPostingDate(formattedDate);
+          } catch (e) {
+            console.error("Could not parse date:", dateResponse, e);
+            setPostingDate(dateResponse);
+          }
+        } else {
+          showSnackBar("Failed to load official posting date.", "error");
+          setPostingDate("Error");
+        }
+
+        const currencyResponse = await callApi(
+          "/CM/common-master/currency",
+          null,
+          "GET"
+        );
+        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
+          const uniqueCurrencies = [...new Set(currencyResponse.data)];
+          setCurrencyOptions(uniqueCurrencies);
+        } else {
+          showSnackBar("Failed to load currencies.", "error");
+        }
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+        showSnackBar("An error occurred while loading page data.", "error");
+      } finally {
+        setIsPageLoading(false);
+      }
+    };
+
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+  const handleNext = () => {
+    if (activeStep === 0 && !selectedVoucher) {
+      showSnackBar("Please select a voucher from the list first.", "warning");
+      return;
+    }
+    setActiveStep((prevStep) => prevStep + 1);
+  };
+
+  const handleMethodSelection = (method) => {
+    setEntryMethod(method);
+    handleNext();
+  };
+
+  const handleResetWizard = () => {
+    setActiveStep(0);
+    setSelectedVoucher(null);
+    setEntryMethod("MANUAL");
+    setRows([{ ...initialRowState, id: Date.now() }]);
+    setCommonBatchRemarks("");
+    setScheduledTime(null);
+    setChecked(false);
+    setSubmittedBatchId(null);
+    setShowSchedulePicker(false);
+  };
+
+  const handleApplySchedule = async () => {
+    if (!scheduledTime || !scheduledTime.isValid()) {
+      showSnackBar("Please select a valid future date and time.", "warning");
+      return;
+    }
+    setIsApplyingSchedule(true);
+    try {
+      // Dayjs formats it perfectly for the backend: "YYYY-MM-DD HH:mm:ss"
+      const formattedSchedule = scheduledTime.format("YYYY-MM-DD HH:mm:ss");
+
+      await callApi(
+        "/JS/voucher/update-schedule",
+        {
+          batchId: submittedBatchId,
+          scheduledTime: formattedSchedule,
+        },
+        "POST"
+      );
+
+      showSnackBar("Schedule applied successfully!", "success");
+      handleResetWizard();
+    } catch (e) {
+      showSnackBar("Failed to apply schedule.", "error");
+    } finally {
+      setIsApplyingSchedule(false);
+    }
+  };
+
+  const handleChangePage = (event, newPage) => {
+    setPage(newPage);
+  };
+
+  const handleChangeRowsPerPage = (event) => {
+    setRowsPerPage(parseInt(event.target.value, 10));
+    setPage(0);
+  };
+
+  const handleRowExpand = (id) => {
+    setExpandedRow(expandedRow === id ? null : id);
+  };
+  const handleBack = () => {
+    setActiveStep((prevStep) => prevStep - 1);
+  };
+
+  const filterRemarks = (val) => {
+    let filtered = val.replace(/[^a-zA-Z0-9 ]/g, ""); // Allow only alphanumeric and spaces
+    filtered = filtered.replace(/^\s+/, ""); // Remove leading spaces
+    filtered = filtered.replace(/\s{2,}/g, " "); // Replace multiple consecutive spaces with a single space
+    return filtered;
+  };
+
+  // 1. Common remarks can be empty. If filled, must be 2-30.
+  const isCommonRemarksValid = (val) =>
+    val.trim().length === 0 ||
+    (val.trim().length >= 2 && val.trim().length <= 30);
+
+  // 2. Row remarks are STRICTLY compulsory (2-30 chars).
+  const isRowRemarksValid = (val) =>
+    val.trim().length >= 2 && val.trim().length <= 30;
+  const filterAndWarn = (val, type) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphabets and numbers are allowed.";
+
+    if (type === "alphanumeric_space") {
+      // 1. Strip any character using the centralized regex
+      filtered = val.replace(REMARKS_REPLACE_REGEX, "");
+
+      if (filtered !== val) {
+        hasError = true;
+      }
+
+      // 2. Strip leading space and collapse double spaces
+      const beforeSpaceTrim = filtered;
+      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+      if (beforeSpaceTrim !== filtered && !hasError) {
+        hasError = true;
+        msg =
+          "Remark should not start with space or contain consecutive spaces.";
+      }
     }
 
-```
-### Summary of Cleanup Locations:
-| Process Stage | Method | Action |
-|---|---|---|
-| **Validation Failed** | VoucherBulkValidationService.failRequest() | Call cleanupBulkData(reqId) |
-| **Success/Fatal Crash** | VoucherRequestServiceImpl.executeAsyncBatchCreation() | Call cleanupBulkData(reqId) in finally |
-| **Cancellation** | VoucherRequestServiceImpl.executeAsyncBatchCancellation() | Call cleanupBulkData(reqId) if deleting orphaned cache |
-### One Final Tip:
-Since you are using redisTemplate in two different services (VoucherBulkValidationService and VoucherRequestServiceImpl), make sure cleanupBulkData is **public** in VoucherBulkValidationService so that VoucherRequestServiceImpl can access it.
-**Does your current architecture have any other edge cases where a user might abandon an upload (e.g., closing the browser), or are you confident that the finally blocks will catch all termination scenarios?**
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+    return filtered;
+  };
+
+  // Both Common Batch Remarks and Row Remarks are now strictly compulsory (2-30 chars)
+  const isRemarksValid = (val) =>
+    val.trim().length >= 2 && val.trim().length <= 30;
+  const handleAddRow = () => {
+    const lastRow = rows[rows.length - 1];
+
+    if (
+      !lastRow.branch ||
+      !lastRow.currency ||
+      !lastRow.cgl ||
+      !lastRow.amount ||
+      !lastRow.txnType ||
+      !isRowRemarksValid(lastRow.remarks)
+    ) {
+      showSnackBar(
+        "Please fill all required fields (*) in the current row before adding a new one.",
+        "warning"
+      );
+      return;
+    }
+
+    const newRow = {
+      ...initialRowState,
+      id: Date.now(),
+      remarks: checked ? commonBatchRemarks : "",
+    };
+    setRows([...rows, newRow]);
+  };
+
+  const handleRemarksSync = (event) => {
+    const isChecked = event.target.checked;
+    setChecked(isChecked);
+
+    if (isChecked) {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: commonBatchRemarks,
+      }));
+      setRows(newRows);
+    } else {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: "",
+      }));
+      setRows(newRows);
+    }
+  };
+
+  const handleDeleteRow = (id) => {
+    if (rows.length > 1) {
+      setRows(rows.filter((row) => row.id !== id));
+      // Cleanup input tracking
+      const newBranchInputs = { ...branchInputValues };
+      delete newBranchInputs[id];
+      setBranchInputValues(newBranchInputs);
+      const newCglInputs = { ...cglInputValues };
+      delete newCglInputs[id];
+      setCglInputValues(newCglInputs);
+    } else {
+      showSnackBar("Cannot delete the first row.", "warning");
+    }
+  };
+
+  const handleRowChange = (id, field, value) => {
+    setRows((prevRows) =>
+      prevRows.map((row) => {
+        if (row.id === id) {
+          return { ...row, [field]: value };
+        }
+        return row;
+      })
+    );
+  };
+
+  const searchBranches = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query || query.trim().length < 3) {
+        setBranchSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
+      try {
+        const response = await callApi(
+          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setBranchSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("Branch search failed.", "error");
+        setBranchSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const searchCgls = useCallback(
+    debounce(async (query, rowId) => {
+      // Changed from === 0 to < 3 to enforce the minimum character limit
+      if (!query || query.trim().length < 3) {
+        setCglSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
+
+      try {
+        const response = await callApi(
+          `/JS/cgl-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setCglSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("CGL search failed.", "error");
+        setCglSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const handleSubmit = async () => {
+    if (!isCommonRemarksValid(commonBatchRemarks)) {
+      showSnackBar(
+        "Common Batch Remarks must be 2-30 characters if provided.",
+        "error"
+      );
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    const [day, month, year] = postingDate.split("-");
+    const formattedBackendDate = `${year}-${month}-${day}`;
+
+    const branchCurrencyTotals = new Map();
+    const branchEntryCheck = new Map();
+    const rowPayloads = [];
+
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch ||
+        !row.currency ||
+        !row.cgl ||
+        !row.amount ||
+        parseFloat(row.amount) === 0 ||
+        !row.txnType ||
+        !isRowRemarksValid(row.remarks)
+      ) {
+        showSnackBar(
+          `Row ${
+            index + 1
+          } is incomplete or has a zero amount. Amount must be greater than 0, and remarks must be 2-30 characters.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+
+      const branchCode = row.branch.code;
+      const branchName = row.branch.name;
+      const currency = row.currency;
+
+      const cglNumber = String(row.cgl.cglNumber);
+      const isMemo = cglNumber.startsWith("5");
+      const type = isMemo ? "MEMO" : "NORMAL";
+
+      const [integerPart = "0", fractionalPart = "0"] = (
+        row.amount || "0"
+      ).split(".");
+      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
+      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
+
+      const compositeKey = `${branchCode}-${currency}-${type}`;
+
+      if (!branchCurrencyTotals.has(compositeKey)) {
+        branchCurrencyTotals.set(compositeKey, {
+          totalDebit: 0n,
+          totalCredit: 0n,
+          branchName: branchName,
+          branchCode: branchCode,
+          currency: currency,
+          type: type,
+        });
+      }
+      const currencyTotals = branchCurrencyTotals.get(compositeKey);
+
+      if (row.txnType === "Debit") {
+        currencyTotals.totalDebit += amountAsBigInt;
+      } else if (row.txnType === "Credit") {
+        currencyTotals.totalCredit += amountAsBigInt;
+      }
+
+      if (!branchEntryCheck.has(branchCode)) {
+        branchEntryCheck.set(branchCode, {
+          hasDebit: false,
+          hasCredit: false,
+          branchName: branchName,
+        });
+      }
+      const branchCheck = branchEntryCheck.get(branchCode);
+
+      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
+        branchCheck.hasDebit = true;
+      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
+        branchCheck.hasCredit = true;
+      }
+
+      const finalAmount =
+        row.txnType === "Credit" ? "-" + row.amount : row.amount;
+
+      rowPayloads.push({
+        branch: row.branch.code,
+        currency: row.currency,
+        cgl: row.cgl.cglNumber,
+        amount: finalAmount,
+        productType: row.productCode,
+        remarks: row.remarks,
+        arFlag: "A",
+        postingDate: formattedBackendDate,
+      });
+    }
+
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar(
+          "Branch must have at least one Debit and one Credit entry.",
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit } = totals;
+
+      if (totalDebit !== totalCredit) {
+        showSnackBar(
+          "Branch and Currency Debit/Credit Mismatch for Real/Memo CGL.",
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    let formattedSchedule = null;
+    if (scheduledTime) {
+      const dateObj = new Date(scheduledTime);
+      formattedSchedule = dateObj.toISOString().slice(0, 19).replace("T", " ");
+    }
+
+    const finalPayload = {
+      vid: selectedVoucher?.VID || selectedVoucher?.vid,
+      scheduledTime: null, // Handled in Step 3 now
+      commonBatchRemarks: commonBatchRemarks.trim(),
+      rows: rowPayloads,
+    };
+    try {
+      const response = await callApi(
+        "/JS/voucher/create-batch",
+        finalPayload,
+        "POST"
+      );
+
+      showSnackBar("Manual batch submitted successfully!", "success");
+
+      // Reset state form inputs
+      setRows([{ ...initialRowState, id: Date.now() }]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+      setBranchInputValues({});
+      setCglInputValues({});
+
+      // ? REDIRECT INTERCEPTOR: Fire parent tab switcher instead of transitioning to local success screens
+      if (props.onViewTabChange) {
+        props.onViewTabChange("STATUS"); // Swaps your main shell view context directly
+      } else {
+        // Fallback safety if component is loaded independently
+        const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
+        setSubmittedBatchId(newBatchId);
+        setActiveStep(3);
+      }
+    } catch (error) {
+      // If it fails instantly (e.g. server down, bad network), show an error snackbar
+      const errMsg =
+        error?.response?.data?.message ||
+        error.message ||
+        "System error occurred.";
+      showSnackBar(`Failed to initiate request: ${errMsg}`, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const isFormReadyToSubmit = rows.every(
+    (row) =>
+      row.branch &&
+      row.currency &&
+      row.cgl &&
+      row.amount &&
+      parseFloat(row.amount) > 0 &&
+      row.txnType &&
+      isRowRemarksValid(row.remarks)
+  );
+
+  const SelectedVoucherCard = () => {
+    if (!selectedVoucher) return null;
+
+    return (
+      <Box sx={{ mb: 4, px: 1 }}>
+        <Typography
+          variant="h6"
+          fontWeight="bold"
+          color="primary.main"
+          gutterBottom
+        >
+          Selected Voucher Details
+        </Typography>
+        <Grid container spacing={2} sx={{ mt: 1 }}>
+          <Grid item xs={12} sm={6}>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              display="block"
+            >
+              VID
+            </Typography>
+            <Typography variant="body1" fontWeight="bold">
+              {selectedVoucher.VID}
+            </Typography>
+          </Grid>
+          <Grid item xs={12} sm={6}>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              display="block"
+            >
+              Category
+            </Typography>
+            <Typography variant="body1" fontWeight="500">
+              {selectedVoucher.CATEGORY_NAME}
+            </Typography>
+          </Grid>
+          <Grid item xs={12}>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              display="block"
+            >
+              Description
+            </Typography>
+            <Typography
+              variant="body2"
+              color="text.primary"
+              sx={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+            >
+              {selectedVoucher.DESCRIPTION || "No description provided."}
+            </Typography>
+          </Grid>
+        </Grid>
+        <Divider sx={{ mt: 3 }} />
+      </Box>
+    );
+  };
+
+  if (isPageLoading) {
+    return (
+      <Box
+        sx={{
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          height: "80vh",
+        }}
+      >
+        <CircularProgress size={60} />
+      </Box>
+    );
+  }
+  if (isEodRunning) {
+    return (
+      <Box
+        sx={{
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "top",
+          height: "25vh",
+          p: 2,
+          marginBottom: "500px",
+        }}
+      >
+        <Paper
+          elevation={4}
+          sx={{ p: 6, textAlign: "center", borderRadius: 4 }}
+        >
+          <Typography variant="h4" color="error" fontWeight="bold" gutterBottom>
+            EOD is Currently Running
+          </Typography>
+          <Typography variant="h6" color="text.secondary" sx={{ mt: 2 }}>
+            Journal Posting is temporarily disabled.
+          </Typography>
+          <Typography variant="body1" color="text.secondary" sx={{ mt: 1 }}>
+            Please wait until the End of Day process completes to post new
+            transactions.
+          </Typography>
+        </Paper>
+      </Box>
+    );
+  }
+
+  return (
+    <Box sx={{ p: { xs: 1, md: 3 }, width: "100%" }}>
+      {/* INTERNAL STEP 0: VOUCHER SELECTION TABLE */}
+      {activeStep === 0 && (
+        <Box>
+          <Typography
+            variant="h6"
+            fontWeight="bold"
+            gutterBottom
+            color="primary.main"
+          >
+            Select Voucher Id (VID)
+          </Typography>
+
+          <Paper
+            elevation={2}
+            sx={{ width: "100%", mb: 2, borderRadius: 2, overflow: "hidden" }}
+          >
+            <TableContainer sx={{ overflowX: "hidden" }}>
+              <Table size="medium" sx={{ tableLayout: "fixed" }}>
+                <TableHead sx={{ backgroundColor: "action.hover" }}>
+                  <TableRow>
+                    <TableCell
+                      padding="checkbox"
+                      sx={{ width: "5%" }}
+                    ></TableCell>
+                    <TableCell sx={{ fontWeight: "bold", width: "20%" }}>
+                      VID
+                    </TableCell>
+                    <TableCell sx={{ fontWeight: "bold", width: "25%" }}>
+                      Category
+                    </TableCell>
+                    <TableCell sx={{ fontWeight: "bold", width: "25%" }}>
+                      Created By
+                    </TableCell>
+                    <TableCell sx={{ fontWeight: "bold", width: "25%" }}>
+                      Created At
+                    </TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {voucherList
+                    .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                    .map((row) => {
+                      const isSelected = selectedVoucher?.ID === row.ID;
+                      const isExpanded = expandedRow === row.ID;
+
+                      return (
+                        <React.Fragment key={row.ID}>
+                          {/* MAIN ROW */}
+                          <TableRow
+                            hover
+                            onClick={() => {
+                              setSelectedVoucher(row);
+                              handleRowExpand(row.ID);
+                            }}
+                            sx={{
+                              cursor: "pointer",
+                              backgroundColor: isSelected
+                                ? "action.selected"
+                                : "inherit",
+                              "& > *": {
+                                borderBottom: isExpanded
+                                  ? "none"
+                                  : "1px solid rgba(224, 224, 224, 1)",
+                              },
+                            }}
+                          >
+                            <TableCell padding="checkbox">
+                              <Radio checked={isSelected} color="primary" />
+                            </TableCell>
+                            <TableCell
+                              sx={{
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {row.VID}
+                            </TableCell>
+                            <TableCell
+                              sx={{
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {row.CATEGORY_NAME || "General"}
+                            </TableCell>
+                            <TableCell
+                              sx={{
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {row.CREATOR_NAME}{" "}
+                              <Typography
+                                component="span"
+                                variant="caption"
+                                color="text.secondary"
+                              >
+                                ({row.CREATOR_ID})
+                              </Typography>
+                            </TableCell>
+                            <TableCell
+                              sx={{
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {row.CREATED_AT
+                                ? new Date(row.CREATED_AT).toLocaleDateString(
+                                    "en-GB",
+                                    {
+                                      day: "numeric",
+                                      month: "short",
+                                      year: "numeric",
+                                    }
+                                  ) +
+                                  ", " +
+                                  new Date(row.CREATED_AT)
+                                    .toLocaleTimeString("en-US", {
+                                      hour: "numeric",
+                                      minute: "2-digit",
+                                      hour12: true,
+                                    })
+                                    .toLowerCase()
+                                : "N/A"}
+                            </TableCell>
+                          </TableRow>
+
+                          <TableRow
+                            sx={{ backgroundColor: "background.default" }}
+                          >
+                            {/* colSpan is now 5 to match the new column count */}
+                            <TableCell
+                              style={{
+                                paddingBottom: 0,
+                                paddingTop: 0,
+                                borderBottom: isExpanded
+                                  ? "1px solid rgba(224, 224, 224, 1)"
+                                  : "none",
+                              }}
+                              colSpan={5}
+                            >
+                              <Collapse
+                                in={isExpanded}
+                                timeout="auto"
+                                unmountOnExit
+                              >
+                                <Box sx={{ margin: 2, p: 2, borderRadius: 2 }}>
+                                  <Typography
+                                    variant="body2"
+                                    color="text.secondary"
+                                  >
+                                    <strong>Description:</strong>{" "}
+                                    {row.DESCRIPTION ||
+                                      "No description provided for this voucher configuration."}
+                                  </Typography>
+                                </Box>
+                              </Collapse>
+                            </TableCell>
+                          </TableRow>
+                        </React.Fragment>
+                      );
+                    })}
+                  {voucherList.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={4} align="center" sx={{ py: 3 }}>
+                        No configurations found.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+            <TablePagination
+              rowsPerPageOptions={[5, 10, 25]}
+              component="div"
+              count={voucherList.length}
+              rowsPerPage={rowsPerPage}
+              page={page}
+              onPageChange={handleChangePage}
+              onRowsPerPageChange={handleChangeRowsPerPage}
+            />
+          </Paper>
+
+          <Box sx={{ display: "flex", justifyContent: "flex-end", mt: 3 }}>
+            <Button
+              variant="contained"
+              onClick={handleNext}
+              disabled={!selectedVoucher}
+              endIcon={<ArrowForwardIcon />}
+              sx={{ px: 4 }}
+            >
+              Next
+            </Button>
+          </Box>
+        </Box>
+      )}
+
+      {/* INTERNAL STEP 1: CHOOSE ENTRY METHOD */}
+      {activeStep === 1 && (
+        <Box sx={{ display: "flex", flexDirection: "column" }}>
+          <Typography
+            variant="h5"
+            align="center"
+            fontWeight="bold"
+            gutterBottom
+            sx={{ mt: 2 }}
+          >
+            How would you like to input the data?
+          </Typography>
+          <Typography
+            variant="body1"
+            align="center"
+            color="text.secondary"
+            sx={{ mb: 6 }}
+          >
+            Selected VID : <b>{selectedVoucher?.VID}</b>
+          </Typography>
+          {/* Using Flexbox with fixed widths instead of dynamic Grids for perfect symmetry */}
+          <Box
+            sx={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 4,
+              justifyContent: "center",
+              alignItems: "center",
+            }}
+          >
+            {/* MANUAL ENTRY CARD */}
+            <Card
+              elevation={2}
+              sx={{
+                width: 320,
+                height: 260,
+                borderRadius: 3,
+                transition: "0.3s",
+                "&:hover": { transform: "translateY(-5px)", boxShadow: 6 },
+              }}
+            >
+              <CardActionArea
+                onClick={() => handleMethodSelection("MANUAL")}
+                sx={{
+                  height: "100%",
+                  p: 4,
+                  textAlign: "center",
+                  display: "flex",
+                  flexDirection: "column",
+                  justifyContent: "center",
+                }}
+              >
+                <EditNoteIcon color="primary" sx={{ fontSize: 60, mb: 2 }} />
+                <Typography variant="h6" fontWeight="bold" gutterBottom>
+                  Manual Entry
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Manual Voucher Posting
+                </Typography>
+              </CardActionArea>
+            </Card>
+
+            {/* EXCEL UPLOAD CARD */}
+            <Card
+              elevation={2}
+              sx={{
+                width: 320,
+                height: 260,
+                borderRadius: 3,
+                transition: "0.3s",
+                "&:hover": { transform: "translateY(-5px)", boxShadow: 6 },
+              }}
+            >
+              <CardActionArea
+                onClick={() => handleMethodSelection("BULK")}
+                sx={{
+                  height: "100%",
+                  p: 4,
+                  textAlign: "center",
+                  display: "flex",
+                  flexDirection: "column",
+                  justifyContent: "center",
+                }}
+              >
+                {/* Standard Excel Green Hex Code */}
+                <TableChartIcon
+                  sx={{ fontSize: 60, mb: 2, color: "#217346" }}
+                />
+                <Typography variant="h6" fontWeight="bold" gutterBottom>
+                  Excel Upload
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Upload an Excel file (.xlsx or .xls) to process hundreds of
+                  voucher entries instantly.
+                </Typography>
+              </CardActionArea>
+            </Card>
+          </Box>
+
+          <Box sx={{ display: "flex", justifyContent: "flex-start", mt: 6 }}>
+            <Button
+              variant="outlined"
+              onClick={handleBack}
+              startIcon={<ArrowBackIcon />}
+            >
+              Previous
+            </Button>
+          </Box>
+        </Box>
+      )}
+
+      {/* INTERNAL STEP 2: DATA ENTRY GRID */}
+      {activeStep === 2 && entryMethod === "MANUAL" && (
+        <Box>
+          {/* Replaces the old basic header with the professional detailed card */}
+          <SelectedVoucherCard onBackClick={handleBack} showBackButton={true} />
+
+          <Box component={Paper} elevation={3} sx={{ p: 2 }}>
+            {/* ... EXISTING GRID START ... */}
+            <Grid item xs={12} md={12} sx={{ mt: 3, width: "100%" }}>
+              <TextField
+                label="Common Batch Remarks"
+                value={commonBatchRemarks}
+                onChange={(e) => {
+                  const newValue = filterAndWarn(
+                    e.target.value,
+                    "alphanumeric_space"
+                  );
+                  if (newValue.length <= 30) {
+                    setCommonBatchRemarks(newValue);
+                    if (checked) {
+                      setRows(
+                        rows.map((row) => ({ ...row, remarks: newValue }))
+                      );
+                    }
+                  }
+                }}
+                fullWidth
+                required
+                multiline
+                rows={1}
+                inputProps={{ maxLength: 30 }}
+                error={
+                  commonBatchRemarks.length > 0 &&
+                  !isCommonRemarksValid(commonBatchRemarks)
+                }
+              />
+              <FormHelperText
+                sx={{ color: "text.secondary", textAlign: "left", ml: 1.5 }}
+              >
+                Allowed 2-30 chars (alphabets, numbers)
+              </FormHelperText>
+              <Box sx={{ display: "flex", alignItems: "center", mt: 2 }}>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={checked}
+                      onChange={handleRemarksSync}
+                      color="primary"
+                      disabled={
+                        commonBatchRemarks.length > 0 &&
+                        !isRemarksValid(commonBatchRemarks)
+                      }
+                    />
+                  }
+                  label="Apply this remark to all below transactions"
+                />
+              </Box>
+            </Grid>
+
+            <Box sx={{ mt: 2 }}>
+              {rows.map((row, index) => {
+                // Universal Regex: Up to 16 digits, up to 4 decimal places
+                const amountRegex = /^\d{0,16}(\.\d{0,4})?$/;
+
+                return (
+                  <React.Fragment key={row.id}>
+                    <Grid container spacing={2} alignItems="flex-start">
+                      {/* Branch */}
+                      <Grid item xs={12} md={3}>
+                        <Autocomplete
+                          popupIcon={null}
+                          autoHighlight
+                          options={branchSearch.options}
+                          getOptionLabel={(option) =>
+                            option && option.code
+                              ? `${option.code} - ${option.name}`
+                              : ""
+                          }
+                          value={row.branch || null}
+                          onChange={(event, newValue) =>
+                            handleRowChange(row.id, "branch", newValue)
+                          }
+                          inputValue={branchInputValues[row.id] || ""}
+                          onInputChange={(event, newInputValue, reason) => {
+                            if (reason === "input") {
+                              const cleanInput = newInputValue
+                                .replace(BRANCH_REPLACE_REGEX, "")
+                                .substring(0, 5);
+                              setBranchInputValues((prev) => ({
+                                ...prev,
+                                [row.id]: cleanInput,
+                              }));
+                              searchBranches(cleanInput, row.id);
+                            } else {
+                              setBranchInputValues((prev) => ({
+                                ...prev,
+                                [row.id]: newInputValue,
+                              }));
+                            }
+                          }}
+                          loading={branchSearch.loadingId === row.id}
+                          filterOptions={(x) => x}
+                          isOptionEqualToValue={(option, value) =>
+                            option?.code === value?.code
+                          }
+                          noOptionsText={
+                            (branchInputValues[row.id] || "").length < 3
+                              ? "Please enter at least 3 digits"
+                              : "No Branch found"
+                          }
+                          renderInput={(params) => (
+                            <Tooltip
+                              title="Search by Branch Code"
+                              placement="top-start"
+                            >
+                              <TextField
+                                {...params}
+                                label="Branch *"
+                                placeholder="Enter branch code..."
+                                InputLabelProps={{ shrink: true }}
+                                InputProps={{
+                                  ...params.InputProps,
+                                  endAdornment: (
+                                    <Box>
+                                      {branchSearch.loadingId === row.id ? (
+                                        <CircularProgress
+                                          color="inherit"
+                                          size={20}
+                                        />
+                                      ) : null}
+                                      {params.InputProps.endAdornment}
+                                    </Box>
+                                  ),
+                                }}
+                              />
+                            </Tooltip>
+                          )}
+                        />
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            fontSize: "0.65rem",
+                            color: "text.secondary",
+                            mt: 0.5,
+                            ml: 1.2,
+                            display: "block",
+                            textAlign: "left",
+                          }}
+                        >
+                          Min 3 Digits required
+                        </Typography>
+                      </Grid>
+
+                      {/* Currency */}
+                      <Grid item xs={12} md={1.5}>
+                        <TextField
+                          select
+                          label="Currency *"
+                          value={row.currency}
+                          InputLabelProps={{ shrink: false }}
+                          onChange={(e) => {
+                            handleRowChange(row.id, "currency", e.target.value);
+                            handleRowChange(row.id, "amount", "");
+                          }}
+                          SelectProps={{
+                            displayEmpty: true,
+                            renderValue: (selected) =>
+                              !selected ? (
+                                <span style={{ color: "gray", opacity: 0.8 }}>
+                                  Select Currency
+                                </span>
+                              ) : (
+                                selected
+                              ),
+                            MenuProps: {
+                              anchorOrigin: {
+                                vertical: "bottom",
+                                horizontal: "left",
+                              },
+                              transformOrigin: {
+                                vertical: "top",
+                                horizontal: "left",
+                              },
+                              PaperProps: { style: { maxHeight: 250 } },
+                            },
+                          }}
+                        >
+                          {currencyOptions.map((c) => (
+                            <MenuItem key={c} value={c}>
+                              {c}
+                            </MenuItem>
+                          ))}
+                        </TextField>
+                      </Grid>
+
+                      {/* CGL */}
+                      <Grid item xs={12} md={2} sx={{ flexGrow: 1.8 }}>
+                        <Autocomplete
+                          popupIcon={null}
+                          autoHighlight
+                          options={cglSearch.options}
+                          getOptionLabel={(option) =>
+                            option && option.cglNumber
+                              ? `${option.cglNumber} - ${option.description}`
+                              : ""
+                          }
+                          value={row.cgl || null}
+                          onChange={(event, newValue) =>
+                            handleRowChange(row.id, "cgl", newValue)
+                          }
+                          inputValue={cglInputValues[row.id] || ""}
+                          onInputChange={(event, newInputValue, reason) => {
+                            if (reason === "input") {
+                              const cleanInput = newInputValue
+                                .replace(CGL_REPLACE_REGEX, "")
+                                .substring(0, 10);
+                              setCglInputValues((prev) => ({
+                                ...prev,
+                                [row.id]: cleanInput,
+                              }));
+                              searchCgls(cleanInput, row.id);
+                            } else {
+                              setCglInputValues((prev) => ({
+                                ...prev,
+                                [row.id]: newInputValue,
+                              }));
+                            }
+                          }}
+                          loading={cglSearch.loadingId === row.id}
+                          filterOptions={(x) => x}
+                          isOptionEqualToValue={(option, value) =>
+                            option?.cglNumber === value?.cglNumber
+                          }
+                          noOptionsText={
+                            (cglInputValues[row.id] || "").length < 3
+                              ? "Type at least 3 digits of CGL Number..."
+                              : "CGL not found"
+                          }
+                          renderInput={(params) => (
+                            <Tooltip
+                              title="Search by CGL Number"
+                              placement="top-start"
+                            >
+                              <TextField
+                                {...params}
+                                label="CGL *"
+                                placeholder="Search CGL number..."
+                                InputLabelProps={{ shrink: true }}
+                                InputProps={{
+                                  ...params.InputProps,
+                                  endAdornment: (
+                                    <Box
+                                      sx={{
+                                        marginLeft: "2%",
+                                        display: "flex",
+                                        alignItems: "center",
+                                      }}
+                                    >
+                                      {row.cgl &&
+                                        String(row.cgl.cglNumber).startsWith(
+                                          "5"
+                                        ) && (
+                                          <Chip
+                                            label="MEMO"
+                                            size="small"
+                                            color="warning"
+                                            sx={{
+                                              height: 20,
+                                              fontSize: "0.7rem",
+                                              mr: 1,
+                                            }}
+                                          />
+                                        )}
+                                      {cglSearch.loadingId === row.id ? (
+                                        <CircularProgress
+                                          color="inherit"
+                                          size={20}
+                                        />
+                                      ) : null}
+                                      {params.InputProps.endAdornment}
+                                    </Box>
+                                  ),
+                                }}
+                              />
+                            </Tooltip>
+                          )}
+                        />
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            fontSize: "0.65rem",
+                            color: "text.secondary",
+                            mt: 0.5,
+                            ml: 1.2,
+                            display: "block",
+                            textAlign: "left",
+                          }}
+                        >
+                          Min 3 digits required
+                        </Typography>
+                      </Grid>
+
+                      {/* Amount */}
+                      <Grid item xs={12} md={2} sx={{ flexGrow: 1.5 }}>
+                        <TextField
+                          label="Amount *"
+                          type="text"
+                          value={row.amount}
+                          InputLabelProps={{ shrink: true }}
+                          disabled={!row.currency}
+                          fullWidth
+                          placeholder="0.0000"
+                          inputProps={{ style: { textAlign: "right" } }}
+                          onChange={(e) => {
+                            const rawVal = e.target.value;
+                            if (/[^0-9.]/.test(rawVal)) {
+                              showSnackBar(
+                                "Only numbers and decimal point are allowed.",
+                                "warning"
+                              );
+                              return;
+                            }
+                            if (rawVal === "" || amountRegex.test(rawVal)) {
+                              handleRowChange(row.id, "amount", rawVal);
+                            } else {
+                              showSnackBar(
+                                "Exceeded maximum digits or decimal places.",
+                                "warning"
+                              );
+                            }
+                          }}
+                        />
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            fontSize: "0.65rem",
+                            color: "text.secondary",
+                            mt: 0.5,
+                            ml: 1.2,
+                            display: "block",
+                            textAlign: "left",
+                          }}
+                        >
+                          {!row.currency
+                            ? "Select Currency first"
+                            : "Max 16 digits, 4 decimals (numbers)"}
+                        </Typography>
+                      </Grid>
+
+                      {/* Txn Type */}
+                      <Grid item xs={12} md={1} sx={{ flexGrow: 1.3 }}>
+                        <TextField
+                          select
+                          label="Type *"
+                          value={row.txnType}
+                          fullWidth
+                          InputLabelProps={{ shrink: true }}
+                          onChange={(e) =>
+                            handleRowChange(row.id, "txnType", e.target.value)
+                          }
+                          SelectProps={{
+                            displayEmpty: true,
+                            renderValue: (selected) =>
+                              !selected ? (
+                                <span style={{ color: "gray", opacity: 0.8 }}>
+                                  Type
+                                </span>
+                              ) : (
+                                selected
+                              ),
+                          }}
+                        >
+                          <MenuItem value="Debit">Debit</MenuItem>
+                          <MenuItem value="Credit">Credit</MenuItem>
+                        </TextField>
+                      </Grid>
+
+                      {/* Product Code */}
+                      <Grid item xs={12} md={2} sx={{ flexGrow: 1.5 }}>
+                        <TextField
+                          label="Product Code"
+                          value={row.productCode}
+                          InputLabelProps={{ shrink: true }}
+                          placeholder="Enter Product Code.."
+                          fullWidth
+                          inputProps={{ maxLength: 8 }}
+                          onChange={(e) => {
+                            const rawVal = e.target.value;
+                            const cleanVal = rawVal.replace(/[^0-9]/g, "");
+                            if (rawVal !== cleanVal) {
+                              showSnackBar(
+                                "Only digits are allowed.",
+                                "warning"
+                              );
+                            }
+                            if (cleanVal.length <= 8) {
+                              handleRowChange(row.id, "productCode", cleanVal);
+                            }
+                          }}
+                        />
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            fontSize: "0.65rem",
+                            color: "text.secondary",
+                            mt: 0.5,
+                            ml: 1.2,
+                            display: "block",
+                            textAlign: "left",
+                          }}
+                        >
+                          Max 8 digits (numbers)
+                        </Typography>
+                      </Grid>
+
+                      {/* Remarks (Individual) */}
+                      <Grid item xs={12} md={2} sx={{ flexGrow: 2 }}>
+                        <TextField
+                          label="Remarks *"
+                          value={row.remarks}
+                          InputLabelProps={{ shrink: true }}
+                          placeholder="Enter remarks..."
+                          fullWidth
+                          inputProps={{ maxLength: 30 }}
+                          disabled={checked}
+                          error={
+                            row.remarks.length > 0 &&
+                            !isRowRemarksValid(row.remarks)
+                          }
+                          onChange={(e) => {
+                            const val = filterAndWarn(
+                              e.target.value,
+                              "alphanumeric_space"
+                            );
+                            if (val.length <= 30) {
+                              handleRowChange(row.id, "remarks", val);
+                            }
+                          }}
+                        />
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            fontSize: "0.65rem",
+                            color: "text.secondary",
+                            ml: 1.2,
+                            display: "block",
+                            textAlign: "left",
+                          }}
+                        >
+                          Allowed 2-30 chars (alphabets, numbers)
+                        </Typography>
+                      </Grid>
+
+                      {/* Delete Action */}
+                      <Grid item xs={12} md={0.5} sx={{ textAlign: "center" }}>
+                        <Tooltip title="Delete row" arrow>
+                          <IconButton
+                            onClick={() => handleDeleteRow(row.id)}
+                            aria-label="delete row"
+                            sx={{
+                              color: "inherit",
+                              "&:hover": {
+                                color: "error.main",
+                                backgroundColor: "action.hover",
+                              },
+                            }}
+                          >
+                            <DeleteIcon />
+                          </IconButton>
+                        </Tooltip>
+                      </Grid>
+                    </Grid>
+
+                    {index < rows.length - 1 && (
+                      <Box
+                        sx={{ borderBottom: 1, borderColor: "divider", my: 2 }}
+                      />
+                    )}
+                  </React.Fragment>
+                );
+              })}
+
+              {/* ACTION BUTTONS */}
+              <Box
+                sx={{
+                  mt: 4,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                }}
+              >
+                <Button
+                  variant="outlined"
+                  startIcon={<ArrowBackIcon />}
+                  onClick={handleBack}
+                >
+                  Back
+                </Button>
+                <Box sx={{ display: "flex", gap: 2 }}>
+                  <Button
+                    variant="contained"
+                    startIcon={<AddIcon />}
+                    onClick={handleAddRow}
+                  >
+                    Add Row
+                  </Button>
+                  <Button
+                    variant="contained"
+                    color="success"
+                    onClick={handleSubmit}
+                    disabled={
+                      isSubmitting ||
+                      !isCommonRemarksValid(commonBatchRemarks) ||
+                      !isFormReadyToSubmit
+                    }
+                  >
+                    {isSubmitting ? (
+                      <CircularProgress size={24} color="inherit" />
+                    ) : (
+                      "Submit Request"
+                    )}
+                  </Button>
+                </Box>
+              </Box>
+            </Box>
+          </Box>
+        </Box>
+      )}
+
+      {/* EXTERNAL STEP 2: BULK UPLOAD EXCEL COMPONENT */}
+      {activeStep === 2 && entryMethod === "BULK" && (
+        <JournalBulkUpload
+          selectedVoucher={selectedVoucher}
+          onBack={handleBack}
+          onReset={handleResetWizard}
+          // Triggered automatically when Bulk Excel completes
+          onSuccessSubmit={(batchId) => {
+            setSubmittedBatchId(batchId);
+            setActiveStep(3);
+          }}
+        />
+      )}
+
+      {/* NEW STEP 3: POST-SUBMISSION SUCCESS & SCHEDULING SCREEN */}
+      {activeStep === 3 && (
+        <Box
+          sx={{
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "center",
+            minHeight: "50vh",
+          }}
+        >
+          <Paper
+            elevation={3}
+            sx={{ p: 5, maxWidth: 600, textAlign: "center", borderRadius: 3 }}
+          >
+            <TaskAltIcon sx={{ fontSize: 80, color: "success.main", mb: 2 }} />
+
+            <Typography variant="h5" fontWeight="bold" gutterBottom>
+              Your request has been submitted!
+            </Typography>
+            <Typography variant="body1" color="text.secondary" sx={{ mb: 4 }}>
+              Batch ID <b>{submittedBatchId}</b> is now pending for approvals.
+            </Typography>
+
+            <Divider sx={{ my: 3 }} />
+
+            <Typography
+              variant="h6"
+              fontWeight="bold"
+              color="primary.main"
+              gutterBottom
+            >
+              Do you want to schedule this execution?
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 4 }}>
+              By default, this batch will post immediately after the final
+              approval. You can choose to delay the posting to a specific future
+              date and time.
+            </Typography>
+
+            {!showSchedulePicker ? (
+              <Box sx={{ display: "flex", gap: 3, justifyContent: "center" }}>
+                <Button
+                  variant="outlined"
+                  size="large"
+                  onClick={handleResetWizard}
+                  sx={{ px: 4, py: 1.5, fontWeight: "bold" }}
+                >
+                  Execute Immediately
+                </Button>
+                <Button
+                  variant="contained"
+                  size="large"
+                  startIcon={<ScheduleIcon />}
+                  onClick={() => setShowSchedulePicker(true)}
+                  sx={{ px: 4, py: 1.5, fontWeight: "bold" }}
+                >
+                  Schedule Execution
+                </Button>
+              </Box>
+            ) : (
+              <Box
+                sx={{
+                  mt: 2,
+                  p: 3,
+                  backgroundColor: "action.hover",
+                  borderRadius: 2,
+                  border: "1px dashed",
+                  borderColor: "divider",
+                }}
+              >
+                <Typography variant="subtitle2" gutterBottom>
+                  Select Future Date & Time
+                </Typography>
+                <LocalizationProvider dateAdapter={AdapterDayjs}>
+                  <DateTimePicker
+                    value={scheduledTime}
+                    onChange={(newValue) => setScheduledTime(newValue)}
+                    minDateTime={dayjs().add(30, "minute")} // At least 30 minutes from now
+                    maxDateTime={dayjs().add(24, "hour")} // Maximum 24 hours from now
+                    slotProps={{
+                      textField: {
+                        size: "small",
+                        fullWidth: true,
+                        sx: { backgroundColor: "white", mb: 3 },
+                        helperText:
+                          "Scheduling is only allowed between 30 minutes and 24 hours from current time.",
+                      },
+                    }}
+                  />
+                </LocalizationProvider>{" "}
+                <Box sx={{ display: "flex", gap: 2, justifyContent: "center" }}>
+                  <Button
+                    onClick={() => setShowSchedulePicker(false)}
+                    color="inherit"
+                    disabled={isApplyingSchedule}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="contained"
+                    color="primary"
+                    onClick={handleApplySchedule}
+                    disabled={!scheduledTime || isApplyingSchedule}
+                  >
+                    {isApplyingSchedule ? (
+                      <CircularProgress size={24} color="inherit" />
+                    ) : (
+                      "Confirm Schedule"
+                    )}
+                  </Button>
+                </Box>
+              </Box>
+            )}
+          </Paper>
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+
+
+
+import React, { useState, useRef, useEffect } from "react";
+import dayjs from "dayjs";
+import {
+  Box,
+  Typography,
+  Paper,
+  TextField,
+  Button,
+  CircularProgress,
+  Chip,
+  Alert,
+  Stack,
+  Stepper,
+  Step,
+  StepLabel,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  TablePagination,
+  IconButton,
+  Tooltip,
+  Grid,
+} from "@mui/material";
+import {
+  CloudUpload as CloudUploadIcon,
+  RestartAlt as RestartAltIcon,
+  Description as DescriptionIcon,
+  Send as SendIcon,
+  FileDownload as FileDownloadIcon,
+  ArrowBack as ArrowBackIcon,
+  Close as CloseIcon,
+  TaskAlt as TaskAltIcon,
+} from "@mui/icons-material";
+import { alpha } from "@mui/material/styles";
+
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
+
+// --- STYLES ---
+const mainContainerStyle = { padding: 3, height: "100%", width: "100%" };
+const ALLOWED_FILE_TYPES = [".xlsx"];
+
+const controlPanelStyle = {
+  padding: "30px",
+  marginBottom: "20px",
+  borderRadius: "12px",
+  backgroundColor: "background.paper",
+  boxShadow: 2,
+};
+
+const uploadBoxStyle = {
+  position: "relative",
+  display: "flex",
+  flexDirection: "column",
+  justifyContent: "center",
+  alignItems: "center",
+  border: 2,
+  borderStyle: "dashed",
+  borderColor: "primary.main",
+  borderRadius: "12px",
+  padding: "60px 40px 40px 40px",
+  cursor: "default", // Changed from pointer to default as the box is no longer clickable
+  backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.02),
+  transition: "all 0.3s ease",
+  minHeight: "250px",
+  "&:hover": {
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+    borderColor: "primary.dark",
+  },
+};
+
+const templateSectionStyle = {
+  position: "absolute",
+  top: 15,
+  right: 20,
+  textAlign: "right",
+  zIndex: 10,
+};
+
+const iconStyle = {
+  fontSize: "6rem",
+  color: "primary.main",
+};
+
+const headerTextStyle = {
+  fontWeight: 600,
+  fontSize: "1.2rem",
+  textAlign: "center",
+  color: "text.primary",
+  mb: 1,
+};
+
+const subTextStyle = {
+  color: "text.secondary",
+  fontSize: "0.85rem",
+  textAlign: "center",
+  marginBottom: "25px",
+};
+
+const descriptionIconStyle = {
+  color: "success.main",
+  mb: 1,
+  fontSize: "5rem",
+};
+
+const tableContainerStyle = {
+  borderRadius: "12px",
+  border: "1px solid",
+  borderColor: "divider",
+  overflowY: "auto",
+  marginTop: "20px",
+  boxShadow: 1,
+  maxHeight: 600,
+};
+
+const tableHeaderStyle = {
+  backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+};
+
+const tableHeaderCellStyle = {
+  color: "text.primary",
+  fontWeight: "bold",
+  fontSize: "0.95rem",
+};
+
+const actionButtonsContainer = {
+  display: "flex",
+  justifyContent: "center",
+  marginTop: 4,
+  gap: 2,
+};
+
+const customButtonStyle = {
+  background: (theme) => alpha(theme.palette.primary.main, 0.8),
+  boxShadow: "none",
+  color: (theme) => theme.palette.primary.contrastText || "#fff",
+  padding: "8px 40px",
+  "&:hover": {
+    background: (theme) => alpha(theme.palette.primary.main, 1),
+  },
+};
+
+const boxCenterStyle = {
+  display: "flex",
+  justifyContent: "center",
+  alignItems: "center",
+  flexDirection: "column",
+  width: "100%",
+};
+
+const dateinputfield = {
+  display: "flex",
+  justifyContent: "center",
+  marginRight: "20px",
+  "& .MuiTextField-root": { minWidth: "250px" },
+};
+
+const mainSteps = ["Upload & Validate", "Preview & Submit"];
+const validationSteps = [
+  "Format Validation",
+  "Database Validation",
+  "Balance Validation",
+];
+
+const JournalBulkUpload = ({ selectedVoucher, onBack, onReset, onSuccessSubmit }) => {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [activeStep, setActiveStep] = useState(0);
+  const [selectedDate, setSelectedDate] = useState(null);
+  const [file, setFile] = useState(null);
+  const [isCsvFile, setIsCsvFile] = useState(false);
+  const fileInputRef = useRef(null);
+   const [scheduledTime, setScheduledTime] = useState(null);
+  const [requestId, setRequestId] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isDebouncing, setIsDebouncing] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [showProductColumn, setShowProductColumn] = useState(false);
+
+  const [validationStage, setValidationStage] = useState(0);
+  const [resultStatus, setResultStatus] = useState(null);
+  const [resultMsg, setResultMsg] = useState("");
+  const [autoDlTriggered, setAutoDlTriggered] = useState(false);
+  const [downloadMsg, setDownloadMsg] = useState("Downloading error report...");
+  const [isErrorDownloaded, setIsErrorDownloaded] = useState(false);
+  const [previewRows, setPreviewRows] = useState([]);
+  const [totalRows, setTotalRows] = useState(0);
+
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(50);
+  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
+  const [batchCreated, setBatchCreated] = useState(false); 
+    const [isPageLoading, setIsPageLoading] = useState(true);
+  const [isEodRunning, setIsEodRunning] = useState(false);
+  const allowManualDateSelection = true; 
+    useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        setIsPageLoading(true);
+        
+        // 1. Check EOD Status First
+        const eodResponse = await callApi("/JS/voucher/eod_status", null, "GET");
+        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
+          if (eodResponse[0].eodStatus === 1) {
+            setIsEodRunning(true);
+            return; // Stop loading anything else, block the screen
+          }
+        }
+
+        // 2. Fetch the Official Posting Date
+        const dateResponse = await callApi("/JS/voucher/current-posting-date", null, "GET");
+        if (dateResponse) {
+          // Parse the YYYY-MM-DD date perfectly into DayJS for the calendar
+          const parsedDate = dayjs(dateResponse, "YYYY-MM-DD");
+          if (parsedDate.isValid()) {
+            setSelectedDate(parsedDate);
+          } else {
+            showSnackBar("Failed to parse official posting date.", "error");
+          }
+        } else {
+          showSnackBar("Failed to load official posting date.", "error");
+        }
+
+      } catch (error) {
+        console.error("Failed to fetch initial data:", error);
+      } finally {
+        setIsPageLoading(false);
+      }
+    };
+
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+
+    useEffect(() => {
+    const checkEodStatus = async () => {
+      try {
+        setIsPageLoading(true);
+        const eodResponse = await callApi("/JS/voucher/eod_status", null, "GET");
+        
+        // The API returns an array: [{ "eodStatus": 0 }]
+        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
+          if (eodResponse[0].eodStatus === 1) {
+            setIsEodRunning(true);
+          }
+        }
+      } catch (error) {
+        console.error("Failed to check EOD status:", error);
+      } finally {
+        setIsPageLoading(false);
+      }
+    };
+
+    checkEodStatus();
+  }, [callApi]);
+
+  const triggerDebounce = () => {
+    setIsDebouncing(true);
+    setTimeout(() => {
+      setIsDebouncing(false);
+    }, 3000);
+  };
+
+  const validateAndSetFile = (selected) => {
+    if (!selected) return;
+    const fileName = selected.name.toLowerCase();
+    const fileSize = selected.size;
+
+    const isValidExt = ALLOWED_FILE_TYPES.some((ext) => fileName.endsWith(ext));
+
+    if (!isValidExt) {
+      showSnackBar(`Invalid file type! Only ${ALLOWED_FILE_TYPES.join(", ")} files are supported.`, "error");
+      clearInput();
+      return;
+    }
+
+    const MAX_SIZE_MB = 50;
+    if (fileSize > MAX_SIZE_MB * 1024 * 1024) {
+      showSnackBar(`File too large! Maximum allowed size is ${MAX_SIZE_MB}MB.`, "error");
+      clearInput();
+      return;
+    }
+
+    if (fileSize === 0) {
+      showSnackBar("The selected file is empty. Please upload a valid file.", "error");
+      clearInput();
+      return;
+    }
+
+
+
+    setFile(selected);
+    setIsCsvFile(fileName.endsWith(".csv"));
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setPreviewRows([]);
+    setTotalRows(0);
+    setRequestId(null);
+    setAutoDlTriggered(false);
+    setIsProcessing(false);
+    setIsErrorDownloaded(false);
+    setDownloadMsg("Downloading error report...");
+  };
+
+  const handleFileSelect = (e) => {
+    if (e.target.files[0]) {
+      validateAndSetFile(e.target.files[0]);
+    }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      validateAndSetFile(e.dataTransfer.files[0]);
+      e.dataTransfer.clearData();
+    }
+  };
+
+  const clearInput = () => {
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleClearFile = (e) => {
+    if (e) e.stopPropagation();
+    setFile(null);
+    setIsCsvFile(false);
+    clearInput();
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setIsProcessing(false);
+    setIsErrorDownloaded(false);
+    setBatchCreated(false);
+  };
+ const resetAll = () => {
+    setRequestId(null);
+    setResultStatus(null);
+    setValidationStage(0);
+    setResultMsg("");
+    setPreviewRows([]);
+    setTotalRows(0);
+    setIsProcessing(false);
+    setAutoDlTriggered(false);
+    setIsCsvFile(false);
+    setIsErrorDownloaded(false);
+    setBatchCreated(false); 
+    setFile(null);
+    setPage(0);
+    setDownloadMsg("Downloading error report...");
+    clearInput();
+    if (onReset) onReset(); // Tells JournalPosting.jsx to go back to Step 0
+  };
+  const handleBackNavigation = () => {
+    if (onBack) onBack(); // Tells JournalPosting.jsx to go back to Step 1
+  };
+
+  const handleBack = () => {
+    setActiveStep(0);
+    setResultStatus(null);
+    setValidationStage(0);
+    setResultMsg("");
+    setIsProcessing(false);
+    setAutoDlTriggered(false);
+    setDownloadMsg("Downloading error report...");
+  };
+
+  const downloadFileHelper = async (url, filename) => {
+    try {
+      const response = await callApi(url, null, "GET", "blob", null, {}, false);
+      const blobData = response.data || response;
+      if (!blobData) throw new Error("Empty response data");
+
+      const blob = new Blob([blobData], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+
+      const link = document.createElement("a");
+      const objectUrl = window.URL.createObjectURL(blob);
+      link.href = objectUrl;
+      link.setAttribute("download", filename);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(objectUrl);
+      return true;
+    } catch (e) {
+      showSnackBar("File download failed.", "error");
+      return false;
+    }
+  };
+
+  const handleDownloadTemplate = (e) => {
+    if (e) e.stopPropagation();
+    downloadFileHelper("/JS/voucher/download-template", "Journal_Upload_Template.xlsx");
+  };
+
+  const handleDownloadFile = async (type, reqId = requestId) => {
+    if (type === "ERROR") showSnackBar("Downloading error report...", "info");
+    const success = await downloadFileHelper(
+      `/JS/voucher/download-bulk-file/${reqId}?type=${type}`,
+      type === "ERROR" ? "Error_Report.xlsx" : "Success_Batch.csv"
+    );
+    if (success && type === "SUCCESS") showSnackBar("Downloaded successfully.", "success");
+    if (success && type === "ERROR") {
+      setDownloadMsg("Error report downloaded.");
+       setIsErrorDownloaded(true);
+    }
+  };
+
+  const handleStartValidation = async () => {
+    if (!selectedDate || !selectedDate.isValid() || !file) {
+      showSnackBar("Please select a valid date and file.", "warning");
+      return;
+    }
+    triggerDebounce();
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setRequestId(null);     // FIX: Prevent the useEffect from polling the old ID
+    setIsProcessing(true);
+    setAutoDlTriggered(false);
+    setDownloadMsg("Downloading error report...");
+
+   const formData = new FormData();
+    formData.append("file", file);
+    formData.append("postingDate", selectedDate.format("DD/MM/YYYY"));
+    if (scheduledTime) {
+        formData.append("scheduledTime", scheduledTime.format('YYYY-MM-DD HH:mm:ss'));
+    }
+
+    // Automatically appends the globally selected VID to your upload request payload context
+    if (selectedVoucher) {
+      formData.append("vid", selectedVoucher.VID || selectedVoucher.vid);
+    }
+
+    try {
+      const data = await callApi("/JS/voucher/bulk-validate-init", formData, "POST", "json", "multipart/form-data");
+      if (data && data.requestId) {
+        setRequestId(data.requestId);
+      } else {
+        throw new Error("Invalid response from server.");
+      }
+    } catch (err) {
+      setIsProcessing(false);
+      setResultStatus("ERROR");
+      setResultMsg("Initialization failed: " + (err.message || "Unknown error"));
+    }
+  };
+
+
+      const autoSubmitBatch = async (reqId) => {
+    setIsCreatingBatch(true);
+    try {
+      const payload = {
+        requestId: reqId,
+        commonBatchRemarks: `Bulk Upload - ${selectedDate.format("YYYY-MM-DD")}`,
+        postingDate: selectedDate.format("DD/MM/YYYY"),
+        vid: selectedVoucher?.VID || selectedVoucher?.vid 
+      };
+      
+      const response = await callApi("/JS/voucher/create-batch-from-cache", payload, "POST");
+      
+      if (response && (response.status === "SUCCESS" || response.batchId)) {
+        showSnackBar("Batch compiled and submitted successfully!", "success");
+        
+        if (props.setViewTab) {
+          props.setViewTab("STATUS"); 
+        } else if (onSuccessSubmit) {
+          // Alternative: Use your existing routing completion handler if it modifies global layout state
+          onSuccessSubmit(response.batchId, "GO_TO_STATUS");
+        } else {
+          setBatchCreated(true);
+        }
+      } else {
+        throw new Error(response.message || "Failed.");
+      }
+    } catch (e) {
+      let msg = e.message || "Unknown error";
+      if (e.response && e.response.data && e.response.data.message) {
+        msg = e.response.data.message;
+      }
+      showSnackBar("Failed to submit batch: " + msg, "error");
+    } finally {
+      setIsCreatingBatch(false);
+    }
+  };
+
+
+  useEffect(() => {
+    let interval;
+    if (isProcessing && requestId) {
+      interval = setInterval(async () => {
+        try {
+          const res = await callApi(`/JS/voucher/bulk-status/${requestId}`, null, "GET");
+          if (!res) return;
+          if (res.totalRows) setTotalRows(res.totalRows);
+          if (res.status === "ERROR") {
+            setIsProcessing(false);
+            setResultStatus("ERROR");
+            setResultMsg(res.message);
+            setValidationStage(res.currentStage || 1);
+            clearInterval(interval);
+            showSnackBar(res.message, "error", 5000);
+            if (res.hasErrorFile && !autoDlTriggered) {
+              setAutoDlTriggered(true);
+              handleDownloadFile("ERROR", res.requestId);
+            }
+          }   else if (res.status === "SUCCESS") {
+            setResultStatus("SUCCESS");
+            setValidationStage(4);
+            setTotalRows(res.totalRows);
+            clearInterval(interval);
+            setIsProcessing(false);
+            
+            // Instantly trigger submission without an extra snackbar message
+            autoSubmitBatch(res.requestId); 
+          } else {
+            setValidationStage(res.currentStage);
+          }
+        } catch (e) { }
+      }, 800);
+    }
+    return () => clearInterval(interval);
+  }, [isProcessing, requestId, autoDlTriggered, callApi, showSnackBar]);
+
+  const handleChangePage = (event, newPage) => setPage(newPage);
+  const handleChangeRowsPerPage = (event) => {
+    setRowsPerPage(parseInt(event.target.value, 10));
+    setPage(0);
+  };
+
+  const visibleRows = previewRows.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
+  const isValidationStepFailed = (index) => {
+    return resultStatus === "ERROR" && index === validationStage - 1;
+  };
+  if (isPageLoading) {
+    return (
+      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '80vh' }}>
+        <CircularProgress size={60} />
+      </Box>
+    );
+  }
+
+  if (isEodRunning) {
+    return (
+      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'top', height: '25vh', p: 3 }}>
+        <Paper elevation={4} sx={{ p: 6, textAlign: 'center', borderRadius: 4, }}>
+          <Typography variant="h4" color="error" fontWeight="bold" gutterBottom>
+            EOD is Currently Running
+          </Typography>
+          <Typography variant="h6" color="text.secondary" sx={{ mt: 2 }}>
+            Bulk Upload is temporarily disabled.
+          </Typography>
+          <Typography variant="body1" color="text.secondary" sx={{ mt: 1 }}>
+            Please wait until the End of Day process completes to upload new transactions.
+          </Typography>
+        </Paper>
+      </Box>
+    );
+  }
+
+  // --- ORIGINAL UI RENDER (Cleaned up without activeSteps) ---
+  return (
+<Box sx={mainContainerStyle}>
+      {/* --- STANDARDIZED HORIZONTAL SELECTION HEADER --- */}
+      {selectedVoucher && (
+        <Paper elevation={0} sx={{ p: 3, mb: 4, backgroundColor: "#f8fafc", borderRadius: 2, border: "1px solid", borderColor: "divider" }}>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
+            <Typography variant="subtitle1" fontWeight="bold" color="text.primary">
+              Selected Voucher Details
+            </Typography>
+            <Button startIcon={<ArrowBackIcon />} onClick={handleBackNavigation} variant="outlined" size="small">
+              Change Method
+            </Button>
+          </Box>
+          
+          <Grid container spacing={3}>
+            <Grid item xs={12} sm={6}>
+              <Typography variant="caption" color="text.secondary" display="block" gutterBottom>VID</Typography>
+              <Typography variant="body1" fontWeight="bold" color="primary">{selectedVoucher.VID || selectedVoucher.vid}</Typography>
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
+              <Typography variant="body1" fontWeight="500">{selectedVoucher.CATEGORY_NAME || selectedVoucher.category || "General"}</Typography>
+            </Grid>
+            <Grid item xs={12}>
+              <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Description</Typography>
+              <Box sx={{ backgroundColor: "white", p: 2, borderRadius: 1, border: "1px solid", borderColor: "divider" }}>
+                <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                  {selectedVoucher.DESCRIPTION || selectedVoucher.description || "No description provided."}
+                </Typography>
+              </Box>
+            </Grid>
+          </Grid>
+        </Paper>
+      )}
+
+      <Paper elevation={1} sx={controlPanelStyle}>
+
+        <Box
+          sx={{
+            borderColor: resultStatus === "ERROR" ? "error.main" : "primary.main",
+            opacity: (isProcessing || isCreatingBatch) ? 0.6 : 1,
+          }}
+        >
+          <Box
+            sx={{
+              ...uploadBoxStyle,
+              borderColor: isDragging ? "secondary.main" : (resultStatus === "ERROR" ? "error.main" : "primary.main"),
+              backgroundColor: (theme) => isDragging ? alpha(theme.palette.primary.main, 0.12) : alpha(theme.palette.primary.main, 0.02),
+              transform: isDragging ? "scale(1.01)" : "scale(1)",
+            }}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+          >
+            <Box sx={templateSectionStyle} onClick={(e) => e.stopPropagation()}>
+              <Typography variant="caption" sx={{ display: "block", color: "text.secondary", fontWeight: 500, mb: 0.5 }}>
+                Need assistance? Download the template (.xlsx)
+              </Typography>
+              <Button
+                variant="outlined"
+                size="small"
+                startIcon={<FileDownloadIcon />}
+                onClick={handleDownloadTemplate}
+                sx={{ borderRadius: "8px", textTransform: "none" }}
+              >
+                Download Template
+              </Button>
+            </Box>
+ <Box sx={boxCenterStyle}>
+              <Box sx={{ position: "relative", textAlign: "center" }}>
+                 <CloudUploadIcon sx={{ fontSize: "6rem", color: "primary.main", mb: 1 }} />
+                <Typography sx={headerTextStyle}>
+                  {file ? file.name : (isDragging ? "Drop file now" : "Drag or Browse the File")}
+                </Typography>
+                {!file && (
+                  <Typography sx={subTextStyle}>
+                    Supported file formats: {ALLOWED_FILE_TYPES.join(", ")} (Maximum Size: 50MB)
+                  </Typography>
+                )}
+                
+                {/* 1. RESTORED: The "Remove File" (X) button is back! */}
+                {file && (
+                  <Tooltip title="Remove File">
+                    <IconButton
+                      size="small"
+                      onClick={handleClearFile}
+                      sx={{
+                        position: "absolute",
+                        top: -10,
+                        right: -40,
+                        bgcolor: "background.paper",
+                        "&:hover": { bgcolor: "error.light", color: "white" },
+                      }}
+                    >
+                      <CloseIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                )}
+              </Box>
+            </Box>
+
+
+             <Box sx={{ ...boxCenterStyle, flexDirection: "row", alignItems: "flex-start", mt: 2 }} onClick={(e) => e.stopPropagation()}>
+              
+              {/* DatePicker Column */}
+              <Box sx={{ display: "flex", flexDirection: "column", marginRight: "20px" }}>
+                <Box sx={{ "& .MuiTextField-root": { minWidth: "250px" } }}>
+                  <LocalizationProvider dateAdapter={AdapterDayjs}>
+                    <DatePicker
+                      label="Posting Date"
+                      value={selectedDate}
+                      onChange={(newValue) => {
+                        if (allowManualDateSelection) setSelectedDate(newValue);
+                      }}
+                      disabled={isProcessing || isCreatingBatch}
+                      readOnly={!allowManualDateSelection} 
+                      minDate={dayjs().subtract(1, 'year')}
+                      maxDate={dayjs()}
+                      slotProps={{
+                        textField: {
+                          size: "small",
+                          onKeyDown: (e) => e.preventDefault(),
+                          helperText: file && !selectedDate ? "Please select a posting date" : "",
+                          FormHelperTextProps: { sx: { color: "primary.main", fontWeight: 500 } },
+                          sx: file && !selectedDate ? { "& .MuiOutlinedInput-root": { "& fieldset": { borderColor: "primary.main", borderWidth: "2px" } } } : {},
+                          inputProps: { 
+                            readOnly: true, 
+                            sx: { cursor: allowManualDateSelection ? 'pointer' : 'default' } 
+                          }
+                        },
+                      }}
+                    />
+                  </LocalizationProvider>
+                </Box>
+                
+               
+                <Typography
+                  variant="caption"
+                  sx={{ color: "#ec0101ff", mt: 0.8, textAlign: "left" }}
+                >
+                  Note: All Journals will be Posted on this Date
+                </Typography>
+              </Box>
+              
+              {/* Browse File Button Column */}
+
+              {!file && (
+                <Box>
+                  <input
+                    type="file"
+                    hidden
+                    ref={fileInputRef}
+                    onChange={handleFileSelect}
+                    onClick={(e) => (e.target.value = null)}
+                    accept={ALLOWED_FILE_TYPES.join(",")}
+                  />
+                  <Button
+                    sx={customButtonStyle}
+                    variant="contained"
+                    onClick={() => fileInputRef.current.click()}
+                    disabled={isProcessing || isCreatingBatch}
+                  >
+                    Browse File
+                  </Button>
+                </Box>
+              )}
+            </Box>
+          </Box>
+
+          {(isProcessing || resultStatus) && (
+            <Box sx={{ mt: 4, mb: 2 }}>
+              <Stepper activeStep={validationStage - 1} alternativeLabel>
+                {validationSteps.map((label, index) => {
+                  const labelProps = {};
+                  if (isValidationStepFailed(index)) {
+                    labelProps.optional = <Typography variant="caption" color="error">Failed</Typography>;
+                    labelProps.error = true;
+                  }
+                  return (
+                    <Step key={label}>
+                      <StepLabel {...labelProps}>{label}</StepLabel>
+                    </Step>
+                  );
+                })}
+              </Stepper>
+            </Box>
+          )}
+
+          {resultStatus === "ERROR" && (
+            <Alert
+              severity="error"
+              sx={{ 
+                mt: 3, 
+                mx: "auto", 
+                maxWidth: "100%", 
+                backgroundColor: "#fff5f5",  
+                alignItems: "center"         
+              }}
+            >
+              <Typography variant="body1" fontWeight="500">
+                {resultMsg} {downloadMsg ? `— ${downloadMsg}` : ""}
+              </Typography>
+            </Alert>
+          )}
+
+          {batchCreated && (
+            <Alert 
+              severity="success" 
+              sx={{ 
+                mt: 3, 
+                mx: "auto", 
+                maxWidth: "100%", 
+                backgroundColor: "transparent", 
+                '& .MuiAlert-message': { width: '100%' } 
+              }}
+            >
+              <Typography variant="body1" fontWeight="bold">Batch Successfully Validated and Submitted!</Typography>
+              <Typography variant="body2">Total valid records processed: <strong>{totalRows.toLocaleString()}</strong>.</Typography>
+            </Alert>
+          )}
+
+          <Stack direction="row" sx={{ ...actionButtonsContainer, alignItems: "center" }}>
+            {/* Download CSV Button */}
+            {batchCreated && !isCsvFile && (
+              <Button
+                variant="outlined"
+                color="primary"
+                size="large"
+                startIcon={<FileDownloadIcon />}
+                onClick={() => handleDownloadFile("SUCCESS")}
+              >
+                Download CSV
+              </Button>
+            )}
+
+            {!batchCreated && (
+              <Button
+                variant="contained"
+                size="large"
+                onClick={handleStartValidation}
+                disabled={!file || !selectedDate || isDebouncing || isProcessing || isCreatingBatch || isErrorDownloaded}
+                startIcon={(isProcessing || isCreatingBatch) ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
+              >
+                {isProcessing ? "Validating..." : isCreatingBatch ? "Submitting..." : "Validate & Submit"}
+              </Button>
+            )}
+
+            {batchCreated && (
+              <Tooltip title="Clear and Upload New File" placement="top">
+                <IconButton 
+                  onClick={resetAll} 
+                  color="primary" 
+                  size="large"
+                  sx={{ 
+                    ml: 1, 
+                    border: '1px solid', 
+                    borderColor: 'primary.main',
+                    bgcolor: (theme) => alpha(theme.palette.primary.main, 0.05),
+                    '&:hover': {
+                       bgcolor: (theme) => alpha(theme.palette.primary.main, 0.15),
+                    }
+                  }}
+                >
+                  <RestartAltIcon />
+                </IconButton>
+              </Tooltip>
+            )}
+          </Stack>
+        </Box>
+      </Paper>
+    </Box>
+  );
+};
+
+export default JournalBulkUpload;
+
+i have problem like when ever i try to post journal bulk excel upload it automatically submit batch but it is not taking me to the next step where i am selecting the scadule time as a creator that page is vissible it is stuck on that bulk upload page only
