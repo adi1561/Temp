@@ -1,14 +1,31 @@
-Since your frontend is now perfectly wired to call DELETE /JS/voucher/my-requests/by-batch/{batchId}, we just need to ensure your **Java Backend (Spring Boot)** is correctly exposing this API and enforcing the security rules before it triggers the Oracle PURGE_JOURNAL_BATCH procedure.
-You do not need to build a massive new architecture, but you must ensure these **two methods** exist and are updated in your backend Controller and Service.
-Here is exactly what you should have in your backend to handle the deletion securely and professionally:
-### 1. The Controller API Endpoint
-Open your VoucherPostingController.java. You need to ensure you have a @DeleteMapping that catches the URL the frontend is calling. It should extract the Maker's User ID from the security token to prevent someone else from deleting their batch.
+Ah, I understand. If your project doesn't have a standardized ApiResponseDto class, you have two very easy options.
+You can either create it (it is a great standard practice to have one), or we can modify the controller to just return a generic Map or String so you don't have to create any new files.
+### Option 1: Create the ApiResponseDto (Recommended)
+This is the standard way to wrap REST API responses so your React frontend always gets a consistent JSON structure { "status": "...", "message": "...", "data": ... }.
+Create a new file in your Dto folder: ApiResponseDto.java:
 ```java
-    /**
-     * Maker API: Deletes an entire pending batch that they created.
-     */
+package com.fincore.VoucherService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class ApiResponseDto {
+    private String status;
+    private String message;
+    private Object data;
+}
+
+```
+### Option 2: Modify the Controller to NOT use a DTO
+If you prefer not to add new classes and just want the delete API to work right now, change the return type in the controller from ResponseEntity<ApiResponseDto> to ResponseEntity<Map<String, String>>.
+Here is the updated Controller method without needing the DTO:
+```java
     @DeleteMapping("/my-requests/by-batch/{batchId}")
-    public ResponseEntity<ApiResponseDto> deletePendingBatch(
+    public ResponseEntity<Map<String, String>> deletePendingBatch(
             @PathVariable String batchId,
             @RequestHeader("Authorization") String token) {
         
@@ -19,86 +36,16 @@ Open your VoucherPostingController.java. You need to ensure you have a @DeleteMa
             // Send to service layer for validation and deletion
             voucherRequestService.deleteBatchRequest(batchId, userId);
             
-            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
+            return ResponseEntity.ok(Map.of("status", "Success", "message", "Batch deletion process initiated."));
         } catch (IllegalStateException e) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(new ApiResponseDto("Error", e.getMessage(), null));
+                    .body(Map.of("status", "Error", "message", e.getMessage()));
         } catch (Exception e) {
             log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(new ApiResponseDto("Error", "Failed to delete batch", null));
+                    .body(Map.of("status", "Error", "message", "Failed to delete batch"));
         }
     }
 
 ```
-### 2. The Service Layer (Validation & Execution)
-Open your VoucherRequestServiceImpl.java. You need two methods here: one to validate the request synchronously (so the frontend gets an immediate error if they break a rule), and the async method we fixed earlier to actually run the database purge.
-```java
-    /**
-     * Synchronous Validation: Checks rules before allowing deletion.
-     */
-    @Override
-    public void deleteBatchRequest(String batchId, String userId) {
-        // 1. Fetch the batch
-        VoucherPosting batch = voucherPostingRepository.findById(batchId)
-                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch not found."));
-
-        // 2. SECURITY CHECK: Only the creator can delete it
-        if (!batch.getCreatedBy().equalsIgnoreCase(userId)) {
-            log.warn("SECURITY_VIOLATION | User {} attempted to delete batch {} owned by {}", userId, batchId, batch.getCreatedBy());
-            throw new IllegalStateException("You do not have permission to delete this batch.");
-        }
-
-        // 3. STATE CHECK: Can only delete if it is still PENDING ('P')
-        if (!"P".equalsIgnoreCase(batch.getBatchStatus())) {
-            throw new IllegalStateException("Only Pending batches can be deleted. Current status: " + batch.getBatchStatus());
-        }
-
-        // 4. Update status to QUEUED so nobody else can touch it while it's being deleted
-        jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ?", batchId);
-
-        // 5. Hand off to the background thread to do the heavy database deletion
-        self.executeAsyncBatchCancellation(batchId, userId);
-    }
-
-    /**
-     * Asynchronous Execution: Runs the Oracle Stored Procedure safely in the background.
-     */
-    @Async("bulkExecutor")
-    public void executeAsyncBatchCancellation(String batchId, String userId) {
-        MDC.put("batchId", batchId);
-        long start = System.currentTimeMillis();
-
-        try {
-            log.info("PURGE_START | Batch: {}", batchId);
-            
-            // Calls your specific Oracle PL/SQL procedure
-            jdbcTemplate.execute("{call PURGE_JOURNAL_BATCH(?, ?)}", (CallableStatementCallback<Object>) cs -> {
-                cs.setString(1, batchId);
-                cs.setString(2, userId);
-                cs.execute();
-                return null;
-            });
-            
-            logAudit(userId, "CANCEL_SUCCESS", "DELETE", "Purged Batch " + batchId);
-            log.info("BATCH_PURGE_COMPLETE | Batch: {} | Duration: {}ms", batchId, System.currentTimeMillis() - start);
-            
-        } catch (DataAccessException e) {
-            log.error("PURGE_DB_ERROR | Batch: {} | Status: SQL operation failed", batchId, e);
-            
-            // If the database fails to delete it, revert the status back to 'P' (Pending)
-            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
-        } finally {
-            // Clean up the Redis Cache so orphaned data doesn't sit in memory
-            voucherBulkValidationService.cleanupBulkData(batchId); 
-            MDC.clear();
-        }
-    }
-
-```
-### Why this is the correct Backend flow:
- 1. **Frontend clicks "Delete"** and calls /JS/voucher/my-requests/by-batch/12345.
- 2. **The Controller** intercepts it, verifies the JWT token, and extracts the userId.
- 3. **The Service (deleteBatchRequest)** checks the database to ensure the userId matches the CREATED_BY column, and ensures the status is still strictly 'P'.
- 4. It flags the batch as 'QUEUED' immediately so the user can't double-click or have a Checker try to approve it simultaneously.
- 5. It hands the heavy lifting to executeAsyncBatchCancellation, which triggers your PURGE_JOURNAL_BATCH procedure safely in the background.
+Both approaches will work perfectly with your frontend React code! Let me know if you hit any compilation issues with either option.
