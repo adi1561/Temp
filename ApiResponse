@@ -1,4 +1,88 @@
-2026-06-11T11:48:01.672+05:30  INFO 31632 --- [VoucherService] [    BulkCoord-2] c.f.V.S.VoucherBulkValidationService     : CACHE_RETRIEVAL_SUCCESS | ReqID: 1aedb505-1a56-447e-b732-4960a947c448 | Rows: 2 | Duration: 7ms
-2026-06-11T11:48:01.716+05:30 ERROR 31632 --- [VoucherService] [   BulkWriter-1] c.f.V.Service.VoucherRequestServiceImpl  : JDBC_BATCH_FAIL | Batch: 0008507 | Offset: 0 | Error: PreparedStatementCallback; bad SQL grammar [INSERT INTO VOUCHER_POSTING_DATA (REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, BATCH_ID, JOURNAL_ID, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT) VALUES (VOUCHER_POSTING_DATA_SEQ.NEXTVAL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)]
-2026-06-11T11:48:01.733+05:30 ERROR 31632 --- [VoucherService] [    BulkCoord-2] c.f.V.Service.VoucherRequestServiceImpl  : BATCH_FATAL_ERROR | Batch: 0008507 | Error: com.fincore.VoucherService.Exception.CustomExceptions$DatabaseOperationException: Database integrity error during chunk insert
-2026-06-11T11:48:01.775+05:30  INFO 31632 --- [VoucherService] [    BulkCoord-2] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008507
+The error in your logs (bad SQL grammar) is directly caused by a mismatch between the columns defined in your SQL INSERT statement and the number of ? placeholders provided.
+When you removed the POSTING_DATE column from the database schema and the query string, the code was left with **11 target columns** but **12 ? placeholders**, and the PreparedStatement was still attempting to bind a 12th value at index 10.
+Here is the exact fix for your **VoucherRequestServiceImpl.java**. You must update the processChunkRaw method to remove the 12th placeholder and shift the parameter bindings down by one.
+### The Fix: Update processChunkRaw
+Replace your existing processChunkRaw method with this corrected version:
+```java
+    /**
+     * Rule 3: High-performance JDBC Batch Insertion logic.
+     * Directly uses connection pool to avoid JPA overhead for large datasets.
+     * Debit is stored as positive, Credit as negative in REQ_AMOUNT.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processChunkRaw(List<VoucherBulkValidationService.ExcelRowData> chunk,
+                                String batchId,
+                                String journalPrefix,
+                                String commonRemarks,
+                                String creatorId,
+                                Integer creatorRole,
+                                int globalOffset,
+                                AtomicReference<BigDecimal> globalDebit,
+                                AtomicReference<BigDecimal> globalCredit) {
+
+        // FIX: Removed POSTING_DATE from columns. 
+        // 11 explicit columns + 1 sequence = 12 total targets.
+        // 11 explicit '?' placeholders match the 11 explicit columns.
+        String sql = "INSERT INTO VOUCHER_POSTING_DATA (" +
+                "REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, BATCH_ID, " +
+                "JOURNAL_ID, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, " +
+                "REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT) " +
+                "VALUES (VOUCHER_POSTING_DATA_SEQ.NEXTVAL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+        try {
+            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                    VoucherBulkValidationService.ExcelRowData r = chunk.get(i);
+
+                    int globalIdx = globalOffset + i + 1;
+                    String jId = journalPrefix + "-" + globalIdx;
+
+                    // 1. Case-Insensitive Check for Credit
+                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                    String safeTxnType = r.txnType != null ? r.txnType.trim() : "";
+                    boolean isCredit = "CR".equalsIgnoreCase(safeTxnType) || "CREDIT".equalsIgnoreCase(safeTxnType);
+                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+
+                    // 2. PERFECTLY MAPPED SETTERS (Shifted to 11 parameters)
+                    ps.setString(1, "P");                                                           // REQ_STATUS
+                    ps.setTimestamp(2, java.sql.Timestamp.valueOf(LocalDateTime.now()));            // REQ_DATE
+                    ps.setString(3, creatorId);                                                     // CREATOR_ID
+                    ps.setString(4, batchId);                                                       // BATCH_ID
+                    ps.setString(5, jId);                                                           // JOURNAL_ID
+                    ps.setString(6, r.branch);                                                      // REQ_BRANCH_CODE
+                    ps.setString(7, r.currency);                                                    // REQ_CURRENCY
+                    ps.setString(8, r.cgl);                                                         // REQ_CGL
+                    ps.setBigDecimal(9, signedAmt);                                                 // REQ_AMOUNT
+                    
+                    // POSTING_DATE binding safely removed
+                    
+                    ps.setString(10, r.remarks);                                                    // REQ_NARRATION (Shifted from 11)
+                    ps.setString(11, r.productCode);                                                // REQ_PRODUCT (Shifted from 12)
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return chunk.size();
+                }
+            });
+
+            // 3. Update Thread-Safe Aggregates Case-Insensitively
+            for (VoucherBulkValidationService.ExcelRowData r : chunk) {
+                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                String safeTxnType = r.txnType != null ? r.txnType.trim() : "";
+
+                if ("CR".equalsIgnoreCase(safeTxnType) || "CREDIT".equalsIgnoreCase(safeTxnType)) {
+                    globalCredit.updateAndGet(curr -> curr.add(absAmt));
+                } else {
+                    globalDebit.updateAndGet(curr -> curr.add(absAmt));
+                }
+            }
+
+        } catch (org.springframework.dao.DataAccessException e) {
+            log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
+        }
+    }
+
+```
