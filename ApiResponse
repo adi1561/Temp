@@ -1,161 +1,63 @@
-The reason you are not seeing any requests on your checker screen is a classic **API Response Unwrapping Bug**.
-When your backend returns the list of pending batches, it wraps the list in an ApiResponseDto (e.g., { "status": "Success", "data": [...] }). However, your current JournalAuthorization code explicitly checks Array.isArray(data) ? data : []. Because the response is an object (the DTO) and not a direct array, it evaluates to false and forces the rows array to be empty [].
-To fix this critical issue and get your requests showing up immediately, you need to apply defensive data unwrapping in your frontend.
-Here are the precise code replacements for **JournalAuthorization.js**:
-### Fix 1: Update fetchPendingBatches
-We need to properly extract the .data payload from the API response and map the raw step objects for the stepper. Find your fetchPendingBatches function and replace it with this:
-```javascript
-  const fetchPendingBatches = useCallback(async () => {
-    setLoading(true);
-    try {
-      // 1. Fetch only pending approvals for THIS user's role
-      const response = await callApi(
-        "/JS/voucher/checker/pending-approvals",
-        null,
-        "GET"
-      );
-      
-      // CRITICAL FIX: Defensively extract the array whether it's wrapped in a DTO or not
-      let fetchedRows = [];
-      if (Array.isArray(response)) {
-        fetchedRows = response;
-      } else if (response && Array.isArray(response.data)) {
-        fetchedRows = response.data;
-      } else if (response && Array.isArray(response.content)) {
-        fetchedRows = response.content;
-      }
-
-      // 2. Extract unique workflow codes
-      const uniqueWorkflows = [
-        ...new Set(
-          fetchedRows.map((row) => row.approvalWorkflow).filter(Boolean)
-        ),
-      ];
-
-      // 3. Dynamically fetch the step configurations for each workflow
-      const stepsMap = {};
-      await Promise.all(
-        uniqueWorkflows.map(async (wfCode) => {
-          try {
-            const stepsResponse = await callApi(
-              `/JS/voucher/workflow/steps/${wfCode}`,
-              null,
-              "GET"
-            );
-            // Defensively unwrap steps
-            const steps = Array.isArray(stepsResponse) ? stepsResponse : (stepsResponse?.data || []);
-            
-            // CRITICAL FIX: Store the raw object so both steppers can read it safely
-            stepsMap[wfCode] = steps; 
-          } catch (e) {
-            stepsMap[wfCode] = [
-              { state: "P", designation: "Creator" },
-              { state: "APPROVED", designation: "Approver" }
-            ]; // Fallback
-          }
-        })
-      );
-
-      // 4. Update states
-      if (isMounted.current) {
-        setWorkflowStepsMap(stepsMap);
-        setRows(fetchedRows);
-      }
-    } catch (err) {
-      if (isMounted.current && err.name !== "CanceledError")
-        showSnackBar("Failed to load requests", "error");
-    } finally {
-      if (isMounted.current) setLoading(false);
-    }
-  }, [callApi, showSnackBar]);
+I reviewed your VoucherRequestServiceImpl.java backend implementation very closely. You are completely right—there is a major logic mismatch in the checker workflow queries that will cause the **JournalAuthorization (Checker screen)** to show completely blank results, even if you fix the frontend response unwrapping!
+Here are the two critical backend bugs discovered and how to fix them immediately:
+### Bug 1: Status Word Mismatch in Checker Summary Query
+In your getPendingBatchesForChecker method, you have this filter:
+```sql
+WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
 
 ```
-### Fix 2: Prevent Crashes in the Grid Stepper (columns)
-Because we are now correctly saving the *objects* inside stepsMap (instead of flat strings), we need to slightly adjust the grid stepper so it doesn't crash trying to read .charAt(0) on an object.
-Find your workflowState column inside the columns array, and replace its renderCell with this:
-```javascript
-      renderCell: (params) => {
-        const state = params.value || "";
-        const workflow = params.row.approvalWorkflow;
-        const isRejected = state === "REJECTED" || params.row.batchStatus === "R";
-
-        // CRITICAL FIX: Read the array of objects
-        const steps = workflowStepsMap[workflow] || [];
-        
-        let activeStep = params.row.currentOrder ? params.row.currentOrder - 1 : 0;
-
-        if (state === "POSTED" || state === "SCHEDULED" || state === "C" || state === "S") {
-          activeStep = steps.length;
-        }
-        if (activeStep === -1) activeStep = 0;
-
-        const escalationHours = params.row.escalationTime || 24;
-        const hoursPending = Math.abs(new Date() - new Date(params.row.requestDate)) / 36e5;
-        const isEscalated = !isRejected && activeStep < steps.length && hoursPending > escalationHours;
-
-        return (
-          <Box sx={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "flex-start", pl: 2, height: "100%" }}>
-            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={{ width: "100%", mt: 0.5 }}>
-              {steps.map((step, index) => {
-                const isCompleted = index < activeStep;
-                const isCurrent = index === activeStep;
-
-                let statusFlag = "PENDING";
-                if (isCompleted) statusFlag = "COMPLETED";
-                if (isCurrent && isRejected) statusFlag = "REJECTED";
-                else if (isCurrent && isEscalated) statusFlag = "ESCALATED";
-                else if (isCurrent) statusFlag = "ACTIVE";
-
-                // CRITICAL FIX: Extract the label safely from the object
-                const label = step?.designation || step?.state || "Unknown";
-
-                return (
-                  <Tooltip title={label} key={`${label}-${index}`} arrow>
-                    <Step completed={isCompleted} active={isCurrent} sx={{ px: 0, opacity: isRejected && index > activeStep ? 0.3 : 1 }}>
-                      <StepLabel
-                        StepIconComponent={() => (
-                          <CustomWorkflowIcon
-                            statusFlag={statusFlag}
-                            iconLetter={label.charAt(0).toUpperCase()}
-                            label={label}
-                            isMini={true}
-                          />
-                        )}
-                        sx={{ p: 0, m: 0 }}
-                      />
-                    </Step>
-                  </Tooltip>
-                );
-              })}
-            </Stepper>
-          </Box>
-        );
-      },
+However, look at your processWorkflowAction method. When a checker approves a batch and it's the final step with a future schedule, your code updates it to:
+```java
+jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'SCHEDULED' WHERE BATCH_ID = ?", batchId);
 
 ```
-### Fix 3: Safely Unwrap the View Modal APIs
-When the checker clicks the "View" (Eye) icon, it makes 3 API calls at the same time. If any of those return an ApiResponseDto, the modal will crash. Update handleOpenViewModal to safely unwrap those too:
-Find handleOpenViewModal and replace the try block with this:
-```javascript
-    try {
-      const workflowCode = row.approvalWorkflow || "Workflow_3";
+And earlier, we established that you want to stick strictly to 'P' for pending batches throughout the processing engine. Because processWorkflowAction writes 'SCHEDULED', these records instantly vanish from the screen or cause errors down the road.
+#### The Fix: Keep Status as 'P' in processWorkflowAction
+Update the final step scheduling branch inside your processWorkflowAction method to save the status as 'P' instead of 'SCHEDULED':
+```java
+if ("YES".equalsIgnoreCase(posting.getIS_EXECUTION_SCHEDULED()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+    // FIX: Maintain state machine consistency by keeping status as 'P' (Pending)
+    posting.setBatchStatus("P"); 
 
-      const [stepsData, summaryData, historyData] = await Promise.all([
-        callApi(`/JS/voucher/workflow/steps/${workflowCode}`, null, "GET"),
-        callApi(`/JS/voucher/batch-summary/${row.batchId}`, null, "GET"),
-        callApi(`/JS/voucher/workflow-history/${row.batchId}`, null, "GET"),
-      ]);
+    String actionLog = isOverride ? "Final Approval(Sch. Override)" : "Final Approval(Scheduled)";
+    logWorkflowAction(batchId, posting.getVidFk(), actionLog, executorId, dto.getRemarks(), posting.getScheduledTime());
 
-      // CRITICAL FIX: Defensively extract `.data` if wrapped in ApiResponseDto
-      setDynamicSteps(Array.isArray(stepsData) ? stepsData : (stepsData?.data || []));
-      setVidDetails(summaryData?.data || summaryData); 
-      setWorkflowHistory(Array.isArray(historyData) ? historyData : (historyData?.data || [])); 
-      
-    } catch (err) {
-      showSnackBar("Failed to load batch details.", "error");
-    } finally {
-      setIsFetchingSteps(false);
-      setIsFetchingVid(false);
+    // FIX: Update to 'P' instead of 'SCHEDULED'
+    jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+}
+
+```
+### Bug 2: Hardcoded Status String in processBulkRequestsAsync
+Look at your lock query in processBulkRequestsAsync:
+```java
+String lockSql = "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'A' WHERE BATCH_ID = ? AND BATCH_STATUS = 'P'";
+
+```
+This is safe now that we changed processWorkflowAction to write 'P'. However, when your background automated VoucherExecutionScheduler wakes up, it dispatches the scheduled batches to this exact method. To make sure it can handle rows moving through the scheduler flawlessly, it's best to handle boundary states explicitly:
+```java
+@Override
+@Transactional
+public void processBulkRequestsAsync(BulkProcessVoucherPostingDto dto, String executorId, Integer executorRole) {
+    // Robust batch update lock statement safely scoping both standard and timer pending steps
+    String lockSql = "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'A' WHERE BATCH_ID = ? AND BATCH_STATUS IN ('P', 'PENDING')";
+    int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
+
+    if (updated == 0) {
+        log.warn("APPROVAL_LOCK_FAIL | Batch: {} | Status: Already processing or invalid status", dto.getBatchId());
+        throw new IllegalStateException("Batch is already being processed or is not in a valid state for execution.");
     }
 
+    progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
+    self.executeAsyncBatchProcessing(dto, executorId);
+}
+
 ```
+### Bug 3: Missing Method Declaration in Interface
+Ensure that your VoucherRequestService.java interface explicitly contains the new delete request configuration, otherwise your project won't compile:
+```java
+void deleteBatchRequest(String batchId, String userId);
+
+```
+### Why these backend changes completely fix your issue:
+ 1. By changing BATCH_STATUS = 'SCHEDULED' back to 'P', your getPendingBatchesForChecker query (WHERE p.BATCH_STATUS = 'P') will successfully find the rows.
+ 2. The UI data-grids on both the Status Screen and the Authorization Screen can now seamlessly fetch and unwrap the dataset without getting blank arrays or processing locks.
