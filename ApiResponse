@@ -1,94 +1,134 @@
-
-package com.fincore.VoucherService.Service;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.VoucherService.Models.Notifications;
-import com.fincore.VoucherService.Repository.NotificationRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class NotificationWriterService {
-
-    private final NotificationRepository notificationRepository;
-    private final StringRedisTemplate stringRedisTemplate;
-    private final ObjectMapper objectMapper;
-
-    @Value("${notification.alert.topic:notifications:alerts}")
-    private String alertTopic;
+This is actually a fantastic setup. Because your NotificationWriterService is already wired up with JPA and uses StringRedisTemplate to broadcast messages, your React frontend will be able to display real-time popup alerts the second a batch advances!
+Since you already have the core service built, we just need to add **two new helper methods** to it to handle the Maker's submission and the "Exclude Creator" routing logic. Then, we will inject those perfectly into your VoucherRequestServiceImpl.
+Here are the exact code updates you need to make to both files.
+### 1. Update NotificationWriterService.java
+Add these two helper methods at the bottom of your existing file.
+Notice how createNextStepApprovalNotification deliberately passes BOTH the userToExclude and the targetRoleId to the core method. This triggers your database design rule: *"In a scenario where both role and userId are provided, the userId will be excluded."*
+```java
+    // ==================================================================================
+    // NEW HELPER METHODS (Add these to your existing NotificationWriterService)
+    // ==================================================================================
 
     /**
-     * Core method to save and broadcast the notification.
-     * Uses REQUIRES_NEW so the alert fires instantly during long background tasks.
+     * Alerts the Maker that their batch was successfully sent to the workflow pipeline.
      */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+    public void createBatchSubmissionNotification(String batchId, String creatorId) {
+        String message = "Your Batch '" + batchId + "' was submitted successfully.";
+        createNotification(creatorId, null, message, "/journal-posting-status", batchId, "JournalService");
+    }
 
-        if (userId == null && targetRole == null) {
-            log.warn("NOTIFICATION_SKIPPED | Reason: Recipient missing | AggregateID: {}", aggregateId);
+    /**
+     * Alerts the Checkers that a batch is waiting for them.
+     * By passing userToExclude to the userId parameter, your database natively excludes them 
+     * from the targetRole blast, preventing self-approval alerts.
+     */
+    public void createNextStepApprovalNotification(String batchId, String userToExclude, String targetRoleId) {
+        String message = "Journal Batch '" + batchId + "' has advanced to your stage and requires your review.";
+        createNotification(userToExclude, targetRoleId, message, "/journal-authorization", batchId, "JournalService");
+    }
+
+```
+### 2. Update VoucherRequestServiceImpl.java (Batch Creation)
+When a user uploads Excel data or submits manual entries, we must fetch the ALLOWED_ROLE_ID of Step 2, then fire the notifications.
+Find the dynamic workflow initialization inside your **createBatchRequest** method and replace it with this:
+```java
+        // ==========================================
+        // 2. DYNAMIC WORKFLOW INITIALIZATION
+        // ==========================================
+        String workflowCode;
+        try {
+            workflowCode = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                    String.class, creatorRole
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
+        }
+
+        // --- NEW: FETCH BOTH WORKFLOW_ID AND ALLOWED_ROLE_ID FOR STEP 2 ---
+        Map<String, Object> step2Info;
+        try {
+            step2Info = jdbcTemplate.queryForMap(
+                    "SELECT WORKFLOW_ID, ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
+                    workflowCode
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
+        }
+
+        Long firstApproverWorkflowId = ((Number) step2Info.get("WORKFLOW_ID")).longValue();
+        String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
+
+        VoucherPosting posting = new VoucherPosting();
+        // ... (Keep all your existing posting.set values here)
+        posting.setPendingAt(firstApproverWorkflowId);
+        voucherPostingRepository.save(posting);
+
+        // ==========================================
+        // 3. SMART NOTIFICATION ROUTING
+        // ==========================================
+        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created");
+        
+        // 1. Notify the Maker (Success Alert)
+        notificationWriterService.createBatchSubmissionNotification(batchId, creatorId);
+
+        // 2. Notify the Checkers (Excludes the Creator natively)
+        notificationWriterService.createNextStepApprovalNotification(batchId, creatorId, nextApproverRoleId);
+
+        // ... (Keep your existing updateVidStatus and logWorkflowAction calls here)
+
+```
+### 3. Update VoucherRequestServiceImpl.java (Workflow Approvals & Rejections)
+When a Checker hits Accept or Reject, we need to alert the original Maker or push the batch to the *next* Checker.
+Find the execution block inside your **processWorkflowAction** method and update the routing branches like this:
+```java
+        // ==========================================
+        // 4. HANDLE REJECTION
+        // ==========================================
+        if ("REJECTED".equals(dto.getStatus().toString())) {
+            posting.setBatchStatus("R");
+            voucherPostingRepository.save(posting);
+
+            logWorkflowAction(batchId, (String)stepData.get("VID_FK"), "Rejected (" + currentStageName + ")", executorId, dto.getRemarks(), null);
+
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'REJECTED' WHERE BATCH_ID = ?", batchId);
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING_DATA SET REQ_STATUS = 'R', EXECUTION_DATE = SYSTIMESTAMP WHERE BATCH_ID = ?", batchId);
+
+            // --- NOTIFY MAKER: BATCH REJECTED ---
+            notificationWriterService.createBatchRejectedNotification(batchId, posting.getCreatedBy(), executorId, dto.getRemarks());
+
+            if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
             return;
         }
 
-        if (message == null || message.isBlank()) {
-            throw new IllegalArgumentException("Notification message content is required.");
+        // ==========================================
+        // 5. HANDLE APPROVAL / PROGRESSION
+        // ==========================================
+        if (isFinalStep) {
+            
+            // ... (Keep your existing scheduling and Override logic here) ...
+
+            // --- NOTIFY MAKER: FINAL APPROVAL ---
+            notificationWriterService.createBatchApprovedNotification(batchId, posting.getCreatedBy(), executorId);
+
+        } else {
+            // Move to next intermediate step
+            Map<String, Object> nextStepInfo = jdbcTemplate.queryForMap(
+                "SELECT WORKFLOW_ID, ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?", 
+                workflowCode, currentOrder + 1
+            );
+            
+            Long nextStepId = ((Number) nextStepInfo.get("WORKFLOW_ID")).longValue();
+            String nextRoleId = String.valueOf(nextStepInfo.get("ALLOWED_ROLE_ID"));
+
+            posting.setPendingAt(nextStepId);
+            logWorkflowAction(batchId, posting.getVidFk(), "Approved (" + currentStageName + ")", executorId, dto.getRemarks(), null);
+            
+            // --- NOTIFY NEXT CHECKER TIER ---
+            // Passes executorId to exclude the person who just approved it from getting the next alert
+            notificationWriterService.createNextStepApprovalNotification(batchId, executorId, nextRoleId);
         }
 
-        try {
-            Notifications notification = Notifications.builder()
-                    .userId(userId)
-                    .targetRole(targetRole)
-                    .message(message)
-                    .linkUrl(linkUrl)
-                    .aggregateId(aggregateId)
-                    .eventSource(eventSource)
-                    .build();
+        voucherPostingRepository.save(posting);
 
-            // 1. Save to Database (Like your friend's code)
-            Notifications savedNotification = notificationRepository.save(notification);
-
-            // 2. Broadcast to Redis for live UI updates (Required for your async architecture)
-            try {
-                String jsonPayload = objectMapper.writeValueAsString(savedNotification);
-                stringRedisTemplate.convertAndSend(alertTopic, jsonPayload);
-            } catch (JsonProcessingException e) {
-                log.error("NOTIFICATION_BROADCAST_FAIL | AggregateID: {} | Reason: JSON Serialization failed", aggregateId);
-            }
-
-            log.info("NOTIFICATION_SENT | User/Role: {} | Ref: {}", (userId != null ? userId : targetRole), aggregateId);
-
-        } catch (DataAccessException e) {
-            log.error("NOTIFICATION_DB_FAIL | AggregateID: {} | Reason: Database persistence failure", aggregateId);
-            throw e;
-        }
-    }
-
-    // ==================================================================================
-    // HELPER METHODS (Adapted from your friend's architecture for cleaner code)
-    // ==================================================================================
-
-    public void createBatchApprovedNotification(String batchId, String creatorId, String approverId) {
-        String message = "Your Journal Batch '" + batchId + "' has been APPROVED by " + approverId;
-        createNotification(creatorId, null, message, "/journal-view/" + batchId, batchId, "JournalService");
-    }
-
-    public void createBatchRejectedNotification(String batchId, String creatorId, String rejectorId, String reason) {
-        String message = "Your Journal Batch '" + batchId + "' was REJECTED by " + rejectorId + ". Reason: " + reason;
-        createNotification(creatorId, null, message, "/journal-view/" + batchId, batchId, "JournalService");
-    }
-
-    public void createRequiresApprovalBroadcast(String batchId, String creatorId, String targetRoles) {
-        String message = "New Journal Batch '" + batchId + "' uploaded by " + creatorId + " requires your approval.";
-        createNotification(null, targetRoles, message, "/journal-view/" + batchId, batchId, "JournalService");
-    }
-    
-    
-}
+```
