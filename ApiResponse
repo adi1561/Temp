@@ -1,6 +1,51 @@
-2026-06-15T15:51:17.934+05:30  WARN 46996 --- [VoucherService] [io-9999-exec-10] c.f.V.Exception.GlobalExceptionHandler   : INVALID_DATA | Path: /api/voucher/create-batch-from-cache | Msg: Voucher ID (VID-2606-00039) has already been used in another batch. Please select a fresh VID.
+Ah, excellent catch! This is a classic state-machine edge case. You correctly wrote the logic to revert the VID to ACTIVE upon rejection, but the database validation check was too aggressive. It was counting *all* historical batches linked to that VID, including the dead/rejected ones.
+We simply need to update the SQL query so that it ignores batches with a status of R or REJECTED.
+Here are the two targeted fixes you need to apply in **VoucherRequestServiceImpl.java**. I have also included the fix for your manual entry method, as it was missing this safety check entirely!
+### 1. Fix Bulk Upload (createBatchFromCacheAsync)
+Find the vidExists check near the top of your createBatchFromCacheAsync method (around line 95) and replace it with this updated query:
+```java
+            // ✨ FIX 2: Allow VID reuse if the previous batch was rejected.
+            // We only block if the VID is tied to a batch that is NOT rejected or errored.
+            Integer vidExists = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')", 
+                    Integer.class, vid
+            );
+            
+            if (vidExists != null && vidExists > 0) {
+                throw new CustomExceptions.InvalidDataException("Voucher ID (" + vid + ") is currently in use by an active batch. Please select a fresh VID.");
+            }
 
-there is same changes or we can see bug is there as we know the flow 
-voucher posting create -> then we change the status to USED
-and if any one rejected the request then we again change the status to active
-and according to buiess requirement in this case we need to allow him to create the request using that same VID but it giving error solve this 
+```
+### 2. Secure Manual Upload (createBatchRequest)
+Your manual batch creation method is currently vulnerable to the same issue, as it completely skips the VID duplication check.
+Find your **createBatchRequest** method and add this exact block right at the top (around line 666), immediately after generating the batchId and journalPrefix:
+```java
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole)  {
+        String batchId = sequenceService.getNextBatchId();
+        String journalPrefix = sequenceService.getNextJournalIdPrefix();
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+
+        // --- NEW: STRICT VID DUPLICATION CHECK ---
+        if (dto.getVid() == null || dto.getVid().trim().isEmpty()) {
+            throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
+        }
+
+        // Checks if the VID is already used by an active/pending batch, ignoring rejected ones
+        Integer vidExists = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')", 
+                Integer.class, dto.getVid()
+        );
+        
+        if (vidExists != null && vidExists > 0) {
+            throw new CustomExceptions.InvalidDataException("Voucher ID (" + dto.getVid() + ") is currently in use by an active batch. Please select a fresh VID.");
+        }
+        // ------------------------------------------
+
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal totalDebit = BigDecimal.ZERO;
+        // ... rest of your existing logic ...
+
+```
+By filtering out 'R', 'REJECTED', and 'ERROR' from the COUNT(*) query, the system now intelligently drops dead batches from the active count, allowing you to seamlessly reuse a rejected VID without triggering the INVALID_DATA exception!
