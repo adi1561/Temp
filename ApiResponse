@@ -1,9 +1,18 @@
+This is a highly critical and excellent architectural addition. When relying on automated background tasks, you must have a "Dead Letter Queue" or a retry mechanism; otherwise, a temporary database glitch could cause a scheduled batch to loop infinitely or get lost.
+To achieve this cleanly **without modifying your core services**, we will add the tracking logic entirely inside your VoucherExecutionScheduler.
+We will introduce a 3-step cycle inside the scheduler:
+ 1. **Housekeeping:** Check if previously executing batches succeeded and mark them as COMPLETED in the retry table.
+ 2. **Attempt Tracking:** Check the retry table before executing a batch. If it doesn't exist, insert it. If it fails and exceeds the maximum retries (e.g., 3 attempts), mark it as FAILED and permanently halt it by setting the master batch status to ERROR.
+ 3. **Execution:** Fire the API call.
+Here is your upgraded and robust **VoucherExecutionScheduler.java**:
+```java
 package com.fincore.VoucherService.Service;
 
 import com.fincore.VoucherService.Models.enums.RequestStatus;
 import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -11,6 +20,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -21,6 +31,8 @@ public class VoucherExecutionScheduler {
     private final JdbcTemplate jdbcTemplate;
     private final VoucherRequestServiceImpl voucherRequestService;
     private final StringRedisTemplate stringRedisTemplate;
+
+    private static final int MAX_RETRIES = 3;
 
     /**
      * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
@@ -39,38 +51,84 @@ public class VoucherExecutionScheduler {
 
             if (!lockAcquired) return;
 
-            String sql = "SELECT p.BATCH_ID FROM VOUCHER_POSTING p " +
-                    "WHERE p.BATCH_STATUS = 'P' " +
-                    "AND p.IS_EXECUTION_SCHEDULED = 'YES' " +
-                    "AND p.SCHEDULED_TIME <= ? " +
-                    "AND EXISTS (" +
-                    "    SELECT 1 FROM VOUCHER_WORKFLOW vw " +
-                    "    WHERE vw.BATCH_ID_FK = p.BATCH_ID " +
-                    "    AND vw.LAST_ACTION LIKE 'Final Approval%'" +
-                    ")";
+            // --- STEP 1: HOUSEKEEPING (Update success states) ---
+            // If the core service successfully processed the batch, it changed the BATCH_STATUS to 'A' or 'C'.
+            // We find those and cleanly mark them as COMPLETED in our retry tracker.
+            String cleanupSql = """
+                UPDATE SCHEDULED_BATCH_RETRY r 
+                SET r.STATUS = 'COMPLETED' 
+                WHERE r.STATUS = 'PENDING' 
+                AND EXISTS (
+                    SELECT 1 FROM VOUCHER_POSTING p 
+                    WHERE p.BATCH_ID = r.BATCH_ID 
+                    AND p.BATCH_STATUS IN ('A', 'C', 'POSTED')
+                )
+            """;
+            jdbcTemplate.update(cleanupSql);
 
-            // FIX 3: Convert LocalDateTime to java.sql.Timestamp for Oracle compatibility
+            // --- STEP 2: FETCH DUE BATCHES ---
+            String fetchSql = """
+                SELECT p.BATCH_ID FROM VOUCHER_POSTING p 
+                WHERE p.BATCH_STATUS = 'P' 
+                AND p.IS_EXECUTION_SCHEDULED = 'YES' 
+                AND p.SCHEDULED_TIME <= ? 
+                AND EXISTS (
+                    SELECT 1 FROM VOUCHER_WORKFLOW vw 
+                    WHERE vw.BATCH_ID_FK = p.BATCH_ID 
+                    AND vw.LAST_ACTION LIKE 'Final Approval%'
+                )
+            """;
+
             java.sql.Timestamp currentTime = java.sql.Timestamp.valueOf(LocalDateTime.now());
-            List<String> dueBatches = jdbcTemplate.queryForList(sql, String.class, currentTime);
+            List<String> dueBatches = jdbcTemplate.queryForList(fetchSql, String.class, currentTime);
 
             if (dueBatches.isEmpty()) return;
 
             log.info("SCHEDULER_WAKEUP | Found {} scheduled batches ready for execution.", dueBatches.size());
 
+            // --- STEP 3: PROCESS WITH RETRY TRACKING ---
             for (String batchId : dueBatches) {
                 try {
+                    int currentRetries = 0;
+                    
+                    // A. Check tracking table
+                    try {
+                        Map<String, Object> retryData = jdbcTemplate.queryForMap(
+                                "SELECT RETRY_COUNT, STATUS FROM SCHEDULED_BATCH_RETRY WHERE BATCH_ID = ?", batchId);
+                        currentRetries = ((Number) retryData.get("RETRY_COUNT")).intValue();
+                    } catch (EmptyResultDataAccessException e) {
+                        // First attempt: Create tracking record
+                        jdbcTemplate.update(
+                                "INSERT INTO SCHEDULED_BATCH_RETRY (BATCH_ID, CREATED_AT, RETRY_COUNT, STATUS) VALUES (?, SYSTIMESTAMP, 0, 'PENDING')", 
+                                batchId);
+                    }
+
+                    // B. Validate Limits
+                    if (currentRetries >= MAX_RETRIES) {
+                        log.error("SCHEDULER_EXHAUSTED | Batch {} failed after {} attempts. Halting execution.", batchId, MAX_RETRIES);
+                        
+                        // Mark Tracker as FAILED
+                        jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET STATUS = 'FAILED' WHERE BATCH_ID = ?", batchId);
+                        
+                        // Mark Master Batch as ERROR so the UI stops showing it as Pending/Scheduled
+                        jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR' WHERE BATCH_ID = ?", batchId);
+                        continue;
+                    }
+
+                    // C. Increment Attempt Count
+                    jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
+
+                    // D. Fire the Core Execution
                     BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
                     execDto.setBatchId(batchId);
                     execDto.setStatus(RequestStatus.ACCEPTED);
                     execDto.setRemarks("Executed automatically by System Scheduler");
 
-                    // 3. Process the batch (This automatically calls your PL/SQL procedure)
                     voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
-
-                    log.info("SCHEDULER_TRIGGERED | Batch: {} processing started.", batchId);
+                    log.info("SCHEDULER_TRIGGERED | Batch: {} processing started (Attempt {}/{}).", batchId, (currentRetries + 1), MAX_RETRIES);
 
                 } catch (Exception e) {
-                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+                    log.error("SCHEDULER_LOOP_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
                 }
             }
 
@@ -84,12 +142,16 @@ public class VoucherExecutionScheduler {
     }
 }
 
-this is we create in past as we know but now we need to take care that this is imp and if fail we need to keep in the table for retry and track the retry count 
-something like this 
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-CREATED_AT	TIMESTAMP(6)	Yes	SYSTIMESTAMP	2	
-RETRY_COUNT	NUMBER	Yes	0	3	
-STATUS	VARCHAR2(20 BYTE)	Yes	"'PENDING' -- PENDING, FAILED, COMPLETED
-"	4	
+```
+### Required Database Table
+Make sure you run this in your Oracle Database so the tracking table exists before you compile the application:
+```sql
+CREATE TABLE SCHEDULED_BATCH_RETRY (
+    BATCH_ID VARCHAR2(50 BYTE) NOT NULL,
+    CREATED_AT TIMESTAMP(6) DEFAULT SYSTIMESTAMP,
+    RETRY_COUNT NUMBER DEFAULT 0,
+    STATUS VARCHAR2(20 BYTE) DEFAULT 'PENDING',
+    CONSTRAINT PK_SCHEDULED_RETRY PRIMARY KEY (BATCH_ID)
+);
 
-
+```
