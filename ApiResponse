@@ -1,86 +1,38 @@
-We have successfully locked down the physical file upload mechanics. Now, we must tackle one of the most critical vulnerabilities explicitly mentioned in your enterprise security checklist: **IDOR (Insecure Direct Object Reference) and Forced Browsing**.
-Currently, your download endpoint (/download-batch/{batchId}) only asks for the batchId. A malicious user (or simply a curious employee) could intercept the network request, change the batch ID from 0008530 to 0008531, and download a highly sensitive journal batch belonging to another department.
-To comply with the requirement to **"Enforce principle of least privileges and role-based access controls"** and prevent **"Unrestricted file download and force browsing"**, we must add an authorization firewall before serving the file.
-Here is **Stage 5: Access Control & Anti-Forced Browsing**.
-### 1. Add Authorization Logic to the Service Layer
-We need a method that checks the database to confirm if the user requesting the file either created the batch OR is an assigned Checker for its current workflow stage.
-**A. Add this signature to VoucherRequestService.java (Interface):**
-```java
-    boolean isUserAuthorizedForBatch(String batchId, String userId, Integer roleId);
-
-```
-**B. Add the implementation to VoucherRequestServiceImpl.java:**
-Paste this helper method anywhere inside the class:
-```java
-    @Override
-    public boolean isUserAuthorizedForBatch(String batchId, String userId, Integer roleId) {
-        // 1. Check if the user is the original Maker (Creator) of the batch
-        String creatorSql = "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ? AND CREATED_BY = ?";
-        Integer isCreator = jdbcTemplate.queryForObject(creatorSql, Integer.class, batchId, userId);
-        if (isCreator != null && isCreator > 0) {
-            return true;
-        }
-
-        // 2. Check if the user's role is authorized to view this batch in its current workflow stage
-        String roleSql = """
-            SELECT COUNT(*) 
-            FROM VOUCHER_POSTING vp
-            JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID
-            WHERE vp.BATCH_ID = ? AND wt.ALLOWED_ROLE_ID = ?
-        """;
-        Integer isAuthorizedRole = jdbcTemplate.queryForObject(roleSql, Integer.class, batchId, roleId);
-        
-        return isAuthorizedRole != null && isAuthorizedRole > 0;
-    }
-
-```
-### 2. Lock Down the Download API in the Controller
-Now, we update your Controller to require the user's JWT token and verify their authorization before triggering the file generation.
-In **VoucherPostingController.java**, replace your existing downloadBatchExcel method with this highly secure version:
-```java
-    @GetMapping("/download-batch/{batchId}")
-    public ResponseEntity<byte[]> downloadBatchExcel(
-            @PathVariable String batchId,
-            @RequestHeader("Authorization") String token) {
-        
-        try {
-            // 1. Extract User Identity
-            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
-            Integer userRole = jwtUtil.getUserRoleFromToken(token.substring(7));
-
-            // 2. Anti-IDOR Check: Is this user allowed to view this specific batch?
-            if (!voucherRequestService.isUserAuthorizedForBatch(batchId, userId, userRole)) {
-                log.warn("SECURITY_VIOLATION | User: {} attempted forced browsing on Batch: {}", userId, batchId);
-                // Return 403 Forbidden to block unauthorized access
-                return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
-            }
-
-            // 3. Get the byte array from your service
-            byte[] fileData = voucherRequestService.generateBatchExcel(batchId);
-
-            // 4. Build Security Headers (Cache disabling & MIME protection)
-            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
-            headers.setPragma("no-cache");
-            headers.setExpires(0L);
-            headers.set("X-Content-Type-Options", "nosniff");
-            headers.set("Content-Security-Policy", "default-src 'self'");
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-
-            // 5. Serve File Securely
-            return ResponseEntity.ok()
-                    .headers(headers)
-                    .body(fileData);
-
-        } catch (Exception e) {
-            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
-            return ResponseEntity.badRequest().build();
-        }
-    }
-
-```
-### Why this fulfills the final Backend Requirements:
- 1. **IDOR & Forced Browsing Terminated:** Attackers can no longer enumerate or guess batchId parameters to steal files. If the database doesn't map their userId or roleId to that specific batch, the API throws a hard 403 Forbidden.
- 2. **Metadata & Macro Mitigation:** Because you are using Apache POI's SXSSFWorkbook and StreamingReader, VBA Macros (.xlsm execution) and hidden file metadata (like OS usernames) are inherently stripped out and ignored by the Java heap during parsing and file regeneration.
-With this implemented, your backend is fully fortified against the enterprise checklist. Are you ready to shift gears to the **Frontend React UI validations**, or is there any specific backend query you want to test first?
+• Malicious file upload checks to be in place- 
+o File Name 
+o File Name Length 
+o File Size (minimum and maximum) minimum size -> 10 kb  , maximum size-> 50 mb
+o File Type Whitelist  
+o File Type length. 
+o Multiple extension check 
+• Additionally following file related checks should be imposed- 
+o POST only. 
+o Unrestricted file download 
+o File path should not be visible in request/response to the end user. 
+o Validate Headers: Content-Type, Content-Disposition, X-Content-Type-Options, Content
+Security-Policy 
+o Disable browser caching. 
+o File permissions on storage. 
+o Client side as well as server-side file restrictions should be implemented. 
+o If it is excel file, check for macros and CSV injection related attacks. 
+o No decompression should be allowed to bypass file size restrictions. 
+o Filename change in format which is not guessable on upload success. 
+o Metadata should also be sanitized or removed.  
+o Restrict file name characters that are not allowed. 
+• Malicious content should be filtered and sanitised adequately to protect SBI ecosystem. 
+• Please ensure that file related attacks like below but not just limited the same are taken are of- 
+? LFI 
+? RFI 
+? Unrestricted file download. 
+? Do not display the file upload path in URL. 
+? Forced browsing 
+? Parameter manipulation 
+? IDOR 
+o Kindly take care of- 
+? Injection attacks. 
+? XSS (Reflected, DOM and Stored). 
+• Unrestricted file download and force browsing to be taken care of. 
+• Session management flaws to be taken care of. 
+• MFA implementation may be considered. 
+• Enforce principle of least privileges and role-based access controls. 
+• Sensitive information should not be hardcoded. 
