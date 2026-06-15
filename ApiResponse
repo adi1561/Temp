@@ -1,129 +1,95 @@
-To implement a time-based escalation system, you need to step away from standard API calls. Because an escalation happens precisely when **nobody is doing anything**, this logic must run automatically in the background.
-To do this professionally and cleanly, we will create a Spring Boot @Scheduled job (a Cron job) that wakes up every minute, checks the database for SLA breaches, and fires notifications.
-We will also use a very clever Oracle SQL trick (NOT EXISTS) to ensure it only alerts the Checkers **once per stage**, so they don't get spammed every single minute after the time breaches.
-Here is the complete setup.
-### 1. Update NotificationWriterService.java
-First, we need to add a dedicated helper method to your notification service so we can track exactly which alerts came from the "EscalationEngine".
-Add this to the bottom of NotificationWriterService.java:
-```java
-    /**
-     * Alerts the Checkers and the Maker that the SLA time limit has been breached.
-     * Uses 'EscalationEngine' as the source to prevent duplicate spamming.
-     */
-    public void createEscalationNotification(String batchId, String targetRoleId, String stageName, String creatorId) {
-        
-        // 1. Send High-Priority Alert to the Checkers responsible for this stage
-        String checkerMsg = "ESCALATION: Journal Batch '" + batchId + "' has breached the " + stageName + " SLA limit. Immediate action required.";
-        createNotification(null, targetRoleId, checkerMsg, "/journal-authorization", batchId, "EscalationEngine");
-
-        // 2. Keep the Maker informed that there is a delay
-        String makerMsg = "UPDATE: Your Batch '" + batchId + "' is taking longer than expected at the " + stageName + " stage. The respective team has been alerted.";
-        createNotification(creatorId, null, makerMsg, "/journal-posting-status", batchId, "EscalationEngine");
-    }
-
-```
-### 2. Create the Background Escalation Engine
-Create a brand new Java file in your Service folder named **VoucherEscalationScheduler.java**.
-This engine will run in the background. Look closely at the SQL query—it uses Oracle's NUMTODSINTERVAL to calculate exact minute-by-minute differences between the last workflow action and the current time.
-```java
 package com.fincore.VoucherService.Service;
 
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
 
+import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
-@Component
+@Service
 @RequiredArgsConstructor
 @Slf4j
-public class VoucherEscalationScheduler {
+public class VoucherExecutionScheduler {
 
     private final JdbcTemplate jdbcTemplate;
-    private final NotificationWriterService notificationWriterService;
+    private final VoucherRequestServiceImpl voucherRequestService;
+    private final StringRedisTemplate stringRedisTemplate;
 
     /**
-     * Runs every 1 minute (60,000 milliseconds) in the background.
-     * Scans for any pending batches that have breached their designated ESCALATION_TIME.
+     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
+     * executes the scheduled batches in a distributed environment.
      */
     @Scheduled(fixedRate = 60000)
-    public void checkAndTriggerEscalations() {
-        
-        // --- THE ESCALATION QUERY ---
-        // 1. Finds 'Pending' batches with an escalation limit > 0
-        // 2. Checks if (Last Action Time + Escalation Minutes) is older than RIGHT NOW
-        // 3. Ensures we haven't already sent an escalation for this specific stage to prevent spam
-        String sql = """
-            SELECT 
-                vp.BATCH_ID, 
-                vp.CREATED_BY, 
-                TO_CHAR(wt.ALLOWED_ROLE_ID) AS ROLE_ID, 
-                wt.WORKFLOW_STAGE
-            FROM VOUCHER_POSTING vp
-            JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID
-            WHERE vp.BATCH_STATUS = 'P' 
-              AND wt.ESCALATION_TIME > 0
-              AND (
-                    SELECT MAX(LAST_ACTION_AT) 
-                    FROM VOUCHER_WORKFLOW 
-                    WHERE BATCH_ID_FK = vp.BATCH_ID
-                  ) + NUMTODSINTERVAL(wt.ESCALATION_TIME, 'MINUTE') < SYSTIMESTAMP
-              AND NOT EXISTS (
-                    SELECT 1 FROM NOTIFICATIONS n 
-                    WHERE n.AGGREGATE_ID = vp.BATCH_ID 
-                      AND n.EVENT_SOURCE = 'EscalationEngine'
-                      AND n.MESSAGE LIKE '%' || wt.WORKFLOW_STAGE || '%'
-              )
-        """;
+    public void executeScheduledBatches() {
+        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
+        boolean lockAcquired = false;
 
         try {
-            List<Map<String, Object>> breachedBatches = jdbcTemplate.queryForList(sql);
+            // 1. Distributed lock so only one server pod runs this at a time
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 50, TimeUnit.SECONDS);
+            lockAcquired = Boolean.TRUE.equals(acquired);
 
-            if (!breachedBatches.isEmpty()) {
-                log.warn("ESCALATION_ENGINE | Found {} batches breaching SLA limits.", breachedBatches.size());
-            }
+            if (!lockAcquired) return;
 
-            // Loop through the breached batches and fire the notifications
-            for (Map<String, Object> batch : breachedBatches) {
-                String batchId = (String) batch.get("BATCH_ID");
-                String targetRoleId = (String) batch.get("ROLE_ID");
-                String stageName = (String) batch.get("WORKFLOW_STAGE");
-                String creatorId = (String) batch.get("CREATED_BY");
+            String sql = "SELECT p.BATCH_ID FROM VOUCHER_POSTING p " +
+                    "WHERE p.BATCH_STATUS = 'P' " +
+                    "AND p.IS_EXECUTION_SCHEDULED = 'YES' " +
+                    "AND p.SCHEDULED_TIME <= ? " +
+                    "AND EXISTS (" +
+                    "    SELECT 1 FROM VOUCHER_WORKFLOW vw " +
+                    "    WHERE vw.BATCH_ID_FK = p.BATCH_ID " +
+                    "    AND vw.LAST_ACTION LIKE 'Final Approval%'" +
+                    ")";
 
-                notificationWriterService.createEscalationNotification(batchId, targetRoleId, stageName, creatorId);
-                
-                log.info("ESCALATION_TRIGGERED | Batch: {} | Stage: {} | Alerted Role: {}", batchId, stageName, targetRoleId);
+            // FIX 3: Convert LocalDateTime to java.sql.Timestamp for Oracle compatibility
+            java.sql.Timestamp currentTime = java.sql.Timestamp.valueOf(LocalDateTime.now());
+            List<String> dueBatches = jdbcTemplate.queryForList(sql, String.class, currentTime);
+
+            if (dueBatches.isEmpty()) return;
+
+            log.info("SCHEDULER_WAKEUP | Found {} scheduled batches ready for execution.", dueBatches.size());
+
+            for (String batchId : dueBatches) {
+                try {
+                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                    execDto.setBatchId(batchId);
+                    execDto.setStatus(RequestStatus.ACCEPTED);
+                    execDto.setRemarks("Executed automatically by System Scheduler");
+
+                    // 3. Process the batch (This automatically calls your PL/SQL procedure)
+                    voucherRequestService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
+
+                    log.info("SCHEDULER_TRIGGERED | Batch: {} processing started.", batchId);
+
+                } catch (Exception e) {
+                    log.error("SCHEDULER_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+                }
             }
 
         } catch (Exception e) {
-            log.error("ESCALATION_ENGINE_FAIL | Error running scheduled SLA check: {}", e.getMessage());
+            log.error("SCHEDULER_CRITICAL_ERROR | {}", e.getMessage());
+        } finally {
+            if (lockAcquired) {
+                stringRedisTemplate.delete(lockKey);
+            }
         }
     }
 }
 
-```
-### 3. Enable Scheduling in Spring Boot
-For the @Scheduled annotation to actually work, you must tell Spring Boot to activate background tasks.
-Go to your main Spring Boot Application class (usually named VoucherServiceApplication.java or FincoreApplication.java) and add the @EnableScheduling annotation to the top:
-```java
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.scheduling.annotation.EnableScheduling; // <-- Import this
+this is we create in past as we know but now we need to take care that this is imp and if fail we need to keep in the table for retry and track the retry count 
+something like this 
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	
+CREATED_AT	TIMESTAMP(6)	Yes	SYSTIMESTAMP	2	
+RETRY_COUNT	NUMBER	Yes	0	3	
+STATUS	VARCHAR2(20 BYTE)	Yes	"'PENDING' -- PENDING, FAILED, COMPLETED
+"	4	
 
-@SpringBootApplication
-@EnableScheduling // <-- ADD THIS
-public class VoucherServiceApplication {
 
-    public static void main(String[] args) {
-        SpringApplication.run(VoucherServiceApplication.class, args);
-    }
-}
-
-```
-### How this architecture works:
- 1. **Time Tracking:** It queries the VOUCHER_WORKFLOW table to find exactly when the batch entered the current stage (the MAX(LAST_ACTION_AT)). It then adds the minutes from the transition table to that timestamp.
- 2. **Anti-Spam (NOT EXISTS):** If a batch sits at the "Verification" stage for 2 hours, it won't send an email every single minute. The SQL query checks if EscalationEngine has already logged an alert for "Verification".
- 3. **Resets Automatically:** If the Checker finally approves it and pushes it to the "Review" stage, the timer resets. If it breaches the *next* time limit, a new notification is sent because the MESSAGE LIKE '%Review%' check will trigger a fresh alert.
