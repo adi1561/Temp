@@ -1,88 +1,20 @@
-You are completely right. I bypassed your explicit instruction to use a proper relational JOIN to derive the state, and I mistakenly populated the USER_ID field in the outbox when it should have strictly been null for role-based targeting.
-By hardcoding the userId exclusion previously, I corrupted your notification outbox entries (as shown in your logs where 7796007 and 9623004 populated the USER_ID column instead of leaving it null).
-Here is the perfect implementation of your logic. We will use a precise JOIN between VOUCHER_POSTING and WORKFLOW_TRANSITIONS to extract the next role dynamically, and we will strictly pass null for the userId in the notification payload.
-### 1. Fix NotificationWriterService.java
-Update your helper method so it **only** accepts the targetRoleId and forces userId to be null.
-```java
-    /**
-     * Alerts the Checkers that a batch is waiting for them.
-     * As per architecture, USER_ID is strictly NULL so it maps cleanly to TARGET_ROLE.
-     */
-    public void createNextStepApprovalNotification(String batchId, String targetRoleId) {
-        String message = "Journal Batch '" + batchId + "' has advanced to your stage and requires your review.";
-        // First parameter (userId) is explicitly forced to null
-        createNotification(null, targetRoleId, message, "/journal-authorization", batchId, "JournalService");
+// Add timeSteps={{ minutes: 1 }} to your component
+
+<DateTimePicker
+  value={scheduledTime}
+  onChange={(newValue) => setScheduledTime(newValue)}
+  minDateTime={dayjs().add(30, 'minute')} 
+  maxDateTime={dayjs().add(24, 'hour')}   
+  timeSteps={{ minutes: 1 }} // <--- ADD THIS LINE
+  slotProps={{
+    textField: {
+      size: 'small',
+      fullWidth: true,
+      sx: { mb: 3, caretColor: 'transparent' },
+      helperText: "Scheduling is only allowed between 30 minutes and 24 hours from current time.",
+      onKeyDown: (e) => e.preventDefault(),
+      onPaste: (e) => e.preventDefault(),
+      inputProps: { readOnly: true }
     }
-
-```
-### 2. Fix Intermediate Approvals (processWorkflowAction)
-Instead of calculating currentOrder + 1 blindly, we will use your exact JOIN logic to cross-reference the batch's current PENDING_AT state with the transitions table.
-Find the } else { block near the bottom of processWorkflowAction (around line 768) and replace it with this:
-```java
-        } else {
-            // --- PERFECTED JOIN LOGIC ---
-            // Joins VOUCHER_POSTING with WORKFLOW_TRANSITIONS to safely fetch the exact next routing stage
-            String nextStepSql = """
-                SELECT w_next.WORKFLOW_ID, w_next.ALLOWED_ROLE_ID
-                FROM VOUCHER_POSTING vp
-                JOIN WORKFLOW_TRANSITIONS w_curr 
-                  ON vp.PENDING_AT = w_curr.WORKFLOW_ID
-                JOIN WORKFLOW_TRANSITIONS w_next 
-                  ON w_curr.WORKFLOW_CODE = w_next.WORKFLOW_CODE 
-                 AND w_next.WORKFLOW_ORDER = (w_curr.WORKFLOW_ORDER + 1)
-                WHERE vp.BATCH_ID = ?
-            """;
-            
-            Map<String, Object> nextStepInfo = jdbcTemplate.queryForMap(nextStepSql, batchId);
-            Long nextStepId = ((Number) nextStepInfo.get("WORKFLOW_ID")).longValue();
-            String nextRoleId = String.valueOf(nextStepInfo.get("ALLOWED_ROLE_ID"));
-
-            posting.setPendingAt(nextStepId);
-            logWorkflowAction(batchId, posting.getVidFk(), "Approved (" + currentStageName + ")", executorId, dto.getRemarks(), null);
-            
-            // Notifies strictly using the TARGET_ROLE (USER_ID is safely null)
-            notificationWriterService.createNextStepApprovalNotification(batchId, nextRoleId);
-        }
-
-        voucherPostingRepository.save(posting);
-
-```
-### 3. Fix Bulk Excel Creation (executeAsyncBatchCreation)
-For the bulk upload background thread, we use a clean JOIN to find WORKFLOW_ORDER = 2 based on the batch's assigned workflow code.
-Replace your try-catch notification block (around line 223) with this:
-```java
-            // --- SAFELY ROUTE NOTIFICATIONS USING JOINS ---
-            try {
-                String nextStepSql = """
-                    SELECT w.ALLOWED_ROLE_ID 
-                    FROM VOUCHER_POSTING vp
-                    JOIN WORKFLOW_TRANSITIONS w 
-                      ON vp.WORKFLOW_CODE = w.WORKFLOW_CODE
-                    WHERE vp.BATCH_ID = ? AND w.WORKFLOW_ORDER = 2
-                """;
-                String nextApproverRoleId = jdbcTemplate.queryForObject(nextStepSql, String.class, batchId);
-
-                notificationWriterService.createBatchSubmissionNotification(batchId, creatorId);
-                
-                // Notifies strictly using the TARGET_ROLE
-                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId);
-            } catch (Exception notifEx) {
-                log.warn("NOTIFICATION_WARN | Batch: {} | Failed to route next step notification, but batch is safe.", batchId);
-            }
-
-```
-### 4. Fix Manual Creation (createBatchRequest)
-At the very bottom of your manual creation method (around line 614), simply update the method call so it drops the creatorId exclusion argument.
-```java
-        // ==========================================
-        // SMART NOTIFICATION ROUTING
-        // ==========================================
-        // 1. Notify the Maker
-        notificationWriterService.createBatchSubmissionNotification(batchId, creatorId);
-
-        // 2. Notify the Checkers (Strictly to TARGET_ROLE)
-        notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId);
-
-        // ---> TRIGGER 1: LOCK THE VID AS USED <---
-
-```
+  }}
+/>
