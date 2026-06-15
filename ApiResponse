@@ -1,20 +1,89 @@
-// Add timeSteps={{ minutes: 1 }} to your component
-
-<DateTimePicker
-  value={scheduledTime}
-  onChange={(newValue) => setScheduledTime(newValue)}
-  minDateTime={dayjs().add(30, 'minute')} 
-  maxDateTime={dayjs().add(24, 'hour')}   
-  timeSteps={{ minutes: 1 }} // <--- ADD THIS LINE
-  slotProps={{
-    textField: {
-      size: 'small',
-      fullWidth: true,
-      sx: { mb: 3, caretColor: 'transparent' },
-      helperText: "Scheduling is only allowed between 30 minutes and 24 hours from current time.",
-      onKeyDown: (e) => e.preventDefault(),
-      onPaste: (e) => e.preventDefault(),
-      inputProps: { readOnly: true }
+Here is the exact, perfected implementation using strict SQL JOIN logic to dynamically calculate the next role based on the workflow order.
+As requested, this strictly handles **Creation** and **Intermediate Approvals**. The Rejection block is left completely alone, so no advancement notifications will fire if a batch is rejected.
+### 1. Update NotificationWriterService.java (The Helper)
+Ensure your helper method only accepts the targetRoleId and passes null for the User ID.
+```java
+    /**
+     * Alerts the Checkers that a batch is waiting for them.
+     * Uses strictly the Target Role derived from the JOIN logic.
+     */
+    public void createNextStepApprovalNotification(String batchId, String targetRoleId) {
+        String message = "Journal Batch '" + batchId + "' has advanced to your stage and requires your review.";
+        // Passes null for userId so it routes exclusively to the targetRole
+        createNotification(null, targetRoleId, message, "/journal-authorization", batchId, "JournalService");
     }
-  }}
-/>
+
+```
+### 2. Intermediate Approvals (processWorkflowAction)
+When a checker approves a batch, we use a self-join on WORKFLOW_TRANSITIONS linked to VOUCHER_POSTING to find the exact ALLOWED_ROLE_ID for currentOrder + 1.
+Find the } else { block near the bottom of your **processWorkflowAction** method (around line 768) and replace it with this:
+```java
+        } else {
+            // --- STRICT JOIN LOGIC TO FIND THE NEXT APPROVER ROLE ---
+            // Joins the batch's current state to find the exact next stage based on Order + 1
+            String nextStepSql = """
+                SELECT w_next.WORKFLOW_ID, w_next.ALLOWED_ROLE_ID
+                FROM VOUCHER_POSTING vp
+                JOIN WORKFLOW_TRANSITIONS w_curr 
+                  ON vp.PENDING_AT = w_curr.WORKFLOW_ID
+                JOIN WORKFLOW_TRANSITIONS w_next 
+                  ON w_curr.WORKFLOW_CODE = w_next.WORKFLOW_CODE 
+                 AND w_next.WORKFLOW_ORDER = (w_curr.WORKFLOW_ORDER + 1)
+                WHERE vp.BATCH_ID = ?
+            """;
+            
+            Map<String, Object> nextStepInfo = jdbcTemplate.queryForMap(nextStepSql, batchId);
+            Long nextStepId = ((Number) nextStepInfo.get("WORKFLOW_ID")).longValue();
+            String nextRoleId = String.valueOf(nextStepInfo.get("ALLOWED_ROLE_ID"));
+
+            // 1. Advance the batch state
+            posting.setPendingAt(nextStepId);
+            logWorkflowAction(batchId, posting.getVidFk(), "Approved (" + currentStageName + ")", executorId, dto.getRemarks(), null);
+            
+            // 2. Notify the next role in the chain
+            notificationWriterService.createNextStepApprovalNotification(batchId, nextRoleId);
+        }
+
+        voucherPostingRepository.save(posting);
+
+```
+### 3. Bulk Excel Creation (executeAsyncBatchCreation)
+When a batch is successfully created in the background, we use a JOIN to find the role assigned to WORKFLOW_ORDER = 2.
+Replace your notification block (around line 223) with this:
+```java
+            // --- SAFELY ROUTE NOTIFICATION USING JOINS ---
+            try {
+                String nextStepSql = """
+                    SELECT w.ALLOWED_ROLE_ID 
+                    FROM VOUCHER_POSTING vp
+                    JOIN WORKFLOW_TRANSITIONS w 
+                      ON vp.WORKFLOW_CODE = w.WORKFLOW_CODE
+                    WHERE vp.BATCH_ID = ? AND w.WORKFLOW_ORDER = 2
+                """;
+                String nextApproverRoleId = jdbcTemplate.queryForObject(nextStepSql, String.class, batchId);
+
+                // Notify Maker of Success
+                notificationWriterService.createBatchSubmissionNotification(batchId, creatorId);
+                
+                // Route to the first Checkers (Order 2)
+                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId);
+            } catch (Exception notifEx) {
+                log.warn("NOTIFICATION_WARN | Batch: {} | Failed to route next step notification, but batch is safe.", batchId);
+            }
+
+```
+### 4. Manual Creation (createBatchRequest)
+At the very bottom of your manual creation method (around line 614), use the nextApproverRoleId we already extracted using the database query.
+```java
+        // ==========================================
+        // SMART NOTIFICATION ROUTING
+        // ==========================================
+        // 1. Notify the Maker
+        notificationWriterService.createBatchSubmissionNotification(batchId, creatorId);
+
+        // 2. Notify the Checkers (Strictly by Target Role)
+        notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId);
+
+        // ---> TRIGGER 1: LOCK THE VID AS USED <---
+
+```
