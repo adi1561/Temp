@@ -630,7 +630,6 @@ public class VoucherPostingController {
 
         log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
 
-        // Fixed syntax and passed the two new fields to the async service
         String batchId = voucherRequestService.createBatchFromCacheAsync(
                 payload.getRequestId(),
                 payload.getCommonBatchRemarks(),
@@ -670,22 +669,29 @@ public class VoucherPostingController {
     }
 
     /**
-     * Chunked deletion to prevent DB timeouts on large batches.
+     * Maker API: Deletes an entire pending batch that they created.
      */
     @DeleteMapping("/my-requests/by-batch/{batchId}")
-    public ResponseEntity<Map<String, Object>> cancelMyRequestsByBatch(
-            @RequestHeader("Authorization") String token,
-            @PathVariable String batchId) {
+    public ResponseEntity<ApiResponseDto> deletePendingBatch(
+            @PathVariable String batchId,
+            @RequestHeader("Authorization") String token) {
 
-        String userId = jwtUtil.getUserIdFromToken(token);
-        log.info("BATCH_DELETE_INIT | User: {} | Batch: {}", userId, batchId);
+        try {
+            // Extract the user ID from your JWT/Auth token
+            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
 
-        voucherRequestService.cancelMyRequestsByBatchIdAsync(batchId, userId);
+            // Send to service layer for validation and deletion
+            voucherRequestService.deleteBatchRequest(batchId, userId);
 
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "DELETING",
-                "message", "Batch deletion queued. Status will update shortly."
-        ));
+            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body(new ApiResponseDto("Error", e.getMessage(), null));
+        } catch (Exception e) {
+            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(new ApiResponseDto("Error", "Failed to delete batch", null));
+        }
     }
 
     // ==================================================================================
@@ -728,16 +734,24 @@ public class VoucherPostingController {
         }
 
         try {
-            // Spring already converted it to a LocalDate, so we just use it directly!
             log.info("VALIDATION_INIT | File: {} | Date: {}", file.getOriginalFilename(), postingDate);
 
-            String reqId = voucherBulkValidationService.initiateValidation(
-                    file.getInputStream(),
-                    file.getOriginalFilename(),
-                    postingDate
-            );
+            // FIX 1: Pass the MultipartFile directly (Matches the new 2-argument signature)
+            String reqId = voucherBulkValidationService.initiateValidation(file, postingDate);
 
-            return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
+            // Build Security Headers for Upload
+            HttpHeaders headers = new HttpHeaders();
+            // FIX 2: Use java.time.Duration.ZERO for Spring Boot 3+ compatibility
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.setPragma("no-cache");
+            headers.setExpires(0L);
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set("Content-Security-Policy", "default-src 'self'");
+
+            // Return 200 OK with the security headers attached
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .body(Map.of("status", "QUEUED", "requestId", reqId));
 
         } catch (IOException e) {
             log.error("VALIDATION_IO_FAIL | File: {}", file.getOriginalFilename());
@@ -761,15 +775,6 @@ public class VoucherPostingController {
         return voucherRequestService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
     }
 
-//    @GetMapping("/pending-requests-summary")
-//    public ResponseEntity<List<Map<String, Object>>> getPendingBatchSummaries() {
-//        return ResponseEntity.ok(voucherRequestService.getPendingBatchSummaries());
-//    }
-
-//    @GetMapping("/all-requests-summary")
-//    public ResponseEntity<List<Map<String, Object>>> getAllBatchSummaries() {
-//        return ResponseEntity.ok(voucherRequestService.getAllBatchSummaries());
-//    }
 
     @GetMapping("/by-batch-paginated/{batchId}")
     public ResponseEntity<?> getRequestsByBatchIdPaginated(
@@ -804,8 +809,8 @@ public class VoucherPostingController {
     @GetMapping("/download-template")
     public ResponseEntity<Resource> downloadTemplate() throws IOException {
         return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Journal_Template.xlsx\"")
-                .body(new ByteArrayResource(voucherBulkValidationService.generateTemplateBytes()));
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Voucher_Template.xlsx\"")
+                .body(new ByteArrayResource(voucherBulkValidationService.generateExcelTemplateWithGuidelines()));
     }
 
     // ==================================================================================
@@ -833,21 +838,13 @@ public class VoucherPostingController {
         }
     }
 
-    @GetMapping("/my-requests")
-    public List<JournalRequest> getMyRequests(@RequestHeader("Authorization") String token) {
-        return voucherRequestService.getMyRequests(jwtUtil.getUserIdFromToken(token));
-    }
+
 
     @GetMapping("/pending-requests")
     public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
         return voucherRequestService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
     }
 
-    @PatchMapping("/update-request")
-    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token, @Valid @RequestBody ProcessVoucherRequestDto dto) throws JsonProcessingException {
-        return voucherRequestService.updateRequestStatus(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token))
-                .orElseThrow(() -> new CustomExceptions.FileProcessingException("Request Update Failed"));
-    }
 
 
     @DeleteMapping("/my-request/{requestId}")
@@ -857,23 +854,48 @@ public class VoucherPostingController {
     }
 
 
-    @GetMapping("/status")
-    public ResponseEntity<List<VoucherRequestStatusDto>> getJournalStatusList() {
-        return ResponseEntity.ok(voucherRequestService.getJournalRequestStatusList());
-    }
-
 
     @GetMapping("/download-batch/{batchId}")
-    public org.springframework.http.ResponseEntity<byte[]> downloadBatchExcel(@PathVariable String batchId) {
-        byte[] excelData = voucherRequestService.generateBatchExcel(batchId);
+    public ResponseEntity<byte[]> downloadBatchExcel(
+            @PathVariable String batchId,
+            @RequestHeader("Authorization") String token) {
 
-        HttpHeaders headers = new org.springframework.http.HttpHeaders();
-        headers.setContentType(org.springframework.http.MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
-        headers.setContentDispositionFormData("attachment", "Batch_" + batchId + ".xlsx");
-        headers.setCacheControl("must-revalidate, post-check=0, pre-check=0");
+        try {
+            // 1. Extract User Identity
+            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
+            Integer userRole = jwtUtil.getUserRoleFromToken(token.substring(7));
 
-        return new org.springframework.http.ResponseEntity<>(excelData, headers, org.springframework.http.HttpStatus.OK);
+            // 2. Anti-IDOR Check: Is this user allowed to view this specific batch?
+            if (!voucherRequestService.isUserAuthorizedForBatch(batchId, userId, userRole)) {
+                log.warn("SECURITY_VIOLATION | User: {} attempted forced browsing on Batch: {}", userId, batchId);
+                // Return 403 Forbidden to block unauthorized access
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+            }
+
+            // 3. Get the byte array from your service
+            byte[] fileData = voucherRequestService.generateBatchExcel(batchId);
+
+            // 4. Build Security Headers (Cache disabling & MIME protection)
+            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.setPragma("no-cache");
+            headers.setExpires(0L);
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set("Content-Security-Policy", "default-src 'self'");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+            // 5. Serve File Securely
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .body(fileData);
+
+        } catch (Exception e) {
+            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
+            return ResponseEntity.badRequest().build();
+        }
     }
+
 
 
     @GetMapping("/eod_status")
@@ -882,13 +904,6 @@ public class VoucherPostingController {
         return new ResponseEntity<>(data, HttpStatus.OK);
     }
 
-
-    @GetMapping("/pending-requests-summary")
-    public ResponseEntity<List<Map<String, Object>>> getPendingBatchSummaries(@RequestHeader("Authorization") String token) {
-        // Extract the role from the token
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        return ResponseEntity.ok(voucherRequestService.getPendingBatchSummaries(userRole));
-    }
     @GetMapping("/filter")
     public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(
             @RequestParam(required = false) String category,
@@ -906,8 +921,10 @@ public class VoucherPostingController {
         return ResponseEntity.ok(voucherRequestService.getPendingBatchesForChecker(userRole , userId));
     }
     @GetMapping("/all-requests-summary")
-    public ResponseEntity<List<Map<String, Object>>> getAllRequestsSummary() {
-        return ResponseEntity.ok(voucherRequestService.getAllRequestsSummary());
+    public ResponseEntity<List<Map<String, Object>>> getAllRequestsSummary( @RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+
+        return ResponseEntity.ok(voucherRequestService.getAllRequestsSummary(userId));
     }
     @PostMapping("/workflow/action")
     public ResponseEntity<Map<String, String>> processCheckerAction(
@@ -947,8 +964,17 @@ public class VoucherPostingController {
     }
 
     @GetMapping("/active")
-    public ResponseEntity<List<Map<String, Object>>> getAvailableVouchers(@RequestParam Long roleId) {
-         return ResponseEntity.ok(voucherRequestService.getAvailableVouchersVid(roleId));
+    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
+
+        List<Map<String, Object>> records = voucherRequestService.getAvailableVouchersVid(roleId);
+
+        // Wrap the response in a "data" object to perfectly mimic the external API's ApiResponse wrapper
+        Map<String, Object> response = new HashMap<>();
+        response.put("data", records);
+        response.put("message", "Success");
+        response.put("status", "OK");
+
+        return ResponseEntity.ok(response);
     }
 
     @PostMapping("/update-schedule")
@@ -966,6 +992,7 @@ public class VoucherPostingController {
     }
 
 }
+
 
 DTOs
 
