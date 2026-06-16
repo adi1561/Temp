@@ -1,220 +1,77 @@
-@Query(value = """
-            SELECT
-            RV.ID,
-            RV.VID,
+This is an incredibly smart approach! Instead of rewriting the frontend to accommodate Oracle's default uppercase behavior, we will use a **RowMapper** in the Java Backend.
+The RowMapper will take the SQL results, grab the Issue Categories using the LISTAGG subquery, and map everything into a JSON payload with the **exact camelCase keys** your external API was using (id, vid, categoryName, issueCategories, etc.).
+Here are the only two changes you need to make to your backend. You **do not need to change a single line of frontend code**!
+### 1. Update the Service Layer (VoucherRequestServiceImpl.java)
+Find your getAvailableVouchersVid method (around line 1160) and replace it with this version. It keeps the exact same SQL logic but manually maps the variables to camelCase keys.
+```java
+    @Override
+    public List<Map<String, Object>> getAvailableVouchersVid(Long roleId) {
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                
+                -- Fetch and comma-separate all mapped Issue Categories
+                (
+                    SELECT LISTAGG(ic.ISSUE_CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY ic.ISSUE_CATEGORY_NAME)
+                    FROM REQUEST_VOUCHER_ISSUE_CATEGORY rvic
+                    JOIN ISSUE_CATEGORY ic ON rvic.ISSUE_CATEGORY_ID = ic.ID
+                    WHERE rvic.REQUEST_VOUCHER_ID = rv.ID
+                ) AS ISSUE_CATEGORIES,
 
-            RV.CATEGORY_ID,
-            VC.CATEGORY_NAME,
+                rv.CREATED_BY AS CREATOR_ID,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT
+            FROM REQUEST_VOUCHER rv
+            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
+            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
+            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
+            ORDER BY rv.CREATED_AT DESC
+        """;
 
-            RV.ALLOWED_ROLE,
-            R.ROLE_NAME,
+        // Map the Oracle output to strict camelCase keys so the Frontend doesn't break
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            
+            map.put("id", rs.getLong("ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("description", rs.getString("DESCRIPTION"));
+            map.put("categoryName", rs.getString("CATEGORY_NAME"));
+            map.put("issueCategories", rs.getString("ISSUE_CATEGORIES"));
+            map.put("createdBy", rs.getString("CREATOR_ID"));
+            map.put("createdByName", rs.getString("CREATOR_NAME"));
 
-            RV.DESCRIPTION,
-            RV.SD_REQ_NO,
+            // Safely map Timestamp to standard ISO format
+            java.sql.Timestamp ts = rs.getTimestamp("CREATED_AT");
+            map.put("createdAt", ts != null ? ts.toInstant().toString() : null);
 
-            RV.CREATED_BY,
-            U.FIRST_NAME,
+            return map;
+        }, roleId);
+    }
 
-            RV.CREATED_AT,
+```
+### 2. Update the Controller (VoucherPostingController.java)
+Because your frontend code specifically expects the result to be wrapped in a .data object (if (vouchersResponse && Array.isArray(vouchersResponse.data))), we will wrap the service response in a Map to perfectly mimic the external API.
+Find the /active endpoint in your controller (around line 335) and replace it with this:
+```java
+    @GetMapping("/active")
+    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
+        
+        List<Map<String, Object>> records = voucherRequestService.getAvailableVouchersVid(roleId);
+        
+        // Wrap the response in a "data" object to perfectly mimic the external API's ApiResponse wrapper
+        Map<String, Object> response = new HashMap<>();
+        response.put("data", records);
+        response.put("message", "Success");
+        response.put("status", "OK");
 
-            RV.TERMINATED_BY,
-            RV.TERMINATED_AT,
+        return ResponseEntity.ok(response);
+    }
 
-            RV.STATUS,
-            RV.REMARKS
-
-            FROM REQUEST_VOUCHER RV
-
-            LEFT JOIN VOUCHER_CATEGORY VC
-            ON RV.CATEGORY_ID = VC.ID
-
-            LEFT JOIN ROLES R
-            ON RV.ALLOWED_ROLE = R.ROLE_ID
-
-            LEFT JOIN USERS U
-            ON RV.CREATED_BY = U.USER_ID
-
-            WHERE
-
-            (:status IS NULL
-            OR :status = 'ALL'
-            OR RV.STATUS = :status)
-
-            AND (:categoryId IS NULL
-            OR RV.CATEGORY_ID = :categoryId)
-
-            AND (:allowedRole IS NULL
-            OR RV.ALLOWED_ROLE = :allowedRole)
-
-            AND (:vid IS NULL
-            OR LOWER(RV.VID)
-            LIKE LOWER('%' || :vid || '%'))
-
-            AND (:description IS NULL
-            OR LOWER(RV.DESCRIPTION)
-            LIKE LOWER('%' || :description || '%'))
-
-            AND (:sdReqNo IS NULL
-            OR LOWER(RV.SD_REQ_NO)
-            LIKE LOWER('%' || :sdReqNo || '%'))
-
-            AND (:createdBy IS NULL
-            OR LOWER(RV.CREATED_BY)
-            LIKE LOWER('%' || :createdBy || '%'))
-
-            AND (
-                    :startDate IS NULL
-                    OR (
-                    RV.CREATED_AT >= :startDate
-                    AND RV.CREATED_AT < :endDate
-                    )
-            )
-
-            ORDER BY RV.CREATED_AT DESC
-            """, nativeQuery = true)
-    List<Object[]> searchVid(
-            @Param("status") String status,
-            @Param("categoryId") Long categoryId,
-            @Param("allowedRole") Long allowedRole,
-            @Param("vid") String vid,
-            @Param("description") String description,
-            @Param("sdReqNo") String sdReqNo,
-            @Param("createdBy") String createdBy,
-            @Param("startDate") Timestamp startDate,
-            @Param("endDate") Timestamp endDate);
-			
-			
-			
-			
-			@Override
-        public List<RequestVidResponseDto> searchVid(
-                        String status,
-                        Long categoryId,
-                        Long allowedRole,
-                        String vid,
-                        String description,
-                        String sdReqNo,
-                        String createdBy,
-                        LocalDate date) {
-
-                Timestamp startDate = null;
-                Timestamp endDate = null;
-
-                if (date != null) {
-
-                        startDate = Timestamp.valueOf(date.atStartOfDay());
-
-                        endDate = Timestamp.valueOf(
-                                        date.plusDays(1)
-                                                        .atStartOfDay());
-                }
-
-                List<Object[]> records = requestVidRepository.searchVid(
-                                status,
-                                categoryId,
-                                allowedRole,
-                                vid,
-                                description,
-                                sdReqNo,
-                                createdBy,
-                                startDate,
-                                endDate);
-
-                List<RequestVidResponseDto> response = records.stream()
-                                .map(r -> new RequestVidResponseDto(
-
-                                                ((Number) r[0]).longValue(),
-                                                (String) r[1],
-
-                                                r[2] != null
-                                                                ? ((Number) r[2]).longValue()
-                                                                : null,
-                                                (String) r[3],
-
-                                                r[4] != null
-                                                                ? ((Number) r[4]).longValue()
-                                                                : null,
-                                                (String) r[5],
-
-                                                (String) r[6],
-                                                (String) r[7],
-
-                                                (String) r[8],
-                                                (String) r[9],
-
-                                                r[10] != null ? r[10].toString() : null,
-
-                                                (String) r[11],
-                                                r[12] != null ? r[12].toString()
-                                                                : null,
-
-                                                (String) r[13],
-                                                (String) r[14],
-
-                                                null))
-                                .toList();
-
-                List<Long> voucherIds = response.stream()
-                                .map(RequestVidResponseDto::getId)
-                                .toList();
-
-                if (voucherIds.isEmpty()) {
-
-                        return response;
-                }
-
-                List<Object[]> issueResults = requestVoucherIssueCategoryRepository
-                                .getIssueCategoriesByVoucherIds(
-                                                voucherIds);
-
-                Map<Long, String> issueCategoryMap = new HashMap<>();
-
-                for (Object[] row : issueResults) {
-
-                        issueCategoryMap.put(
-                                        ((Number) row[0]).longValue(),
-                                        (String) row[1]);
-                }
-
-                response.forEach(dto -> dto.setIssueCategories(
-                                issueCategoryMap.get(dto.getId())));
-
-                return response;
-        }
-		
-		
-		@GetMapping("/search-vid")
-    public ResponseEntity<ApiResponse<List<RequestVidResponseDto>>> searchVid(
-
-            @RequestParam(required = false) String status,
-
-            @RequestParam(required = false) Long categoryId,
-
-            @RequestParam(required = false) Long allowedRole,
-
-            @RequestParam(required = false) String vid,
-
-            @RequestParam(required = false) String description,
-
-            @RequestParam(required = false) String sdReqNo,
-
-            @RequestParam(required = false) String createdBy,
-
-            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
-
-        List<RequestVidResponseDto> data = service.searchVid(
-                status,
-                categoryId,
-                allowedRole,
-                vid,
-                description,
-                sdReqNo,
-                createdBy,
-                date);
- 
- 
- listen this is api code which i use ferm onther service 
- i want this kind of names and and res so that i dont need to change my forntend map to this 
- and i dont want that serch functionality i just want get functionality with a filter of that active and log in user role 
- now we will just change the how our backend send the res according to this so i dont need to change the frontend code 
- 
+```
+### What to do on your Frontend:
+You can completely revert your frontend to exactly how it was before.
+ 1. Use your internal API: const vouchersResponse = await callApi('/JS/voucher/active?roleId=${roleToFetch}', null, "GET");
+ 2. It will automatically read row.categoryName, row.vid, and row.issueCategories perfectly. No uppercase overrides needed!
