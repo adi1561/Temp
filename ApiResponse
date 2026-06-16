@@ -1,142 +1,84 @@
-To enforce the strict "Today only, up to 11:59 PM" scheduling rule in the **VoucherAuthorization.js** screen, we need to update the imports, the validation logic, and both areas where a date picker appears (the "Schedule Lapsed" modal and the "Universal Action" screen).
-Here are the exact 4 replacements to make in **VoucherAuthorization.js**.
-### 1. Update the Imports
-Find the @mui/x-date-pickers imports at the top of your file (around line 35) and swap DateTimePicker for TimePicker.
-```javascript
-import dayjs from "dayjs";
-import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
-import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
-// NEW: Import TimePicker instead of DateTimePicker
-import { TimePicker } from "@mui/x-date-pickers/TimePicker";
+You have hit the nail on the head. What you are experiencing is a classic architectural anti-pattern known as the **"God Object"** or **"God Class"**.
+Over time, VoucherRequestServiceImpl has absorbed too many responsibilities: HTTP orchestration, caching, multithreading, JDBC batch processing, Oracle PL/SQL execution, workflow state management, and UI data formatting. This makes the file a nightmare for source control (merge conflicts) and incredibly daunting for new developers to read or unit test.
+To fix this, we must apply the **Single Responsibility Principle (SRP)** and the **Facade Pattern**. We will break this massive service into smaller, highly focused sub-services.
+Here is the exact architectural blueprint to refactor this service safely without breaking your existing VoucherPostingController.
+### The Refactoring Blueprint (4 Sub-Services)
+You should create four new tightly-scoped services. The main VoucherRequestServiceImpl will act purely as a "Facade" (a traffic cop) that receives the request from the controller and delegates it to the appropriate sub-service.
+#### 1. VoucherAsyncExecutionService (The Heavy Lifter)
+Move everything related to background threads, chunking, and database locks here.
+ * **Responsibilities:** Parallel processing, bulk inserts, and PL/SQL procedure execution.
+ * **Methods to move here:** executeAsyncBatchCreation, processChunkRaw, executeAsyncBatchProcessing, executeApprovalInTransaction, executeAsyncBatchCancellation.
+#### 2. VoucherWorkflowEngineService (The State Machine)
+Move all the logic that dictates *who* approves *what*, and *when*.
+ * **Responsibilities:** Routing approvals/rejections, schedule validation, and workflow audit logging.
+ * **Methods to move here:** processWorkflowAction, logWorkflowAction, updateBatchSchedule, validateScheduledTime.
+#### 3. VoucherQueryService (The Read-Only Data Fetcher)
+Move all the complex jdbcTemplate.queryForList() and queryForMap() methods here.
+ * **Responsibilities:** Fetching data strictly for the React UI. By isolating read queries, you ensure UI changes never accidentally break core business logic.
+ * **Methods to move here:** getPendingBatchesForChecker, getAllRequestsSummary, getBatchSummaryDetails, getWorkflowHistory, getWorkflowSteps, getActiveRoles.
+#### 4. VoucherExportService (The File Generator)
+ * **Responsibilities:** Using Apache POI to stream data into Excel files.
+ * **Methods to move here:** generateBatchExcel.
+### How to Implement This Safely (The Facade Pattern)
+You do not need to rewrite your Controller. You keep VoucherRequestServiceImpl as the main entry point, but instead of doing the work itself, it injects the new sub-services.
+Here is an example of what your newly refactored VoucherRequestServiceImpl will look like:
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherRequestServiceImpl implements VoucherRequestService {
 
-```
-### 2. Update the handleSubmitAction Validation Logic
-We must enforce the dayjs limits strictly before the API call is fired.
-Find your handleSubmitAction method (around line 520) and replace the formattedNewSchedule logic block:
-**Replace this:**
-```javascript
-    let formattedNewSchedule = null;
-    // Dynamically pick which time variable to use based on the active mode
-    const targetTime = isActionMode ? finalScheduleTime : newScheduleTime;
+    // Inject the new modular services
+    private final VoucherAsyncExecutionService asyncExecutionService;
+    private final VoucherWorkflowEngineService workflowEngineService;
+    private final VoucherQueryService queryService;
+    private final VoucherExportService exportService;
 
-    if (overrideLapse && targetTime) {
-      const dateObj = new Date(targetTime);
-      formattedNewSchedule = dateObj
-        .toISOString()
-        .slice(0, 19)
-        .replace("T", " ");
+    // ... repository injections ...
+
+    // ==========================================
+    // DELEGATED METHOD EXAMPLES
+    // ==========================================
+
+    @Override
+    public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
+        // The main service no longer holds 100 lines of logic. 
+        // It simply delegates to the Workflow Engine.
+        workflowEngineService.processAction(dto, executorId, executorRole);
     }
 
-```
-**With this highly secure block:**
-```javascript
-    let formattedNewSchedule = null;
-    const targetTime = isActionMode ? finalScheduleTime : newScheduleTime;
-
-    if (overrideLapse && targetTime) {
-      const today = dayjs();
-      const scheduledDayjs = dayjs(targetTime);
-      
-      // Force the date to strictly be TODAY, merging it with the selected time
-      const finalSchedule = scheduledDayjs
-        .year(today.year())
-        .month(today.month())
-        .date(today.date());
-
-      const minAllowed = dayjs().add(28, 'minute'); // 2 min buffer
-      const maxAllowed = dayjs().endOf('day'); // 11:59:59 PM today
-
-      if (finalSchedule.isBefore(minAllowed)) {
-        showSnackBar("Schedule time must be at least 30 minutes from now.", "warning");
-        setIsSubmitting(false);
-        return;
-      }
-      if (finalSchedule.isAfter(maxAllowed)) {
-        showSnackBar("Schedule time cannot exceed today's end of day (11:59 PM).", "warning");
-        setIsSubmitting(false);
-        return;
-      }
-
-      // Format safely for Oracle
-      formattedNewSchedule = finalSchedule.format("YYYY-MM-DD HH:mm:ss");
+    @Override
+    public Map<String, Object> getBatchSummaryDetails(String batchId) {
+        // Read operations go straight to the Query Service
+        return queryService.fetchBatchSummary(batchId);
     }
 
-```
-### 3. Replace the Native Picker in the "Schedule Lapsed" Modal
-Find the <TextField type="datetime-local" ... /> inside your isScheduleLapseModalOpen Dialog (around line 750) and replace it with the new TimePicker.
-**Replace this:**
-```javascript
-              <TextField
-                type="datetime-local"
-                size="small"
-                fullWidth
-                InputLabelProps={{ shrink: true }}
-                value={newScheduleTime}
-                onChange={(e) => setNewScheduleTime(e.target.value)}
-                inputProps={{ min: new Date().toISOString().slice(0, 16) }}
-              />
+    @Override
+    public byte[] generateBatchExcel(String batchId) {
+        // File generation logic is hidden away in the Export Service
+        return exportService.createExcelByteArray(batchId);
+    }
+
+    // ==========================================
+    // CORE LOGIC KEPT IN MAIN SERVICE
+    // ==========================================
+
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole) {
+        // Keep primary orchestrations here. 
+        // For example, saving the manual rows to the database...
+        
+        // ... then handing off the workflow routing to the engine:
+        workflowEngineService.initializeWorkflow(batchId, dto.getVid(), creatorId, creatorRole);
+        
+        return savedEntities;
+    }
+}
 
 ```
-**With this:**
-```javascript
-              <LocalizationProvider dateAdapter={AdapterDayjs}>
-                <TimePicker
-                  label="New Execution Time (Today)"
-                  value={newScheduleTime ? dayjs(newScheduleTime) : null}
-                  onChange={(newValue) => {
-                    setNewScheduleTime(newValue ? newValue.format("YYYY-MM-DDTHH:mm") : "");
-                  }}
-                  minTime={dayjs().add(30, 'minute')}
-                  maxTime={dayjs().endOf('day')}
-                  timeSteps={{ minutes: 1 }}
-                  slotProps={{
-                    textField: {
-                      size: 'small',
-                      fullWidth: true,
-                      sx: { caretColor: 'transparent' },
-                      onKeyDown: (e) => e.preventDefault(),
-                      onPaste: (e) => e.preventDefault(),
-                      inputProps: { readOnly: true }
-                    }
-                  }}
-                />
-              </LocalizationProvider>
-
-```
-### 4. Replace the DateTimePicker in the Universal Action Screen
-Find the <DateTimePicker> component block near the bottom of your file (inside scheduleOverrideType === "OVERRIDE", around line 1250) and swap it to <TimePicker>.
-**Replace the <DateTimePicker ... /> block with this:**
-```javascript
-                                <TimePicker
-                                  label="New Execution Time (Today)"
-                                  value={finalScheduleTime ? dayjs(finalScheduleTime) : null}
-                                  onChange={(newValue) => {
-                                    setFinalScheduleTime(newValue ? newValue.format("YYYY-MM-DDTHH:mm") : "");
-                                  }}
-                                  minTime={dayjs().add(30, 'minute')}
-                                  maxTime={dayjs().endOf('day')}
-                                  timeSteps={{ minutes: 1 }}
-                                  slotProps={{
-                                    textField: {
-                                      size: 'small',
-                                      fullWidth: true,
-                                      required: true,
-                                      sx: {
-                                        caretColor: 'transparent',
-                                        '& .MuiFormHelperText-root': {
-                                          whiteSpace: 'normal',
-                                          wordBreak: 'break-word',
-                                          marginInline: 0, 
-                                          mt: 1
-                                        }
-                                      },
-                                      helperText: "Execution must be scheduled at least 30 mins from now, and before 11:59 PM today.",
-                                      onKeyDown: (e) => e.preventDefault(),
-                                      onPaste: (e) => e.preventDefault(),
-                                      inputProps: { readOnly: true }
-                                    }
-                                  }}
-                                />
-
-```
-*(Note: Because we updated the backend constraints during the VoucherPosting step earlier, your backend is already perfectly configured to accept and validate this exact time logic!)*
+### Why this is the ultimate solution:
+ 1. **Zero Controller Impact:** Your API endpoints remain exactly the same. The frontend UI will not notice a thing.
+ 2. **Eliminates Circular Dependencies:** Background async threads sometimes require looping back to update statuses. Putting async logic in a separate file prevents the dreaded BeanCurrentlyInCreationException where a service tries to inject itself.
+ 3. **Developer Velocity:** If a future developer gets a ticket saying "Fix a bug in the checker approval logic," they instantly know to open VoucherWorkflowEngineService.java. They don't have to scroll through 1,500 lines of unrelated Excel generation and JDBC batch inserting code.
+Would you like me to draft the complete class structure for one of these specific modules, like the VoucherQueryService or the VoucherWorkflowEngineService, to get you started?
