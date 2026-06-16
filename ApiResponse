@@ -1,27 +1,28 @@
-create or replace PROCEDURE PURGE_JOURNAL_BATCH(
+CREATE OR REPLACE PROCEDURE PURGE_JOURNAL_BATCH(
     p_batch_id IN VARCHAR2,
     p_user_id  IN VARCHAR2
 ) AS
     v_status VARCHAR2(20);
 BEGIN
+    -- 1. Validate ownership and current status
     SELECT BATCH_STATUS INTO v_status
     FROM VOUCHER_POSTING
     WHERE BATCH_ID = p_batch_id 
       AND UPPER(TRIM(CREATED_BY)) = UPPER(TRIM(p_user_id));
 
-    IF v_status NOT IN ('P') THEN
+    -- (Note: Added 'QUEUED' because Java updates the status to 'QUEUED' right before calling this)
+    IF v_status NOT IN ('P', 'QUEUED') THEN
         RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
     END IF;
-    DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+    -- 2. CRITICAL FIX: Delete child workflow history FIRST
+    DELETE FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p_batch_id;
+
+    -- 3. Delete child data rows
+    DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = p_batch_id;
+    
+    -- 4. Delete the parent master record LAST
     DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = p_batch_id;
     
-    
 END;
-2026-06-16T16:27:36.355+05:30 ERROR 29276 --- [VoucherService] [    BulkCoord-1] c.f.V.Service.VoucherRequestServiceImpl  : PURGE_DB_ERROR | Batch: 0008545 | Status: SQL operation failed | Cause: CallableStatementCallback; SQL [{call PURGE_JOURNAL_BATCH(?, ?)}]; ORA-02292: integrity constraint (FINCORE.FK_VP_BATCH) violated - child record found
-ORA-06512: at "FINCORE.PURGE_JOURNAL_BATCH", line 17
-ORA-06512: at line 1
-
-2026-06-16T16:29:31.527+05:30 ERROR 29276 --- [VoucherService] [    BulkCoord-2] c.f.V.Service.VoucherRequestServiceImpl  : PURGE_DB_ERROR | Batch: 0008545 | Status: SQL operation failed | Cause: CallableStatementCallback; SQL [{call PURGE_JOURNAL_BATCH(?, ?)}]; ORA-02292: integrity constraint (FINCORE.FK_VP_BATCH) violated - child record found
-ORA-06512: at "FINCORE.PURGE_JOURNAL_BATCH", line 17
-ORA-06512: at line 1
-
+/
