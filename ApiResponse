@@ -1,88 +1,84 @@
-To enforce the strict "Today only, up to 11:59 PM" rule, remove the calendar view, disable all past times so the user clearly sees what is allowed, and force the popup to open **upwards**, you need to replace the DateTimePicker with the TimePicker and utilize the popper placement property.
-Here are the exact two replacements you need to make in **VoucherAuthorization.js** to fix both the Universal Action Screen and the Schedule Lapsed Modal.
-### 1. Fix the Picker in the "Universal Action Screen" (Bottom of file)
-Find the <DateTimePicker ... /> component inside your scheduleOverrideType === "OVERRIDE" block (around line 1910).
-Replace that **entire <DateTimePicker ... /> block** with this highly optimized <TimePicker>:
+To ensure the time picker automatically defaults to a perfectly valid time (and gives the user a buffer if they take a minute or two to click submit), we should pre-fill the state with **Current Time + 35 minutes** whenever they open the action screen or toggle the "Override Schedule" option.
+This prevents the picker from starting out blank or accidentally causing a validation failure if they sit on the screen for too long.
+Here are the exact 3 replacements to make in **VoucherAuthorization.js**:
+### 1. Pre-fill the Universal Action Screen (handleProceed)
+Find your handleProceed method (around line 450) and update the else block to inject a safe default time.
+**Replace the entire handleProceed method with this:**
 ```javascript
-                                <TimePicker
-                                  label="New Execution Time (Today)"
-                                  value={finalScheduleTime ? dayjs(finalScheduleTime) : null}
-                                  onChange={(newValue) => {
-                                    setFinalScheduleTime(newValue ? newValue.format("YYYY-MM-DDTHH:mm") : "");
-                                  }}
-                                  disablePast // Visually disables all past times
-                                  minTime={dayjs().add(30, 'minute')}
-                                  maxTime={dayjs().endOf('day')}
-                                  timeSteps={{ minutes: 1 }}
-                                  slotProps={{
-                                    // CRITICAL: Forces the clock popup to open UPWARDS
-                                    popper: {
-                                      placement: "top", 
-                                    },
-                                    textField: {
-                                      size: 'small',
-                                      fullWidth: true,
-                                      required: true,
-                                      sx: {
-                                        caretColor: 'transparent',
-                                        '& .MuiFormHelperText-root': {
-                                          whiteSpace: 'normal',
-                                          wordBreak: 'break-word',
-                                          marginInline: 0,
-                                          mt: 1
-                                        }
-                                      },
-                                      helperText: "Execution must be scheduled at least 30 mins from now, and before 11:59 PM today.",
-                                      onKeyDown: (e) => e.preventDefault(),
-                                      onPaste: (e) => e.preventDefault(),
-                                      inputProps: { readOnly: true }
-                                    }
-                                  }}
-                                />
+  const handleProceed = () => {
+    setIsActionMode(true); // Open the universal action screen
+
+    // Only pre-fill time if it's the final approval
+    if (viewingBatch?.isFinalApproval === "Y") {
+      if (vidDetails?.SCHEDULED_TIME) {
+        const dateObj = new Date(vidDetails.SCHEDULED_TIME);
+        dateObj.setMinutes(dateObj.getMinutes() - dateObj.getTimezoneOffset());
+        setFinalScheduleTime(dateObj.toISOString().slice(0, 16));
+      } else {
+        // FIX: Automatically pre-fill with a valid safe time (Current Time + 35 mins)
+        setFinalScheduleTime(dayjs().add(35, 'minute').format("YYYY-MM-DDTHH:mm"));
+      }
+    }
+  };
 
 ```
-### 2. Fix the Picker in the "Schedule Lapsed" Modal
-In the code you provided, the Schedule Lapsed modal (around line 1395) had a small bug where it was using finalScheduleTime instead of newScheduleTime, and it also needs the popup to open upwards.
-Find the <TimePicker ... /> block inside your isScheduleLapseModalOpen Dialog and replace it with this:
+### 2. Auto-refresh when clicking "Override Schedule"
+If the user clicks "Keep Original Routing" and then waits 10 minutes before clicking "Override Schedule" again, the previously stored time might now be invalid. We will add logic to auto-refresh the time to a valid +35 minutes when they click the Override card.
+Find the <Box onClick={() => setScheduleOverrideType("OVERRIDE")} inside the routing options (around line 1240) and replace that **entire <Grid item>** with this:
 ```javascript
-                <TimePicker
-                  label="New Execution Time (Today)"
-                  value={newScheduleTime ? dayjs(newScheduleTime) : null} // FIX: Bound to newScheduleTime
-                  onChange={(newValue) => {
-                    setNewScheduleTime(newValue ? newValue.format("YYYY-MM-DDTHH:mm") : "");
-                  }}
-                  disablePast
-                  minTime={dayjs().add(30, 'minute')}
-                  maxTime={dayjs().endOf('day')}
-                  timeSteps={{ minutes: 1 }}
-                  slotProps={{
-                    // CRITICAL: Forces the clock popup to open UPWARDS
-                    popper: {
-                      placement: "top",
-                    },
-                    textField: {
-                      size: 'small',
-                      fullWidth: true,
-                      required: true,
-                      sx: {
-                        caretColor: 'transparent',
-                        '& .MuiFormHelperText-root': {
-                          whiteSpace: 'normal',
-                          wordBreak: 'break-word',
-                          marginInline: 0,
-                          mt: 1
-                        }
-                      },
-                      helperText: "Execution must be scheduled at least 30 mins from now, and before 11:59 PM today.",
-                      onKeyDown: (e) => e.preventDefault(),
-                      onPaste: (e) => e.preventDefault(),
-                      inputProps: { readOnly: true }
-                    }
-                  }}
-                />
+                            <Grid item xs={12} md={6} sx={{ p: 0 }}>
+                              <Box
+                                onClick={() => {
+                                  setScheduleOverrideType("OVERRIDE");
+                                  // FIX: If the stored time is missing or has become invalid while waiting, refresh it!
+                                  const safeTime = dayjs().add(35, 'minute');
+                                  if (!finalScheduleTime || dayjs(finalScheduleTime).isBefore(safeTime)) {
+                                    setFinalScheduleTime(safeTime.format("YYYY-MM-DDTHH:mm"));
+                                  }
+                                }}
+                                sx={jaStyles.overrideOption(scheduleOverrideType === "OVERRIDE", true)}
+                              >
+                                <Box sx={jaStyles.overrideRadioBtn(scheduleOverrideType === "OVERRIDE", true)} />
+                                <Box sx={{ minWidth: 0, flex: 1 }}>
+                                  <Typography
+                                    variant="subtitle2"
+                                    fontWeight="bold"
+                                    sx={{ whiteSpace: 'normal', wordBreak: 'break-word' }}
+                                    color={scheduleOverrideType === "OVERRIDE" ? "warning.dark" : "text.primary"}
+                                  >
+                                    Override Schedule
+                                  </Typography>
+                                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                                    Set a new execution date & time
+                                  </Typography>
+                                </Box>
+                              </Box>
+                            </Grid>
 
 ```
-### Why this works perfectly:
- 1. **TimePicker**: Completely removes the Calendar view. The user will only see the clock/time selection list.
- 2. **popper: { placement: "top" }**: This targets Material UI's underlying Popper.js engine and forces the dropdown to render above the input field instead of below it.
- 3. **disablePast & minTime/maxTime**: Material UI natively handles these by graying out and disabling any hour or minute that falls in the past or beyond 11:59 PM today. The user physically cannot click on an unallowed time.
+### 3. Pre-fill the "Schedule Lapsed" Modal
+If the API returns a 409 Conflict because the original schedule lapsed, the popup modal should instantly give them a pre-filled, valid recovery time.
+Find the catch block inside handleSubmitAction (around line 545) and update the 409 logic:
+**Replace this part of the catch block:**
+```javascript
+    } catch (e) {
+      if (e.response && e.response.status === 409) {
+        setIsScheduleLapseModalOpen(true);
+        setIsSubmitting(false);
+        return;
+      }
+
+```
+**With this:**
+```javascript
+    } catch (e) {
+      if (e.response && e.response.status === 409) {
+        setIsScheduleLapseModalOpen(true);
+        setIsSubmitting(false);
+        // FIX: Automatically suggest a safe recovery time (+35 mins)
+        setNewScheduleTime(dayjs().add(35, 'minute').format("YYYY-MM-DDTHH:mm"));
+        return;
+      }
+
+```
+With these 3 changes, whenever the user is asked to select a time, the system will automatically hand them a perfectly valid timestamp exactly 35 minutes into the future, eliminating the chance of them accidentally submitting an expired/blank value.
