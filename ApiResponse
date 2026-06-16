@@ -1,84 +1,19 @@
-You have hit the nail on the head. What you are experiencing is a classic architectural anti-pattern known as the **"God Object"** or **"God Class"**.
-Over time, VoucherRequestServiceImpl has absorbed too many responsibilities: HTTP orchestration, caching, multithreading, JDBC batch processing, Oracle PL/SQL execution, workflow state management, and UI data formatting. This makes the file a nightmare for source control (merge conflicts) and incredibly daunting for new developers to read or unit test.
-To fix this, we must apply the **Single Responsibility Principle (SRP)** and the **Facade Pattern**. We will break this massive service into smaller, highly focused sub-services.
-Here is the exact architectural blueprint to refactor this service safely without breaking your existing VoucherPostingController.
-### The Refactoring Blueprint (4 Sub-Services)
-You should create four new tightly-scoped services. The main VoucherRequestServiceImpl will act purely as a "Facade" (a traffic cop) that receives the request from the controller and delegates it to the appropriate sub-service.
-#### 1. VoucherAsyncExecutionService (The Heavy Lifter)
-Move everything related to background threads, chunking, and database locks here.
- * **Responsibilities:** Parallel processing, bulk inserts, and PL/SQL procedure execution.
- * **Methods to move here:** executeAsyncBatchCreation, processChunkRaw, executeAsyncBatchProcessing, executeApprovalInTransaction, executeAsyncBatchCancellation.
-#### 2. VoucherWorkflowEngineService (The State Machine)
-Move all the logic that dictates *who* approves *what*, and *when*.
- * **Responsibilities:** Routing approvals/rejections, schedule validation, and workflow audit logging.
- * **Methods to move here:** processWorkflowAction, logWorkflowAction, updateBatchSchedule, validateScheduledTime.
-#### 3. VoucherQueryService (The Read-Only Data Fetcher)
-Move all the complex jdbcTemplate.queryForList() and queryForMap() methods here.
- * **Responsibilities:** Fetching data strictly for the React UI. By isolating read queries, you ensure UI changes never accidentally break core business logic.
- * **Methods to move here:** getPendingBatchesForChecker, getAllRequestsSummary, getBatchSummaryDetails, getWorkflowHistory, getWorkflowSteps, getActiveRoles.
-#### 4. VoucherExportService (The File Generator)
- * **Responsibilities:** Using Apache POI to stream data into Excel files.
- * **Methods to move here:** generateBatchExcel.
-### How to Implement This Safely (The Facade Pattern)
-You do not need to rewrite your Controller. You keep VoucherRequestServiceImpl as the main entry point, but instead of doing the work itself, it injects the new sub-services.
-Here is an example of what your newly refactored VoucherRequestServiceImpl will look like:
-```java
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherRequestServiceImpl implements VoucherRequestService {
+create or replace PROCEDURE PURGE_JOURNAL_BATCH(
+    p_batch_id IN VARCHAR2,
+    p_user_id  IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+BEGIN
+    SELECT BATCH_STATUS INTO v_status
+    FROM VOUCHER_POSTING
+    WHERE BATCH_ID = p_batch_id 
+      AND UPPER(TRIM(CREATED_BY)) = UPPER(TRIM(p_user_id));
 
-    // Inject the new modular services
-    private final VoucherAsyncExecutionService asyncExecutionService;
-    private final VoucherWorkflowEngineService workflowEngineService;
-    private final VoucherQueryService queryService;
-    private final VoucherExportService exportService;
-
-    // ... repository injections ...
-
-    // ==========================================
-    // DELEGATED METHOD EXAMPLES
-    // ==========================================
-
-    @Override
-    public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
-        // The main service no longer holds 100 lines of logic. 
-        // It simply delegates to the Workflow Engine.
-        workflowEngineService.processAction(dto, executorId, executorRole);
-    }
-
-    @Override
-    public Map<String, Object> getBatchSummaryDetails(String batchId) {
-        // Read operations go straight to the Query Service
-        return queryService.fetchBatchSummary(batchId);
-    }
-
-    @Override
-    public byte[] generateBatchExcel(String batchId) {
-        // File generation logic is hidden away in the Export Service
-        return exportService.createExcelByteArray(batchId);
-    }
-
-    // ==========================================
-    // CORE LOGIC KEPT IN MAIN SERVICE
-    // ==========================================
-
-    @Override
-    @Transactional
-    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole) {
-        // Keep primary orchestrations here. 
-        // For example, saving the manual rows to the database...
-        
-        // ... then handing off the workflow routing to the engine:
-        workflowEngineService.initializeWorkflow(batchId, dto.getVid(), creatorId, creatorRole);
-        
-        return savedEntities;
-    }
-}
-
-```
-### Why this is the ultimate solution:
- 1. **Zero Controller Impact:** Your API endpoints remain exactly the same. The frontend UI will not notice a thing.
- 2. **Eliminates Circular Dependencies:** Background async threads sometimes require looping back to update statuses. Putting async logic in a separate file prevents the dreaded BeanCurrentlyInCreationException where a service tries to inject itself.
- 3. **Developer Velocity:** If a future developer gets a ticket saying "Fix a bug in the checker approval logic," they instantly know to open VoucherWorkflowEngineService.java. They don't have to scroll through 1,500 lines of unrelated Excel generation and JDBC batch inserting code.
-Would you like me to draft the complete class structure for one of these specific modules, like the VoucherQueryService or the VoucherWorkflowEngineService, to get you started?
+    IF v_status NOT IN ('P') THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+    END IF;
+    DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = p_batch_id;
+    
+    
+END;
