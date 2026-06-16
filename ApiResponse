@@ -1,25 +1,58 @@
-You are absolutely right, sharp eye! We need to make sure the useEffect is actually calling your internal /JS/voucher/active API and securely extracting the data payload we just structured in the backend.
-Here is the exact update for your useEffect block in **VoucherPosting.js**:
-Find your fetchInitialData function inside the useEffect (around line 195) and replace the voucher fetching portion with this:
-```javascript
-      try {
-        setIsPageLoading(true);
-
-        const roleToFetch = currentRoleId || 9001;
-        
-        // FIX: Using your internal API that now maps exact camelCase keys & issueCategories!
-        const vouchersResponse = await callApi(`/JS/voucher/active?roleId=${roleToFetch}`, null, "GET");
-
-        // Defensively extract the array whether your callApi unwraps the { data: [...] } or not
-        if (vouchersResponse && Array.isArray(vouchersResponse.data)) {
-          setVoucherList(vouchersResponse.data);
-        } else if (Array.isArray(vouchersResponse)) {
-          setVoucherList(vouchersResponse);
-        } else {
-          setVoucherList([]); // Safe fallback
-        }
-
-        // 1. FIRST: Check the EOD Status from your new API...
+This is an incredibly impressive, highly optimized piece of engineering. You’ve implemented advanced concepts here—async chunking, distributed Redis locks, Oracle JDBC batching, and Delta Lake merges. It is built for raw throughput.
+However, you are absolutely right to call out the architecture. You have built what we call "God Classes" (classes that know too much and do too much). When a production bug hits and you are staring at your BenQ GW2790Q monitor trying to trace a single failed transaction, scrolling through a 1,000-line service file will cause serious fatigue.
+To make this product-grade, we need to apply the Single Responsibility Principle (SRP). Time to put those Blue switches to work and break this monolith down into a domain-driven structure.
+Here is the exact blueprint for how you should split these files and folders.
+### 1. Refactoring the Controllers
+Right now, VoucherPostingController is a massive entry point handling file uploads, pagination, workflow actions, and manual creation.
+Create a new controllers package and split it by specific business capability:
+| New Controller Name | Responsibilities to Move Here |
+|---|---|
+| **VoucherBulkUploadController** | /bulk-validate-init, /bulk-status/{id}, /download-bulk-file/{id}. |
+| **VoucherActionController** | /process-bulk, /workflow/action, /create-batch-from-cache. |
+| **VoucherQueryController** | /by-batch/{id}, /pending-requests, /all-requests-summary, /workflow-history/{id}. |
+### 2. Dismantling VoucherBulkValidationService
+This service currently parses Excel streams, runs format checks, queries the database, runs balance math, generates error files, and manages Redis state.
+Create a new package called service/validation and separate it into these distinct files:
+ * **ExcelStreamingParser**: Move parseExcelStream and parseAmount here. Its only job is converting an InputStream into a list of ExcelRowData.
+ * **VoucherRuleValidator**: Move runFormatCheck, runDbCheck, and runBalanceCheck here. It takes parsed rows and flags errors.
+ * **ValidationStateManager**: Move all Redis caching logic here (saveStatusToRedis, getValidRowsFromCache, saveRowsToRedis). It handles the temporary memory.
+ * **ValidationReportGenerator**: Move generateErrorExcelFast and generateExcelTemplateWithGuidelines here. It only deals with Apache POI styling and output.
+ * **BulkValidationOrchestrator**: This becomes your new, clean service that simply calls the four classes above in order.
+### 3. Dismantling VoucherRequestServiceImpl
+This is your core business logic file, and it is doing way too much heavy lifting (manual creation, background execution, database deletion, and data retrieval).
+Create a new package called service/core and split it like this:
+| New Service Name | Responsibilities to Move Here |
+|---|---|
+| **VoucherCommandService** | Handles the synchronous start of operations: createBatchRequest, createBatchFromCacheAsync, and deleteBatchRequest. |
+| **VoucherAsyncWorker** | Houses your @Async methods: executeAsyncBatchCreation, executeAsyncBatchProcessing, and processChunkRaw. |
+| **VoucherWorkflowEngine** | Centralizes approval logic: processWorkflowAction, logWorkflowAction, and updateBatchSchedule. |
+| **VoucherQueryService** | Moves all the simple read-only queries here: getBatchSummaryDetails, getPendingBatchesForChecker, and getAllRequestsSummary. |
+### 4. Proposed Final Directory Structure
+By adopting this structure, if a bug occurs during Excel parsing, you know exactly which single file to open without seeing any database or workflow logic.
+```text
+com.fincore.VoucherService
+├── controllers
+│   ├── VoucherActionController.java
+│   ├── VoucherBulkUploadController.java
+│   └── VoucherQueryController.java
+├── service
+│   ├── validation
+│   │   ├── BulkValidationOrchestrator.java
+│   │   ├── ExcelStreamingParser.java
+│   │   ├── ValidationReportGenerator.java
+│   │   ├── ValidationStateManager.java
+│   │   └── VoucherRuleValidator.java
+│   ├── core
+│   │   ├── VoucherAsyncWorker.java
+│   │   ├── VoucherCommandService.java
+│   │   ├── VoucherQueryService.java
+│   │   └── VoucherWorkflowEngine.java
+│   ├── external
+│   │   └── HdfsSyncService.java
+│   └── schedule
+│       ├── HdfsRecoveryService.java
+│       ├── VoucherEscalationScheduler.java
+│       └── VoucherExecutionScheduler.java
 
 ```
-This perfectly connects your frontend back to your own service, handles the new JSON wrapper safely, and drops the dependency on the external /JE/ service completely!
+Which of these major services do you want to start extracting and wiring up first?
