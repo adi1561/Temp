@@ -1,1 +1,85 @@
-2026-06-16T16:55:29.554+05:30  WARN 52216 --- [VoucherService] [io-9999-exec-10] c.f.V.Exception.GlobalExceptionHandler   : INVALID_DATA | Path: /api/voucher/create-batch-from-cache | Msg: Configuration Error: No workflow mapped for Role ID 9002
+You are completely correct. In your frontend code, you are currently using the external API endpoint (/JE/voucher-transactions/search-vid), but you already have your own internal API (/JS/voucher/active) ready to go. We just need to add the LISTAGG join for the Issue Categories to your backend so the frontend can render those Chips correctly!
+Here are the exact changes for the Backend and Frontend to switch to your own robust API.
+### 1. Backend Change (VoucherRequestServiceImpl.java)
+Find the getAvailableVouchersVid method (around line 1160) and replace the SQL query with this updated version that fetches the comma-separated issue categories:
+```java
+    @Override
+    public List<Map<String, Object>> getAvailableVouchersVid(Long roleId) {
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                
+                -- NEW: Fetch and comma-separate all mapped Issue Categories
+                (
+                    SELECT LISTAGG(ic.ISSUE_CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY ic.ISSUE_CATEGORY_NAME)
+                    FROM REQUEST_VOUCHER_ISSUE_CATEGORY rvic
+                    JOIN ISSUE_CATEGORY ic ON rvic.ISSUE_CATEGORY_ID = ic.ID
+                    WHERE rvic.REQUEST_VOUCHER_ID = rv.ID
+                ) AS ISSUE_CATEGORIES,
+
+                rv.CREATED_BY AS CREATOR_ID,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT
+            FROM REQUEST_VOUCHER rv
+            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
+            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
+            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
+            ORDER BY rv.CREATED_AT DESC
+        """;
+
+       return jdbcTemplate.queryForList(sql, roleId);
+    }
+
+```
+### 2. Frontend Change 1: Switch to Internal API (VoucherPosting.js)
+In your useEffect block where you fetch the initial data (around line 200), you commented out your internal API to use the external /JE/ one. Switch it back.
+**Replace this:**
+```javascript
+        const roleToFetch = currentRoleId || 9001;
+        // const vouchersResponse = await callApi(`/JS/voucher/active?roleId=${roleToFetch}`, null, "GET");
+        const vouchersResponse = await callApi(`/JE/voucher-transactions/search-vid`, null, "GET");
+
+```
+**With this:**
+```javascript
+        const roleToFetch = currentRoleId || 9001;
+        // FIX: Switched back to our internal API that now includes Issue Categories
+        const vouchersResponse = await callApi(`/JS/voucher/active?roleId=${roleToFetch}`, null, "GET");
+
+```
+### 3. Frontend Change 2: Map the Oracle Uppercase Key
+Because jdbcTemplate.queryForList returns Oracle columns in uppercase by default, we need to ensure the React component reads row.ISSUE_CATEGORIES.
+Find the Expanded Row section for Issue Categories inside your DataGrid (around line 410) and update the map function:
+**Replace this:**
+```javascript
+                                  <Grid item size={{ lg: 10.7, md: 10.5 }}>
+                                    <Box>
+                                      {row.issueCategories?.split(",")
+                                        .map((cat) => (
+                                          <Chip label={cat.trim()} sx={jpStyles.issueCategoryChip} />
+                                        ))}
+                                    </Box>
+                                  </Grid>
+
+```
+**With this:**
+```javascript
+                                  <Grid item size={{ lg: 10.7, md: 10.5 }}>
+                                    <Box>
+                                      {/* FIX: Read the uppercase Oracle key and add a fallback */}
+                                      {(row.ISSUE_CATEGORIES || row.issueCategories) ? 
+                                        (row.ISSUE_CATEGORIES || row.issueCategories).split(",")
+                                          .map((cat, index) => (
+                                            <Chip key={index} label={cat.trim()} sx={jpStyles.issueCategoryChip} />
+                                          ))
+                                        : 
+                                        <Typography variant="body2" color="text.secondary">N/A</Typography>
+                                      }
+                                    </Box>
+                                  </Grid>
+
+```
+This perfectly disconnects you from the external API, speeds up your application, and populates the UI completely from your own database!
