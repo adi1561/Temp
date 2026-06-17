@@ -1,99 +1,111 @@
-This is happening because of a classic React "stale state" race condition in your frontend code.
-When your page loads, both of your useEffect hooks fire immediately. The first one extracts the auth data and calls setCurrentRoleId(). However, React state updates are asynchronous. By the time your second useEffect calls fetchInitialData(), the currentRoleId variable is still null.
-Because it passes roleId=null to your backend, your backend is likely ignoring the WHERE clause and returning *all* VIDs instead of restricting them to the specific role.
-To fix this, we need to extract the roleId synchronously straight from local storage right before making the API call, completely bypassing the React state race condition.
-### The Fix (VoucherPosting.js)
-Find your second useEffect block (around line 185) and replace the **entire fetchInitialData function** with this highly secure version:
-```javascript
-  useEffect(() => {
-    const fetchInitialData = async () => {
-      try {
-        setIsPageLoading(true);
+The reason issueCategories is entirely missing from your API JSON response is due to how Oracle handles inline subqueries and how Spring Boot serializes JSON.
+When you use LISTAGG as an inline subquery, Oracle returns a strict null if no categories are found. Spring Boot’s Jackson JSON serializer is typically configured to drop any keys that have a null value (spring.jackson.default-property-inclusion=non_null). Because the key is dropped from the JSON, your React frontend receives nothing and renders blank spaces.
+To guarantee the categories are always populated (exactly like your working searchVid API from the other service), we will use a **2-step fetch** in Java. This completely bypasses the subquery issue and manually maps the categories.
+Here are the exact replacements for your Backend and Frontend:
+### 1. Backend Change (VoucherRequestServiceImpl.java)
+Find your getAvailableVouchersVid method (around line 1160) and replace it with this robust 2-step approach:
+```java
+    @Override
+    public List<Map<String, Object>> getAvailableVouchersVid(Long roleId) {
+        // Step 1: Fetch the core voucher data (No inline subquery to avoid Oracle null stripping)
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                rv.CREATED_BY AS CREATOR_ID,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT
+            FROM REQUEST_VOUCHER rv
+            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
+            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
+            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
+            ORDER BY rv.CREATED_AT DESC
+        """;
 
-        // CRITICAL FIX: Synchronously extract the role directly from storage. 
-        // Do not rely on 'currentRoleId' state here, as it will be 'null' on the first render.
-        let actualRoleId = null;
-        const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-        if (auth) {
-          const user = JSON.parse(JSON.parse(auth).user);
-          // Checks multiple common property names just to be safe
-          actualRoleId = user?.roleId || user?.role || user?.ROLE_ID; 
+        List<Map<String, Object>> vouchers = jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("id", rs.getLong("ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("description", rs.getString("DESCRIPTION"));
+            map.put("categoryName", rs.getString("CATEGORY_NAME"));
+            map.put("createdBy", rs.getString("CREATOR_ID"));
+            map.put("createdByName", rs.getString("CREATOR_NAME"));
+            
+            java.sql.Timestamp ts = rs.getTimestamp("CREATED_AT");
+            map.put("createdAt", ts != null ? ts.toInstant().toString() : null);
+            return map;
+        }, roleId);
+
+        if (vouchers.isEmpty()) {
+            return vouchers;
         }
 
-        if (!actualRoleId) {
-          showSnackBar("Security Error: User Role ID not found. Cannot fetch VIDs.", "error");
-          setIsPageLoading(false);
-          return; // Aborts the call if no role is found
+        // Step 2: Fetch the Issue Categories for these specific Vouchers
+        List<Long> voucherIds = vouchers.stream()
+                .map(v -> (Long) v.get("id"))
+                .toList();
+
+        // Dynamically build the IN clause (?,?,?)
+        String inClause = String.join(",", Collections.nCopies(voucherIds.size(), "?"));
+        
+        String issueSql = String.format("""
+            SELECT 
+                rvic.REQUEST_VOUCHER_ID, 
+                LISTAGG(ic.ISSUE_CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY ic.ISSUE_CATEGORY_NAME) AS CATEGORIES
+            FROM REQUEST_VOUCHER_ISSUE_CATEGORY rvic
+            JOIN ISSUE_CATEGORY ic ON rvic.ISSUE_CATEGORY_ID = ic.ID
+            WHERE rvic.REQUEST_VOUCHER_ID IN (%s)
+            GROUP BY rvic.REQUEST_VOUCHER_ID
+        """, inClause);
+
+        Map<Long, String> issueCategoryMap = new HashMap<>();
+        jdbcTemplate.query(issueSql, rs -> {
+            issueCategoryMap.put(rs.getLong("REQUEST_VOUCHER_ID"), rs.getString("CATEGORIES"));
+        }, voucherIds.toArray());
+
+        // Step 3: Map the categories back to the vouchers (Defaults to "N/A" so Jackson never drops the key)
+        for (Map<String, Object> voucher : vouchers) {
+            Long vId = (Long) voucher.get("id");
+            voucher.put("issueCategories", issueCategoryMap.getOrDefault(vId, "N/A"));
         }
 
-        // Passes the guaranteed correct role ID to the backend
-        const vouchersResponse = await callApi(`/JS/voucher/active?roleId=${actualRoleId}`, null, "GET");
-
-         // Defensively extract the array whether your callApi unwraps the { data: [...] } or not
-        if (vouchersResponse && Array.isArray(vouchersResponse.data)) {
-          setVoucherList(vouchersResponse.data);
-        } else if (Array.isArray(vouchersResponse)) {
-          setVoucherList(vouchersResponse);
-        } else {
-          setVoucherList([]); // Safe fallback
-        }
-
-        // 1. FIRST: Check the EOD Status from your new API
-        const eodResponse = await callApi("/JS/voucher/eod_status", null, "GET");
-
-        // The API returns an array: [{ "eodStatus": 0 }]
-        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
-          if (eodResponse[0].eodStatus === 1) {
-            setIsEodRunning(true);
-            setIsPageLoading(false);
-            return; // STOP loading everything else, block the screen
-          }
-        }
-
-        // 2. IF EOD IS NOT RUNNING: Continue loading the normal page data
-        const dateResponse = await callApi("/JS/voucher/current-posting-date", null, "GET");
-
-        if (dateResponse) {
-          try {
-            const [year, month, day] = dateResponse.split("-");
-            const formattedDate = `${day}-${month}-${year}`;
-            setPostingDate(formattedDate);
-          } catch (e) {
-            console.error("Could not parse date:", dateResponse, e);
-            setPostingDate(dateResponse);
-          }
-        } else {
-          showSnackBar("Failed to load official posting date.", "error");
-          setPostingDate("Error");
-        }
-
-        const currencyResponse = await callApi("/CM/common-master/currency", null, "GET");
-        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
-          let uniqueCurrencies = [...new Set(currencyResponse.data)];
-          
-          // Sort the array so "INR" is always at index 0, and the rest are alphabetical
-          uniqueCurrencies.sort((a, b) => {
-            if (a === "INR") return -1;
-            if (b === "INR") return 1;
-            return a.localeCompare(b);
-          });
-          
-          setCurrencyOptions(uniqueCurrencies);
-        } else {
-          showSnackBar("Failed to load currencies.", "error");
-        }
-
-      } catch (error) {
-        console.error("Error fetching initial data:", error);
-        showSnackBar("An error occurred while loading page data.", "error");
-      } finally {
-        setIsPageLoading(false);
-      }
-    };
-
-    fetchInitialData();
-  }, [callApi, showSnackBar]);
+        return vouchers;
+    }
 
 ```
-### A Quick Backend Security Note
-While fixing the frontend solves the immediate UI bug, your backend API (/JS/voucher/active) should theoretically extract the role ID securely from the JWT token (using jwtUtil.getUserRoleFromToken(token)) rather than trusting a URL parameter (?roleId=X). Relying strictly on the JWT token prevents malicious users from manually altering the URL to view unauthorized VIDs.
+### 2. Frontend Change (VoucherPosting.js)
+Your DataGrid rows are already set up to read {row.issueCategories?.split(",")}, which will now work perfectly.
+However, in your SelectedVoucherCard (around line 285), the Issue Categories display block is missing from your code. Let's add it back so it correctly shows on the screen when a user clicks a row.
+**Replace your existing <Grid container> inside SelectedVoucherCard with this:**
+```javascript
+        <Grid container>
+          <Grid item sx={{ mb: 2 }} size={12}>
+            <Stack direction="row" spacing={10}>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>VID</Typography>
+                <Typography variant="body1" fontWeight="bold" color="primary">{selectedVoucher.vid}</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
+                <Typography variant="body1" fontWeight="500">{selectedVoucher.categoryName || "General"}</Typography>
+              </Box>
+              {/* FIX: Added back the Issue Categories display */}
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Issue Categories</Typography>
+                <Typography variant="body1" fontWeight="600" color="primary.main">
+                  {selectedVoucher.issueCategories || "N/A"}
+                </Typography>
+              </Box>
+            </Stack>
+          </Grid>
+          <Grid item xs={12}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Description</Typography>
+            <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6, fontWeight: 300 }}>
+              {selectedVoucher.description || "No description provided."}
+            </Typography>
+          </Grid>
+        </Grid>
+
+```
