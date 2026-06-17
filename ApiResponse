@@ -1,48 +1,51 @@
-You are absolutely right, I gave you the generic blueprint for the VoucherCommandService a few steps ago, but I did not give you the **final version built using your exact Oracle queries, Redis locks, and DTOs**.
-This file is the "Traffic Cop." It takes the incoming HTTP requests from the Controller, performs the synchronous safety checks (like verifying the VID isn't duplicated and locking Redis), creates the master database records, and then immediately delegates the heavy lifting to the VoucherAsyncWorker (which we will build next).
-Here is your true, fully extracted **VoucherCommandService.java** using exactly your original logic.
+Here is the exact extraction of your asynchronous background workers, chunk processors, and PL/SQL integration methods.
+By pulling these into **VoucherAsyncWorker.java**, we completely decouple your heavy database operations (Oracle Parallel Execution, JDBC Batching, and HDFS Data Lake syncing) from your synchronous web requests.
+Create this file in your Service/core package.
 ```java
 package com.fincore.VoucherService.Service.core;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.VoucherService.Dto.BatchPostingDto;
 import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
-import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Dto.ExcelRowData;
+import com.fincore.VoucherService.Dto.HdfsSyncDto;
 import com.fincore.VoucherService.Models.JournalLog;
-import com.fincore.VoucherService.Models.JournalRequest;
-import com.fincore.VoucherService.Models.VoucherPosting;
 import com.fincore.VoucherService.Models.enums.RequestStatus;
 import com.fincore.VoucherService.Models.enums.VoucherStatus;
-import com.fincore.VoucherService.Repository.JournalRequestRepository;
 import com.fincore.VoucherService.Repository.VoucherLogRepository;
-import com.fincore.VoucherService.Repository.VoucherPostingRepository;
+import com.fincore.VoucherService.Service.HdfsSyncService;
 import com.fincore.VoucherService.Service.NotificationWriterService;
 import com.fincore.VoucherService.Service.ProgressService;
-import com.fincore.VoucherService.Service.SequenceService;
+import com.fincore.VoucherService.Service.validation.VoucherBulkValidationService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataAccessException;
-import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.jdbc.core.CallableStatementCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
-import java.sql.Timestamp;
+import java.sql.ResultSet;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class VoucherCommandService {
+public class VoucherAsyncWorker {
 
     @Autowired
     @Qualifier("oracleJdbcTemplate")
@@ -52,323 +55,350 @@ public class VoucherCommandService {
     @Qualifier("byteArrayRedisTemplate")
     private RedisTemplate<String, byte[]> redisTemplate;
 
-    private final ObjectMapper objectMapper;
-    private final SequenceService sequenceService;
-    private final VoucherPostingRepository voucherPostingRepository;
-    private final JournalRequestRepository journalRequestRepository;
-    private final VoucherLogRepository voucherLogRepository;
-    private final VoucherWorkflowEngine workflowEngine;
+    @Autowired
+    @Qualifier("chunkWorkerExecutor")
+    private Executor chunkWorkerExecutor;
+
+    private final VoucherBulkValidationService voucherBulkValidationService;
     private final ProgressService progressService;
     private final NotificationWriterService notificationWriterService;
-    
-    // The background worker that we will create in the next step
-    private final VoucherAsyncWorker asyncWorker; 
+    private final VoucherWorkflowEngine workflowEngine;
+    private final VoucherLogRepository voucherLogRepository;
+    private final HdfsSyncService hdfsSyncService;
+
+    // Injected to avoid circular dependencies
+    @Lazy
+    @Autowired
+    private VoucherCommandService commandService;
+
+    // Self-injection to allow proxying of @Transactional methods called from within the same class
+    @Lazy
+    @Autowired
+    private VoucherAsyncWorker self;
 
     // ==================================================================================
-    // 1. ASYNC BULK BATCH CREATION (Traffic Cop Logic)
+    // 1. ASYNC CHUNKED DATA INSERTION (Maker Flow)
     // ==================================================================================
 
-    @Transactional
-    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid) {
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid) {
         String lockKey = "LOCK_REQ_" + requestId;
-        Boolean acquired;
+        MDC.put("batchId", batchId);
+        MDC.put("user", creatorId);
+
+        Map<String, String> contextMap = MDC.getCopyOfContextMap();
+        AtomicInteger successfulRowsCount = new AtomicInteger(0);
+        log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
 
         try {
-            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
+            // 1. IDEMPOTENCY
+            jdbcTemplate.update("DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ?", batchId);
+            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+
+            List<ExcelRowData> cachedRows = voucherBulkValidationService.getValidRowsFromCache(requestId);
+            if (cachedRows == null || cachedRows.isEmpty()) {
+                log.error("CACHE_MISS | Batch: {} | Status: No valid rows found", batchId);
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
+                return;
+            }
+
+            long totalRows = cachedRows.size();
+            int batchSize = 5000;
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            AtomicReference<BigDecimal> totalDebit = new AtomicReference<>(BigDecimal.ZERO);
+            AtomicReference<BigDecimal> totalCredit = new AtomicReference<>(BigDecimal.ZERO);
+            AtomicInteger completedChunks = new AtomicInteger(0);
+            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
+
+            // 2. PARALLEL CHUNKING
+            for (int i = 0; i < totalRows; i += batchSize) {
+                final int startIdx = i;
+                final int endIdx = Math.min(i + batchSize, Math.toIntExact(totalRows));
+                final List<ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
+
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                            if (contextMap != null) MDC.setContextMap(contextMap);
+                            try {
+                                self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+                                successfulRowsCount.addAndGet(chunk.size());
+                            } finally {
+                                MDC.clear();
+                            }
+                        }, chunkWorkerExecutor)
+                        .thenRun(() -> {
+                            int done = completedChunks.incrementAndGet();
+                            int percent = 5 + (done * 90 / totalChunks);
+                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING", String.format("Writing records: %d of %d", Math.min(done * batchSize, totalRows), totalRows));
+                        });
+                futures.add(future);
+            }
+
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+
+            String nextStepSql = """
+                    SELECT w.ALLOWED_ROLE_ID 
+                    FROM VOUCHER_POSTING vp
+                    JOIN WORKFLOW_TRANSITIONS w 
+                      ON vp.WORKFLOW_CODE = w.WORKFLOW_CODE
+                    WHERE vp.BATCH_ID = ? AND w.WORKFLOW_ORDER = 2
+                """;
+
+            String workflowCode = jdbcTemplate.queryForObject("SELECT WORKFLOW_CODE FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
+            String nextApproverRoleId = jdbcTemplate.queryForObject(nextStepSql, String.class, batchId);
+
+            notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId);
+            log.info("BATCH_CREATION_FINISHED | Batch: {} | Rows: {}", batchId, successfulRowsCount.get());
+
+        } catch (Exception e) {
+            log.error("BATCH_FATAL_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred.");
+        } finally {
+            redisTemplate.delete(lockKey);
+            MDC.clear();
+        }
+    }
+
+    private void handleAsyncFailure(String batchId, String creatorId, String requestId, String message) {
+        try {
+            jdbcTemplate.update("DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ?", batchId);
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR' WHERE BATCH_ID = ?", batchId);
         } catch (DataAccessException e) {
-            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
+            log.error("CLEANUP_CRITICAL_FAIL | Batch: {} | Cannot record failure state", batchId);
         }
+        progressService.sendProgress(batchId, creatorId, 0, "FAILED", message);
+        sendNotification(creatorId, null, "Batch creation Failed for Batch ID : " + batchId, batchId);
+    }
 
-        if (Boolean.FALSE.equals(acquired)) {
-            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", requestId);
-            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
-        }
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processChunkRaw(List<ExcelRowData> chunk,
+                                String batchId,
+                                String journalPrefix,
+                                String commonRemarks,
+                                String creatorId,
+                                Integer creatorRole,
+                                int globalOffset,
+                                AtomicReference<BigDecimal> globalDebit,
+                                AtomicReference<BigDecimal> globalCredit) {
+
+        String sql = "INSERT INTO VOUCHER_POSTING_DATA (" +
+                "REQ_ID, REQ_STATUS, REQ_DATE, CREATOR_ID, BATCH_ID, " +
+                "JOURNAL_ID, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, " +
+                "REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT) " +
+                "VALUES (VOUCHER_POSTING_DATA_SEQ.NEXTVAL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         try {
-            if (vid == null || vid.trim().isEmpty()) {
-                throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
+            jdbcTemplate.batchUpdate(sql, new org.springframework.jdbc.core.BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(java.sql.PreparedStatement ps, int i) throws java.sql.SQLException {
+                    ExcelRowData r = chunk.get(i);
+
+                    int globalIdx = globalOffset + i + 1;
+                    String jId = journalPrefix + "-" + globalIdx;
+
+                    BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                    String safeTxnType = r.txnType != null ? r.txnType.trim() : "";
+                    boolean isCredit = "CR".equalsIgnoreCase(safeTxnType) || "CREDIT".equalsIgnoreCase(safeTxnType);
+                    BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+
+                    ps.setString(1, "P");
+                    ps.setTimestamp(2, java.sql.Timestamp.valueOf(LocalDateTime.now()));
+                    ps.setString(3, creatorId);
+                    ps.setString(4, batchId);
+                    ps.setString(5, jId);
+                    ps.setString(6, r.branch);
+                    ps.setString(7, r.currency);
+                    ps.setString(8, r.cgl);
+                    ps.setBigDecimal(9, signedAmt);
+                    ps.setString(10, r.remarks);
+                    ps.setString(11, r.productCode);
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return chunk.size();
+                }
+            });
+
+            for (ExcelRowData r : chunk) {
+                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+                String safeTxnType = r.txnType != null ? r.txnType.trim() : "";
+                if ("CR".equalsIgnoreCase(safeTxnType) || "CREDIT".equalsIgnoreCase(safeTxnType)) {
+                    globalCredit.updateAndGet(curr -> curr.add(absAmt));
+                } else {
+                    globalDebit.updateAndGet(curr -> curr.add(absAmt));
+                }
             }
 
-            Integer vidExists = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')",
-                    Integer.class, vid
-            );
-            if (vidExists != null && vidExists > 0) {
-                throw new CustomExceptions.InvalidDataException("Voucher ID (" + vid + ") has already been used in another batch. Please select a fresh VID.");
-            }
-
-            String batchId = sequenceService.getNextBatchId();
-            String journalPrefix = sequenceService.getNextJournalIdPrefix();
-
-            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
-            long totalRows = 0;
-            if (metaBytes != null) {
-                try {
-                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
-                    totalRows = ((Number) meta.get("totalRows")).longValue();
-                } catch (Exception ignored) {}
-            }
-
-            String workflowCode;
-            try {
-                workflowCode = jdbcTemplate.queryForObject(
-                        "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
-                        String.class, creatorRole
-                );
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
-            }
-
-            Long firstApproverWorkflowId;
-            try {
-                firstApproverWorkflowId = jdbcTemplate.queryForObject(
-                        "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
-                        Long.class, workflowCode
-                );
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
-            }
-
-            VoucherPosting posting = new VoucherPosting();
-            posting.setBatchId(batchId);
-            posting.setVidFk(vid);
-            posting.setCommonBatchRemarks(commonRemarks);
-            posting.setCreatorRole(creatorRole);
-            posting.setCreatedBy(creatorId);
-            posting.setWorkflowCode(workflowCode);
-            posting.setPendingAt(firstApproverWorkflowId);
-            posting.setBatchStatus("P");
-            posting.setIS_EXECUTION_SCHEDULED("NO");
-            posting.setScheduledTime(null);
-            posting.setIsScheduleOverride("NO");
-            posting.setRecordsCount(totalRows);
-
-            voucherPostingRepository.save(posting);
-
-            workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
-            workflowEngine.logWorkflowAction(batchId, vid, "Submitted", creatorId, commonRemarks, null);
-
-            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
-
-            // Hand off to background thread
-            asyncWorker.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole, vid);
-
-            return batchId;
-        }
-        catch (org.springframework.dao.DataIntegrityViolationException e) {
-            redisTemplate.delete(lockKey);
-            log.error("DB_CONSTRAINT_FAIL | ReqID: {} | Error: {}", requestId, e.getRootCause() != null ? e.getRootCause().getMessage() : e.getMessage());
-            throw new CustomExceptions.InvalidDataException("Database constraint failed. Ensure the VID is not duplicated or missing.");
-        }
-        catch (DataAccessException e) {
-            redisTemplate.delete(lockKey);
-            log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
+        } catch (org.springframework.dao.DataAccessException e) {
+            log.error("JDBC_BATCH_FAIL | Batch: {} | Offset: {} | Error: {}", batchId, globalOffset, e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Database integrity error during chunk insert", e);
         }
     }
 
     // ==================================================================================
-    // 2. ASYNC APPROVAL EXECUTION
+    // 2. ASYNC APPROVAL (Oracle Procedure & HDFS SYNC)
     // ==================================================================================
 
-    @Transactional
-    public void processBulkRequestsAsync(BulkProcessVoucherPostingDto dto, String executorId, Integer executorRole) {
-        String lockSql = "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'A' WHERE BATCH_ID = ? AND BATCH_STATUS IN ('P', 'PENDING')";
-        int updated = jdbcTemplate.update(lockSql, dto.getBatchId());
+    @Async("bulkExecutor")
+    public void executeAsyncBatchProcessing(BulkProcessVoucherPostingDto dto, String executorId) {
+        String batchId = dto.getBatchId();
+        MDC.put("batchId", batchId);
+        MDC.put("user", executorId);
+        long start = System.currentTimeMillis();
 
-        if (updated == 0) {
-            log.warn("APPROVAL_LOCK_FAIL | Batch: {} | Status: Already processing or invalid status", dto.getBatchId());
-            throw new IllegalStateException("Batch is already being processed or is not in a valid state for execution.");
+        try {
+            self.executeApprovalInTransaction(dto, executorId);
+            log.info("BATCH_PROCESSING_DONE | Batch: {} | Status: {} | Duration: {}ms", batchId, dto.getStatus(), System.currentTimeMillis() - start);
+        } catch (org.springframework.dao.PessimisticLockingFailureException e) {
+            log.error("DATABASE_LOCK_TIMEOUT | Batch: {} | Status: GL_BALANCE row locked", batchId);
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "System is busy. Please retry in 1 minute.");
+        } catch (DataAccessException e) {
+            log.error("PROCEDURE_EXEC_FAIL | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "Database execution error during approval.");
+        } catch (Exception e) {
+            log.error("INTERNAL_PROCESSING_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "An internal logic error occurred.");
+        } finally {
+            MDC.clear();
         }
-
-        progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
-        
-        // Hand off to background thread
-        asyncWorker.executeAsyncBatchProcessing(dto, executorId);
     }
 
-    // ==================================================================================
-    // 3. MANUAL / SMALL BATCH CREATION (Synchronous)
-    // ==================================================================================
-
-    @Transactional
-    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole) {
-        String batchId = sequenceService.getNextBatchId();
-        String journalPrefix = sequenceService.getNextJournalIdPrefix();
-
-        if (dto.getVid() == null || dto.getVid().trim().isEmpty()) {
-            throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
-        }
-
-        Integer vidExists = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')",
-                Integer.class, dto.getVid()
-        );
-        if (vidExists != null && vidExists > 0) {
-            throw new CustomExceptions.InvalidDataException("Voucher ID (" + dto.getVid() + ") is currently in use by an active batch. Please select a fresh VID.");
-        }
-
-        List<JournalRequest> entities = new ArrayList<>();
-        BigDecimal totalDebit = BigDecimal.ZERO;
-        BigDecimal totalCredit = BigDecimal.ZERO;
-        int rowIndex = 1;
-
-        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
-            JournalRequest entity = new JournalRequest();
-            entity.setRequestStatus(RequestStatus.PENDING);
-            entity.setRequestDate(LocalDateTime.now());
-            entity.setCreatorId(creatorId);
-            entity.setBatchId(batchId);
-
-            String journalId = journalPrefix + "-" + rowIndex;
-            entity.setJournalId(journalId);
-            entity.setBranchCode(row.getBranch());
-            entity.setCurrency(row.getCurrency());
-            entity.setCgl(row.getCgl());
-
-            BigDecimal amount = row.getAmount();
-            if (amount.compareTo(BigDecimal.ZERO) == 0) {
-                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
-            }
-            entity.setAmount(amount);
-            entity.setNarration(row.getRemarks());
-            entity.setProductCode(row.getProductType());
-            
-            if (amount.compareTo(BigDecimal.ZERO) < 0) {
-                totalCredit = totalCredit.add(amount.abs());
-            } else {
-                totalDebit = totalDebit.add(amount.abs());
-            }
-
-            entities.add(entity);
-            rowIndex++;
-        }
-
-        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
-
-        String workflowCode;
-        try {
-            workflowCode = jdbcTemplate.queryForObject(
-                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
-                    String.class, creatorRole
-            );
-        } catch (EmptyResultDataAccessException e) {
-            throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
-        }
-
-        Map<String, Object> step2Info;
-        try {
-            step2Info = jdbcTemplate.queryForMap(
-                    "SELECT WORKFLOW_ID, ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
-                    workflowCode
-            );
-        } catch (EmptyResultDataAccessException e) {
-            throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
-        }
-
-        Long firstApproverWorkflowId = ((Number) step2Info.get("WORKFLOW_ID")).longValue();
-        String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void executeApprovalInTransaction(BulkProcessVoucherPostingDto dto, String executorId) {
+        String batchId = dto.getBatchId();
         
-        VoucherPosting posting = new VoucherPosting();
-        posting.setBatchId(batchId);
-        posting.setVidFk(dto.getVid());
-        posting.setCreatedBy(creatorId);
-        posting.setPendingAt(firstApproverWorkflowId);
-        posting.setBatchStatus("P");
-        posting.setWorkflowCode(workflowCode);
-        posting.setCommonBatchRemarks(dto.getCommonBatchRemarks());
-        posting.setCreatorRole(creatorRole);
-        
-        if (dto.getRows() != null) {
-            posting.setRecordsCount((long) dto.getRows().size());
-        }
+        Map<String, Object> postingInfo = jdbcTemplate.queryForMap(
+                "SELECT CREATED_BY, VID_FK FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId);
+        String vid = (String) postingInfo.get("VID_FK");
 
-        if (dto.getScheduledTime() != null) {
-            workflowEngine.validateScheduledTime(dto.getScheduledTime());
-            posting.setIS_EXECUTION_SCHEDULED("YES");
-            posting.setScheduledTime(dto.getScheduledTime());
-            posting.setIsScheduleOverride("NO");
-        } else {
-            posting.setIS_EXECUTION_SCHEDULED("NO");
-            posting.setIsScheduleOverride("NO");
-        }
-
-        voucherPostingRepository.save(posting);
-        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under " + workflowCode);
-        notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId);
-        
-        if (dto.getVid() != null && !dto.getVid().isEmpty()) {
-            workflowEngine.updateVidStatus(dto.getVid(), VoucherStatus.USED);
-        }
-
-        workflowEngine.logWorkflowAction(batchId, dto.getVid(), "Submitted", creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
-
-        return savedEntities;
-    }
-
-    // ==================================================================================
-    // 4. BATCH / RECORD DELETION
-    // ==================================================================================
-
-    @Transactional
-    public void deleteBatchRequest(String batchId, String userId) {
-        VoucherPosting batch = voucherPostingRepository.findById(batchId)
-                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch not found."));
+        String creatorId = jdbcTemplate.queryForObject(
+                "SELECT CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
                 
-        if (!batch.getCreatedBy().equalsIgnoreCase(userId)) {
-            log.warn("SECURITY_VIOLATION | User {} attempted to delete batch {} owned by {}", userId, batchId, batch.getCreatedBy());
-            throw new IllegalStateException("You do not have permission to delete this batch.");
+        if (creatorId != null && creatorId.equalsIgnoreCase(executorId)) {
+            log.error("SECURITY_VIOLATION | Self-approval attempt blocked | Batch: {} | User: {}", batchId, executorId);
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), "Security Violation: You cannot approve or reject your own batch.");
+            return;
         }
 
-        if (!"P".equalsIgnoreCase(batch.getBatchStatus())) {
-            throw new IllegalStateException("Only Pending batches can be deleted. Current status: " + batch.getBatchStatus());
-        }
-
-        String orderSql = """
-            SELECT wt.WORKFLOW_ORDER 
-            FROM VOUCHER_POSTING vp 
-            JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
-            WHERE vp.BATCH_ID = ?
-        """;
-        Integer currentOrder;
-        try {
-            currentOrder = jdbcTemplate.queryForObject(orderSql, Integer.class, batchId);
-        } catch (EmptyResultDataAccessException e) {
-            currentOrder = -1;
-        }
-
-        if (currentOrder == null || currentOrder != 2) {
-            throw new IllegalStateException("Batch cannot be deleted as it has already been processed or moved from the initial stage.");
-        }
-
-        int updated = jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND CREATED_BY = ? AND BATCH_STATUS IN ('P', 'PENDING', 'ERROR')", batchId, userId);
-        if (updated == 0) {
-            throw new IllegalStateException("Batch not found, unauthorized, or already being processed.");
-        }
+        progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Executing Oracle Core Business Logic...");
         
-        progressService.sendProgress(batchId, userId, 0, "PROCESSING", "Purging Batch Data...");
-        
-        // Hand off to background thread
-        asyncWorker.executeAsyncBatchCancellation(batchId, userId);
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+
+            List<HdfsSyncDto> syncData = jdbcTemplate.execute(
+                    "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
+                    (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
+                        cs.setString(1, batchId);
+                        cs.setString(2, executorId);
+                        cs.setString(3, dto.getRemarks());
+                        cs.setString(4, "A");
+                        cs.registerOutParameter(5, -10);
+                        cs.execute();
+                        List<HdfsSyncDto> list = new ArrayList<>();
+                        try (ResultSet rs = (ResultSet) cs.getObject(5)) {
+                            while (rs.next()) {
+                                list.add(new HdfsSyncDto(
+                                        rs.getString("BRANCH"), rs.getString("CURRENCY"), rs.getString("CGL"),
+                                        rs.getDate("BAL_DATE") != null ? rs.getDate("BAL_DATE").toLocalDate() : null,
+                                        rs.getBigDecimal("NEW_BALANCE"), rs.getBigDecimal("NEW_INR_BALANCE")
+                                ));
+                            }
+                        }
+                        return list;
+                    }
+            );
+            
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'A', EXECUTED_AT = SYSTIMESTAMP, EXECUTOR_ID = ? WHERE BATCH_ID = ?",
+                    executorId, batchId);
+                    
+            workflowEngine.logWorkflowAction(batchId, vid, "Execution Completed", "SYSTEM", "Automated background execution completed successfully.", null);
+            
+            try {
+                hdfsSyncService.syncToDataLake(syncData);
+            } catch (Exception hdfsEx) {
+                log.error("HDFS_SYNC_FAIL | Batch: {} | Error: {} | Status: Background recovery queued", batchId, hdfsEx.getClass().getSimpleName());
+                jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'P')", batchId);
+            }
+
+            progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
+            notificationWriterService.createBatchApprovedNotification(batchId, creatorId, executorId);
+
+        } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING_DATA SET REQ_STATUS = 'R' WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
+                    batchId);
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R', EXECUTED_AT = SYSTIMESTAMP, EXECUTOR_ID = ? WHERE BATCH_ID = ?",
+                    executorId, batchId);
+                    
+            progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
+            notificationWriterService.createBatchRejectedNotification(batchId, creatorId, executorId, dto.getRemarks());
+        }
     }
 
-    @Transactional
-    public void cancelMyRequest(Long requestId, String userId) {
-        JournalRequest request = journalRequestRepository.findById(requestId)
-                .orElseThrow(() -> new RuntimeException("Request not found: " + requestId));
+    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String msg) {
+        jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+        progressService.sendProgress(batchId, executorId, 0, "FAILED", msg);
 
-        if (!request.getCreatorId().equalsIgnoreCase(userId)) {
-            log.warn("UNAUTHORIZED_DELETE | User: {} | RequestOwner: {} | ReqID: {}", userId, request.getCreatorId(), requestId);
-            throw new IllegalStateException("You can only cancel your own requests.");
+        String vid = workflowEngine.getVidByBatchId(batchId);
+        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", "SYSTEM", msg, null);
+
+        String actionName = (actionStatus == RequestStatus.ACCEPTED) ? "approve" : "reject";
+        String notifMsg = String.format("Failed to %s Journal Batch '%s'. It has been returned to PENDING.", actionName, batchId);
+        
+        try {
+            notificationWriterService.createNotification(executorId, null, notifMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+        } catch (Exception e) {
+            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notification", batchId);
         }
+    }
 
-        if (request.getRequestStatus() != RequestStatus.PENDING) {
-            throw new IllegalStateException("Only PENDING requests can be cancelled. Current: " + request.getRequestStatus());
+    // ==================================================================================
+    // 3. ASYNC DELETION (PL/SQL Integration)
+    // ==================================================================================
+
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCancellation(String batchId, String userId) {
+        MDC.put("batchId", batchId);
+        MDC.put("user", userId);
+        long start = System.currentTimeMillis();
+
+        try {
+            progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Data Rows...");
+            
+            jdbcTemplate.execute("{call PURGE_JOURNAL_BATCH(?, ?)}", (CallableStatementCallback<Object>) cs -> {
+                cs.setString(1, batchId);
+                cs.setString(2, userId);
+                cs.execute();
+                return null;
+            });
+
+            logAudit(userId, "CANCEL_SUCCESS", "DELETE", "Purged Batch " + batchId);
+            progressService.sendProgress(batchId, userId, 100, "COMPLETED", "Batch Deleted");
+            sendNotification(userId, null, "Batch " + batchId + " deleted successfully.", batchId);
+            
+            log.info("BATCH_PURGE_COMPLETE | Batch: {} | Duration: {}ms", batchId, System.currentTimeMillis() - start);
+        } catch (DataAccessException e) {
+            log.error("PURGE_DB_ERROR | Batch: {} | Status: SQL operation failed | Cause: {}", batchId, e.getMessage());
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+            progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: System error or missing database procedure.");
+        } finally {
+            MDC.clear();
         }
+    }
 
-        journalRequestRepository.delete(request);
-        log.info("REQUEST_CANCELLED | User: {} | ReqID: {}", userId, requestId);
+    // ==================================================================================
+    // 4. UTILITY METHODS
+    // ==================================================================================
+
+    private void sendNotification(String userId, String roles, String message, String batchId) {
+        try {
+            notificationWriterService.createNotification(userId, roles, message, "/journal-view/" + batchId, batchId, "VoucherService");
+        } catch (DataAccessException e) {
+            log.warn("NOTIFICATION_WARN | Batch: {} | Status: Failed to persist notification", batchId);
+        }
     }
 
     private void logAudit(String user, String action, String type, String val) {
@@ -387,5 +417,3 @@ public class VoucherCommandService {
 }
 
 ```
-This completes the synchronous half of your processing logic. You will notice it calls asyncWorker.executeAsyncBatchCreation(...) and asyncWorker.executeAsyncBatchProcessing(...).
-Are you ready to build that final VoucherAsyncWorker.java file containing the background Oracle Parallel insertion/approval logic to clear those red lines?
