@@ -1,20 +1,60 @@
-This error is happening because of a tiny but crucial missing keyword: **final**.
-You are using Lombok's @RequiredArgsConstructor at the top of your class. This annotation tells Spring Boot to automatically inject dependencies, but **it only works for variables marked as final**.
-Because voucherCommandService is missing the final keyword, Spring Boot ignores it, leaves it as null, and your application crashes the moment the scheduler wakes up and tries to use it.
-### The Fix
-Open your **VoucherExecutionScheduler.java** file and look at the top where your variables are declared (around line 23).
-**Change this:**
+You are absolutely right to enforce a strict domain of values (A, R, P) for your database column. Using 'ERROR' can break frontend mapping and database constraints.
+In the background processes we built, 'ERROR' was used as a safety net to flag batches that physically crashed the system (so the UI wouldn't think they were still happily "Pending").
+If you strictly only want 'A' (Approved), 'R' (Rejected), or 'P' (Pending), we should convert those system crashes into **'R' (System Rejected)**.
+Here is exactly where 'ERROR' is hiding in your database queries and how to replace them.
+### 1. In VoucherAsyncWorker.java
+If the background worker fails to create the chunked data, it currently marks the master record as 'ERROR'.
+**Find this inside the handleAsyncFailure method:**
 ```java
-    private final JdbcTemplate jdbcTemplate;
-    private final StringRedisTemplate stringRedisTemplate;
-    private VoucherCommandService voucherCommandService;  // <--- Missing 'final'
+jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR' WHERE BATCH_ID = ?", batchId);
 
 ```
-**To this:**
+**Replace it with:**
 ```java
-    private final JdbcTemplate jdbcTemplate;
-    private final StringRedisTemplate stringRedisTemplate;
-    private final VoucherCommandService voucherCommandService; // <--- Added 'final'
+// Reverts to 'R' (Rejected by System) instead of 'ERROR'
+jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
 
 ```
-Once you add the final keyword, restart the application. Spring Boot will correctly inject the service, and your scheduled batches will execute perfectly!
+### 2. In VoucherExecutionScheduler.java
+If the scheduled batch fails to execute 5 times (MAX_RETRIES), it gives up and marks it as 'ERROR'.
+**Find this inside the executeScheduledBatches method (around line 75):**
+```java
+// Mark Master Batch as ERROR so the UI stops showing it as Pending/Scheduled
+jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR' WHERE BATCH_ID = ?", batchId);
+
+```
+**Replace it with:**
+```java
+// Mark Master Batch as 'R' (Rejected) because max retries were exhausted
+jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
+
+```
+### 3. In VoucherCommandService.java
+Because we are no longer setting 'ERROR', we need to remove it from the SQL validation checks where the system looks up previous batches.
+**Find this check in createBatchFromCacheAsync and createBatchRequest:**
+```java
+Integer vidExists = jdbcTemplate.queryForObject(
+        "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')",
+        Integer.class, vid
+);
+
+```
+**Replace it with:**
+```java
+Integer vidExists = jdbcTemplate.queryForObject(
+        "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED')",
+        Integer.class, vid
+);
+
+```
+**Find this check in deleteBatchRequest:**
+```java
+int updated = jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND CREATED_BY = ? AND BATCH_STATUS IN ('P', 'PENDING', 'ERROR')", batchId, userId);
+
+```
+**Replace it with:**
+```java
+int updated = jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND CREATED_BY = ? AND BATCH_STATUS IN ('P', 'PENDING')", batchId, userId);
+
+```
+By making these changes, your BATCH_STATUS column will strictly remain within your clean A, R, P architecture!
