@@ -1,60 +1,138 @@
-You are absolutely right to enforce a strict domain of values (A, R, P) for your database column. Using 'ERROR' can break frontend mapping and database constraints.
-In the background processes we built, 'ERROR' was used as a safety net to flag batches that physically crashed the system (so the UI wouldn't think they were still happily "Pending").
-If you strictly only want 'A' (Approved), 'R' (Rejected), or 'P' (Pending), we should convert those system crashes into **'R' (System Rejected)**.
-Here is exactly where 'ERROR' is hiding in your database queries and how to replace them.
-### 1. In VoucherAsyncWorker.java
-If the background worker fails to create the chunked data, it currently marks the master record as 'ERROR'.
-**Find this inside the handleAsyncFailure method:**
-```java
-jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR' WHERE BATCH_ID = ?", batchId);
 
-```
-**Replace it with:**
-```java
-// Reverts to 'R' (Rejected by System) instead of 'ERROR'
-jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
+    public byte[] generateExcelTemplateWithGuidelines() throws IOException {
+        try (Workbook workbook = new XSSFWorkbook()) {
 
-```
-### 2. In VoucherExecutionScheduler.java
-If the scheduled batch fails to execute 5 times (MAX_RETRIES), it gives up and marks it as 'ERROR'.
-**Find this inside the executeScheduledBatches method (around line 75):**
-```java
-// Mark Master Batch as ERROR so the UI stops showing it as Pending/Scheduled
-jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR' WHERE BATCH_ID = ?", batchId);
+            CellStyle headerStyle = workbook.createCellStyle();
 
-```
-**Replace it with:**
-```java
-// Mark Master Batch as 'R' (Rejected) because max retries were exhausted
-jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
 
-```
-### 3. In VoucherCommandService.java
-Because we are no longer setting 'ERROR', we need to remove it from the SQL validation checks where the system looks up previous batches.
-**Find this check in createBatchFromCacheAsync and createBatchRequest:**
-```java
-Integer vidExists = jdbcTemplate.queryForObject(
-        "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')",
-        Integer.class, vid
-);
+            Sheet templateSheet = workbook.createSheet("Voucher Template");
+            templateSheet.createFreezePane(0, 1);
 
-```
-**Replace it with:**
-```java
-Integer vidExists = jdbcTemplate.queryForObject(
-        "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED')",
-        Integer.class, vid
-);
+            String[] headers = {"Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Product Code", "Remarks*"};
+            Row templateHeaderRow = templateSheet.createRow(0);
+            templateHeaderRow.setHeightInPoints(24);
+            for (int i = 0; i < headers.length; i++) {
+                Cell cell = templateHeaderRow.createCell(i);
+                cell.setCellValue(headers[i]);
+                cell.setCellStyle(headerStyle);
+                templateSheet.setColumnWidth(i, 5500);
+            }
 
-```
-**Find this check in deleteBatchRequest:**
-```java
-int updated = jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND CREATED_BY = ? AND BATCH_STATUS IN ('P', 'PENDING', 'ERROR')", batchId, userId);
+            CellStyle sampleStyle = workbook.createCellStyle();
+            Font italicFont = workbook.createFont();
+            italicFont.setItalic(true);
+            italicFont.setColor(IndexedColors.GREY_50_PERCENT.getIndex());
+            sampleStyle.setFont(italicFont);
+            sampleStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+            sampleStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
 
-```
-**Replace it with:**
-```java
-int updated = jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND CREATED_BY = ? AND BATCH_STATUS IN ('P', 'PENDING')", batchId, userId);
+            Row sampleRow = templateSheet.createRow(1);
+            createStyledCell(sampleRow, 0, "10001", sampleStyle);
+            createStyledCell(sampleRow, 1, "INR", sampleStyle);
+            createStyledCell(sampleRow, 2, "1102003001", sampleStyle);
 
-```
-By making these changes, your BATCH_STATUS column will strictly remain within your clean A, R, P architecture!
+            Cell amtCell = sampleRow.createCell(3);
+            amtCell.setCellValue(55000.00);
+            amtCell.setCellStyle(sampleStyle);
+
+            createStyledCell(sampleRow, 4, "Dr", sampleStyle);
+            createStyledCell(sampleRow, 5, "PRD099", sampleStyle);
+            createStyledCell(sampleRow, 6, "Sample Remarks)", sampleStyle);
+
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            workbook.write(bos);
+
+            Sheet guidelineSheet = workbook.createSheet("Upload Guidelines");
+            guidelineSheet.setColumnWidth(0, 10000);
+            guidelineSheet.setColumnWidth(1, 35000);
+
+            Font headerFont = workbook.createFont();
+            headerFont.setBold(true);
+            headerFont.setColor(IndexedColors.WHITE.getIndex());
+            headerFont.setFontHeightInPoints((short) 11);
+
+            Font boldRed = workbook.createFont();
+            boldRed.setBold(true);
+            boldRed.setColor(IndexedColors.DARK_RED.getIndex());
+
+            Font boldGreen = workbook.createFont();
+            boldGreen.setBold(true);
+            boldGreen.setColor(IndexedColors.DARK_GREEN.getIndex());
+
+            Font boldBlue = workbook.createFont();
+            boldBlue.setBold(true);
+            boldBlue.setColor(IndexedColors.DARK_BLUE.getIndex());
+
+            headerStyle.setFillForegroundColor(IndexedColors.DARK_BLUE.getIndex());
+            headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            headerStyle.setFont(headerFont);
+            headerStyle.setAlignment(HorizontalAlignment.LEFT);
+            headerStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+            headerStyle.setBorderBottom(BorderStyle.MEDIUM);
+            headerStyle.setBorderTop(BorderStyle.MEDIUM);
+            headerStyle.setBorderLeft(BorderStyle.MEDIUM);
+            headerStyle.setBorderRight(BorderStyle.MEDIUM);
+
+            CellStyle bodyStyle = workbook.createCellStyle();
+            bodyStyle.setWrapText(true);
+            bodyStyle.setVerticalAlignment(VerticalAlignment.TOP);
+            bodyStyle.setBorderBottom(BorderStyle.THIN);
+            bodyStyle.setBorderTop(BorderStyle.THIN);
+            bodyStyle.setBorderLeft(BorderStyle.THIN);
+            bodyStyle.setBorderRight(BorderStyle.THIN);
+
+            Row titleRow = guidelineSheet.createRow(0);
+            titleRow.setHeightInPoints(26);
+            Cell titleCellA = titleRow.createCell(0);
+            Cell titleCellB = titleRow.createCell(1);
+            titleCellA.setCellValue("VALIDATION STAGE");
+            titleCellB.setCellValue("STAGE REQUIREMENTS & COLUMN-WISE FORMAT DETAILS");
+            titleCellA.setCellStyle(headerStyle);
+            titleCellB.setCellStyle(headerStyle);
+
+            Row stage1Row = guidelineSheet.createRow(1);
+            stage1Row.setHeightInPoints(180);
+
+            Cell s1Title = stage1Row.createCell(0);
+            s1Title.setCellValue("Stage 1: Format Validation\n(Pre-Database Check)");
+            s1Title.setCellStyle(bodyStyle);
+
+            String stage1Text =
+                    " • Branch* - Mandatory. numeric branch code identifier (2char to 5-char, e.g., '10301').\n\n" +
+                            " • Currency* - Mandatory.  Standard 3-letter alphabetic ISO code (e.g., 'INR', 'USD').\n\n" +
+                            " • CGL* - Mandatory. Core General Ledger identifier. Exactly a 10-digits.\n\n" +
+                            " • Amount* - Mandatory. Numeric layout. Valid non-zero amount. No commas or text max(16 digits and 4 decimal) (e.g., '55000.00').\n\n" +
+                            "  in order to enter numeric value exceeding 15 digits use ' before the number add this special case\n\n" +
+                            " • Type* - Mandatory. 'Dr' (Debit) or 'Cr' (Credit).\n\n" +
+                            " • Product Code - Optional. Alphanumeric string. Max 8 characters length.\n\n" +
+                            " • Remarks* - Mandatory. Text for business narration. Min 2, Max 30 characters.";
+
+            XSSFRichTextString richText = new XSSFRichTextString(stage1Text);
+            applyHighlighting(richText, stage1Text, "Mandatory", boldRed);
+            applyHighlighting(richText, stage1Text, "Optional", boldGreen);
+            applyHighlighting(richText, stage1Text, "Branch*", boldBlue);
+            applyHighlighting(richText, stage1Text, "Currency*", boldBlue);
+            applyHighlighting(richText, stage1Text, "CGL*", boldBlue);
+            applyHighlighting(richText, stage1Text, "Amount*", boldBlue);
+            applyHighlighting(richText, stage1Text, "Type*", boldBlue);
+            applyHighlighting(richText, stage1Text, "Product Code", boldBlue);
+            applyHighlighting(richText, stage1Text, "Remarks*", boldBlue);
+
+            Cell s1Desc = stage1Row.createCell(1);
+            s1Desc.setCellValue(richText);
+            s1Desc.setCellStyle(bodyStyle);
+
+            Row stage2Row = guidelineSheet.createRow(2);
+            stage2Row.setHeightInPoints(40);
+            createStyledCell(stage2Row, 0, "Stage 2: Database Integrity Check", bodyStyle);
+            createStyledCell(stage2Row, 1, "Cross-references record fields against active system reference masters. Validates that the requested Branch Code, Currency Identifier, and CGL exist and are active in the database.", bodyStyle);
+
+            Row stage3Row = guidelineSheet.createRow(3);
+            stage3Row.setHeightInPoints(40);
+            createStyledCell(stage3Row, 0, "Stage 3: Balance Verification", bodyStyle);
+            createStyledCell(stage3Row, 1, "Applies balanced ledger control rules. Aggregates values row-by-row ensuring total active Debits equal total Credits exactly prior to allowing final scheduling submission.", bodyStyle);
+
+
+            return bos.toByteArray();
+        }
+    }
