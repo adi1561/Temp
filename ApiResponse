@@ -1,35 +1,68 @@
+You are in the final stretch. This is exactly what happens during a major architectural shift—endpoints get scattered across old and new files.
+Right now, you have a mix of the old monolithic setup (VoucherPostingController) and the new domain-driven setup (VoucherActionController, VoucherQueryController).
+Here is the exact plan to resolve this and finish the refactoring:
+### Step 1: Delete the Monolith
+Delete **VoucherPostingController.java** entirely. It is a ghost of the past. All of its endpoints need to live in the three specific controllers we are finalizing now.
+### Step 2: Keep VoucherBulkUploadController.java
+The VoucherBulkUploadController you provided is **perfect**. It correctly injects the new VoucherBulkValidationService and handles the file uploads. You do not need to change a single line in that file.
+### Step 3: Replace VoucherActionController.java
+This controller handles all **Writes, Updates, and Deletes**. I have rescued the manual batch creation, deletion, and scheduling endpoints from your old posting controller and moved them here.
+Replace your VoucherActionController with this exact code:
+```java
 package com.fincore.VoucherService.Controllers;
 
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
 import com.fincore.VoucherService.Dto.*;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.JournalRequest;
 import com.fincore.VoucherService.Service.VoucherRequestService;
+import com.fincore.VoucherService.Service.core.VoucherCommandService;
+import com.fincore.VoucherService.Service.core.VoucherWorkflowEngine;
 import com.fincore.commonutilities.jwt.JwtUtil;
 import jakarta.validation.Valid;
-
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+
 @RestController
 @RequestMapping("/api/voucher")
 @RequiredArgsConstructor
 @Slf4j
 public class VoucherActionController {
 
-
-    private final VoucherRequestService voucherRequestService;
-
+    private final VoucherCommandService commandService;
+    private final VoucherWorkflowEngine workflowEngine;
+    
+    // Fallback for methods not explicitly moved to the new core services yet
+    private final VoucherRequestService voucherRequestService; 
     private final JwtUtil jwtUtil;
 
-    /**
-     * Triggers the async approval/rejection process using Oracle Parallel execution.
-     */
+    // ==================================================================================
+    // 1. ASYNC BULK OPERATIONS
+    // ==================================================================================
+
+    @PostMapping("/create-batch-from-cache")
+    public ResponseEntity<Map<String, Object>> createBatchFromCache(
+            @Valid @RequestBody CacheBatchPostingDto payload,
+            @RequestHeader("Authorization") String token) throws IOException {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
+
+        String batchId = commandService.createBatchFromCacheAsync(
+                payload.getRequestId(), payload.getCommonBatchRemarks(), userId, userRole, payload.getVid());
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING", "message", "Batch creation initiated in background.", "batchId", batchId));
+    }
+
     @PostMapping("/process-bulk")
     public ResponseEntity<Map<String, Object>> processBulkRequests(
             @RequestHeader("Authorization") String token,
@@ -37,18 +70,17 @@ public class VoucherActionController {
 
         String userId = jwtUtil.getUserIdFromToken(token);
         Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        log.info("BULK_PROCESS_START | User: {} | Batch: {} | Action: {}", userId, dto.getBatchId(), dto.getStatus());
 
-        log.info("BULK_PROCESS_START | User: {} | Batch: {} | Action: {}",
-                userId, dto.getBatchId(), dto.getStatus());
-
-        voucherRequestService.processBulkRequestsAsync(dto, userId, userRole);
+        commandService.processBulkRequestsAsync(dto, userId, userRole);
 
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING",
-                "message", "Approval process started. Notifications will be sent upon completion."
-        ));
+                "status", "PROCESSING", "message", "Approval process started. Notifications will be sent upon completion."));
     }
 
+    // ==================================================================================
+    // 2. WORKFLOW & SCHEDULING
+    // ==================================================================================
 
     @PostMapping("/workflow/action")
     public ResponseEntity<Map<String, String>> processCheckerAction(
@@ -58,394 +90,9 @@ public class VoucherActionController {
         String userId = jwtUtil.getUserIdFromToken(token);
         Integer userRole = jwtUtil.getUserRoleFromToken(token);
 
-        voucherRequestService.processWorkflowAction(dto, userId, userRole);
+        workflowEngine.processWorkflowAction(dto, userId, userRole);
 
         return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Workflow action processed successfully."));
-    }
-
-
-
-    // ==================================================================================
-    // 1. ASYNC BULK OPERATIONS
-    // ==================================================================================
-
-    /**
-     * Creates a batch from pre-validated cache data.
-     * Uses fire-and-forget logic; returns 202 Accepted immediately.
-     */
-    @PostMapping("/create-batch-from-cache")
-    public ResponseEntity<Map<String, Object>> createBatchFromCache(
-            @Valid @RequestBody CacheBatchPostingDto payload,
-            @RequestHeader("Authorization") String token) throws IOException {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
-
-        String batchId = voucherRequestService.createBatchFromCacheAsync(
-                payload.getRequestId(),
-                payload.getCommonBatchRemarks(),
-                userId,
-                userRole,
-                payload.getVid()
-        );
-
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING",
-                "message", "Batch creation initiated in background.",
-                "batchId", batchId
-        ));
-    }
-
-
-
-}
-package com.fincore.VoucherService.Controllers;
-
-
-import com.fincore.VoucherService.Dto.BulkUploadStateDto;
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Service.validation.VoucherBulkValidationService;
-import jakarta.servlet.http.HttpServletRequest;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.io.ByteArrayResource;
-import org.springframework.core.io.Resource;
-import org.springframework.format.annotation.DateTimeFormat;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.multipart.MultipartFile;
-
-import java.io.IOException;
-import java.time.LocalDate;
-import java.util.Map;
-
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherBulkUploadController {
-
-    private final VoucherBulkValidationService voucherBulkValidationService;
-
-    /**
-     * Entry point for Journal File uploads. Validates file existence and starts parsing.
-     */
-
-    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<Map<String, Object>> initiateValidation(
-            @RequestParam("file") MultipartFile file,
-            @RequestParam("postingDate") @DateTimeFormat(pattern = "dd/MM/yyyy") LocalDate postingDate,
-            HttpServletRequest request) {
-
-        if (file == null || file.isEmpty()) {
-            throw new CustomExceptions.FileProcessingException("File is missing or empty");
-        }
-
-        try {
-            log.info("VALIDATION_INIT | File: {} | Date: {}", file.getOriginalFilename(), postingDate);
-
-            // FIX 1: Pass the MultipartFile directly (Matches the new 2-argument signature)
-            String reqId = voucherBulkValidationService.initiateValidation(file, postingDate);
-
-            // Build Security Headers for Upload
-            HttpHeaders headers = new HttpHeaders();
-            // FIX 2: Use java.time.Duration.ZERO for Spring Boot 3+ compatibility
-            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
-            headers.setPragma("no-cache");
-            headers.setExpires(0L);
-            headers.set("X-Content-Type-Options", "nosniff");
-            headers.set("Content-Security-Policy", "default-src 'self'");
-
-            // Return 200 OK with the security headers attached
-            return ResponseEntity.ok()
-                    .headers(headers)
-                    .body(Map.of("status", "QUEUED", "requestId", reqId));
-
-        } catch (IOException e) {
-            log.error("VALIDATION_IO_FAIL | File: {}", file.getOriginalFilename());
-            throw new CustomExceptions.FileProcessingException("Failed to read uploaded file.");
-        }
-    }
-
-
-    @GetMapping("/bulk-status/{requestId}")
-    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
-        BulkUploadStateDto state = voucherBulkValidationService.getState(requestId);
-        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
-    }
-
-
-    /**
-     * Downloads specific report types (ERROR or SUCCESS).
-     */
-    @GetMapping("/download-bulk-file/{requestId}")
-    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
-        byte[] data = voucherBulkValidationService.getFileBytes(requestId, type);
-        if (data == null) {
-            log.warn("DOWNLOAD_FAIL | File not found | ReqID: {} | Type: {}", requestId, type);
-            return ResponseEntity.notFound().build();
-        }
-
-        String filename = type.equalsIgnoreCase("ERROR") ? "Error_Report.xlsx" : "Success.csv";
-        MediaType mediaType = type.equalsIgnoreCase("ERROR")
-                ? MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                : MediaType.TEXT_PLAIN;
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
-                .contentType(mediaType)
-                .body(new ByteArrayResource(data));
-    }
-
-    @GetMapping("/download-template")
-    public ResponseEntity<org.springframework.core.io.Resource> downloadTemplate() throws IOException {
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Voucher_Template.xlsx\"")
-                .body(new ByteArrayResource(voucherBulkValidationService.generateExcelTemplateWithGuidelines()));
-    }
-
-}
-package com.fincore.VoucherService.Controllers;
-
-import com.fincore.VoucherService.Dto.*;
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Models.JournalRequest;
-import com.fincore.VoucherService.Models.RequestVoucher;
-import com.fincore.VoucherService.Service.RequestVoucherService;
-import com.fincore.VoucherService.Service.VoucherRequestService;
-import com.fincore.VoucherService.Service.JsEodMasterService;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-
-import org.springframework.data.domain.PageRequest;
-import org.springframework.format.annotation.DateTimeFormat;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
-/**
- * Manages life-cycle of journal batches including async bulk operations and manual creation.
- * All original endpoints and business logic are preserved.
- */
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherPostingController {
-
-    private final VoucherRequestService voucherRequestService;
-
-    private final JwtUtil jwtUtil;
-    private final JsEodMasterService jsEodMasterService;
-    private final RequestVoucherService requestVoucherService;
-
-
-
-
-
-    /**
-     * Maker API: Deletes an entire pending batch that they created.
-     */
-    @DeleteMapping("/my-requests/by-batch/{batchId}")
-    public ResponseEntity<ApiResponseDto> deletePendingBatch(
-            @PathVariable String batchId,
-            @RequestHeader("Authorization") String token) {
-
-        try {
-            // Extract the user ID from your JWT/Auth token
-            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
-
-            // Send to service layer for validation and deletion
-            voucherRequestService.deleteBatchRequest(batchId, userId);
-
-            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
-        } catch (IllegalStateException e) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (Exception e) {
-            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(new ApiResponseDto("Error", "Failed to delete batch", null));
-        }
-    }
-
-    // ==================================================================================
-    // 2. FETCH APIs
-    // ==================================================================================
-
-
-
-
-    // ==================================================================================
-    // 4. UTILS & SUPPORT
-    // ==================================================================================
-
-    @GetMapping("/current-posting-date")
-    public String getCurrentPostingDate() {
-        return voucherRequestService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
-    }
-
-
-    @GetMapping("/by-batch-paginated/{batchId}")
-    public ResponseEntity<?> getRequestsByBatchIdPaginated(
-            @PathVariable String batchId,
-            @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "10") int size) {
-        return ResponseEntity.ok(voucherRequestService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
-    }
-
-
-
-
-
-    // ==================================================================================
-    // 5. MANUAL/SMALL BATCH ENDPOINTS
-    // ==================================================================================
-
-    @PostMapping("/create-batch")
-    public ResponseEntity<List<JournalRequest>> createBatchRequest(
-            @Valid @RequestBody BatchPostingDto batchDto,
-            @RequestHeader("Authorization") String token) {
-
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
-
-            List<JournalRequest> created = voucherRequestService.createBatchRequest(
-                    batchDto,
-                    userId,
-                    jwtUtil.getUserRoleFromToken(token)
-            );
-            return ResponseEntity.status(HttpStatus.CREATED).body(created);
-        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
-            log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
-            throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
-        }
-    }
-
-
-
-
-
-    @DeleteMapping("/my-request/{requestId}")
-    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
-        voucherRequestService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
-        return ResponseEntity.noContent().build();
-    }
-
-
-
-    @GetMapping("/download-batch/{batchId}")
-    public ResponseEntity<byte[]> downloadBatchExcel(
-            @PathVariable String batchId,
-            @RequestHeader("Authorization") String token) {
-
-        try {
-            // 1. Extract User Identity
-            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
-            Integer userRole = jwtUtil.getUserRoleFromToken(token.substring(7));
-
-            // 2. Anti-IDOR Check: Is this user allowed to view this specific batch?
-            if (!voucherRequestService.isUserAuthorizedForBatch(batchId, userId, userRole)) {
-                log.warn("SECURITY_VIOLATION | User: {} attempted forced browsing on Batch: {}", userId, batchId);
-                // Return 403 Forbidden to block unauthorized access
-                return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
-            }
-
-            // 3. Get the byte array from your service
-            byte[] fileData = voucherRequestService.generateBatchExcel(batchId);
-
-            // 4. Build Security Headers (Cache disabling & MIME protection)
-            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
-            headers.setPragma("no-cache");
-            headers.setExpires(0L);
-            headers.set("X-Content-Type-Options", "nosniff");
-            headers.set("Content-Security-Policy", "default-src 'self'");
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-
-            // 5. Serve File Securely
-            return ResponseEntity.ok()
-                    .headers(headers)
-                    .body(fileData);
-
-        } catch (Exception e) {
-            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
-            return ResponseEntity.badRequest().build();
-        }
-    }
-
-
-
-    @GetMapping("/eod_status")
-    public ResponseEntity<List<JsEodMasterDTO>> getEodStatus() {
-        List<JsEodMasterDTO> data = jsEodMasterService.getAllData();
-        return new ResponseEntity<>(data, HttpStatus.OK);
-    }
-
-    @GetMapping("/filter")
-    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(
-            @RequestParam(required = false) String category,
-            @RequestParam(required = false) String role,
-            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
-
-        List<RequestVoucher> results = requestVoucherService.getFilteredVouchers(category, role, date);
-        return ResponseEntity.ok(results);
-    }
-
-    @GetMapping("/checker/pending-approvals")
-    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
-        Integer userRole = jwtUtil.getUserRoleFromToken(token); // Extract role from JWT
-        String userId = jwtUtil.getUserIdFromToken(token);
-        return ResponseEntity.ok(voucherRequestService.getPendingBatchesForChecker(userRole , userId));
-    }
-
-    @GetMapping("/workflow/steps/{workflowCode}")
-    public ResponseEntity<List<Map<String, Object>>> getWorkflowSteps(@PathVariable String workflowCode) {
-        return ResponseEntity.ok(voucherRequestService.getWorkflowSteps(workflowCode)); // (Don't forget to add this method signature to the Interface as well!)
-    }
-
-    @GetMapping("/active-roles")
-    public ResponseEntity<Map<String, String>> getActiveRoles() {
-        return ResponseEntity.ok(voucherRequestService.getActiveRoles());
-    }
-
-    @GetMapping("/vid-details/{vid}")
-    public ResponseEntity<Map<String, Object>> getVidDetails(@PathVariable String vid) {
-        return ResponseEntity.ok(voucherRequestService.getVidDetails(vid));
-    }
-
-    @GetMapping("/batch-summary/{batchId}")
-    public ResponseEntity<Map<String, Object>> getBatchSummaryDetails(@PathVariable String batchId) {
-        return ResponseEntity.ok(voucherRequestService.getBatchSummaryDetails(batchId));
-    }
-
-
-    @GetMapping("/active")
-    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
-
-        List<Map<String, Object>> records = voucherRequestService.getAvailableVouchersVid(roleId);
-
-        // Wrap the response in a "data" object to perfectly mimic the external API's ApiResponse wrapper
-        Map<String, Object> response = new HashMap<>();
-        response.put("data", records);
-        response.put("message", "Success");
-        response.put("status", "OK");
-
-        return ResponseEntity.ok(response);
     }
 
     @PostMapping("/update-schedule")
@@ -458,31 +105,80 @@ public class VoucherPostingController {
         Map<String, String> response = new HashMap<>();
         response.put("message", "Schedule updated successfully.");
         response.put("status", "SUCCESS");
-
         return ResponseEntity.ok(response);
     }
 
+    // ==================================================================================
+    // 3. MANUAL CREATION & DELETION
+    // ==================================================================================
+
+    @PostMapping("/create-batch")
+    public ResponseEntity<List<JournalRequest>> createBatchRequest(
+            @Valid @RequestBody BatchPostingDto batchDto,
+            @RequestHeader("Authorization") String token) {
+        try {
+            String userId = jwtUtil.getUserIdFromToken(token);
+            log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
+
+            List<JournalRequest> created = commandService.createBatchRequest(
+                    batchDto, userId, jwtUtil.getUserRoleFromToken(token));
+            return ResponseEntity.status(HttpStatus.CREATED).body(created);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
+            throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
+        }
+    }
+
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<ApiResponseDto> deletePendingBatch(
+            @PathVariable String batchId, @RequestHeader("Authorization") String token) {
+        try {
+            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
+            commandService.deleteBatchRequest(batchId, userId);
+            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", e.getMessage(), null));
+        } catch (Exception e) {
+            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "Failed to delete batch", null));
+        }
+    }
+
+    @DeleteMapping("/my-request/{requestId}")
+    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
+        commandService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
+        return ResponseEntity.noContent().build();
+    }
 }
 
+```
+### Step 4: Replace VoucherQueryController.java
+This controller handles all **Reads and Lookups**. I have moved all the dashboard summaries, paginated fetches, and Excel downloads here.
+Replace your VoucherQueryController with this exact code:
+```java
 package com.fincore.VoucherService.Controllers;
 
-
+import com.fincore.VoucherService.Dto.JsEodMasterDTO;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Models.RequestVoucher;
+import com.fincore.VoucherService.Service.JsEodMasterService;
+import com.fincore.VoucherService.Service.RequestVoucherService;
+import com.fincore.VoucherService.Service.VoucherRequestService;
+import com.fincore.VoucherService.Service.core.VoucherQueryService;
+import com.fincore.commonutilities.jwt.JwtUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import com.fincore.VoucherService.Dto.*;
-import com.fincore.VoucherService.Models.JournalRequest;
-import com.fincore.VoucherService.Service.VoucherRequestService;
-import com.fincore.commonutilities.jwt.JwtUtil;
-
+import org.springframework.data.domain.PageRequest;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-
 
 @RestController
 @RequestMapping("/api/voucher")
@@ -490,50 +186,145 @@ import java.util.Map;
 @Slf4j
 public class VoucherQueryController {
 
-
-    private final VoucherRequestService voucherRequestService;
+    private final VoucherQueryService queryService;
+    private final VoucherRequestService voucherRequestService; // Retained for utility methods
+    private final JsEodMasterService jsEodMasterService;
+    private final RequestVoucherService requestVoucherService;
     private final JwtUtil jwtUtil;
 
+    // ==================================================================================
+    // 1. BATCH DATA FETCHING
+    // ==================================================================================
 
-
-    /**
-     * Safeguard: Forces pagination if batch rows exceed 2000 to avoid Server OOM.
-     */
     @GetMapping("/by-batch/{batchId}")
     public ResponseEntity<?> getRequestsByBatchId(@PathVariable String batchId) {
         long count = voucherRequestService.getRequestCountByBatchId(batchId);
-
         if (count > 2000) {
             log.warn("LARGE_FETCH_BLOCKED | Batch: {} | Rows: {}", batchId, count);
             return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of(
                     "error", "Batch too large (" + count + " rows). Please use Paginated API.",
-                    "suggestion", "/api/journals/by-batch-paginated/" + batchId
+                    "suggestion", "/api/voucher/by-batch-paginated/" + batchId
             ));
         }
         return ResponseEntity.ok(voucherRequestService.getRequestsByBatchId(batchId));
     }
 
+    @GetMapping("/by-batch-paginated/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchIdPaginated(
+            @PathVariable String batchId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        return ResponseEntity.ok(voucherRequestService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
+    }
 
+    @GetMapping("/download-batch/{batchId}")
+    public ResponseEntity<byte[]> downloadBatchExcel(
+            @PathVariable String batchId, @RequestHeader("Authorization") String token) {
+        try {
+            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
+            Integer userRole = jwtUtil.getUserRoleFromToken(token.substring(7));
+
+            if (!voucherRequestService.isUserAuthorizedForBatch(batchId, userId, userRole)) {
+                log.warn("SECURITY_VIOLATION | User: {} attempted forced browsing on Batch: {}", userId, batchId);
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+            }
+
+            byte[] fileData = voucherRequestService.generateBatchExcel(batchId);
+
+            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.setPragma("no-cache");
+            headers.setExpires(0L);
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set("Content-Security-Policy", "default-src 'self'");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+            return ResponseEntity.ok().headers(headers).body(fileData);
+        } catch (Exception e) {
+            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
+            return ResponseEntity.badRequest().build();
+        }
+    }
+
+    // ==================================================================================
+    // 2. DASHBOARDS & SUMMARIES
+    // ==================================================================================
+
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<List<Map<String, Object>>> getAllRequestsSummary(@RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return ResponseEntity.ok(queryService.getAllRequestsSummary(userId));
+    }
+
+    @GetMapping("/checker/pending-approvals")
+    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId));
+    }
 
     @GetMapping("/pending-requests")
     public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
         return voucherRequestService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
     }
 
-
-
-    @GetMapping("/all-requests-summary")
-    public ResponseEntity<List<Map<String, Object>>> getAllRequestsSummary( @RequestHeader("Authorization") String token) {
-        String userId = jwtUtil.getUserIdFromToken(token);
-
-        return ResponseEntity.ok(voucherRequestService.getAllRequestsSummary(userId));
+    @GetMapping("/batch-summary/{batchId}")
+    public ResponseEntity<Map<String, Object>> getBatchSummaryDetails(@PathVariable String batchId) {
+        return ResponseEntity.ok(queryService.getBatchSummaryDetails(batchId));
     }
-
 
     @GetMapping("/workflow-history/{batchId}")
     public ResponseEntity<List<Map<String, Object>>> getWorkflowHistory(@PathVariable String batchId) {
-        return ResponseEntity.ok(voucherRequestService.getWorkflowHistory(batchId));
+        return ResponseEntity.ok(queryService.getWorkflowHistory(batchId));
     }
 
+    // ==================================================================================
+    // 3. UTILITIES & METADATA
+    // ==================================================================================
+
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() {
+        return voucherRequestService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
+    }
+
+    @GetMapping("/eod_status")
+    public ResponseEntity<List<JsEodMasterDTO>> getEodStatus() {
+        return new ResponseEntity<>(jsEodMasterService.getAllData(), HttpStatus.OK);
+    }
+
+    @GetMapping("/filter")
+    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(
+            @RequestParam(required = false) String category,
+            @RequestParam(required = false) String role,
+            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
+        return ResponseEntity.ok(requestVoucherService.getFilteredVouchers(category, role, date));
+    }
+
+    @GetMapping("/workflow/steps/{workflowCode}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowSteps(@PathVariable String workflowCode) {
+        return ResponseEntity.ok(voucherRequestService.getWorkflowSteps(workflowCode));
+    }
+
+    @GetMapping("/active-roles")
+    public ResponseEntity<Map<String, String>> getActiveRoles() {
+        return ResponseEntity.ok(voucherRequestService.getActiveRoles());
+    }
+
+    @GetMapping("/vid-details/{vid}")
+    public ResponseEntity<Map<String, Object>> getVidDetails(@PathVariable String vid) {
+        return ResponseEntity.ok(voucherRequestService.getVidDetails(vid));
+    }
+
+    @GetMapping("/active")
+    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
+        List<Map<String, Object>> records = voucherRequestService.getAvailableVouchersVid(roleId);
+        Map<String, Object> response = new HashMap<>();
+        response.put("data", records);
+        response.put("message", "Success");
+        response.put("status", "OK");
+        return ResponseEntity.ok(response);
+    }
 }
 
+```
