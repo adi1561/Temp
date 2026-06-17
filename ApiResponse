@@ -1,6 +1,174 @@
+This is a very common trap when dismantling a "God Class." You are 95% of the way there.
+The errors you are seeing happen because your new classes are still holding onto "ghosts" of the old architecture. Specifically:
+ 1. In VoucherRuleValidator, the methods are asking for List<VoucherBulkValidationService.ExcelRowData>. It is still looking for the old inner class instead of your new standalone DTO.
+ 2. In VoucherBulkValidationService, you accidentally pasted some of the old helper methods (like updateState and the ParsingResult class) at the very bottom, which is confusing the compiler.
+Let's fix this permanently. You just need to replace the contents of these specific files with the code below.
+### 1. The Missing DTO: ParsingResult.java
+First, make sure you actually created this file in your Dto folder alongside ExcelRowData.
+**Path:** com/fincore/VoucherService/Dto/ParsingResult.java
+```java
+package com.fincore.VoucherService.Dto;
+
+import java.util.List;
+
+public class ParsingResult {
+    public List<ExcelRowData> rows;
+    public boolean hasProductColumn;
+
+    public ParsingResult(List<ExcelRowData> rows, boolean hasProductColumn) {
+        this.rows = rows;
+        this.hasProductColumn = hasProductColumn;
+    }
+}
+
+```
+### 2. The Fixed VoucherRuleValidator.java
+I have removed the references to the old VoucherBulkValidationService and correctly imported your new ExcelRowData. Replace your entire file with this:
+```java
+package com.fincore.VoucherService.Service.validation;
+
+import com.fincore.VoucherService.Dto.ExcelRowData; // Correct DTO Import
+import com.fincore.VoucherService.Service.ValidationMasterService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+
+@Service
+public class VoucherRuleValidator {
+
+    private final ValidationMasterService validationMasterService;
+
+    @Autowired
+    public VoucherRuleValidator(ValidationMasterService validationMasterService) {
+        this.validationMasterService = validationMasterService;
+    }
+
+    // Notice we now just use List<ExcelRowData>
+    public void runFormatCheck(List<ExcelRowData> rows) {
+        rows.parallelStream().forEach(d -> {
+
+            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
+
+            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
+                d.txnType = "Credit";
+            } else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
+                d.txnType = "Debit";
+            } else {
+                synchronized(d.formatErrors) {
+                    d.formatErrors.add("Transaction type must be 'CR' or 'DR' (Case insensitive).");
+                }
+            }
+
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Amount must be greater than 0."); }
+            } else {
+                if (d.amount.precision() > 20 || d.amount.scale() > 4) {
+                    synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum digits or decimal places."); }
+                } else if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) {
+                    synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum digits or decimal places."); }
+                }
+            }
+
+            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Product code must be up to 8 digits or left blank."); }
+            }
+
+            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Remarks must be 2-30 characters."); }
+            } else if (!d.remarks.matches("^[a-zA-Z0-9 ]+$") || d.remarks.contains("  ")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Only alphabets and numbers are allowed."); }
+            }
+
+            if (d.currency == null || d.currency.length() != 3) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Currency code must be exactly 3 characters."); }
+            }
+
+            if (d.cgl == null || d.cgl.isEmpty()) {
+                synchronized(d.formatErrors) { d.formatErrors.add("CGL is mandatory."); }
+            } else if (!d.cgl.matches("^[0-9]{10}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("CGL must be exactly 10 digits."); }
+            }
+
+            if (d.branch == null || d.branch.trim().isEmpty()) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Branch code is mandatory."); }
+            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters."); }
+            }
+        });
+    }
+
+    public void runDbCheck(List<ExcelRowData> rows) {
+        Set<String> validBranches = validationMasterService.getAllActiveBranches();
+        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
+        Set<String> validCgls = validationMasterService.getAllActiveCgls();
+
+        rows.parallelStream().forEach(d -> {
+            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
+                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
+            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
+                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
+            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
+                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
+        });
+    }
+
+    public void runBalanceCheck(List<ExcelRowData> rows) {
+        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
+
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
+            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
+
+            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
+            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+
+            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
+                    .updateAndGet(curr -> curr.add(finalVal));
+        });
+
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
+            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
+
+            synchronized (d.balErrors) {
+                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
+                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
+                }
+
+                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
+                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
+                }
+            }
+        });
+    }
+}
+
+```
+### 3. The Fixed ExcelStreamingParser.java
+I have added the correct import for ParsingResult and removed the old private VoucherBulkValidationService variable. Replace your file with this:
+```java
 package com.fincore.VoucherService.Service.validation;
 
 import com.fincore.VoucherService.Dto.ExcelRowData;
+import com.fincore.VoucherService.Dto.ParsingResult; // Correct DTO Import
 import org.apache.poi.ss.usermodel.*;
 import org.springframework.stereotype.Service;
 
@@ -14,15 +182,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Pattern;
 
-
 @Service
 public class ExcelStreamingParser {
 
     private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
     private static final DateTimeFormatter SYSTEM_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
-    private VoucherBulkValidationService voucherBulkValidationService;
 
-
+    // Make sure this is public, and returns the DTO ParsingResult
     public ParsingResult parseExcelStream(InputStream is, LocalDate postingDate) throws IOException {
         List<ExcelRowData> list = new ArrayList<>();
         boolean hasProductCol = false;
@@ -90,10 +256,6 @@ public class ExcelStreamingParser {
         return new ParsingResult(list, hasProductCol);
     }
 
-    /**
-     * Rule 4: Amount parsing logic.
-     * Ensures Dr/Cr detection and scale validation without changing numeric values.
-     */
     private void parseAmount(ExcelRowData d, String amountRaw, String typeRaw) {
         try {
             String amtClean = (amountRaw == null) ? "" : amountRaw.trim();
@@ -157,1089 +319,16 @@ public class ExcelStreamingParser {
             if (r.getCell(c) != null && r.getCell(c).getCellType() != CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false;
         return true;
     }
-
 }
 
-in this file 
-Cannot resolve symbol 'ParsingResult'
-
-
-
-
-package com.fincore.VoucherService.Service.validation;
-
-import com.fasterxml.jackson.annotation.*;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.VoucherService.Dto.BulkUploadStateDto;
-import com.fincore.VoucherService.Dto.ExcelRowData;
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Service.ValidationMasterService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.usermodel.XSSFRichTextString;
-import org.slf4j.MDC;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-
-import java.io.*;
-import java.math.BigDecimal;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-
-
-/**
- * Handles high-performance streaming parsing and multi-stage validation.
- * Optimized to prevent OOM errors by offloading large datasets to Redis with GZIP compression.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherBulkValidationService {
-
-    private VoucherRuleValidator voucherRuleValidator;
-
-    private final ExcelStreamingParser excelParser;
-    private final VoucherRuleValidator ruleValidator;
-    private final ValidationStateManager stateManager;
-    private final ValidationReportGenerator reportGenerator;
-    private final ObjectMapper objectMapper;
-
-    // ==================================================================================
-    // GLOBAL SECURITY CONFIGURATION
-    // ==================================================================================
-    static {
-        // Prevents Zip Bomb / Decompression attacks by enforcing a strict inflation ratio
-        org.apache.poi.openxml4j.util.ZipSecureFile.setMinInflateRatio(0.001);
-
-        // Prevents massive file memory allocation attacks
-        org.apache.poi.openxml4j.util.ZipSecureFile.setMaxEntrySize(100 * 1024 * 1024); // 100MB Max
-    }
-
-    private static final DateTimeFormatter SYSTEM_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
-
-    private final ValidationMasterService validationMasterService;
-
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
-
-    @Autowired
-    @Lazy
-    private VoucherBulkValidationService self;
-
-    private BulkUploadStateDto getStatusFromRedis(String reqId) {
-        try {
-            byte[] json = redisTemplate.opsForValue().get("BULK_STATUS_" + reqId);
-            if (json == null) return null;
-            return objectMapper.readValue(json, BulkUploadStateDto.class);
-        } catch (IOException | DataAccessException e) {
-            log.error("REDIS_READ_FAIL | ReqID: {} | Type: {}", reqId, e.getClass().getSimpleName());
-            return null;
-        }
-    }
-
-
-    // ==================================================================================
-    // 2. UPLOAD INITIALIZATION (Security & Storage)
-    // ==================================================================================
-
-    public String initiateValidation(org.springframework.web.multipart.MultipartFile file, LocalDate postingDate) throws IOException {
-
-        String filename = file.getOriginalFilename();
-        long fileSize = file.getSize();
-
-        // 1A. Minimum File Size Validation (Min 5 KB)
-        if (fileSize < 5 * 1024) {
-            log.error("UPLOAD_SECURITY_DENIED | Status: File too small (Size: {} bytes)", fileSize);
-            throw new CustomExceptions.FileProcessingException("File is too small. Minimum allowed size is 5 KB.");
-        }
-
-        // 1B. Maximum File Size Validation (Max 50MB)
-        if (fileSize > 50 * 1024 * 1024) {
-            log.error("UPLOAD_SECURITY_DENIED | Status: File size out of bounds (Size: {} bytes)", fileSize);
-            throw new CustomExceptions.FileProcessingException("File size cannot exceed 50MB.");
-        }
-
-        // 2. Null or Empty Check
-        if (filename == null || filename.isBlank()) {
-            throw new CustomExceptions.FileProcessingException("Filename cannot be empty.");
-        }
-
-        // 3. File Name Length Validation (Max 20 chars including extension)
-        if (filename.length() > 20) {
-            log.error("UPLOAD_SECURITY_DENIED | Status: Filename exceeds 20 characters");
-            throw new CustomExceptions.FileProcessingException("File name length cannot exceed 20 characters.");
-        }
-
-        // 4. Multiple Extension Check (Prevents attacks like 'malicious.php.xlsx')
-        if (filename.indexOf('.') != filename.lastIndexOf('.')) {
-            log.error("UPLOAD_SECURITY_DENIED | Status: Multiple extensions detected");
-            throw new CustomExceptions.FileProcessingException("Files with multiple extensions are strictly prohibited.");
-        }
-
-        // 5. File Type Whitelist & Allowed Characters (Alphanumeric, dashes, underscores only)
-        if (!filename.matches("^[a-zA-Z0-9_\\-]+\\.(xlsx|xls)$")) {
-            log.error("UPLOAD_SECURITY_DENIED | Status: Invalid characters or extension in filename");
-            throw new CustomExceptions.FileProcessingException("Invalid file name or type. Only .xls and .xlsx files with alphanumeric names are allowed.");
-        }
-
-        String requestId = UUID.randomUUID().toString();
-
-        // 6. Filename change in format which is not guessable (UUID renaming)
-        // 7. Temporary Storage with Least Privilege Paths (Keeps path out of user URLs)
-        String mimeType = file.getContentType();
-        if (mimeType == null || (
-                !"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".equals(mimeType) &&
-                        !"application/vnd.ms-excel".equals(mimeType))) {
-            log.error("UPLOAD_SECURITY_DENIED | Status: Invalid MIME Type: {}", mimeType);
-            throw new CustomExceptions.FileProcessingException("Invalid file format. Detected MIME type does not match Excel.");
-        }
-
-
-        // --- ADD THIS: EXPLICIT SECURE FILE PERMISSIONS ---
-        Path tempFile;
-        try {
-            // Check if running on Linux/Unix to apply strict POSIX permissions (rw-------)
-            if (java.nio.file.FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
-                java.nio.file.attribute.FileAttribute<java.util.Set<java.nio.file.attribute.PosixFilePermission>> attr =
-                        java.nio.file.attribute.PosixFilePermissions.asFileAttribute(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
-                tempFile = Files.createTempFile("UPLOAD_" + requestId + "_", ".tmp", attr);
-            } else {
-                // Fallback for Windows environments
-                tempFile = Files.createTempFile("UPLOAD_" + requestId + "_", ".tmp");
-                tempFile.toFile().setReadable(true, true);
-                tempFile.toFile().setWritable(true, true);
-                tempFile.toFile().setExecutable(false);
-            }
-        } catch (IOException e) {
-            throw new CustomExceptions.FileProcessingException("Failed to allocate secure storage for upload.");
-        }
-
-        // The variable is renamed to uploadStream to guarantee no naming collisions
-        try (InputStream uploadStream = file.getInputStream()) {
-            Files.copy(uploadStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
-        } catch (IOException e) {
-            log.error("TEMP_FILE_CREATE_FAIL | ReqID: {} | Status: Disk IO failure", requestId);
-            throw new CustomExceptions.FileProcessingException("Failed to secure uploaded file on disk.");
-        }
-
-        BulkUploadStateDto state = new BulkUploadStateDto();
-        state.setRequestId(requestId);
-        state.setStatus("PROCESSING");
-        state.setCurrentStage(1);
-        state.setMessage("Initializing Upload...");
-        state.setTotalRows(0);
-        stateManager.saveStatusToRedis(requestId, state);
-
-        log.info("VALIDATION_INIT | ReqID: {} | Status: Temporary storage allocated", requestId);
-        self.processAsync(requestId, tempFile.toString(), filename, postingDate);
-        return requestId;
-    }
-
-
-    // ==================================================================================
-    // 3. ORCHESTRATION ENGINE (The Async Loop)
-    // ==================================================================================
-
-    @Async("bulkExecutor")
-    public void processAsync(String requestId, String tempFilePath, String filename, LocalDate postingDate) {
-        MDC.put("requestId", requestId);
-        long startTime = System.currentTimeMillis();
-        File tempFile = new File(tempFilePath);
-
-        try {
-            updateState(requestId, s -> s.setMessage("Parsing File..."));
-            ParsingResult parsingResult;
-
-            try (InputStream is = new FileInputStream(tempFile)) {
-                // Directly parse as Excel
-                parsingResult = excelParser.parseExcelStream(is, postingDate);
-            }
-
-            List<ExcelRowData> parsedRows = parsingResult.rows;
-            if (parsedRows == null || parsedRows.isEmpty()) {
-                throw new CustomExceptions.InvalidDataException("File data is empty. No transaction rows found.");
-            }
-
-            stateManager.updateState(requestId, s -> {
-                s.setTotalRows(parsedRows.size());
-                s.setMessage("Validating Formats...");
-            });
-
-            // DELEGATE: Stage 1 (Format Check)
-            ruleValidator.runFormatCheck(parsedRows);
-            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
-                failRequest(requestId, parsedRows, "Format Validation Failed", 1, parsingResult.hasProductColumn);
-                return;
-            }
-
-            // DELEGATE: Stage 2 (Database Check)
-            stateManager.updateState(requestId, s -> {
-                s.setCurrentStage(2);
-                s.setMessage("Checking Database...");
-            });
-            ruleValidator.runDbCheck(parsedRows);
-            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
-                failRequest(requestId, parsedRows, "Database Validation Failed", 2, parsingResult.hasProductColumn);
-                return;
-            }
-
-            // DELEGATE: Stage 3 (Balance Check)
-            stateManager.updateState(requestId, s -> {
-                s.setCurrentStage(3);
-                s.setMessage("Checking Balances...");
-            });
-            ruleValidator.runBalanceCheck(parsedRows);
-            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
-                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3, parsingResult.hasProductColumn);
-                return;
-            }
-
-
-            log.info("VALIDATION_SUCCESS | ReqID: {} | Duration: {}ms", requestId, (System.currentTimeMillis() - startTime));
-
-            // Removed isCsv flag from the method call
-            completeRequest(requestId, parsedRows, postingDate, parsingResult.hasProductColumn);
-
-        }
-        // --- ALL ORIGINAL CATCH BLOCKS RESTORED EXACTLY ---
-        catch (CustomExceptions.InvalidDataException e) {
-            log.warn("EMPTY_DATA_REJECTED | ReqID: {} | Reason: {}", requestId, e.getMessage());
-            handleAsyncCrash(requestId, e.getMessage());
-        }
-        catch (FileNotFoundException e) {
-            handleAsyncCrash(requestId, "System Error: File not found in temporary storage.");
-        } catch (IOException e) {
-            handleAsyncCrash(requestId, "System Error: Failed to read file content.");
-        } catch (DateTimeParseException e) {
-            log.error("DATE_PARSING_FAIL | ReqID: {} | Status: Invalid row date format", requestId);
-            handleAsyncCrash(requestId, "Validation Failed: Incorrect date format detected in rows.");
-        } catch (NumberFormatException e) {
-            log.error("AMOUNT_PARSING_FAIL | ReqID: {} | Status: Numeric format error", requestId);
-            handleAsyncCrash(requestId, "Validation Failed: Non-numeric values found in amount column.");
-        } catch (DataAccessException e) {
-            log.error("REDIS_OR_DB_UNAVAILABLE | ReqID: {} | Status: Backend connection failure", requestId);
-            handleAsyncCrash(requestId, "System temporarily unavailable. Please try again later.");
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException e) {
-            log.error("INTERNAL_LOGIC_ERROR | ReqID: {} | Type: {}", requestId, e.getClass().getSimpleName());
-            handleAsyncCrash(requestId, "Internal system failure during processing.");
-        }
-        catch (Throwable t) {
-            log.error("FATAL_SYSTEM_ERROR | ReqID: {} | Type: {}", requestId, t.getClass().getSimpleName(), t);
-            handleAsyncCrash(requestId, "A critical system error occurred during processing.");
-        }
-        finally {
-            if (tempFile.exists() && !tempFile.delete()) {
-                log.warn("CLEANUP_WARN | Path: {} | Status: Temp file purge failed", tempFilePath);
-            }
-            MDC.clear();
-        }
-    }
-
-
-    // ==================================================================================
-    // 4. COMPLETION & ERROR DELEGATION
-    // ==================================================================================
-    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage, boolean hasProductColumn) throws IOException {
-        log.warn("VALIDATION_FAILED | ReqID: {} | Reason: {}", reqId, msg);
-
-        // Let the Report Generator build the Excel
-        byte[] excel = reportGenerator.generateErrorExcelFast(rows, hasProductColumn);
-
-        // Let the State Manager save it to Redis
-        stateManager.saveErrorFileToRedis(reqId, excel);
-
-        stateManager.updateState(reqId, s -> {
-            s.setStatus("ERROR");
-            s.setMessage(msg);
-            s.setCurrentStage(stage);
-            s.setErrorCount(rows.stream().filter(ExcelRowData::hasErrors).count());
-            s.setHasErrorFile(true);
-        });
-    }
-
-    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean hasProductColumn) throws IOException {
-        stateManager.saveRowsToRedis(reqId, rows);
-
-        List<Map<String, Object>> preview = rows.stream().limit(2000).map(this::mapToPreview).collect(Collectors.toList());
-
-        stateManager.updateState(reqId, s -> {
-            s.setCurrentStage(4);
-            s.setStatus("SUCCESS");
-            s.setMessage("Validation Successful");
-            s.setHasSuccessFile(false);
-            s.setHasProductColumn(hasProductColumn);
-            try {
-                s.setPreviewDataJson(objectMapper.writeValueAsString(preview));
-            } catch (JsonProcessingException ignored) {}
-        });
-    }
-
-
-    private void handleAsyncCrash(String requestId, String message) {
-        log.error("ASYNC_PROCESS_CRASH | ReqID: {} | Reason: {}", requestId, message);
-        stateManager.updateState(requestId, s -> {
-            s.setStatus("ERROR");
-            s.setMessage(message);
-            s.setHasErrorFile(false);
-        });
-    }
-
-    private Map<String, Object> mapToPreview(ExcelRowData r) {
-        Map<String, Object> m = new java.util.HashMap<>();
-        m.put("id", r.rowIndex);
-        m.put("branch", r.branch);
-        m.put("currency", r.currency);
-        m.put("cgl", r.cgl);
-        m.put("amount", r.amount != null ? r.amount.toString() : "");
-        m.put("txnType", r.txnType);
-        m.put("remarks", r.remarks);
-        m.put("productCode", r.productCode);
-        return m;
-    }
-
-
-    // Pass-through methods for Controllers
-    public BulkUploadStateDto getState(String reqId) {
-        return stateManager.getStatusFromRedis(reqId);
-    }
-
-    public byte[] getFileBytes(String reqId, String type) {
-        return stateManager.getFileBytes(reqId, type);
-    }
-
-
-    private String padBranch(String branch) {
-        if (branch == null || branch.trim().isEmpty()) return "";
-        String b = branch.trim();
-        if (b.length() < 5) {
-            return String.format("%5s", b).replace(' ', '0');
-        }
-        return b;
-    }
-
-
-	
-	other filess
-	
-	package com.fincore.VoucherService.Service.validation;
-
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.VoucherService.Dto.BulkUploadStateDto;
-import com.fincore.VoucherService.Dto.ExcelRowData;
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.stereotype.Service;
-
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
-
-@Service
-@Slf4j
-public class ValidationStateManager {
-
-    private final ObjectMapper objectMapper;
-
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
-
-    public ValidationStateManager(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
-    }
-
-    // ==================================================================================
-    // 1. REDIS STATE MANAGEMENT
-    // ==================================================================================
-    public void saveStatusToRedis(String reqId, BulkUploadStateDto state) {
-        try {
-            byte[] json = objectMapper.writeValueAsBytes(state);
-            redisTemplate.opsForValue().set("BULK_STATUS_" + reqId, json, 2, TimeUnit.HOURS);
-        } catch (JsonProcessingException e) {
-            log.error("SERIALIZATION_FAIL | ReqID: {} | Status: Object mapping error", reqId);
-        } catch (DataAccessException e) {
-            log.error("REDIS_WRITE_FAIL | ReqID: {} | Status: Connection/Persistence failure", reqId);
-        }
-    }
-
-    public BulkUploadStateDto getStatusFromRedis(String reqId) {
-        try {
-            byte[] json = redisTemplate.opsForValue().get("BULK_STATUS_" + reqId);
-            if (json == null) return null;
-            return objectMapper.readValue(json, BulkUploadStateDto.class);
-        } catch (IOException | DataAccessException e) {
-            log.error("REDIS_READ_FAIL | ReqID: {} | Type: {}", reqId, e.getClass().getSimpleName());
-            return null;
-        }
-    }
-    public synchronized void updateState(String requestId, Consumer<BulkUploadStateDto> updater) {
-        BulkUploadStateDto state = getStatusFromRedis(requestId);
-        if (state == null) {
-            state = new BulkUploadStateDto();
-            state.setRequestId(requestId);
-        }
-        updater.accept(state);
-        saveStatusToRedis(requestId, state);
-    }
-
-
-    public List<ExcelRowData> getValidRowsFromCache(String requestId) {
-        byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
-        if (metaBytes == null) {
-            throw new CustomExceptions.CacheExpiredException("Validation data expired (TTL 1 Hour). Please re-upload.");
-        }
-
-        try {
-            Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
-            int totalChunks = (int) meta.get("totalChunks");
-            int totalRows = (int) meta.get("totalRows");
-            List<ExcelRowData> allRows = new ArrayList<>(totalRows);
-
-            for (int i = 0; i < totalChunks; i++) {
-                byte[] compressedChunk = redisTemplate.opsForValue().get("DATA_CHUNK_" + requestId + "_" + i);
-                if (compressedChunk == null) {
-                    throw new CustomExceptions.CacheExpiredException("Missing data chunk " + i + ". Please re-upload.");
-                }
-                try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressedChunk))) {
-                    List<ExcelRowData> chunkRows = objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
-                    allRows.addAll(chunkRows);
-                }
-            }
-            return allRows;
-        } catch (IOException | DataAccessException e) {
-            throw new CustomExceptions.FileProcessingException("Failed to reconstruct cached data", e);
-        }
-    }
-
-
-
-    public void saveRowsToRedis(String requestId, List<ExcelRowData> rows) {
-        if (rows == null || rows.isEmpty()) return;
-        try {
-            int chunkSize = 5000;
-            int totalRows = rows.size();
-            int totalChunks = (int) Math.ceil((double) totalRows / chunkSize);
-
-            for (int i = 0; i < totalChunks; i++) {
-                int start = i * chunkSize;
-                int end = Math.min(start + chunkSize, totalRows);
-                List<ExcelRowData> chunk = rows.subList(start, end);
-
-                try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                     GZIPOutputStream gos = new GZIPOutputStream(baos)) {
-                    objectMapper.writeValue(gos, chunk);
-                    gos.finish();
-                    String chunkKey = "DATA_CHUNK_" + requestId + "_" + i;
-                    redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 1, TimeUnit.HOURS);
-                }
-            }
-
-            Map<String, Object> meta = new HashMap<>();
-            meta.put("totalChunks", totalChunks);
-            meta.put("totalRows", totalRows);
-            byte[] metaBytes = objectMapper.writeValueAsBytes(meta);
-            redisTemplate.opsForValue().set("DATA_META_" + requestId, metaBytes, 1, TimeUnit.HOURS);
-
-        } catch (IOException | DataAccessException e) {
-            throw new CustomExceptions.RedisOperationException("Failed to cache large dataset", e);
-        }
-    }
-
-    public byte[] getFileBytes(String reqId, String type) {
-        try {
-            return redisTemplate.opsForValue().get("FILE_" + reqId + "_" + type);
-        } catch (DataAccessException e) {
-            return null;
-        }
-    }
-
-    public void saveErrorFileToRedis(String reqId, byte[] fileData) {
-        try {
-            redisTemplate.opsForValue().set("FILE_" + reqId + "_ERROR", fileData, 30, TimeUnit.MINUTES);
-        } catch (DataAccessException e) {
-            log.error("REDIS_WRITE_FAIL | ReqID: {} | Could not save error file to cache.", reqId);
-        }
-    }
-}
-package com.fincore.VoucherService.Service.validation;
-
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.VoucherService.Dto.ExcelRowData;
-import com.fincore.VoucherService.Service.ValidationMasterService;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.streaming.SXSSFWorkbook;
-import org.apache.poi.xssf.usermodel.XSSFRichTextString;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.stereotype.Service;
-
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.regex.Pattern;
-
-@Service
-public class ValidationReportGenerator {
-
-    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{1,8}$");
-    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
-    // ==================================================================================
-    // GLOBAL SECURITY CONFIGURATION
-    // ==================================================================================
-    static {
-        // Prevents Zip Bomb / Decompression attacks by enforcing a strict inflation ratio
-        org.apache.poi.openxml4j.util.ZipSecureFile.setMinInflateRatio(0.001);
-
-        // Prevents massive file memory allocation attacks
-        org.apache.poi.openxml4j.util.ZipSecureFile.setMaxEntrySize(100 * 1024 * 1024); // 100MB Max
-    }
-
-    private static final DateTimeFormatter SYSTEM_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
-
-    private final ValidationMasterService validationMasterService;
-    private final ObjectMapper objectMapper;
-
-    @Autowired
-    @Lazy
-    private VoucherBulkValidationService self;
-
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
-
-
-    public ValidationReportGenerator(ValidationMasterService validationMasterService, ObjectMapper objectMapper) {
-        this.validationMasterService = validationMasterService;
-        this.objectMapper = objectMapper;
-    }
-
-
-    private String sanitize(String value) {
-        if (value == null) return "";
-        if (value.startsWith("=") || value.startsWith("+") || value.startsWith("-") || value.startsWith("@")) return "'" + value;
-        return value;
-    }
-
-    public byte[] generateErrorExcelFast(List<ExcelRowData> rows, boolean includeProduct) throws IOException {
-        SXSSFWorkbook workbook = new SXSSFWorkbook(100);
-        try {
-            Sheet sheet = workbook.createSheet("Error Report");
-            CellStyle errStyle = workbook.createCellStyle();
-            Font f = workbook.createFont();
-            f.setColor(IndexedColors.RED.getIndex());
-            errStyle.setFont(f);
-
-            boolean isSystem = rows.stream().anyMatch(r -> r.isSystemFormat);
-
-            Row h = sheet.createRow(0);
-            List<String> headerList = new ArrayList<>();
-
-            if (isSystem) {
-                headerList.addAll(Arrays.asList("Site", "Date", "Year", "Month", "Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product Code"));
-            } else {
-                headerList.addAll(Arrays.asList("Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*", "Product Code"));
-            }
-
-            headerList.add("ERRORS");
-            for (int i = 0; i < headerList.size(); i++) h.createCell(i).setCellValue(headerList.get(i));
-
-            int idx = 1;
-            for (ExcelRowData d : rows) {
-                Row r = sheet.createRow(idx++);
-                int col = 0;
-                if (isSystem) {
-                    r.createCell(col++).setCellValue(sanitize(d.sysSite));
-                    r.createCell(col++).setCellValue(sanitize(d.sysDate));
-                    r.createCell(col++).setCellValue(sanitize(d.sysYear));
-                    r.createCell(col++).setCellValue(sanitize(d.sysPeriod));
-                    r.createCell(col++).setCellValue(sanitize(d.branch));
-                    r.createCell(col++).setCellValue(sanitize(d.currency));
-                    r.createCell(col++).setCellValue(sanitize(d.cgl));
-                    r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
-                    r.createCell(col++).setCellValue(sanitize(d.txnType));
-                    r.createCell(col++).setCellValue(sanitize(d.remarks));
-                    r.createCell(col++).setCellValue(sanitize(d.productCode));
-                } else {
-                    r.createCell(col++).setCellValue(sanitize(d.branch));
-                    r.createCell(col++).setCellValue(sanitize(d.currency));
-                    r.createCell(col++).setCellValue(sanitize(d.cgl));
-                    r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
-                    r.createCell(col++).setCellValue(sanitize(d.txnType));
-                    r.createCell(col++).setCellValue(sanitize(d.remarks));
-                    r.createCell(col++).setCellValue(sanitize(d.productCode));
-                }
-
-                Cell c = r.createCell(col);
-                if (d.hasErrors()) {
-                    c.setCellValue(d.getAllErrors());
-                    c.setCellStyle(errStyle);
-                }
-            }
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            workbook.write(out);
-            return out.toByteArray();
-        } finally {
-            workbook.dispose();
-            workbook.close();
-        }
-    }
-
-
-
-    public byte[] generateExcelTemplateWithGuidelines() throws IOException {
-        try (Workbook workbook = new XSSFWorkbook()) {
-
-            CellStyle headerStyle = workbook.createCellStyle();
-
-
-            Sheet templateSheet = workbook.createSheet("Voucher Template");
-            templateSheet.createFreezePane(0, 1);
-
-            String[] headers = {"Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Product Code", "Remarks*"};
-            Row templateHeaderRow = templateSheet.createRow(0);
-            templateHeaderRow.setHeightInPoints(24);
-            for (int i = 0; i < headers.length; i++) {
-                Cell cell = templateHeaderRow.createCell(i);
-                cell.setCellValue(headers[i]);
-                cell.setCellStyle(headerStyle);
-                templateSheet.setColumnWidth(i, 5500);
-            }
-
-            CellStyle sampleStyle = workbook.createCellStyle();
-            Font italicFont = workbook.createFont();
-            italicFont.setItalic(true);
-            italicFont.setColor(IndexedColors.GREY_50_PERCENT.getIndex());
-            sampleStyle.setFont(italicFont);
-            sampleStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
-            sampleStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-
-            Row sampleRow = templateSheet.createRow(1);
-            createStyledCell(sampleRow, 0, "10001", sampleStyle);
-            createStyledCell(sampleRow, 1, "INR", sampleStyle);
-            createStyledCell(sampleRow, 2, "1102003001", sampleStyle);
-
-            Cell amtCell = sampleRow.createCell(3);
-            amtCell.setCellValue(55000.00);
-            amtCell.setCellStyle(sampleStyle);
-
-            createStyledCell(sampleRow, 4, "D", sampleStyle);
-            createStyledCell(sampleRow, 5, "PRD099", sampleStyle);
-            createStyledCell(sampleRow, 6, "Sample bulk upload entry row (Overwrite this)", sampleStyle);
-
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            workbook.write(bos);
-
-            Sheet guidelineSheet = workbook.createSheet("Upload Guidelines");
-            guidelineSheet.setColumnWidth(0, 10000);
-            guidelineSheet.setColumnWidth(1, 35000);
-
-            Font headerFont = workbook.createFont();
-            headerFont.setBold(true);
-            headerFont.setColor(IndexedColors.WHITE.getIndex());
-            headerFont.setFontHeightInPoints((short) 11);
-
-            Font boldRed = workbook.createFont();
-            boldRed.setBold(true);
-            boldRed.setColor(IndexedColors.DARK_RED.getIndex());
-
-            Font boldGreen = workbook.createFont();
-            boldGreen.setBold(true);
-            boldGreen.setColor(IndexedColors.DARK_GREEN.getIndex());
-
-            Font boldBlue = workbook.createFont();
-            boldBlue.setBold(true);
-            boldBlue.setColor(IndexedColors.DARK_BLUE.getIndex());
-
-            headerStyle.setFillForegroundColor(IndexedColors.DARK_BLUE.getIndex());
-            headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-            headerStyle.setFont(headerFont);
-            headerStyle.setAlignment(HorizontalAlignment.LEFT);
-            headerStyle.setVerticalAlignment(VerticalAlignment.CENTER);
-            headerStyle.setBorderBottom(BorderStyle.MEDIUM);
-            headerStyle.setBorderTop(BorderStyle.MEDIUM);
-            headerStyle.setBorderLeft(BorderStyle.MEDIUM);
-            headerStyle.setBorderRight(BorderStyle.MEDIUM);
-
-            CellStyle bodyStyle = workbook.createCellStyle();
-            bodyStyle.setWrapText(true);
-            bodyStyle.setVerticalAlignment(VerticalAlignment.TOP);
-            bodyStyle.setBorderBottom(BorderStyle.THIN);
-            bodyStyle.setBorderTop(BorderStyle.THIN);
-            bodyStyle.setBorderLeft(BorderStyle.THIN);
-            bodyStyle.setBorderRight(BorderStyle.THIN);
-
-            Row titleRow = guidelineSheet.createRow(0);
-            titleRow.setHeightInPoints(26);
-            Cell titleCellA = titleRow.createCell(0);
-            Cell titleCellB = titleRow.createCell(1);
-            titleCellA.setCellValue("VALIDATION STAGE");
-            titleCellB.setCellValue("STAGE REQUIREMENTS & COLUMN-WISE FORMAT DETAILS");
-            titleCellA.setCellStyle(headerStyle);
-            titleCellB.setCellStyle(headerStyle);
-
-            Row stage1Row = guidelineSheet.createRow(1);
-            stage1Row.setHeightInPoints(180);
-
-            Cell s1Title = stage1Row.createCell(0);
-            s1Title.setCellValue("Stage 1: Format Validation\n(Pre-Database Check)");
-            s1Title.setCellStyle(bodyStyle);
-
-            String stage1Text =
-                    " • Branch* - Mandatory. numeric branch code identifier (2char to 5-char, e.g., '10301').\n\n" +
-                            " • Currency* - Mandatory.  Standard 3-letter alphabetic ISO code (e.g., 'INR', 'USD').\n\n" +
-                            " • CGL* - Mandatory. Core General Ledger identifier. Exactly a 10-digits.\n\n" +
-                            " • Amount* - Mandatory. Numeric layout. Valid non-zero amount. No commas or text max(16 digits and 4 decimal) (e.g., '55000.00').\n\n" +
-                            "  in order to enter numeric value exceeding 15 digits use ' before the number add this special case\n\n" +
-                            " • Type* - Mandatory. 'Dr' (Debit) or 'Cr' (Credit).\n\n" +
-                            " • Product Code - Optional. Alphanumeric string. Max 8 characters length.\n\n" +
-                            " • Remarks* - Mandatory. Text for business narration. Min 2, Max 30 characters.";
-
-            XSSFRichTextString richText = new XSSFRichTextString(stage1Text);
-            applyHighlighting(richText, stage1Text, "Mandatory", boldRed);
-            applyHighlighting(richText, stage1Text, "Optional", boldGreen);
-            applyHighlighting(richText, stage1Text, "Branch*", boldBlue);
-            applyHighlighting(richText, stage1Text, "Currency*", boldBlue);
-            applyHighlighting(richText, stage1Text, "CGL*", boldBlue);
-            applyHighlighting(richText, stage1Text, "Amount*", boldBlue);
-            applyHighlighting(richText, stage1Text, "Type*", boldBlue);
-            applyHighlighting(richText, stage1Text, "Product Code", boldBlue);
-            applyHighlighting(richText, stage1Text, "Remarks*", boldBlue);
-
-            Cell s1Desc = stage1Row.createCell(1);
-            s1Desc.setCellValue(richText);
-            s1Desc.setCellStyle(bodyStyle);
-
-            Row stage2Row = guidelineSheet.createRow(2);
-            stage2Row.setHeightInPoints(40);
-            createStyledCell(stage2Row, 0, "Stage 2: Database Integrity Check", bodyStyle);
-            createStyledCell(stage2Row, 1, "Cross-references record fields against active system reference masters. Validates that the requested Branch Code, Currency Identifier, and CGL exist and are active in the database.", bodyStyle);
-
-            Row stage3Row = guidelineSheet.createRow(3);
-            stage3Row.setHeightInPoints(40);
-            createStyledCell(stage3Row, 0, "Stage 3: Balance Verification", bodyStyle);
-            createStyledCell(stage3Row, 1, "Applies balanced ledger control rules. Aggregates values row-by-row ensuring total active Debits equal total Credits exactly prior to allowing final scheduling submission.", bodyStyle);
-
-
-            return bos.toByteArray();
-        }
-    }
-
-    private void applyHighlighting(XSSFRichTextString richText, String fullText, String targetWord, Font font) {
-        int index = 0;
-        while ((index = fullText.indexOf(targetWord, index)) != -1) {
-            richText.applyFont(index, index + targetWord.length(), font);
-            index += targetWord.length();
-        }
-    }
-
-    private void createStyledCell(Row row, int column, String value, CellStyle style) {
-        Cell cell = row.createCell(column);
-        cell.setCellValue(value);
-        cell.setCellStyle(style);
-    }
-}
-
-this are files
-
-    private void validateSystemColumns(ExcelRowData d, String c0, String cDate, String cYear, String cMonth, String c11, String c12, String c13, LocalDate postingDate) {
-        if (!"01".equals(c0)) d.formatErrors.add("Site must be '01'.");
-
-        try {
-            if (cDate == null || cDate.trim().length() != 8) {
-                d.formatErrors.add("Invalid date format. Expected: ddMMyyyy.");
-            } else {
-                LocalDate parsedDate = LocalDate.parse(cDate.trim(), SYSTEM_DATE_FMT);
-
-                if (!parsedDate.equals(postingDate)) d.formatErrors.add("Date does not match the current posting date.");
-
-                String expectedYear = (parsedDate.getMonthValue() >= 4) ? String.valueOf(parsedDate.getYear()) : String.valueOf(parsedDate.getYear() - 1);
-                String expectedMonth = String.format("%02d", (parsedDate.getMonthValue() >= 4) ? (parsedDate.getMonthValue() - 3) : (parsedDate.getMonthValue() + 9));
-
-                if (cYear == null || !cYear.trim().equals(expectedYear)) d.formatErrors.add("Invalid financial year. Expected: " + expectedYear);
-                if (cMonth == null || !cMonth.trim().equals(expectedMonth)) d.formatErrors.add("Invalid financial month. Expected: " + expectedMonth);
-            }
-        } catch (DateTimeParseException e) {
-            d.formatErrors.add("Invalid calendar date.");
-        }
-
-        if (c11 == null || !"B".equalsIgnoreCase(c11.trim())) d.formatErrors.add("Column 12 must be 'B'.");
-        if (c12 == null || !"C".equalsIgnoreCase(c12.trim())) d.formatErrors.add("Column 13 must be 'C'.");
-        if (c13 == null || !"D".equalsIgnoreCase(c13.trim())) d.formatErrors.add("Column 14 must be 'D'.");
-    }
-
-
-
-    private synchronized void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) {
-        // 1. Always pull the freshest state from Redis to avoid "Stale Object" overwrites
-        BulkUploadStateDto state = getStatusFromRedis(requestId);
-        if (state == null) {
-            state = new BulkUploadStateDto();
-            state.setRequestId(requestId);
-        }
-
-        // 2. Apply the update (e.g., changing status, incrementing counts, or setting total rows)
-        updater.accept(state);
-
-        // 3. Persist the updated object back to Redis immediately
-        saveStatusToRedis(requestId, state);
-    }
-
-
-
-    /**
-     * Utility to quickly create a cell with a string value and style.
-     */
-    private void createStyledCell(Row row, int column, String value, CellStyle style) {
-        Cell cell = row.createCell(column);
-        cell.setCellValue(value);
-        cell.setCellStyle(style);
-    }
-
-
-
-    private boolean isRowEmpty(Row r) {
-        if (r == null) return true;
-        for (int c = r.getFirstCellNum(); c < r.getLastCellNum(); c++)
-            if (r.getCell(c) != null && r.getCell(c).getCellType() != CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false;
-        return true;
-    }
-
-
-
-    private static class ParsingResult {
-        List<ExcelRowData> rows; boolean hasProductColumn;
-        public ParsingResult(List<ExcelRowData> rows, boolean hasProductColumn) { this.rows = rows; this.hasProductColumn = hasProductColumn; }
-    }
-
-
-
-
-}
-
-
-this file have multiple errors
-Incompatible types. Found: 'ParsingResult', required: 'com.fincore.VoucherService.Service.validation.VoucherBulkValidationService.ParsingResult'
-'runFormatCheck(java.util.List<VoucherBulkValidationService.ExcelRowData>)' in 'com.fincore.VoucherService.Service.validation.VoucherRuleValidator' cannot be applied to '(java.util.List<com.fincore.VoucherService.Dto.ExcelRowData>)'
-'runDbCheck(java.util.List<VoucherBulkValidationService.ExcelRowData>)' in 'com.fincore.VoucherService.Service.validation.VoucherRuleValidator' cannot be applied to '(java.util.List<com.fincore.VoucherService.Dto.ExcelRowData>)'
-'runBalanceCheck(java.util.List<VoucherBulkValidationService.ExcelRowData>)' in 'com.fincore.VoucherService.Service.validation.VoucherRuleValidator' cannot be applied to '(java.util.List<com.fincore.VoucherService.Dto.ExcelRowData>)'
-Cannot resolve method 'saveStatusToRedis' in 'VoucherBulkValidationService'
-
-
-package com.fincore.VoucherService.Service.validation;
-
-
-import com.fincore.VoucherService.Service.ValidationMasterService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-
-import java.math.BigDecimal;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
-
-@Service
-public class VoucherRuleValidator {
-
-    @Autowired
-    private final ValidationMasterService validationMasterService;
-
-    public VoucherRuleValidator(ValidationMasterService validationMasterService) {
-        this.validationMasterService = validationMasterService;
-    }
-
-
-    // ==================================================================================
-    // 4. VALIDATION STAGES
-    // ==================================================================================
-
-    public  void runFormatCheck(List<VoucherBulkValidationService.ExcelRowData> rows) {
-        rows.parallelStream().forEach(d -> {
-
-            // 1. Safely grab the value, remove all spaces, and make it uppercase
-            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
-
-            // 2. Check the cleaned value and instantly standardize it to full words
-            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
-                d.txnType = "Credit";
-            }
-            else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
-                d.txnType = "Debit";
-            }
-            else {
-                synchronized(d.formatErrors) {
-                    d.formatErrors.add("Transaction type must be 'CR' or 'DR' (Case insensitive).");
-                }
-            }
-
-
-            // Amount
-            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Amount must be greater than 0."); }
-            } else {
-                if (d.amount.precision() > 20 || d.amount.scale() > 4) {
-                    synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum digits or decimal places."); }
-                } else if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) {
-                    synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum digits or decimal places."); }
-                }
-            }
-
-
-            // Product Code
-            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Product code must be up to 8 digits or left blank."); }
-            }
-
-            // Remarks (Alphanumeric and single spaces only, matching frontend regex)
-            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Remarks must be 2-30 characters."); }
-            } else if (!d.remarks.matches("^[a-zA-Z0-9 ]+$") || d.remarks.contains("  ")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Only alphabets and numbers are allowed."); }
-            }
-
-            // Currency
-            if (d.currency == null || d.currency.length() != 3) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Currency code must be exactly 3 characters."); }
-            }
-
-            // CGL (Strictly 10 digits)
-            if (d.cgl == null || d.cgl.isEmpty()) {
-                synchronized(d.formatErrors) { d.formatErrors.add("CGL is mandatory."); }
-            } else if (!d.cgl.matches("^[0-9]{10}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("CGL must be exactly 10 digits."); }
-            }
-
-            // Branch (Strictly 5 alphanumeric characters)
-            if (d.branch == null || d.branch.trim().isEmpty()) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Branch code is mandatory."); }
-            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters."); }
-            }
-        });
-    }
-
-    public  void runDbCheck(List<VoucherBulkValidationService.ExcelRowData> rows) {
-        Set<String> validBranches = validationMasterService.getAllActiveBranches();
-        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
-        Set<String> validCgls = validationMasterService.getAllActiveCgls();
-
-        rows.parallelStream().forEach(d -> {
-            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
-                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
-            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
-                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
-            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
-                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
-        });
-    }
-
-    /**
-     * Rule 5: Balance Integrity Logic.
-     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
-     * on parallel streams, preventing floating-point drift in large batches.
-     */
-    public  void runBalanceCheck(List<VoucherBulkValidationService.ExcelRowData> rows) {
-        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
-
-        // Pass 1: Aggregate totals and check for presence
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            // Track Debit/Credit Presence per Branch
-            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
-            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
-
-            // Calculate Balance Groupings
-            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
-            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-
-            // Thread-safe BigDecimal addition without scaling or overflow risks
-            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
-                    .updateAndGet(curr -> curr.add(finalVal));
-        });
-
-        // Pass 2: Apply the simple, generic error messages to the rows
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
-            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
-
-            synchronized (d.balErrors) {
-                // 1. Debit/Credit Presence Check
-                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
-                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
-                }
-
-                // 2. Balance Math Check (Using BigDecimal's compareTo)
-                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
-                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
-                }
-            }
-        });
-    }
-}
-Cannot resolve symbol 'ExcelRowData'
-
-Cannot resolve symbol 'txnType'
-Cannot resolve symbol 'formatErrors'
-Cannot resolve symbol 'formatErrors'
-Cannot resolve symbol 'amount'
-Cannot resolve symbol 'currency'
-Cannot resolve symbol 'productCode'
-Cannot resolve symbol 'remarks'
-Cannot resolve symbol 'cgl'
-Cannot resolve symbol 'branch'
-Cannot resolve symbol 'ExcelRowData'
-Cannot resolve symbol 'balErrors'
-
-many errors
-
-
+```
+### 4. Clean up VoucherBulkValidationService.java
+In your VoucherBulkValidationService, scroll to the very bottom of the file. You will see these methods leftover from before the refactoring:
+ * validateSystemColumns
+ * updateState
+ * createStyledCell
+ * isRowEmpty
+ * class ParsingResult
+**Delete them entirely from VoucherBulkValidationService.** They are causing conflicts because they already exist in your new helper files.
+Also, inside VoucherBulkValidationService.processAsync, make sure you are calling stateManager.updateState(...) instead of just updateState(...).
+Once you copy these fixed classes over, the red error lines for ExcelRowData and ParsingResult will disappear completely. You are right on the finish line!
