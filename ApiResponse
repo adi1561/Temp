@@ -1,24 +1,25 @@
-To make your backend completely bulletproof, we will add the exact same **Branch-Currency-Memo/Normal** balancing logic to your manual entry endpoint.
-Because your frontend already sends Debits as positive numbers and Credits as negative numbers, the math to validate this is actually incredibly elegant: **If we add all the amounts together for a specific group, the final sum must be exactly zero.**
-Open **VoucherCommandService.java** and locate the createBatchRequest method. We are going to replace the simple totalDebit / totalCredit trackers with a strict map-based balancing engine.
-### The Fix
-**Find this exact block inside createBatchRequest (around line 180):**
-```java
-        List<JournalRequest> entities = new ArrayList<>();
-        BigDecimal totalDebit = BigDecimal.ZERO;
-        BigDecimal totalCredit = BigDecimal.ZERO;
-        int rowIndex = 1;
+ @Transactional
+    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole)  {
+        String batchId = sequenceService.getNextBatchId();
+        String journalPrefix = sequenceService.getNextJournalIdPrefix();
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        // --- NEW: STRICT VID DUPLICATION CHECK ---
+        if (dto.getVid() == null || dto.getVid().trim().isEmpty()) {
+            throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
+        }
 
-        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
-            JournalRequest entity = new JournalRequest();
-            entity.setRequestStatus(RequestStatus.PENDING);
-            entity.setRequestDate(LocalDateTime.now());
-            // ... (rest of the entity mapping)
 
-```
-**Replace everything from List<JournalRequest> entities... down to the end of the for loop with this updated version:**
-```java
-        List<JournalRequest> entities = new ArrayList<>();
+        // Checks if the VID is already used by an active/pending batch, ignoring rejected ones
+        Integer vidExists = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')",
+                Integer.class, dto.getVid()
+        );
+
+        if (vidExists != null && vidExists > 0) {
+            throw new CustomExceptions.InvalidDataException("Voucher ID (" + dto.getVid() + ") is currently in use by an active batch. Please select a fresh VID.");
+        }
+
+         List<JournalRequest> entities = new ArrayList<>();
         Map<String, BigDecimal> balancingMap = new java.util.HashMap<>();
         int rowIndex = 1;
 
@@ -33,7 +34,7 @@ Open **VoucherCommandService.java** and locate the createBatchRequest method. We
             entity.setJournalId(journalId);
             entity.setBranchCode(row.getBranch());
             entity.setCurrency(row.getCurrency());
-            
+
             String cgl = row.getCgl() != null ? row.getCgl().trim() : "";
             entity.setCgl(cgl);
 
@@ -68,8 +69,110 @@ Open **VoucherCommandService.java** and locate the createBatchRequest method. We
             }
         }
 
-```
-### Why this is the ultimate safeguard:
-If a hacker or a broken third-party system bypasses your React UI and sends a raw API request directly to /api/voucher/create-batch with mismatched debits and credits, the Java Service will instantly intercept it.
-It calculates the balances internally, realizes the sum for 10301 - INR - NORMAL isn't 0.00, and throws an InvalidDataException.
-Because we already updated your Controller to catch this exact exception in the previous steps, the API will safely reject the payload with a clean 400 Bad Request and your exact error message!
+            entity.setCreatorId(creatorId);
+            entity.setBatchId(batchId);
+
+            String journalId = journalPrefix + "-" + rowIndex;
+            entity.setJournalId(journalId);
+            entity.setBranchCode(row.getBranch());
+            entity.setCurrency(row.getCurrency());
+            entity.setCgl(row.getCgl());
+
+            BigDecimal amount = row.getAmount();
+
+            if (amount.compareTo(BigDecimal.ZERO) == 0) {
+                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
+            }
+            entity.setAmount(amount);
+            entity.setNarration(row.getRemarks());
+            entity.setProductCode(row.getProductType());
+
+            if (amount.compareTo(BigDecimal.ZERO) < 0) {
+                totalCredit = totalCredit.add(amount.abs());
+            } else {
+                totalDebit = totalDebit.add(amount.abs());
+            }
+
+            entities.add(entity);
+            rowIndex++;
+        }
+
+        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+
+        // ==========================================
+        // 2. DYNAMIC WORKFLOW INITIALIZATION (FOREIGN KEY BASED)
+        // ==========================================
+        String workflowCode;
+        try {
+            workflowCode = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                    String.class, creatorRole
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
+        }
+
+
+
+        // --- NEW: FETCH BOTH WORKFLOW_ID AND ALLOWED_ROLE_ID FOR STEP 2 ---
+        Map<String, Object> step2Info;
+        try {
+            step2Info = jdbcTemplate.queryForMap(
+                    "SELECT WORKFLOW_ID, ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
+                    workflowCode
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
+        }
+
+        Long firstApproverWorkflowId = ((Number) step2Info.get("WORKFLOW_ID")).longValue();
+        String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
+
+        VoucherPosting posting = new VoucherPosting();
+        posting.setBatchId(batchId);
+        posting.setVidFk(dto.getVid());
+        posting.setCreatedBy(creatorId);
+        posting.setPendingAt(firstApproverWorkflowId);
+        posting.setBatchStatus("P"); // 'P' = Pending
+        posting.setWorkflowCode(workflowCode);
+        posting.setCommonBatchRemarks(dto.getCommonBatchRemarks());
+        posting.setCreatorRole(creatorRole);
+
+        if (dto.getRows() != null) {
+            posting.setRecordsCount((long) dto.getRows().size());
+        }
+
+        // Handle Maker Scheduling
+        if (dto.getScheduledTime() != null) {
+            workflowEngine.validateScheduledTime(dto.getScheduledTime());
+            posting.setIS_EXECUTION_SCHEDULED("YES");
+            posting.setScheduledTime(dto.getScheduledTime());
+            posting.setIsScheduleOverride("NO");
+        } else {
+            posting.setIS_EXECUTION_SCHEDULED("NO");
+            posting.setIsScheduleOverride("NO");
+        }
+
+        voucherPostingRepository.save(posting);
+
+        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under " + workflowCode);
+
+        // ==========================================
+        // SMART NOTIFICATION ROUTING
+        // ==========================================
+        // 1. Notify the Maker
+//        notificationWriterService.createBatchSubmissionNotification(batchId, creatorId);
+
+        // 2. Notify the Checkers (Strictly to TARGET_ROLE)
+        notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId);
+
+        // ---> TRIGGER 1: LOCK THE VID AS USED <---
+        if (dto.getVid() != null && !dto.getVid().isEmpty()) {
+            workflowEngine.updateVidStatus(dto.getVid(), VoucherStatus.USED);
+        }
+
+        workflowEngine.logWorkflowAction(batchId, dto.getVid(), "Submitted", creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
+
+        return savedEntities;
+
+    }
