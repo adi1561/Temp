@@ -1,61 +1,25 @@
-I see exactly what is happening. The issue is caused by how the backend sends the status text to the frontend.
-In your backend API, if a batch is pending at the Maker's first stage, the currentStatus is sent as **"Verification"** (the name of the stage) instead of the word **"PENDING"**.
-Because your frontend was checking viewingBatchState.toUpperCase() === "PENDING", it evaluated "VERIFICATION" === "PENDING", which is **FALSE**. This is why the button completely hid itself for your brand-new requests!
-To fix this—and absolutely guarantee it never shows up for an approval batch—we will stop relying on the stage name and instead capture the raw database flag (row.batchStatus, which is strictly "P"). We will also add a cross-check with workflowHistory.length to mathematically guarantee no checker has acted on it.
-Here are the **3 exact replacements** to make in **VoucherPostingStatus.js**:
-### 1. Add a State Variable for Raw Status
-Find your state variables (around line 345) and add viewingBatchRawStatus right below viewingBatchOrder.
-**Replace this:**
-```javascript
-  const [dbRoleMap, setDbRoleMap] = useState({});
-  const [viewingBatchOrder, setViewingBatchOrder] = useState(1);
+To remove the strict 2-decimal rule for INR and allow up to 4 decimal places for *all* currencies universally, you just need to delete that else if condition.
+Open your **VoucherRuleValidator.java** file and locate the runFormatCheck method.
+**Find this exact block of code:**
+```java
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Amount must be greater than 0."); }
+            } else {
+                if (d.amount.precision() > 20 || d.amount.scale() > 4) {
+                    synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum digits or decimal places."); }
+                } else if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) {
+                    synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum digits or decimal places."); }
+                }
+            }
 
 ```
-**With this:**
-```javascript
-  const [dbRoleMap, setDbRoleMap] = useState({});
-  const [viewingBatchOrder, setViewingBatchOrder] = useState(1);
-  const [viewingBatchRawStatus, setViewingBatchRawStatus] = useState(""); // FIX: Added to track the pure database flag ('P')
+**Replace it with this:**
+```java
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Amount must be greater than 0."); }
+            } else if (d.amount.precision() > 20 || d.amount.scale() > 4) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum 16 digits or 4 decimal places."); }
+            }
 
 ```
-### 2. Capture the Raw Status when Opening the Modal
-Find the handleOpenViewModal function (around line 430) and add the raw status capture line.
-**Replace the top of the function with this:**
-```javascript
-  const handleOpenViewModal = async (row) => {
-    setViewingBatchId(row.batchId);
-    setViewingBatchCreatorId(row.creatorId);
-    setViewingBatchState(row.currentStatus || "");
-    setViewingBatchRawStatus(row.batchStatus || ""); // FIX: Capture the raw 'P', 'R', 'C', or 'A' flag
-    setViewingBatchRequestDate(row.requestDate);
-    setViewingBatchRequestCount(row.requestCount || 0);
-    setViewingBatchOrder(row.currentOrder || 1);
-    setIsViewModalOpen(true);
-    setIsFetchingSteps(true);
-    setIsFetchingVid(true);
-
-```
-### 3. Update the Delete Button Logic
-Find the isBatchDeletable variable (around line 495) and replace it with this bulletproof logic.
-**Replace this:**
-```javascript
-  const isBatchDeletable =
-    (viewingBatchState?.trim().toUpperCase() === "PENDING" ||
-     viewingBatchState?.trim().toUpperCase() === "P") &&
-    viewingBatchOrder === 2;
-
-```
-**With this highly secure check:**
-```javascript
-  // FIX: Checks the pure 'P' flag, ensures Order is 2, waits for history to load, and ensures NO checker has acted yet.
-  const isBatchDeletable =
-    viewingBatchRawStatus === "P" &&
-    Number(viewingBatchOrder) === 2 &&
-    !isFetchingSteps &&
-    workflowHistory.length <= 1; 
-
-```
-### Why this permanently fixes the problem:
- 1. It uses viewingBatchRawStatus === "P", completely bypassing the issue where the stage was named "Verification".
- 2. workflowHistory.length <= 1 means the moment any Checker approves or rejects it (which adds a 2nd row to the audit history), the button is mathematically forced to disappear.
- 3. !isFetchingSteps prevents the button from "flashing" on the screen for a millisecond while the history is loading from the database.
+This cleaner version will now blindly accept up to 4 decimal places (e.g., 55000.1234) for every single currency code without throwing an error.
