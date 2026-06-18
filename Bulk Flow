@@ -1,424 +1,82 @@
-When you start interviewing at product-based companies, this exact pattern—isolating database transactions for high-throughput batching without locking up the user interface—is what they look for in a senior backend engineer.
+I have analyzed your code across the different layers to verify the column sequence.
 
-We are going to build this from the bottom up. Before we can orchestrate the background threads, we need a bulletproof database wrapper.
+You want to enforce the exact sequence:
 
-Here are the first two core files for your new `com.fincore.VoucherService.Service.core` package.
+1. Branch
+2. Currency
+3. CGL
+4. Amount
+5. Type
+6. **Remarks**
+7. **Product Code**
 
-### 1. `BulkDatabaseManager.java` (The Safe Wrapper)
+Currently, your application has a **mismatch**. Your Excel Parser and your Error Report are aligned with your desired sequence, but your **Excel Template Download** and your **Batch Download** are in the wrong order.
 
-When saving 50,000 rows, if row 49,999 triggers a database error, standard Spring Boot `@Transactional` will roll back the entire 50,000 rows, wasting massive compute resources.
+Here is the exact breakdown and the code you need to fix it.
 
-The secret weapon here is **`Propagation.REQUIRES_NEW`**. This forces Spring to pause the main transaction, open a brand new connection just for the current chunk (e.g., 5,000 rows), commit it, and close it. If chunk 4 fails, chunks 1, 2, and 3 are already safely in the database.
+---
+
+### 1. The Excel Input Parser (Correct)
+
+In `ExcelStreamingParser.java`, the system correctly expects `Remarks` at index 5 and `Product Code` at index 6.
+**Status:** ✅ Good. No changes needed.
+
+### 2. The Error Report Download (Correct)
+
+In `ValidationReportGenerator.generateErrorExcelFast()`, the headers and the row data are correctly mapped to print `Remarks` before `Product Code`.
+**Status:** ✅ Good. No changes needed.
+
+---
+
+### 3. The Downloaded Template (Incorrect)
+
+In `ValidationReportGenerator.generateExcelTemplateWithGuidelines()`, the headers array and the sample rows generate `Product Code` first, followed by `Remarks`. Because the parser expects the opposite, if a user downloads this template and fills it out, **it will fail validation or insert data into the wrong columns.**
+
+**How to Fix It (`ValidationReportGenerator.java`):**
+Find the `generateExcelTemplateWithGuidelines()` method and update the headers and sample row assignments to swap indexes 5 and 6.
 
 ```java
-package com.fincore.VoucherService.Service.core;
+// 1. Fix the Headers Array 
+String[] headers = {"Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*", "Product Code"};
 
-import com.fincore.VoucherService.Dto.validation.ExcelRowData;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.jdbc.core.BatchPreparedStatementSetter;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
+// ... further down ...
 
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
-import java.util.List;
+// 2. Fix Sample Row 1
+createStyledCell(sampleRow1, 4, "Dr", sampleStyle);
+createStyledCell(sampleRow1, 5, "Sample Remarks", sampleStyle); // Moved Remarks to Index 5
+createStyledCell(sampleRow1, 6, "PRD099", sampleStyle);         // Moved Product Code to Index 6
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class BulkDatabaseManager {
-
-    private final JdbcTemplate jdbcTemplate;
-
-    // REQUIRES_NEW guarantees this chunk commits independently of the others
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void saveChunk(String batchId, List<ExcelRowData> chunk, String userId) {
-        
-        // Note: Update this SQL string to match your exact VOUCHER_POSTING table columns
-        String sql = "INSERT INTO VOUCHER_POSTING (BATCH_ID, BRANCH, CURRENCY, CGL, AMOUNT, TXN_TYPE, REMARKS, PRODUCT_CODE, CREATED_BY) " +
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-
-        jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-            @Override
-            public void setValues(PreparedStatement ps, int i) throws SQLException {
-                ExcelRowData row = chunk.get(i);
-                ps.setString(1, batchId);
-                ps.setString(2, row.branch);
-                ps.setString(3, row.currency);
-                ps.setString(4, row.cgl);
-                ps.setBigDecimal(5, row.amount);
-                ps.setString(6, row.txnType);
-                ps.setString(7, row.remarks);
-                ps.setString(8, row.productCode);
-                ps.setString(9, userId);
-                // Add any extra system columns (sys_date, sys_site) here if needed
-            }
-
-            @Override
-            public int getBatchSize() {
-                return chunk.size();
-            }
-        });
-        
-        log.info("DB_CHUNK_COMMITTED | Batch: {} | Rows: {}", batchId, chunk.size());
-    }
-}
+// 3. Fix Sample Row 2
+createStyledCell(sampleRow2, 4, "Cr", sampleStyle);
+createStyledCell(sampleRow2, 5, "Sample Remarks", sampleStyle); // Moved Remarks to Index 5
+createStyledCell(sampleRow2, 6, "PRD099", sampleStyle);         // Moved Product Code to Index 6
 
 ```
 
-### 2. `VoucherCommandService.java` (The Traffic Cop)
+---
 
-This file handles the immediate synchronous request from your Controller. It quickly verifies the Redis state, reserves a Batch ID in the database, kicks off the async process, and immediately frees up the user's browser.
+### 4. The Batch Detail Download (Incorrect)
 
-```java
-package com.fincore.VoucherService.Service.core;
+In `VoucherQueryService.generateBatchExcel()`, when a user downloads an existing batch, the code generates `Product Code` before `Remarks`.
 
-import com.fincore.VoucherService.Models.RequestVoucher;
-import com.fincore.VoucherService.Repository.RequestVoucherRepository;
-import com.fincore.VoucherService.Service.validation.ValidationStateManager;
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherCommandService {
-
-    private final ValidationStateManager stateManager;
-    private final RequestVoucherRepository requestVoucherRepository;
-    
-    // We will build this AsyncWorker in the very next step
-    private final VoucherAsyncWorker asyncWorker; 
-
-    @Transactional
-    public String createBatchFromCacheAsync(String requestId, String userId, String batchDescription) {
-        
-        // 1. Verify the data is still sitting in Redis and passed validation
-        var state = stateManager.getStatusFromRedis(requestId);
-        if (state == null || !"SUCCESS".equals(state.getStatus())) {
-            throw new CustomExceptions.CacheExpiredException("Validation data expired or invalid. Please re-upload.");
-        }
-
-        // 2. Create the Master Batch Record in the DB (In "PROCESSING" state)
-        RequestVoucher masterRecord = new RequestVoucher();
-        
-        // Generate your specific Batch ID (Update this logic if you use a specific sequence generator)
-        String batchId = "BATCH_" + System.currentTimeMillis(); 
-        
-        masterRecord.setBatchId(batchId);
-        masterRecord.setCreatedBy(userId);
-        masterRecord.setDescription(batchDescription);
-        masterRecord.setStatus("PROCESSING");
-        masterRecord.setTotalRows(state.getTotalRows());
-        
-        requestVoucherRepository.save(masterRecord);
-        log.info("BATCH_INITIATED | ReqID: {} | BatchID: {}", requestId, batchId);
-
-        // 3. Hand off the heavy lifting to the background thread pool
-        asyncWorker.executeAsyncBatchProcessing(requestId, batchId, userId);
-
-        // 4. Immediately return the Batch ID to the Controller so the UI returns an HTTP 202
-        return batchId;
-    }
-}
-
-```
-
-### Next Steps
-
-Right now, `VoucherCommandService` will show a red line under `VoucherAsyncWorker` because we haven't built it yet.
-
-The `VoucherAsyncWorker` is the engine that pulls the compressed data out of Redis, cuts it into chunks, and feeds it to the `BulkDatabaseManager` while updating the progress bar.
-
-Are you ready to build the background worker to wire these two together?
-
-
-
-
-This is it. The final piece of the core processing engine.
-
-You have your `VoucherCommandService` ready to take the initial request, and you have your `BulkDatabaseManager` ready to safely commit chunks to Oracle.
-
-Now, we build the engine that connects them: **`VoucherAsyncWorker.java`**.
-
-This file runs entirely in the background. It is responsible for pulling the compressed, validated data out of Redis, slicing it into manageable chunks, feeding it to the database manager, and updating the batch status so the user can see progress.
-
-### 3. `VoucherAsyncWorker.java` (The Background Engine)
-
-Create this file in your `Service.core` package.
+**How to Fix It (`VoucherQueryService.java`):**
+Find the `generateBatchExcel()` method and swap the column generation for indexes 5 and 6.
 
 ```java
-package com.fincore.VoucherService.Service.core;
+// 1. Fix the Headers Array
+String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
 
-import com.fincore.VoucherService.Dto.validation.ExcelRowData;
-import com.fincore.VoucherService.Models.RequestVoucher;
-import com.fincore.VoucherService.Repository.RequestVoucherRepository;
-import com.fincore.VoucherService.Service.validation.ValidationStateManager;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.slf4j.MDC;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
+// ... inside the loop ...
 
-import java.util.List;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherAsyncWorker {
-
-    private final ValidationStateManager stateManager;
-    private final BulkDatabaseManager bulkDatabaseManager;
-    private final RequestVoucherRepository requestVoucherRepository;
-    
-    // Chunk size dictates how many rows are sent to the DB in a single transaction.
-    // 5,000 is usually the sweet spot for Oracle JDBC batching.
-    private static final int DB_CHUNK_SIZE = 5000;
-
-    @Async("bulkExecutor")
-    public void executeAsyncBatchProcessing(String requestId, String batchId, String userId) {
-        MDC.put("requestId", requestId);
-        MDC.put("batchId", batchId);
-        log.info("ASYNC_WORKER_STARTED | Pulling data from cache for Batch: {}", batchId);
-
-        try {
-            // 1. Pull the fully validated dataset from Redis
-            List<ExcelRowData> validRows = stateManager.getValidRowsFromCache(requestId);
-            int totalRows = validRows.size();
-
-            // 2. Process in Chunks
-            int processedCount = 0;
-            for (int i = 0; i < totalRows; i += DB_CHUNK_SIZE) {
-                int end = Math.min(i + DB_CHUNK_SIZE, totalRows);
-                List<ExcelRowData> chunk = validRows.subList(i, end);
-
-                // Send the chunk to the safe Database Manager
-                bulkDatabaseManager.saveChunk(batchId, chunk, userId);
-                
-                processedCount += chunk.size();
-                updateBatchProgress(batchId, processedCount, totalRows);
-            }
-
-            // 3. Mark the Batch as completely saved and ready for the Checker
-            finalizeBatchSuccess(batchId);
-
-            // 4. (Optional but recommended) Trigger your workflow engine here 
-            // to log that the Maker has submitted the batch.
-
-            log.info("ASYNC_WORKER_COMPLETED | Batch: {} | Total Rows: {}", batchId, totalRows);
-
-        } catch (Exception e) {
-            log.error("ASYNC_WORKER_FAILED | Batch: {} | Error: {}", batchId, e.getMessage(), e);
-            handleBatchFailure(batchId, "Database insertion failed: " + e.getMessage());
-        } finally {
-            MDC.clear();
-        }
-    }
-
-    private void updateBatchProgress(String batchId, int processedRows, int totalRows) {
-        requestVoucherRepository.findById(batchId).ifPresent(batch -> {
-            // If you have a 'processedRows' column, update it here so the UI can show a progress bar
-            // batch.setProcessedRows(processedRows); 
-            requestVoucherRepository.save(batch);
-            log.debug("PROGRESS_UPDATE | Batch: {} | {}/{} rows committed.", batchId, processedRows, totalRows);
-        });
-    }
-
-    private void finalizeBatchSuccess(String batchId) {
-        requestVoucherRepository.findById(batchId).ifPresent(batch -> {
-            batch.setStatus("PENDING_CHECKER_APPROVAL");
-            requestVoucherRepository.save(batch);
-        });
-    }
-
-    private void handleBatchFailure(String batchId, String reason) {
-        requestVoucherRepository.findById(batchId).ifPresent(batch -> {
-            batch.setStatus("FAILED");
-            // If you have a failure reason column, map it here
-            // batch.setFailureReason(reason);
-            requestVoucherRepository.save(batch);
-        });
-    }
+// 2. Fix the Row population
+row.createCell(0).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
+row.createCell(1).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
+row.createCell(2).setCellValue(req.getCgl() != null ? req.getCgl() : "");
+if (req.getAmount() != null) {
+    row.createCell(3).setCellValue(req.getAmount().abs().stripTrailingZeros().toPlainString());
+    row.createCell(4).setCellValue(req.getAmount().compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
 }
+row.createCell(5).setCellValue(req.getNarration() != null ? req.getNarration() : ""); // Moved Remarks (Narration) to Index 5
+row.createCell(6).setCellValue(req.getProductCode() != null ? req.getProductCode() : ""); // Moved Product Code to Index 6
 
 ```
-
-### The Architecture is Complete
-
-Take a step back and look at what you have just built for this Bulk Processing flow:
-
-1. **The API Layer (`VoucherActionController`):** Receives the UI click.
-2. **The Traffic Cop (`VoucherCommandService`):** Creates the database ID instantly and replies `202 Accepted`.
-3. **The Worker (`VoucherAsyncWorker`):** Runs quietly in the background, slicing the big Redis payload into chunks.
-4. **The Safe Wrapper (`BulkDatabaseManager`):** Commits each chunk in its own isolated transaction (`REQUIRES_NEW`), protecting the database from massive rollbacks.
-
-Once you paste this into your IDE, the circular dependency and the red line under `asyncWorker` in your `CommandService` will vanish.
-
-With the Validation flow and the Bulk Processing flow structurally separated, you have successfully dismantled the hardest parts of the monolith. You are now left with the Workflow/Approval logic and standard Queries.
-
-Do you want to handle the Workflow Engine next, or do you want to take a moment to run a test file through this new Bulk Processing pipeline to watch the chunking in action?
-
-
----------------------------------
-You are moving at a great pace. We have built the gates (Validation) and the engine (Bulk Processing).
-
-The next step is the **Brain** of the operation: The **Workflow & Approval Engine**.
-
-In financial applications, after a "Maker" uploads and processes 50,000 rows, a "Checker" must review and approve it. Your original service had this approval logic mixed in with everything else. We need to isolate it so that if your business requirements change (e.g., adding a second level of approval), you only have to touch one file.
-
-### 4. `VoucherWorkflowEngine.java` (The State Machine)
-
-Create this file in your `Service.core` package. Its sole responsibility is managing the lifecycle of a batch (Approve, Reject, Cancel) and maintaining the audit trail so compliance teams are happy.
-
-```java
-package com.fincore.VoucherService.Service.core;
-
-import com.fincore.VoucherService.Models.RequestVoucher;
-import com.fincore.VoucherService.Models.VoucherWorkflow;
-import com.fincore.VoucherService.Repository.RequestVoucherRepository;
-import com.fincore.VoucherService.Repository.VoucherWorkflowRepository;
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.time.LocalDateTime;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherWorkflowEngine {
-
-    private final RequestVoucherRepository requestVoucherRepository;
-    private final VoucherWorkflowRepository voucherWorkflowRepository;
-
-    @Transactional
-    public void processWorkflowAction(String batchId, String action, String userId, String remarks) {
-        log.info("WORKFLOW_ACTION | Batch: {} | Action: {} | User: {}", batchId, action, userId);
-
-        RequestVoucher batch = requestVoucherRepository.findById(batchId)
-                .orElseThrow(() -> new CustomExceptions.ResourceNotFoundException("Batch not found: " + batchId));
-
-        // 1. Authorization & State Check
-        validateActionAllowance(batch, action, userId);
-
-        // 2. Apply State Transition
-        String previousState = batch.getStatus();
-        switch (action.toUpperCase()) {
-            case "APPROVE":
-                batch.setStatus("APPROVED_READY_FOR_EXECUTION");
-                break;
-            case "REJECT":
-                batch.setStatus("REJECTED_BY_CHECKER");
-                break;
-            case "CANCEL":
-                batch.setStatus("CANCELLED_BY_MAKER");
-                break;
-            default:
-                throw new IllegalArgumentException("Unknown workflow action: " + action);
-        }
-
-        requestVoucherRepository.save(batch);
-
-        // 3. Record Audit Trail
-        logWorkflowAction(batchId, action, userId, remarks, previousState, batch.getStatus());
-    }
-
-    private void validateActionAllowance(RequestVoucher batch, String action, String userId) {
-        // Standard Maker/Checker Rule: Maker cannot approve their own batch
-        if (("APPROVE".equalsIgnoreCase(action) || "REJECT".equalsIgnoreCase(action)) 
-                && userId.equals(batch.getCreatedBy())) {
-            log.error("WORKFLOW_VIOLATION | Batch: {} | User {} attempted to approve/reject own batch", batch.getBatchId(), userId);
-            throw new IllegalStateException("Maker cannot approve or reject their own batch.");
-        }
-
-        // State machine rules
-        if ("PENDING_CHECKER_APPROVAL".equals(batch.getStatus()) && "CANCEL".equalsIgnoreCase(action)) {
-             // Let's assume a Maker can cancel before it's approved
-             if (!userId.equals(batch.getCreatedBy())) {
-                 throw new IllegalStateException("Only the Maker can cancel a pending batch.");
-             }
-        }
-    }
-
-    private void logWorkflowAction(String batchId, String action, String userId, String remarks, String oldState, String newState) {
-        VoucherWorkflow auditLog = new VoucherWorkflow();
-        auditLog.setBatchIdFk(batchId);
-        auditLog.setAction(action.toUpperCase());
-        auditLog.setActionBy(userId);
-        auditLog.setRemarks(remarks);
-        auditLog.setPreviousState(oldState);
-        auditLog.setNewState(newState);
-        auditLog.setActionAt(LocalDateTime.now());
-        
-        voucherWorkflowRepository.save(auditLog);
-    }
-}
-
-```
-
-### 5. `VoucherQueryService.java` (The Read-Only Layer)
-
-You also need a place to put all those `GET` requests that fetch data for your React UI (e.g., getting the summary of pending batches). Create this file in `Service.core`.
-
-By making this a separate file, you ensure that heavy database reads don't block the same file that does heavy database writes.
-
-```java
-package com.fincore.VoucherService.Service.core;
-
-import com.fincore.VoucherService.Models.RequestVoucher;
-import com.fincore.VoucherService.Models.VoucherWorkflow;
-import com.fincore.VoucherService.Repository.RequestVoucherRepository;
-import com.fincore.VoucherService.Repository.VoucherWorkflowRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherQueryService {
-
-    private final RequestVoucherRepository requestVoucherRepository;
-    private final VoucherWorkflowRepository voucherWorkflowRepository;
-
-    public List<RequestVoucher> getPendingBatchesForChecker() {
-        return requestVoucherRepository.findAllByStatus("PENDING_CHECKER_APPROVAL");
-    }
-
-    public List<RequestVoucher> getBatchesByMaker(String userId) {
-        return requestVoucherRepository.findAllByCreatedBy(userId);
-    }
-
-    public List<VoucherWorkflow> getWorkflowHistory(String batchId) {
-        // From your original code snippet:
-        return voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId);
-    }
-    
-    public RequestVoucher getBatchSummaryDetails(String batchId) {
-        return requestVoucherRepository.findById(batchId).orElse(null);
-    }
-}
-
-```
-
-### The Service Layer is Now 100% Refactored!
-
-Look at what you've achieved. Your massive, thousand-line "God Class" has been successfully dismantled into specific, highly readable, production-grade components:
-
-**Validation:** (`ExcelStreamingParser`, `VoucherRuleValidator`, `ValidationStateManager`, `ValidationReportGenerator`, `VoucherBulkValidationService`)
-**Core Processing:** (`BulkDatabaseManager`, `VoucherCommandService`, `VoucherAsyncWorker`, `VoucherWorkflowEngine`, `VoucherQueryService`)
-
-Because all the logic is now neatly organized into these services, **the final step is incredibly easy: Splitting the Controllers.**
-
-Instead of one giant Controller file routing everything, we just create 3 small controllers that call these new services. Are you ready to do the Controllers to finish this architecture completely?
-
