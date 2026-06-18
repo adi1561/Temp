@@ -1,52 +1,47 @@
-You are absolutely right. The backend is throwing the correct error, but your frontend's catch block in handleStartValidation is currently swallowing it.
-When a standard HTTP request fails (like an Axios or Fetch call), the specific error message sent by Spring Boot is usually nested inside err.response.data.message. Because your catch block was only looking at err.message, it defaulted to the generic network error.
-You just need to update the catch block inside your handleStartValidation function to intelligently look for the backend message first.
-Find your **handleStartValidation** function (around line 255) and replace the entire function with this updated version:
-```javascript
-  const handleStartValidation = async () => {
-    if (!selectedDate || !selectedDate.isValid() || !file) {
-      showSnackBar("Please select a valid date and file.", "warning");
-      return;
+You have great debugging instincts. If the frontend is correctly looking for the error but still getting a generic message, **the backend's Global Exception Handler is swallowing our specific message and returning a generic one.**
+When VoucherBulkValidationService throws the FileProcessingException("File name length cannot exceed 20 characters."), it bubbles up to your Controller. If the Controller doesn't handle it, Spring Boot sends it to your Global @ControllerAdvice, which is likely overriding our specific message with the generic *"Failed to process the uploaded file."*
+We can easily fix this by catching the exception explicitly inside the **VoucherBulkUploadController** and returning it directly to the frontend as a clean JSON object, bypassing the generic global handler.
+Open **VoucherBulkUploadController.java** and replace your initiateValidation method with this updated version:
+```java
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> initiateValidation(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("postingDate") @DateTimeFormat(pattern = "dd/MM/yyyy") LocalDate postingDate,
+            HttpServletRequest request) {
+
+        if (file == null || file.isEmpty()) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", "File is missing or empty."));
+        }
+
+        try {
+            String reqId = voucherBulkValidationService.initiateValidation(file, postingDate);
+            
+            HttpHeaders headers = new HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.setPragma("no-cache"); 
+            headers.setExpires(0L); 
+            headers.set("X-Content-Type-Options", "nosniff"); 
+            headers.set("Content-Security-Policy", "default-src 'self'");
+            
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .body(Map.of("status", "QUEUED", "requestId", reqId));
+
+        } catch (CustomExceptions.FileProcessingException e) {
+            // FIX: Explicitly catch our custom validation errors and send the EXACT message back to React
+            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", e.getMessage()));
+                    
+        } catch (Exception e) {
+            // Fallback for unexpected system errors
+            log.error("VALIDATION_INIT_FAIL | File: {} | Error: {}", file.getOriginalFilename(), e.getMessage());
+            return ResponseEntity.status(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("message", "An unexpected error occurred during upload."));
+        }
     }
-    triggerDebounce();
-    setResultStatus(null);
-    setResultMsg("");
-    setValidationStage(0);
-    setRequestId(null);     // FIX: Prevent the useEffect from polling the old ID
-    setIsProcessing(true);
-    setAutoDlTriggered(false);
-    setDownloadMsg("");
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("postingDate", selectedDate.format("DD/MM/YYYY"));
-
-
-    // Automatically appends the globally selected VID to your upload request payload context
-    if (selectedVoucher) {
-      formData.append("vid", selectedVoucher.VID || selectedVoucher.vid);
-    }
-
-    try {
-      const data = await callApi("/JS/voucher/bulk-validate-init", formData, "POST", "json", "multipart/form-data");
-      if (data && data.requestId) {
-        setRequestId(data.requestId);
-      } else {
-        throw new Error("Invalid response from server.");
-      }
-    } catch (err) {
-      setIsProcessing(false);
-      setResultStatus("ERROR");
-      
-      // FIX: Extract the specific exception message from the backend response
-      let errorMsg = err.message || "Unknown error";
-      if (err.response && err.response.data && err.response.data.message) {
-        errorMsg = err.response.data.message;
-      }
-      
-      setResultMsg("Initialization failed: " + errorMsg);
-    }
-  };
 
 ```
-By safely checking err.response.data.message, the frontend will now beautifully display *"Initialization failed: File name length cannot exceed 20 characters."* right on the screen so the user knows exactly what to fix!
+### Why this fixes it completely:
+Instead of throwing the error back to Spring Boot, we are catching it on the spot and safely packing it into a 400 Bad Request with Map.of("message", e.getMessage()).
+Because we formatted it specifically as {"message": "File name length cannot exceed 20 characters."}, your updated React catch block will extract it flawlessly via err.response.data.message and display it in the Snackbar! Restart the backend and test the long filename again!
