@@ -1,27 +1,75 @@
-The following validations have to be passed before a valid voucher posting is successfully created. The same set of validations will apply for both options: i.e., Manual Posting and Bulk Upload. 
+To make your backend completely bulletproof, we will add the exact same **Branch-Currency-Memo/Normal** balancing logic to your manual entry endpoint.
+Because your frontend already sends Debits as positive numbers and Credits as negative numbers, the math to validate this is actually incredibly elegant: **If we add all the amounts together for a specific group, the final sum must be exactly zero.**
+Open **VoucherCommandService.java** and locate the createBatchRequest method. We are going to replace the simple totalDebit / totalCredit trackers with a strict map-based balancing engine.
+### The Fix
+**Find this exact block inside createBatchRequest (around line 180):**
+```java
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal totalDebit = BigDecimal.ZERO;
+        BigDecimal totalCredit = BigDecimal.ZERO;
+        int rowIndex = 1;
 
-Balancing Rule – all the voucher entries must have matching total debits and total credits for every following groups. 
+        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setRequestDate(LocalDateTime.now());
+            // ... (rest of the entity mapping)
 
-Branch-Currency-NormalCGL 
+```
+**Replace everything from List<JournalRequest> entities... down to the end of the for loop with this updated version:**
+```java
+        List<JournalRequest> entities = new ArrayList<>();
+        Map<String, BigDecimal> balancingMap = new java.util.HashMap<>();
+        int rowIndex = 1;
 
-Branch-Currency-MemoCGL 
+        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setRequestDate(LocalDateTime.now());
+            entity.setCreatorId(creatorId);
+            entity.setBatchId(batchId);
 
-# CGL starts with 5 are considered as Memo CGL, and rest of the CGL’s are treated as Normal CGL. 
+            String journalId = journalPrefix + "-" + rowIndex;
+            entity.setJournalId(journalId);
+            entity.setBranchCode(row.getBranch());
+            entity.setCurrency(row.getCurrency());
+            
+            String cgl = row.getCgl() != null ? row.getCgl().trim() : "";
+            entity.setCgl(cgl);
 
-Master Validations - Branch, Currency and CGL must exist and be active in the respective masters. 
+            BigDecimal amount = row.getAmount();
 
-Branch – up to 5 digit numeric, must be active in master table. 
+            if (amount == null || amount.compareTo(BigDecimal.ZERO) == 0) {
+                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
+            }
+            entity.setAmount(amount);
+            entity.setNarration(row.getRemarks());
+            entity.setProductCode(row.getProductType());
 
-Currency – 3 characters, must be active in master table. 
+            // --- STRICT BACKEND BALANCING RULE ---
+            // 1. Create Composite Key (e.g., "10301-INR-MEMO")
+            String cglType = cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String compositeKey = row.getBranch() + " - " + row.getCurrency() + " - " + cglType;
 
-CGL – 10 digit numeric, must be active in master table. 
+            // 2. Add to Group Balance (Debits are positive, Credits are negative)
+            balancingMap.put(compositeKey, balancingMap.getOrDefault(compositeKey, BigDecimal.ZERO).add(amount));
 
-Amount – must not be 0 and allowed precision is max 16 digits and 4 decimals 
+            entities.add(entity);
+            rowIndex++;
+        }
 
-Each record must have indicator for Debit (DR) or Credit (CR). 
+        // --- ENFORCE BALANCE ---
+        // If Debits and Credits match perfectly, the sum for every group will be exactly 0.00
+        for (Map.Entry<String, BigDecimal> entry : balancingMap.entrySet()) {
+            if (entry.getValue().compareTo(BigDecimal.ZERO) != 0) {
+                throw new CustomExceptions.InvalidDataException(
+                        "Balancing rule failed for [" + entry.getKey() + "]. Total Debits and Credits must exactly match."
+                );
+            }
+        }
 
-The remarks must be alpha-numeric and length between 2-30. 
-
-Product Code – numeric up to 8 digits (Optional). 
-
-check we have backend validation for this 
+```
+### Why this is the ultimate safeguard:
+If a hacker or a broken third-party system bypasses your React UI and sends a raw API request directly to /api/voucher/create-batch with mismatched debits and credits, the Java Service will instantly intercept it.
+It calculates the balances internally, realizes the sum for 10301 - INR - NORMAL isn't 0.00, and throws an InvalidDataException.
+Because we already updated your Controller to catch this exact exception in the previous steps, the API will safely reject the payload with a clean 400 Bad Request and your exact error message!
