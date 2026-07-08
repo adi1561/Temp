@@ -1,84 +1,103 @@
-ok lets discuss then what is the runnable class how to use this and all
-when we use 
+I understand exactly what is happening. **Both of these errors—even though they look different—are caused by the exact same SD environment encryption issue.**
+Here is why they look different to you:
+ 1. **For the Checker Action (which you saw in the backend logs):** The backend tried to parse the encrypted string into ProcessVoucherRequestDto and threw the JSON_PARSE_ERROR stack trace you shared.
+ 2. **For the Manual Upload (which you saw on the frontend):** The exact same encryption crash happens on the backend, but your frontend catch (error) block in VoucherPosting.jsx hides the backend stack trace and shows the generic generic message: *"Unable to submit the voucher request. Please try again."*
+To fix **both** issues, you need to bypass the payload encryption for all POST requests. Here are the exact lines you need to update in your frontend files.
+### 1. Fix for Manual Upload (VoucherPosting.jsx)
+Find the handleValidateClick function (around line 430) where the manual batch is submitted.
+**Replace this:**
+```javascript
+    try {
+      const response = await callApi("/JS/voucher/create-batch", finalPayload, "POST");
+      const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
 
-class MyTask implements Runnable {
-    public void run() {
-        // This is where you put the code you want to run
-        System.out.println("The task is being performed!");
-    }
-}
+```
+**With this:**
+```javascript
+    try {
+      // The 'false' at the end bypasses the SD encryption so the backend can read the JSON
+      const response = await callApi("/JS/voucher/create-batch", finalPayload, "POST", "json", null, {}, false);
+      const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
 
-in this case it wrap the class with runnble object
+```
+### 2. Fix for Bulk Upload / Scheduling (VoucherPosting.jsx)
+Find the handleFinalizeRouting function (around line 249) where the bulk and manual schedules are finalized.
+**Replace these two API calls:**
+```javascript
+      if (entryMethod === "BULK") {
+        // ...
+        const response = await callApi("/JS/voucher/create-batch-from-cache", {
+          requestId: submittedBatchId,
+          postingDate: formattedBackendDate,
+          vid: selectedVoucher.vid,
+          commonBatchRemarks: "Voucher created successfully",
+          scheduledTime: formattedSchedule
+        }, "POST");
+        // ...
+      } else {
+        await callApi("/JS/voucher/update-schedule", {
+          batchId: submittedBatchId,
+          scheduledTime: formattedSchedule
+        }, "POST");
+      }
 
-MOST IMP :-  in every case it always convert into the runnble object when we use the thread 
+```
+**With this:**
+```javascript
+      if (entryMethod === "BULK") {
+        // ...
+        const response = await callApi("/JS/voucher/create-batch-from-cache", {
+          requestId: submittedBatchId,
+          postingDate: formattedBackendDate,
+          vid: selectedVoucher.vid,
+          commonBatchRemarks: "Voucher created successfully",
+          scheduledTime: formattedSchedule
+        }, "POST", "json", null, {}, false); // <--- Bypass Encryption
+        // ...
+      } else {
+        await callApi("/JS/voucher/update-schedule", {
+          batchId: submittedBatchId,
+          scheduledTime: formattedSchedule
+        }, "POST", "json", null, {}, false); // <--- Bypass Encryption
+      }
 
-now when we a class implements the Runnable vs when we are using the @async what is the diff
+```
+### 3. Fix for Checker Action (VoucherAuthorization.jsx)
+Find the handleSubmitAction function (around line 496).
+**Replace this:**
+```javascript
+    try {
+      const response = await callApi(
+        "/JS/voucher/workflow/action",
+        {
+          batchId: viewingBatchId,
+          status: statusToSubmit,
+          remarks: executorRemarks.trim(),
+          overrideScheduleLapse: overrideLapse,
+          newScheduledTime: formattedNewSchedule,
+        },
+        "POST"
+      );
 
-if we are doing like we use the @async on the top of the methods it ultimately convert into the Runnble only same like above 
-internally it doing that only
+```
+**With this:**
+```javascript
+    try {
+      const response = await callApi(
+        "/JS/voucher/workflow/action",
+        {
+          batchId: viewingBatchId,
+          status: statusToSubmit,
+          remarks: executorRemarks.trim(),
+          overrideScheduleLapse: overrideLapse,
+          newScheduledTime: formattedNewSchedule,
+        },
+        "POST",
+        "json",
+        null,
+        {},
+        false // <--- Bypass Encryption
+      );
 
-
-why it convert into the Runble object always ??
-
-beocase the thread is progreammed in a way that it will just find that object which is wrapped with the Runble object amd then
-he will find the run methods and run the code
-
-something like this it works
-
-the key diff is like when we are using the @async for a particular method then not whole class gets convert into the Runnble object 
-only that that methods is converted into the Runnble object that having that @async on the top
-
-
-now how it know it uses the PROXY
-
-lets understand this what is proxy and all how it works
-
-it is like when we write a @async on the top of the method any method from that class it actually convert that class class to the 
-proxy it means that it creating the duplicate class like or we can say as protection class or filter or bodygurad to that class 
-why is it so
-
-when we are calling the class which having a methods with @async first it will intersecpt pass this to the duplicate or proxy class
-then it will cheak the methods which we call that methods is having the @async 
-
-if yes -> it will intersecpt and it will grab that class create a thread and send it to the thread pool soo....
-
-if no -> it send as it is to the original class 
-
-
-
-
-
-
-
-Here are your complete, structured technical notes on the synchronized keyword, compiling all the senior-level concepts, edge cases, and interview traps we discussed.
-# 📖 TECHNICAL NOTES: The Java synchronized Keyword
-## 1. The Core Concept (The Padlock)
-The synchronized keyword is Java's built-in software lock used to prevent **Race Conditions**. It ensures that only one thread can execute a specific block of code at a time.
- * **The Reality:** In modern, high-performance architecture, synchronized is considered the **last resort**. We prefer statelessness, immutability, or Atomic classes first because synchronized creates a traffic bottleneck, effectively turning a multithreaded application into a single-threaded one during that block.
-## 2. The Biggest Misconception: Who is Blocked?
-Junior developers often think synchronized blocks the thread running the method. **This is false.**
- * **The Worker (Inside):** The thread that arrives first grabs the "key" (lock) and enters the method. It is **NOT** blocked. It runs at full speed.
- * **The Waiting Queue (Outside):** The JVM forces every *other* thread that arrives into a BLOCKED state. They stand outside, doing nothing, until the first thread finishes the last line of code and drops the key.
-## 3. The Operating System Trap: Time-Slicing
-The JVM manages the locks, but the Operating System (OS) manages CPU time. The OS does **not** care about your Java locks.
- * **Time-Slicing:** The OS gives every thread a tiny window to execute (e.g., 10ms). If time runs out while a thread is inside a synchronized method, the OS pauses that thread.
- * **Sleeping with the Key:** The paused thread goes to sleep **still holding the lock**.
- * **The Result:** All other threads remain BLOCKED outside. Your application freezes until the OS decides to wake the first thread back up so it can finish its math and drop the lock.
-## 4. Method vs. Block (Scope & Performance)
-Because the OS will inevitably time-slice threads, we must keep the locked area as small as physically possible.
- * **Synchronized Method (public synchronized void update())**
-   * Locks the entire method. (Analogy: Locking the front door of the whole bank).
-   * **Danger:** If you have slow operations (like a Database save or API call) inside the method, the thread will hold the lock while waiting for the network, freezing all other threads out of the entire method.
- * **Synchronized Block (synchronized(this) { ... })**
-   * Locks only a specific chunk of code. (Analogy: Locking only the vault inside the bank).
-   * **Best Practice:** Perform slow network/DB calls outside the block. Only wrap the exact microsecond of math (e.g., balance = balance + 1) inside the block.
-## 5. The Vulnerability: You Lock the Path, Not the Variable
-A massive interview trap: *"Does synchronized protect the variable?"* **No. It only protects the method you put it on.** If you leave other paths open, threads will bypass your lock entirely and corrupt the data.
- * **The Backdoor (Unsynchronized Methods):** If Thread A is inside public synchronized void deposit(), Thread B can still enter public void withdraw() at the exact same time if withdraw() doesn't have the synchronized keyword.
- * **The Broken Window (Public Variables):** If the variable is public, another class can do account.balance = 0;, completely bypassing all your synchronized methods.
-## 6. The Tech Lead Design Rules for Thread Safety
-To build a bulletproof, thread-safe class using synchronized, you must follow strict Object-Oriented Programming (OOP) encapsulation rules:
- 1. **Hide the Gold:** The shared variable **must** be private so no outside class can bypass the locks.
- 2. **Lock Every Door:** Every single method that reads OR writes to that shared variable must be synchronized using the exact same lock object.
- 3. **Keep it Fast:** Never put I/O operations (Database, File System, Network calls) inside the synchronized scope.
-*** *Keep these notes handy when preparing for technical interviews, especially when discussing system stability under heavy load!*
+```
+Once you apply false as the 7th parameter to these callApi requests, your frontend will send standard, readable JSON to the server. This will instantly resolve the JSON_PARSE_ERROR in the backend and the "Unable to submit" error in the frontend!
