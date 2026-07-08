@@ -1,569 +1,3 @@
-
-
-package com.fincore.VoucherService.Controllers;
-
-import com.fincore.VoucherService.Dto.BranchDto;
-import com.fincore.VoucherService.Service.BranchService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-
-
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-
-/**
- * Exposes endpoints for branch master data retrieval and search.
- * Rule: Implements "Starts With" search logic to optimize Oracle Index Range Scans.
- */
-@RestController
-@RequestMapping("/api/branches-journal")
-@RequiredArgsConstructor
-@Slf4j
-public class BranchController {
-
-    private final BranchService branchService;
-
-    /**
-     * Endpoint to retrieve a complete map of branch codes to branch names.
-     */
-    @GetMapping("/map")
-    public ResponseEntity<Map<String, String>> getBranchMap() {
-        log.info("BRANCH_CONTROLLER_MAP_REQUEST | Action: Fetching all active branch mappings");
-        Map<String, String> branchMap = branchService.getBranchCodeAndNameMap();
-        return ResponseEntity.ok(branchMap);
-    }
-
-    /**
-     * Endpoint to perform a PREFIX search for branches.
-     * Logic: Returns results starting with the query string (e.g., '321' matches '32121').
-     */
-    @GetMapping("/search")
-    public ResponseEntity<List<BranchDto>> searchBranches(@RequestParam String query) {
-        // Log the prefix search initialization
-        log.info("BRANCH_CONTROLLER_PREFIX_SEARCH | Query: {}", query);
-
-        if (query == null || query.trim().isEmpty()) {
-            // Preservation of empty list logic for blank inputs
-            return ResponseEntity.ok(Collections.emptyList());
-        }
-
-        // Service layer now handles the "StartingWith" repository call
-        List<BranchDto> results = branchService.searchBranches(query.trim());
-        return ResponseEntity.ok(results);
-    }
-}
-
-
-package com.fincore.VoucherService.Controllers;
-
-import com.fincore.VoucherService.Dto.CglDto;
-import com.fincore.VoucherService.Service.CglService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.Collections;
-import java.util.List;
-
-/**
- * Exposes endpoints for searching Common General Ledger (CGL) master data.
- * Updated to use "Starts With" logic for professional financial filtering.
- */
-@RestController
-@RequestMapping("/api/cgl-journal")
-@RequiredArgsConstructor
-@Slf4j
-public class CglController {
-
-    private final CglService cglService;
-
-    /**
-     * Endpoint to search for CGLs by prefix.
-     * Logic: Implements prefix matching (REQ_CGL LIKE 'query%') for high performance.
-     */
-    @GetMapping("/search")
-    public ResponseEntity<List<CglDto>> searchCgl(
-            @RequestParam(value = "query", required = false, defaultValue = "") String query) {
-
-        if (query == null || query.trim().isEmpty()) {
-            return ResponseEntity.ok(Collections.emptyList());
-        }
-
-        log.info("CGL_CONTROLLER_PREFIX_SEARCH | Action: Filtering CGLs starting with: {}", query);
-
-        // Service layer uses the repository's findBy...StartingWith logic
-        List<CglDto> results = cglService.searchCgls(query.trim());
-        return ResponseEntity.ok(results);
-    }
-}
-
-package com.fincore.VoucherService.Controllers;
-
-
-import com.fincore.VoucherService.Service.ValidationMasterService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.Set;
-
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-public class CurrencyController {
-
-    private final ValidationMasterService validationMasterService;
-
-    /**
-     * Purpose: Returns a list of only the active CURRENCY_CODEs.
-     */
-    @GetMapping("/currencies")
-    public ResponseEntity<Set<String>> getActiveCurrencies() {
-        // Reuses your existing high-performance JDBC method
-        Set<String> currencies = validationMasterService.getAllActiveCurrencies();
-
-        return ResponseEntity.ok(currencies);
-    }
-}
-package com.fincore.VoucherService.Controllers;
-
-
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Models.JournalRequest;
-import com.fincore.VoucherService.Service.core.VoucherCommandService;
-import com.fincore.VoucherService.Service.core.VoucherWorkflowEngine;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import com.fincore.VoucherService.Dto.*;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.validation.Valid;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherActionController {
-
-
-    private final VoucherCommandService commandService;
-    private final VoucherWorkflowEngine workflowEngine;
-    private final JwtUtil jwtUtil;
-
-
-    /**
-     * Triggers the async approval/rejection process using Oracle Parallel execution.
-     */
-    @PostMapping("/process-bulk")
-    public ResponseEntity<Map<String, Object>> processBulkRequests(
-            @RequestHeader("Authorization") String token,
-            @Valid @RequestBody BulkProcessVoucherPostingDto dto) {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        log.info("BULK_PROCESS_START | User: {} | Batch: {} | Action: {}", userId, dto.getBatchId(), dto.getStatus());
-
-        commandService.processBulkRequestsAsync(dto, userId, userRole);
-
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING", "message", "Approval process started. Notifications will be sent upon completion."));
-    }
-
-
-    @PostMapping("/workflow/action")
-    public ResponseEntity<Map<String, String>> processCheckerAction(
-            @RequestHeader("Authorization") String token,
-            @Valid @RequestBody ProcessVoucherRequestDto dto) {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-        workflowEngine.processWorkflowAction(dto, userId, userRole);
-
-        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Workflow action processed successfully."));
-    }
-
-
-
-
-    // ==================================================================================
-    // 1. ASYNC BULK OPERATIONS
-    // ==================================================================================
-
-    /**
-     * Creates a batch from pre-validated cache data.
-     * Uses fire-and-forget logic; returns 202 Accepted immediately.
-     */
-    @PostMapping("/create-batch-from-cache")
-    public ResponseEntity<Map<String, Object>> createBatchFromCache(
-            @Valid @RequestBody CacheBatchPostingDto payload,
-            @RequestHeader("Authorization") String token) throws IOException {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
-
-        // FIX: Since the DTO already converted it to LocalDateTime,
-        // we just pass payload.getScheduledTime() directly to the service!
-        String batchId = commandService.createBatchFromCacheAsync(
-                payload.getRequestId(),
-                payload.getCommonBatchRemarks(),
-                userId,
-                userRole,
-                payload.getVid(),
-                payload.getScheduledTime() // <--- Passed directly
-        );
-
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING", "message", "Batch creation initiated in background.", "batchId", batchId));
-    }
-
-
-    @PostMapping("/update-schedule")
-    public ResponseEntity<Map<String, String>> updateSchedule(@RequestBody Map<String, String> payload) {
-        commandService.updateBatchSchedule(payload.get("batchId"), payload.get("scheduledTime"));
-
-        Map<String, String> response = new HashMap<>();
-        response.put("message", "Schedule updated successfully.");
-        response.put("status", "SUCCESS");
-        return ResponseEntity.ok(response);
-    }
-
-
-    // ==================================================================================
-    // 5. MANUAL/SMALL BATCH ENDPOINTS
-    // ==================================================================================
-
-    @PostMapping("/create-batch")
-    public ResponseEntity<List<JournalRequest>> createBatchRequest(
-            @Valid @RequestBody BatchPostingDto batchDto,
-            @RequestHeader("Authorization") String token) {
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
-
-            List<JournalRequest> created = commandService.createBatchRequest(
-                    batchDto, userId, jwtUtil.getUserRoleFromToken(token));
-            return ResponseEntity.status(HttpStatus.CREATED).body(created);
-        } catch (CustomExceptions.DataMappingException e) {
-            log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
-            throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
-        }
-    }
-
-
-    @DeleteMapping("/my-requests/by-batch/{batchId}")
-    public ResponseEntity<ApiResponseDto> deletePendingBatch(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
-        try {
-            commandService.deleteBatchRequest(batchId, jwtUtil.getUserIdFromToken(token.substring(7)));
-            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
-        } catch (IllegalStateException e) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (CustomExceptions.InvalidDataException e) {
-            // FIX: Catch specific business errors and send the exact message to React
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (Exception e) {
-            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "An unexpected error occurred.", null));
-        }
-    }
-
-
-    @DeleteMapping("/my-request/{requestId}")
-    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
-        commandService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
-        return ResponseEntity.noContent().build();
-    }
-}
-
-
-package com.fincore.VoucherService.Controllers;
-
-
-import com.fincore.VoucherService.Dto.BulkUploadStateDto;
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Service.validation.ValidationReportGenerator;
-import com.fincore.VoucherService.Service.validation.VoucherBulkValidationService;
-import jakarta.servlet.http.HttpServletRequest;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.io.ByteArrayResource;
-import org.springframework.core.io.Resource;
-import org.springframework.format.annotation.DateTimeFormat;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.multipart.MultipartFile;
-
-import java.io.IOException;
-import java.time.LocalDate;
-import java.util.Map;
-
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherBulkUploadController {
-
-    private final VoucherBulkValidationService voucherBulkValidationService;
-    private final ValidationReportGenerator validationReportGenerator;
-    /**
-     * Entry point for Journal File uploads. Validates file existence and starts parsing.
-     */
-
-    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<Map<String, Object>> initiateValidation(
-            @RequestParam("file") MultipartFile file,
-            @RequestParam("postingDate") @DateTimeFormat(pattern = "dd/MM/yyyy") LocalDate postingDate,
-            HttpServletRequest request) {
-
-        if (file == null || file.isEmpty()) {
-            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
-                    .body(Map.of("message", "File is missing or empty."));
-        }
-
-        try {
-            String reqId = voucherBulkValidationService.initiateValidation(file, postingDate);
-
-            HttpHeaders headers = new HttpHeaders();
-            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
-            headers.setPragma("no-cache");
-            headers.setExpires(0L);
-            headers.set("X-Content-Type-Options", "nosniff");
-            headers.set("Content-Security-Policy", "default-src 'self'");
-
-            return ResponseEntity.ok()
-                    .headers(headers)
-                    .body(Map.of("status", "QUEUED", "requestId", reqId));
-
-        } catch (CustomExceptions.FileProcessingException e) {
-            // FIX: Explicitly catch our custom validation errors and send the EXACT message back to React
-            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
-                    .body(Map.of("message", e.getMessage()));
-
-        } catch (Exception e) {
-            // Fallback for unexpected system errors
-            log.error("VALIDATION_INIT_FAIL | File: {} | Error: {}", file.getOriginalFilename(), e.getMessage());
-            return ResponseEntity.status(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(Map.of("message", "An unexpected error occurred during upload."));
-        }
-    }
-
-
-    @GetMapping("/bulk-status/{requestId}")
-    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
-        BulkUploadStateDto state = voucherBulkValidationService.getState(requestId);
-        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
-    }
-
-
-    /**
-     * Downloads the error report excel file.
-     */
-    @GetMapping("/download-bulk-file/{requestId}")
-    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
-        byte[] data = voucherBulkValidationService.getFileBytes(requestId, type);
-        if (data == null) {
-            log.warn("DOWNLOAD_FAIL | File not found | ReqID: {} | Type: {}", requestId, type);
-            return ResponseEntity.notFound().build();
-        }
-
-        // Retrieves the strict date format (e.g., "2026-06-18") without timestamps
-        String filename = "Error_Report" + ".xlsx";
-
-
-        // Exclusively sets the MIME type to Excel (.xlsx) since CSV is no longer needed
-        MediaType mediaType = MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
-                .contentType(mediaType)
-                .body(new ByteArrayResource(data));
-    }
-
-    @GetMapping("/download-template")
-    public ResponseEntity<org.springframework.core.io.Resource> downloadTemplate() throws IOException {
-        return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Voucher_Template.xlsx\"").body(new ByteArrayResource(validationReportGenerator.generateExcelTemplateWithGuidelines()));
-    }
-
-}
-package com.fincore.VoucherService.Controllers;
-
-
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Models.RequestVoucher;
-import com.fincore.VoucherService.Service.JsEodMasterService;
-import com.fincore.VoucherService.Service.RequestVoucherService;
-import com.fincore.VoucherService.Service.core.VoucherQueryService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.PageRequest;
-import org.springframework.format.annotation.DateTimeFormat;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import com.fincore.VoucherService.Dto.*;
-import com.fincore.VoucherService.Models.JournalRequest;
-import com.fincore.commonutilities.jwt.JwtUtil;
-
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
-
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
-
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherQueryController {
-
-
-
-    private final VoucherQueryService queryService;
-    private final JsEodMasterService jsEodMasterService;
-    private final RequestVoucherService requestVoucherService;
-    private final JwtUtil jwtUtil;
-
-
-
-    /**
-     * Safeguard: Forces pagination if batch rows exceed 2000 to avoid Server OOM.
-     */
-    @GetMapping("/by-batch/{batchId}")
-    public ResponseEntity<?> getRequestsByBatchId(@PathVariable String batchId) {
-        long count = queryService.getRequestCountByBatchId(batchId);
-        if (count > 2000) return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of("error", "Batch too large.", "suggestion", "/api/voucher/by-batch-paginated/" + batchId));
-        return ResponseEntity.ok(queryService.getRequestsByBatchId(batchId));
-    }
-
-
-
-    @GetMapping("/by-batch-paginated/{batchId}")
-    public ResponseEntity<?> getRequestsByBatchIdPaginated(@PathVariable String batchId, @RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "10") int size) {
-        return ResponseEntity.ok(queryService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
-    }
-
-    @GetMapping("/download-batch/{batchId}")
-    public ResponseEntity<?> downloadBatchExcel(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
-        try {
-            if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
-                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", "You are not authorized to view this batch."));
-            }
-
-            // Simple synchronous call returning byte[]
-            byte[] fileData = queryService.generateBatchExcel(batchId);
-
-            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-
-            return ResponseEntity.ok().headers(headers).body(fileData);
-
-        } catch (CustomExceptions.InvalidDataException e) {
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("message", e.getMessage()));
-        } catch (Exception e) {
-            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("message", "Failed to generate Excel file."));
-        }
-    }
-
-    @GetMapping("/pending-requests")
-    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
-        return queryService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
-    }
-
-    @GetMapping("/checker/pending-approvals")
-    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        String userId = jwtUtil.getUserIdFromToken(token);
-        return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId));
-    }
-
-    // ==================================================================================
-    // 2. DASHBOARDS & SUMMARIES
-    // ==================================================================================
-
-    @GetMapping("/all-requests-summary")
-    public ResponseEntity<Map<String, Object>> getAllRequestsSummary(@RequestHeader("Authorization") String token , @RequestParam(defaultValue = "0") int page,
-                                                                           @RequestParam(defaultValue = "10") int size) {
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        Map<String, Object> response = queryService.getAllRequestsSummary(userId, userRole, page, size);
-        return ResponseEntity.ok(response);
-    }
-
-
-    @GetMapping("/workflow-history/{batchId}")
-    public ResponseEntity<List<Map<String, Object>>> getWorkflowHistory(@PathVariable String batchId) {
-        return ResponseEntity.ok(queryService.getWorkflowHistory(batchId));
-    }
-
-    @GetMapping("/batch-summary/{batchId}")
-    public ResponseEntity<Map<String, Object>> getBatchSummaryDetails(@PathVariable String batchId) {
-        return ResponseEntity.ok(queryService.getBatchSummaryDetails(batchId));
-    }
-
-
-    // ==================================================================================
-    // 3. UTILITIES & METADATA
-    // ==================================================================================
-
-    @GetMapping("/current-posting-date")
-    public String getCurrentPostingDate() { return queryService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE); }
-
-    @GetMapping("/eod_status")
-    public ResponseEntity<List<JsEodMasterDTO>> getEodStatus() { return new ResponseEntity<>(jsEodMasterService.getAllData(), HttpStatus.OK); }
-
-    @GetMapping("/filter")
-    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(@RequestParam(required = false) String category, @RequestParam(required = false) String role, @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
-        return ResponseEntity.ok(requestVoucherService.getFilteredVouchers(category, role, date));
-    }
-
-    @GetMapping("/workflow/steps/{workflowCode}")
-    public ResponseEntity<List<Map<String, Object>>> getWorkflowSteps(@PathVariable String workflowCode) {
-        return ResponseEntity.ok(queryService.getWorkflowSteps(workflowCode)); }
-
-    @GetMapping("/active-roles")
-    public ResponseEntity<Map<String, String>> getActiveRoles() { return ResponseEntity.ok(queryService.getActiveRoles()); }
-
-    @GetMapping("/vid-details/{vid}")
-    public ResponseEntity<Map<String, Object>> getVidDetails(@PathVariable String vid) { return ResponseEntity.ok(queryService.getVidDetails(vid)); }
-
-    @GetMapping("/active")
-    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
-        Map<String, Object> response = new HashMap<>(); response.put("data", queryService.getAvailableVouchersVid(roleId)); response.put("message", "Success"); response.put("status", "OK");
-        return ResponseEntity.ok(response);
-    }
-}
-
 package com.fincore.VoucherService.Service.core;
 
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -1150,6 +584,9 @@ public class VoucherAsyncWorker {
 
 
 }
+
+
+
 package com.fincore.VoucherService.Service.core;
 
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -1319,9 +756,8 @@ public class VoucherCommandService {
             posting.setRecordsCount(totalRows);
 
             voucherPostingRepository.save(posting);
-
-            workflowEngine.logWorkflowAction(batchId, vid, "Submitted", creatorId, commonRemarks, null);
-
+            String action = (scheduledTime != null) ? "Submitted (Scheduled)" : "Submitted";
+            workflowEngine.logWorkflowAction(batchId, vid, action, creatorId, commonRemarks, scheduledTime);
             progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
 
             // 6. ASYNC HANDOFF (Pass to background thread)
@@ -1674,6 +1110,8 @@ public class VoucherCommandService {
         }
     }
 }
+
+
 package com.fincore.VoucherService.Service.core;
 import com.fincore.VoucherService.Exception.CustomExceptions;
 import com.fincore.VoucherService.Models.JournalRequest;
@@ -2478,1374 +1916,2065 @@ public class VoucherWorkflowEngine {
     }
 
 }
- frontend 
- 
- import React, { useState, useEffect, useCallback, useRef } from "react";
+package com.fincore.VoucherService.Dto;
+
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+import org.apache.htrace.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
+import java.time.LocalDateTime;
+
+@Data
+@Getter
+@Setter
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class ProcessVoucherRequestDto {
+
+    @NotNull(message = "Batch ID is required")
+    private String batchId; // Changed from requestId to batchId for bulk approval
+
+    @NotNull(message = "Status is required")
+    private RequestStatus status;
+
+    @jakarta.validation.constraints.Pattern(
+            regexp = "^([a-zA-Z0-9 \\/&(),.\\-]{2,30})?$",
+            message = "Remarks must be 2-30 characters: Alphanumeric, spaces, and / & ( ) , . -"
+    )
+    private String remarks;
+
+    // --- NEW FIELDS FOR SCHEDULING WORKFLOW ---
+    private Boolean overrideScheduleLapse; // True if the user chooses to post immediately after a lapse prompt
+
+    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    private LocalDateTime newScheduledTime; // If the final approver decides to set a new time
+}
+
+package com.fincore.VoucherService.Controllers;
+
+
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.RequestVoucher;
+import com.fincore.VoucherService.Service.JsEodMasterService;
+import com.fincore.VoucherService.Service.RequestVoucherService;
+import com.fincore.VoucherService.Service.core.VoucherQueryService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import com.fincore.VoucherService.Dto.*;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.commonutilities.jwt.JwtUtil;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherQueryController {
+
+
+
+    private final VoucherQueryService queryService;
+    private final JsEodMasterService jsEodMasterService;
+    private final RequestVoucherService requestVoucherService;
+    private final JwtUtil jwtUtil;
+
+
+
+    /**
+     * Safeguard: Forces pagination if batch rows exceed 2000 to avoid Server OOM.
+     */
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchId(@PathVariable String batchId) {
+        long count = queryService.getRequestCountByBatchId(batchId);
+        if (count > 2000) return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of("error", "Batch too large.", "suggestion", "/api/voucher/by-batch-paginated/" + batchId));
+        return ResponseEntity.ok(queryService.getRequestsByBatchId(batchId));
+    }
+
+
+
+    @GetMapping("/by-batch-paginated/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchIdPaginated(@PathVariable String batchId, @RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "10") int size) {
+        return ResponseEntity.ok(queryService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
+    }
+
+    @GetMapping("/download-batch/{batchId}")
+    public ResponseEntity<?> downloadBatchExcel(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
+        try {
+            if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", "You are not authorized to view this batch."));
+            }
+
+            // Simple synchronous call returning byte[]
+            byte[] fileData = queryService.generateBatchExcel(batchId);
+
+            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+            return ResponseEntity.ok().headers(headers).body(fileData);
+
+        } catch (CustomExceptions.InvalidDataException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("message", e.getMessage()));
+        } catch (Exception e) {
+            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("message", "Failed to generate Excel file."));
+        }
+    }
+
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        return queryService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
+    }
+
+    @GetMapping("/checker/pending-approvals")
+    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId));
+    }
+
+    // ==================================================================================
+    // 2. DASHBOARDS & SUMMARIES
+    // ==================================================================================
+
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<Map<String, Object>> getAllRequestsSummary(@RequestHeader("Authorization") String token , @RequestParam(defaultValue = "0") int page,
+                                                                           @RequestParam(defaultValue = "10") int size) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        Map<String, Object> response = queryService.getAllRequestsSummary(userId, userRole, page, size);
+        return ResponseEntity.ok(response);
+    }
+
+
+    @GetMapping("/workflow-history/{batchId}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowHistory(@PathVariable String batchId) {
+        return ResponseEntity.ok(queryService.getWorkflowHistory(batchId));
+    }
+
+    @GetMapping("/batch-summary/{batchId}")
+    public ResponseEntity<Map<String, Object>> getBatchSummaryDetails(@PathVariable String batchId) {
+        return ResponseEntity.ok(queryService.getBatchSummaryDetails(batchId));
+    }
+
+
+    // ==================================================================================
+    // 3. UTILITIES & METADATA
+    // ==================================================================================
+
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() { return queryService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE); }
+
+    @GetMapping("/eod_status")
+    public ResponseEntity<List<JsEodMasterDTO>> getEodStatus() { return new ResponseEntity<>(jsEodMasterService.getAllData(), HttpStatus.OK); }
+
+    @GetMapping("/filter")
+    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(@RequestParam(required = false) String category, @RequestParam(required = false) String role, @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
+        return ResponseEntity.ok(requestVoucherService.getFilteredVouchers(category, role, date));
+    }
+
+    @GetMapping("/workflow/steps/{workflowCode}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowSteps(@PathVariable String workflowCode) {
+        return ResponseEntity.ok(queryService.getWorkflowSteps(workflowCode)); }
+
+    @GetMapping("/active-roles")
+    public ResponseEntity<Map<String, String>> getActiveRoles() { return ResponseEntity.ok(queryService.getActiveRoles()); }
+
+    @GetMapping("/vid-details/{vid}")
+    public ResponseEntity<Map<String, Object>> getVidDetails(@PathVariable String vid) { return ResponseEntity.ok(queryService.getVidDetails(vid)); }
+
+    @GetMapping("/active")
+    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
+        Map<String, Object> response = new HashMap<>(); response.put("data", queryService.getAvailableVouchersVid(roleId)); response.put("message", "Success"); response.put("status", "OK");
+        return ResponseEntity.ok(response);
+    }
+}
+package com.fincore.VoucherService.Controllers;
+
+
+import com.fincore.VoucherService.Dto.BulkUploadStateDto;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Service.validation.ValidationReportGenerator;
+import com.fincore.VoucherService.Service.validation.VoucherBulkValidationService;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.time.LocalDate;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherBulkUploadController {
+
+    private final VoucherBulkValidationService voucherBulkValidationService;
+    private final ValidationReportGenerator validationReportGenerator;
+    /**
+     * Entry point for Journal File uploads. Validates file existence and starts parsing.
+     */
+
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> initiateValidation(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("postingDate") @DateTimeFormat(pattern = "dd/MM/yyyy") LocalDate postingDate,
+            HttpServletRequest request) {
+
+        if (file == null || file.isEmpty()) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", "File is missing or empty."));
+        }
+
+        try {
+            String reqId = voucherBulkValidationService.initiateValidation(file, postingDate);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.setPragma("no-cache");
+            headers.setExpires(0L);
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set("Content-Security-Policy", "default-src 'self'");
+
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .body(Map.of("status", "QUEUED", "requestId", reqId));
+
+        } catch (CustomExceptions.FileProcessingException e) {
+            // FIX: Explicitly catch our custom validation errors and send the EXACT message back to React
+            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", e.getMessage()));
+
+        } catch (Exception e) {
+            // Fallback for unexpected system errors
+            log.error("VALIDATION_INIT_FAIL | File: {} | Error: {}", file.getOriginalFilename(), e.getMessage());
+            return ResponseEntity.status(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("message", "An unexpected error occurred during upload."));
+        }
+    }
+
+
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
+        BulkUploadStateDto state = voucherBulkValidationService.getState(requestId);
+        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
+    }
+
+
+    /**
+     * Downloads the error report excel file.
+     */
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
+        byte[] data = voucherBulkValidationService.getFileBytes(requestId, type);
+        if (data == null) {
+            log.warn("DOWNLOAD_FAIL | File not found | ReqID: {} | Type: {}", requestId, type);
+            return ResponseEntity.notFound().build();
+        }
+
+        // Retrieves the strict date format (e.g., "2026-06-18") without timestamps
+        String filename = "Error_Report" + ".xlsx";
+
+
+        // Exclusively sets the MIME type to Excel (.xlsx) since CSV is no longer needed
+        MediaType mediaType = MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .contentType(mediaType)
+                .body(new ByteArrayResource(data));
+    }
+
+    @GetMapping("/download-template")
+    public ResponseEntity<org.springframework.core.io.Resource> downloadTemplate() throws IOException {
+        return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Voucher_Template.xlsx\"").body(new ByteArrayResource(validationReportGenerator.generateExcelTemplateWithGuidelines()));
+    }
+
+}
+package com.fincore.VoucherService.Controllers;
+
+
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Service.core.VoucherCommandService;
+import com.fincore.VoucherService.Service.core.VoucherWorkflowEngine;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import com.fincore.VoucherService.Dto.*;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherActionController {
+
+
+    private final VoucherCommandService commandService;
+    private final VoucherWorkflowEngine workflowEngine;
+    private final JwtUtil jwtUtil;
+
+
+    /**
+     * Triggers the async approval/rejection process using Oracle Parallel execution.
+     */
+    @PostMapping("/process-bulk")
+    public ResponseEntity<Map<String, Object>> processBulkRequests(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody BulkProcessVoucherPostingDto dto) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        log.info("BULK_PROCESS_START | User: {} | Batch: {} | Action: {}", userId, dto.getBatchId(), dto.getStatus());
+
+        commandService.processBulkRequestsAsync(dto, userId, userRole);
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING", "message", "Approval process started. Notifications will be sent upon completion."));
+    }
+
+
+    @PostMapping("/workflow/action")
+    public ResponseEntity<Map<String, String>> processCheckerAction(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody ProcessVoucherRequestDto dto) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        workflowEngine.processWorkflowAction(dto, userId, userRole);
+
+        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Workflow action processed successfully."));
+    }
+
+
+
+
+    // ==================================================================================
+    // 1. ASYNC BULK OPERATIONS
+    // ==================================================================================
+
+    /**
+     * Creates a batch from pre-validated cache data.
+     * Uses fire-and-forget logic; returns 202 Accepted immediately.
+     */
+    @PostMapping("/create-batch-from-cache")
+    public ResponseEntity<Map<String, Object>> createBatchFromCache(
+            @Valid @RequestBody CacheBatchPostingDto payload,
+            @RequestHeader("Authorization") String token) throws IOException {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
+
+        // FIX: Since the DTO already converted it to LocalDateTime,
+        // we just pass payload.getScheduledTime() directly to the service!
+        String batchId = commandService.createBatchFromCacheAsync(
+                payload.getRequestId(),
+                payload.getCommonBatchRemarks(),
+                userId,
+                userRole,
+                payload.getVid(),
+                payload.getScheduledTime() // <--- Passed directly
+        );
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING", "message", "Batch creation initiated in background.", "batchId", batchId));
+    }
+
+
+    @PostMapping("/update-schedule")
+    public ResponseEntity<Map<String, String>> updateSchedule(@RequestBody Map<String, String> payload) {
+        commandService.updateBatchSchedule(payload.get("batchId"), payload.get("scheduledTime"));
+
+        Map<String, String> response = new HashMap<>();
+        response.put("message", "Schedule updated successfully.");
+        response.put("status", "SUCCESS");
+        return ResponseEntity.ok(response);
+    }
+
+
+    // ==================================================================================
+    // 5. MANUAL/SMALL BATCH ENDPOINTS
+    // ==================================================================================
+
+    @PostMapping("/create-batch")
+    public ResponseEntity<List<JournalRequest>> createBatchRequest(
+            @Valid @RequestBody BatchPostingDto batchDto,
+            @RequestHeader("Authorization") String token) {
+        try {
+            String userId = jwtUtil.getUserIdFromToken(token);
+            log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
+
+            List<JournalRequest> created = commandService.createBatchRequest(
+                    batchDto, userId, jwtUtil.getUserRoleFromToken(token));
+            return ResponseEntity.status(HttpStatus.CREATED).body(created);
+        } catch (CustomExceptions.DataMappingException e) {
+            log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
+            throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
+        }
+    }
+
+
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<ApiResponseDto> deletePendingBatch(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
+        try {
+            commandService.deleteBatchRequest(batchId, jwtUtil.getUserIdFromToken(token.substring(7)));
+            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", e.getMessage(), null));
+        } catch (CustomExceptions.InvalidDataException e) {
+            // FIX: Catch specific business errors and send the exact message to React
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponseDto("Error", e.getMessage(), null));
+        } catch (Exception e) {
+            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "An unexpected error occurred.", null));
+        }
+    }
+
+
+    @DeleteMapping("/my-request/{requestId}")
+    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
+        commandService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
+        return ResponseEntity.noContent().build();
+    }
+}
+
+frontend
+
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Box,
   Typography,
-  Chip,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
-  Button,
-  CircularProgress,
-  Tooltip,
-  IconButton,
-  Stack,
   Grid,
+  TextField,
+  Button,
+  Paper,
+  IconButton,
+  MenuItem,
+  CircularProgress,
+  Autocomplete,
+  Tooltip,
+  Checkbox,
+  FormControlLabel,
+  Chip,
+  FormHelperText,
+  Divider,
+  Card,
+  CardActionArea,
   Table,
   TableBody,
   TableCell,
   TableContainer,
   TableHead,
   TableRow,
-  Paper,
-  Checkbox,
   TablePagination,
+  Collapse,
+  Radio,
+  Stack,
   Stepper,
-  Step,
-  StepLabel,
-  StepConnector,
-  stepConnectorClasses,
-  styled,
-  Avatar,
-  Alert,
+  Popper,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions
 } from "@mui/material";
-import { DataGrid, GridToolbar } from "@mui/x-data-grid";
-import {
-  DeleteSweep as DeleteSweepIcon,
-  Visibility as VisibilityIcon,
-  FileDownload as FileDownloadIcon,
-  Close as CloseIcon,
-} from "@mui/icons-material";
-import CheckIcon from "@mui/icons-material/Check";
-import AccountCircleIcon from "@mui/icons-material/AccountCircle";
-import InfoIcon from "@mui/icons-material/Info";
+import { useNavigate } from "react-router-dom";
+import AddIcon from "@mui/icons-material/Add";
+import { Bolt as BoltIcon } from "@mui/icons-material";
+import TaskAltIcon from '@mui/icons-material/TaskAlt';
 import DeleteIcon from "@mui/icons-material/Delete";
-import { alpha } from "@mui/material/styles";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import KeyboardArrowUpIcon from '@mui/icons-material/KeyboardArrowUp';
+import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
+import ScheduleIcon from "@mui/icons-material/Schedule";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
+import DateRangeTwoToneIcon from '@mui/icons-material/DateRangeTwoTone';
+import EditNoteIcon from '@mui/icons-material/EditNote';
+import UploadFileIcon from '@mui/icons-material/UploadFile';
+import TableChartIcon from '@mui/icons-material/TableChart';
+import { debounce } from "lodash";
 import useApi from "../../hooks/useApi";
+import JournalBulkUpload from "./VoucherBulkUpload";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
 import dayjs from "dayjs";
-
-const styles = {
-  mainContainer: {
-    padding: 3,
-    height: "100%",
-    width: "100%",
-  },
-  dataGridContainer: {
-    height: 600,
-    width: "100%",
-    backgroundColor: "background.paper",
-    boxShadow: 2,
-    borderRadius: 2,
-    border: 1,
-    borderColor: "divider",
-    "& .MuiDataGrid-columnHeaders": {
-      backgroundColor: "#f5f5f5 !important",
-      fontWeight: 700,
-      borderBottom: "2px solid rgba(88, 70, 159, 0.2)",
-      position: 'sticky',
-      top: 0,
-      zIndex: 1,
-    },
-    "& .MuiDataGrid-row:hover": {
-      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
-    },
-    // --- ADD THESE TWO BLOCKS TO KEEP THE 3 DOTS ALWAYS VISIBLE ---
-    "& .MuiDataGrid-menuIcon": {
-      visibility: "visible !important",
-      width: "auto !important",
-    },
-    "& .MuiDataGrid-iconButtonContainer": {
-      visibility: "visible !important",
-      width: "auto !important",
-    },
-  },
-  tableContainer: {
-    maxHeight: 450,
-    overflowY: "auto",
-    border: 1,
-    borderColor: "divider",
-    mt: 1,
-  },
-  fixedContentBox: {
-    minHeight: 400,
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "space-between",
-  },
-  tableHeaderCell: {
-    fontWeight: "bold",
-    backgroundColor: "#f5f6f8",
-    color: "text.primary",
-    whiteSpace: "nowrap",
-    zIndex: 10,
-  },
-  stickyHeaderColumn: (leftOffset) => ({
-    position: "sticky",
-    left: leftOffset,
-    top: 0,
-    zIndex: 20,
-    backgroundColor: "background.paper",
-    borderBottom: 1,
-    borderRight: 1,
-    borderColor: "divider",
-    fontWeight: "bold",
-  }),
-  stickyBodyColumn: (leftOffset) => ({
-    position: "sticky",
-    left: leftOffset,
-    zIndex: 5,
-    backgroundColor: "background.paper",
-    borderRight: 1,
-    borderColor: "divider",
-  }),
-  dialogTitle: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    pb: 1,
-  },
-  dialogActions: { p: 2, borderTop: 1, borderColor: "divider" },
-  loadingContainer: {
-    height: "100%",
-    display: "flex",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-};
-const formatCurrency = (val) => {
-  if (val === null || val === undefined || val === "") return "0.0000";
-  const strVal = String(val).trim();
-  const parts = strVal.split(".");
-  let intPart = parts[0];
-  let decPart = (parts[1] || "").padEnd(4, "0").substring(0, 4);
-  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return `${intPart}.${decPart}`;
-};
-const getStatusChipColor = (status) => {
-  switch (status) {
-    case "ACCEPTED":
-      return "success";
-    case "REJECTED":
-      return "error";
-    default:
-      return "warning";
-  }
-};
-const getTxnTypeColor = (txnType) =>
-  txnType === "Credit" ? "error" : "success";
-
-const CustomConnector = styled(StepConnector)(({ theme }) => ({
-  [`&.${stepConnectorClasses.alternativeLabel}`]: {
-    top: 12,
-    left: 'calc(-50% + 12px)',
-    right: 'calc(50% + 12px)',
-  },
-  [`&.${stepConnectorClasses.active}`]: {
-    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
-  },
-  [`&.${stepConnectorClasses.completed}`]: {
-    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
-  },
-  [`& .${stepConnectorClasses.line}`]: {
-    borderColor: theme.palette.divider,
-    borderTopWidth: 2,
-    borderRadius: 1,
-  },
-}));
-
-
-const BigConnector = styled(StepConnector)(({ theme }) => ({
-  [`&.${stepConnectorClasses.alternativeLabel}`]: {
-    top: 20,
-    left: 'calc(-50% + 80px)',
-    right: 'calc(50% + 80px)',
-  },
-  [`&.${stepConnectorClasses.active}`]: {
-    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
-  },
-  [`&.${stepConnectorClasses.completed}`]: {
-    [`& .${stepConnectorClasses.line}`]: { borderColor: theme.palette.success.main },
-  },
-  [`& .${stepConnectorClasses.line}`]: {
-    borderColor: theme.palette.divider,
-    borderTopWidth: 3,
-    borderRadius: 1,
-  },
-}));
-
-const CustomWorkflowIcon = (props) => {
-  const { statusFlag, iconLetter, label, isMini } = props;
-  const showTextInside = isMini && (statusFlag === "ACTIVE" || statusFlag === "ESCALATED");
-
-  const baseStyle = {
-    height: 24, // Smaller, consistent size
-    borderRadius: 12,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    zIndex: 2,
-    position: "relative",
-    fontWeight: "bold",
-    fontSize: "0.7rem",
-    px: showTextInside ? 1.2 : 0,
-    minWidth: showTextInside ? "auto" : 24,
-    width: showTextInside ? "max-content" : 24,
-    whiteSpace: "nowrap",
-    boxSizing: "border-box", // Strictly ensures borders don't bloat the circle making them unequal
-  };
-
-  if (statusFlag === "COMPLETED") {
-    return (
-      <Box sx={{ ...baseStyle, backgroundColor: "success.main", border: "2px solid", borderColor: "success.main", color: "#fff" }}>
-        <CheckIcon sx={{ fontSize: 16 }} />
-      </Box>
-    );
-  }
-  if (statusFlag === "REJECTED") {
-    return (
-      <Box sx={{ ...baseStyle, backgroundColor: "error.main", border: "2px solid", borderColor: "error.main", color: "#fff" }}>
-        <CloseIcon sx={{ fontSize: 16 }} />
-      </Box>
-    );
-  }
-  if (statusFlag === "ESCALATED") {
-    return (
-      <Box sx={{ ...baseStyle, backgroundColor: "white", border: "2px solid", borderColor: "warning.main", color: "warning.main" }}>
-        {showTextInside ? `${label} !` : "!"}
-      </Box>
-    );
-  }
-  if (statusFlag === "ACTIVE") {
-    return (
-      <Box sx={{ ...baseStyle, backgroundColor: "white", border: "2px solid", borderColor: "warning.main", color: "warning.main" }}>
-        {showTextInside ? label : iconLetter}
-      </Box>
-    );
-  }
-
-  // PENDING / FUTURE STEPS
-  return (
-    <Box sx={{ ...baseStyle, backgroundColor: "white", border: "2px solid #e2e8f0", color: "text.disabled" }}>
-      {iconLetter}
-    </Box>
-  );
-};
-
-
-const BigWorkflowIcon = (props) => {
-  const { statusFlag, label } = props;
-  const baseStyle = {
-    height: 40,
-    minWidth: 160,
-    borderRadius: 20,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 1,
-    px: 2,
-    position: "relative",
-    zIndex: 2,
-    backgroundColor: "white",
-  };
-  const InfoBadge = () => (
-    <Box
-      sx={{
-        position: "absolute",
-        top: -4,
-        right: -4,
-        width: 18,
-        height: 18,
-        borderRadius: "50%",
-        backgroundColor: "warning.main",
-        color: "white",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        fontSize: "11px",
-        fontWeight: "bold",
-        border: "2px solid white",
-      }}
-    >
-      !
-    </Box>
-  );
-
-  if (statusFlag === "COMPLETED")
-    return (
-      <Box
-        sx={{
-          ...baseStyle,
-          border: "2px solid",
-          borderColor: "success.main",
-          backgroundColor: "#e8f5e9",
-          color: "success.main",
-        }}
-      >
-        <CheckIcon sx={{ fontSize: 18 }} />
-        <Typography variant="body2" fontWeight="bold">
-          {label}
-        </Typography>
-      </Box>
-    );
-  if (statusFlag === "REJECTED")
-    return (
-      <Box
-        sx={{
-          ...baseStyle,
-          border: "2px solid",
-          borderColor: "error.main",
-          backgroundColor: "#ffebee",
-          color: "error.main",
-        }}
-      >
-        <CloseIcon sx={{ fontSize: 18 }} />
-        <Typography variant="body2" fontWeight="bold">
-          {label}
-        </Typography>
-      </Box>
-    );
-  if (statusFlag === "ESCALATED" || statusFlag === "ACTIVE")
-    return (
-      <Box
-        sx={{
-          ...baseStyle,
-          border: "2px solid",
-          borderColor: "warning.main",
-          color: "text.primary",
-        }}
-      >
-        <Typography variant="body2" fontWeight="bold">
-          {label}
-        </Typography>
-        <InfoBadge />
-      </Box>
-    );
-  return (
-    <Box
-      sx={{ ...baseStyle, border: "2px solid #e2e8f0", color: "text.disabled" }}
-    >
-      <Typography variant="body2" fontWeight="bold">
-        {label}
-      </Typography>
-    </Box>
-  );
-};
-
-const calculateTimeElapsed = (startDateString) => {
-  if (!startDateString) return "N/A";
-  const diffMins = Math.floor(
-    Math.abs(new Date() - new Date(startDateString)) / 60000
-  );
-  if (diffMins === 0) return "Just now";
-  if (diffMins < 60) return `${diffMins} min`;
-  const hours = Math.floor(diffMins / 60);
-  return diffMins % 60 > 0 ? `${hours} hr ${diffMins % 60} min` : `${hours} hr`;
-};
-
-function CustomNoRowsOverlay() {
-  return (
-    <Stack height="100%" alignItems="center" justifyContent="center">
-      {" "}
-      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />{" "}
-      <Typography variant="h6">No Requests Found</Typography>{" "}
-    </Stack>
-  );
-}
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { TimePicker } from "@mui/x-date-pickers/TimePicker";
+import { jpStyles } from "./VoucherStyle";
+import { useSelector } from "react-redux";
+import { findMenuById } from "../../utils/CommonUtilities";
+const createNewRow = () => ({
+  id: crypto.randomUUID ? crypto.randomUUID() : Date.now() + Math.random(),
+  branch: null,
+  currency: "",
+  cgl: null,
+  amount: "",
+  txnType: "",
+  remarks: "",
+  productCode: "",
+});
 
 const formatDateTime = (dateVal) => {
   if (!dateVal) return "N/A";
-  // Removing .toLowerCase() keeps DayJS's native capitalized months (e.g. 'Jun')
-  return dayjs(dateVal).format("DD MMM YYYY, hh:mm a");
+  // Formats to: "19 Jun 2026, 12:58 pm"
+  return dayjs(dateVal).format("DD MMM YYYY, hh:mm a").toLowerCase();
 };
 
-const handleBlurAll = () => {
-  // This finds any element currently holding focus and forces it to lose focus
-  if (document.activeElement instanceof HTMLElement) {
-    document.activeElement.blur();
+const shortenString = (value) => {
+  let pos = 0;
+  for (let i = 0; i < 2; i++) {
+    const matchPos = value.indexOf("\n", pos + 1);
+    if (matchPos == -1) {
+      break;
+    }
+    i++;
+    pos = matchPos;
   }
-};
+  if (pos > 100) {
+    return value.substring(0, 100);
+  }
+  return value.substring(0, pos);
+}
 
-export default function VoucherPostingStatus() {
+const formatBigIntForDisplay = (val) => {
+  if (typeof val !== "bigint") {
+    val = BigInt(val || 0);
+  }
+  const str = val.toString().padStart(5, "0");
+  const integer = str.slice(0, -4);
+  const fractional = str.slice(-4);
+  return `${integer || "0"}.${fractional}`;
+};
+export default function VoucherPosting() {
   const { callApi } = useApi();
   const showSnackBar = useCustomSnackbar();
+  const navigate = useNavigate();
+  const menus = useSelector((state) => state.menus);
+  const menuItems = useSelector((state) => state.menus.menus);
+  const selectedMenuItem = menus.selectedMenuItem;
+  const getStatusMenu = findMenuById(menuItems, 32);
+  // --- INTERNAL WIZARD STATE ---
+  const [activeStep, setActiveStep] = useState(0);
+  const [entryMethod, setEntryMethod] = useState("MANUAL");
+
+  const [submittedBatchId, setSubmittedBatchId] = useState(null);
+  const [showSchedulePicker, setShowSchedulePicker] = useState(false);
+  const [isApplyingSchedule, setIsApplyingSchedule] = useState(false);
+  const [isExecutingImmediately, setIsExecutingImmediately] = useState(false);
+  const [routingChoice, setRoutingChoice] = useState(null); // 'IMMEDIATE' or 'SCHEDULE'
+  const [isFinalizing, setIsFinalizing] = useState(false);
+
+  const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
+
+
+  // --- VOUCHER TABLE STATE ---
+  const [voucherList, setVoucherList] = useState([]);
+  const [selectedVoucher, setSelectedVoucher] = useState(null);
+  const [expandedRow, setExpandedRow] = useState(null); // Tracks which row is clicked open
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(5);
+
   const isMounted = useRef(true);
   const [currentUserId, setCurrentUserId] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState([]);
-  const [isModalOpen, setIsModalOpen] = useState(false);
+  // --- STEPPER & WIZARD STATE ---
+  const steps = ['Select Voucher', 'Entry Method', 'Data Entry'];
+
+  const [groupedVouchers, setGroupedVouchers] = useState({});
+  const [scheduledTime, setScheduledTime] = useState(() =>
+    dayjs().add(30, 'minute').startOf('minute') 
+  );
+
+  const [rows, setRows] = useState([createNewRow()]);
+
+  const [currencyOptions, setCurrencyOptions] = useState([]);
+
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [selectedBatch, setSelectedBatch] = useState(null);
-  const [paginationModel, setPaginationModel] = useState({ page: 0, pageSize: 10 });
-  const [totalRowCount, setTotalRowCount] = useState(0);
-  // View/Paginate States
-  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-  const [viewingBatchState, setViewingBatchState] = useState("");
-  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
-  const [viewingBatchRequestDate, setViewingBatchRequestDate] = useState(null);
-  const [viewingBatchRequestCount, setViewingBatchRequestCount] = useState(0);
-  const [viewingBatchTimeSinceLastAction, setViewingBatchTimeSinceLastAction] = useState("");
-  const [workflowStepsMap, setWorkflowStepsMap] = useState({});
-  const [vidDetails, setVidDetails] = useState(null);
-  const [dynamicSteps, setDynamicSteps] = useState([]);
-  const [workflowHistory, setWorkflowHistory] = useState([]);
-  const [isFetchingVid, setIsFetchingVid] = useState(false);
-  const [isFetchingSteps, setIsFetchingSteps] = useState(false);
-  const [isDescExpanded, setIsDescExpanded] = useState(false);
-  const [dbRoleMap, setDbRoleMap] = useState({});
-  const [viewingBatchOrder, setViewingBatchOrder] = useState(1);
-  const [viewingBatchRawStatus, setViewingBatchRawStatus] = useState("");
 
+  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
+  const [postingDate, setPostingDate] = useState("");
+
+  const [checked, setChecked] = useState(false);
+
+  const [isPageLoading, setIsPageLoading] = useState(true);
+  const [isEodRunning, setIsEodRunning] = useState(false);
+
+  // Replaces anything that is NOT an alphabet, number, or space
+  const REMARKS_REPLACE_REGEX = /[^a-zA-Z0-9 _\-]/g;
+
+  // Replaces anything that is NOT a digit (CGL is strictly digits)
+  const CGL_REPLACE_REGEX = /[^0-9]/g;
+
+  // Replaces anything that is NOT alphanumeric (Branch is strictly alphanumeric)
+  const BRANCH_REPLACE_REGEX = /[^0-9]/g;
+
+
+  const [currentRoleId, setCurrentRoleId] = useState(null);
+
+
+  // Track input values to prevent empty dropdown tray on focus
+  const [branchInputValues, setBranchInputValues] = useState({});
+  const [cglInputValues, setCglInputValues] = useState({});
+
+  const [branchSearch, setBranchSearch] = useState({
+    loadingId: null,
+    options: [],
+  });
+  const [cglSearch, setCglSearch] = useState({
+    loadingId: null,
+    options: []
+  });
   useEffect(() => {
-    const fetchRoles = async () => {
-      try {
-        const rolesData = await callApi(
-          "/JS/voucher/active-roles",
-          null,
-          "GET"
-        );
-        if (rolesData && isMounted.current) setDbRoleMap(rolesData);
-      } catch (err) { }
+    const handleBeforeUnload = (e) => {
+      // If they are on Step 3 and haven't clicked the final submit button yet
+      if (activeStep === 3 && !isFinalizing) {
+        e.preventDefault();
+        e.returnValue = "You have an unfinalized batch. If you leave, it will not be sent for approval!";
+      }
     };
-    fetchRoles();
-  }, [callApi]);
 
-  const getRoleDisplayName = (roleValue) => {
-    if (!roleValue || roleValue === "null" || roleValue === "System")
-      return "System";
-    return dbRoleMap[String(roleValue)] || roleValue;
-  };
+    window.addEventListener("beforeunload", handleBeforeUnload);
 
-  const handleDownloadExcel = async () => {
-    if (!viewingBatchId) return;
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
+  }, [activeStep, isFinalizing]);
 
-    try {
-      showSnackBar("Downloading Excel...", "info");
 
-      const response = await callApi(
-        `/JS/voucher/download-batch/${viewingBatchId}`,
-        null,
-        "GET",
-        "blob",
-        null,
-        {},
-        false
-      );
-
-      const blobData = response.data || response;
-      if (!blobData) throw new Error("No data received");
-
-      const blob = new Blob([blobData], {
-        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      });
-      const url = window.URL.createObjectURL(blob);
-
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", `Batch_${viewingBatchId}.xlsx`);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
-
-      showSnackBar("Download complete.", "success");
-    } catch (e) {
-      console.error("Download failed:", e);
-      showSnackBar("Failed to download Excel file.", "error");
-    }
-  };
-
-  // --- SAFE AUTH CHECK ---
   useEffect(() => {
     isMounted.current = true;
     try {
-      const auth =
-        sessionStorage.getItem("persist:auth") ||
-        localStorage.getItem("persist:auth");
-      if (auth) {
-        const user = JSON.parse(JSON.parse(auth).user);
-        console.log(user);
-        // Force string to ensure match
-        if (user?.userId) setCurrentUserId(String(user.userId));
-      }
-    } catch (e) { }
-    return () => {
-      isMounted.current = false;
-    };
-  }, []);
-
-  const fetchMyBatches = useCallback(async (isSilent = false) => {
-    if (!isSilent) setLoading(true); // Only show big spinner if it's NOT silent
-    try {
-
-      let actualRoleId = null;
       const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
       if (auth) {
         const user = JSON.parse(JSON.parse(auth).user);
-        actualRoleId = user?.roleId || user?.role || user?.ROLE_ID;
+        if (user?.userId) setCurrentUserId(String(user.userId));
+        // Assuming your auth object holds the role ID.
+        if (user?.roleId) setCurrentRoleId(user.roleId);
       }
-      const response = await callApi(
-        `/JS/voucher/all-requests-summary?roleId=${actualRoleId}&page=${paginationModel.page}&size=${paginationModel.pageSize}`,
-        null,
-        "GET"
-      );
-
-      console.log("2. Raw API Response:", response);
-
-      let fetchedRows = [];
-      if (response && response.content) {
-        fetchedRows = response.content;            // The 10 rows
-        setTotalRowCount(response.totalElements);  // The true database total
-      } else if (Array.isArray(response)) {
-        fetchedRows = response;
-        setTotalRowCount(response.length);
-      }
+    } catch (e) { }
+    return () => { isMounted.current = false; };
+  }, []);
 
 
-      console.log("3. Extracted Rows:", fetchedRows);
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        setIsPageLoading(true);
 
-      // SAFE MAPPING: Prevent crashes if approvalWorkflow is missing or null
-      const uniqueWorkflows = [
-        ...new Set(
-          fetchedRows.map((row) => row?.approvalWorkflow).filter(Boolean)
-        ),
-      ];
-      console.log("4. Unique Workflows to fetch steps for:", uniqueWorkflows);
+        // CRITICAL FIX: Synchronously extract the role directly from storage. 
+        // Do not rely on 'currentRoleId' state here, as it will be 'null' on the first render.
+        let actualRoleId = null;
+        const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+        if (auth) {
+          const user = JSON.parse(JSON.parse(auth).user);
+          // Checks multiple common property names just to be safe
+          actualRoleId = user?.roleId || user?.role || user?.ROLE_ID;
+        }
 
-      const stepsMap = {};
-      await Promise.all(
-        uniqueWorkflows.map(async (wfCode) => {
-          try {
-            const stepsResponse = await callApi(
-              `/JS/voucher/workflow/steps/${wfCode}`,
-              null,
-              "GET"
-            );
-            // Defensively extract steps array
-            const steps = Array.isArray(stepsResponse)
-              ? stepsResponse
-              : stepsResponse?.data || [];
+        if (!actualRoleId) {
+          showSnackBar("User Role ID not found. Cannot fetch VIDs.", "error");
+          setIsPageLoading(false);
+          return; // Aborts the call if no role is found
+        }
 
-            // FIX: Store the raw step objects instead of mapping to string titles
-            stepsMap[wfCode] = steps;
-          } catch (e) {
-            console.warn(`Failed to fetch steps for ${wfCode}`, e);
-            stepsMap[wfCode] = [
-              { state: "P", designation: "Creator" },
-              { state: "APPROVED", designation: "Approver" }
-            ]; // Fallback structure
+        // Passes the guaranteed correct role ID to the backend
+        const vouchersResponse = await callApi(`/JS/voucher/active?roleId=${actualRoleId}`, null, "GET");
+
+        // Defensively extract the array whether your callApi unwraps the { data: [...] } or not
+        if (vouchersResponse && Array.isArray(vouchersResponse.data)) {
+          setVoucherList(vouchersResponse.data);
+        } else if (Array.isArray(vouchersResponse)) {
+          setVoucherList(vouchersResponse);
+        } else {
+          setVoucherList([]); // Safe fallback
+        }
+
+        // 1. FIRST: Check the EOD Status from your new API
+        const eodResponse = await callApi("/JS/voucher/eod_status", null, "GET");
+
+        // The API returns an array: [{ "eodStatus": 0 }]
+        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
+          if (eodResponse[0].eodStatus === 1) {
+            setIsEodRunning(true);
+            setIsPageLoading(false);
+            return; // STOP loading everything else, block the screen
           }
-        })
-      );
+        }
 
-      console.log("5. Final Steps Map:", stepsMap);
+        // 2. IF EOD IS NOT RUNNING: Continue loading the normal page data
+        const dateResponse = await callApi("/JS/voucher/current-posting-date", null, "GET");
 
-      if (isMounted.current) {
-        setWorkflowStepsMap(stepsMap);
-        setRows(fetchedRows);
+        if (dateResponse) {
+          try {
+            const [year, month, day] = dateResponse.split("-");
+            const formattedDate = `${day}-${month}-${year}`;
+            setPostingDate(formattedDate);
+          } catch (e) {
+            console.error("Could not parse date:", dateResponse, e);
+            setPostingDate(dateResponse);
+          }
+        } else {
+          showSnackBar("Failed to load posting date.", "error");
+          setPostingDate("Error");
+        }
+
+        const currencyResponse = await callApi("/JS/voucher/currencies", null, "GET");
+        const currencyData = currencyResponse?.data || currencyResponse;
+
+        if (Array.isArray(currencyData)) {
+          let uniqueCurrencies = [...new Set(currencyData)];
+
+          // Sort the array so "INR" is always at index 0, and the rest are alphabetical
+          uniqueCurrencies.sort((a, b) => {
+            if (a === "INR") return -1;
+            if (b === "INR") return 1;
+            return a.localeCompare(b);
+          });
+
+          setCurrencyOptions(uniqueCurrencies);
+        } else {
+          showSnackBar("Failed to load currencies.", "error");
+        }
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+        showSnackBar("An error occurred while loading page data.", "error");
+      } finally {
+        setIsPageLoading(false);
       }
-    } catch (err) {
-      console.error("CATCH BLOCK TRIGGERED. Full Error Object:", err);
-      console.error("Error Message:", err.message);
+    };
 
-      if (isMounted.current && err.name !== "CanceledError") {
-        showSnackBar(
-          `Failed to load: ${err.message}`,
-          "error"
-        );
-      }
-    } finally {
-      if (isMounted.current) setLoading(false);
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+  const handleNext = () => {
+    if (activeStep === 0 && !selectedVoucher) {
+      showSnackBar("Please select a voucher from the list first.", "warning");
+      return;
     }
-  }, [callApi, showSnackBar, paginationModel.page, paginationModel.pageSize]);
-
-  useEffect(() => {
-    fetchMyBatches();
-  }, [fetchMyBatches]);
-
-  const hasProcessingBatches = rows.some((row) => row.batchStatus === 'S');
-
-  useEffect(() => {
-    let interval;
-    if (hasProcessingBatches) {
-      interval = setInterval(() => {
-        fetchMyBatches(true); // true = silent mode
-      }, 5000); // Ping server every 5 seconds
-    }
-    return () => clearInterval(interval);
-  }, [hasProcessingBatches, fetchMyBatches]);
-
-  const handleOpenModal = (batch) => {
-    setSelectedBatch(batch);
-    setIsModalOpen(true);
-  };
-  const handleCloseModal = () => {
-    if (isSubmitting) return;
-    setIsModalOpen(false);
-    setSelectedBatch(null);
+    setActiveStep((prevStep) => prevStep + 1);
   };
 
-  const handleSubmitBatchCancel = async () => {
-    setIsSubmitting(true);
-    const targetBatchId = selectedBatch.batchId; // Store it before modal closes
+  const handleMethodSelection = (method) => {
+    setEntryMethod(method);
+    handleNext();
+  };
+
+
+
+  const handleResetWizard = () => {
+
+    setSelectedVoucher(null);
+    setEntryMethod("MANUAL");
+    setRows([createNewRow()]);
+    setCommonBatchRemarks("");
+    setScheduledTime(null);
+    setChecked(false);
+    setSubmittedBatchId(null);
+    setShowSchedulePicker(false);
+    navigate(getStatusMenu.route || selectedMenuItem.route)
+
+  };
+
+  const handleFinalizeRouting = async () => {
+    setIsFinalizing(true);
+    let formattedSchedule = null;
+
+    // Default to the manual batch ID (since it's already created in Step 2)
+    let finalDisplayBatchId = submittedBatchId;
 
     try {
-      await callApi(
-        `/JS/voucher/my-requests/by-batch/${targetBatchId}`,
-        null,
-        "DELETE"
-      );
-      showSnackBar(
-        `Batch ${targetBatchId} deletion process started.`,
-        "success"
-      );
+      if (routingChoice === "SCHEDULE") {
+        if (!scheduledTime || !scheduledTime.isValid()) {
+          showSnackBar("Please select a valid time.", "warning");
+          setIsFinalizing(false);
+          return;
+        }
 
-      setRows((prevRows) =>
-        prevRows.filter((row) => row.batchId !== targetBatchId)
-      );
+        const today = dayjs();
+        const finalSchedule = scheduledTime
+          .year(today.year())
+          .month(today.month())
+          .date(today.date());
 
-      handleCloseModal();
+        const minAllowed = dayjs().add(28, 'minute');
+        const maxAllowed = dayjs().endOf('day');
 
-      setTimeout(() => {
-        fetchMyBatches();
-      }, 1500);
+        if (finalSchedule.isBefore(minAllowed)) {
+          showSnackBar("Schedule time must be at least 30 minutes from now.", "warning");
+          setIsFinalizing(false);
+          return;
+        }
+        if (finalSchedule.isAfter(maxAllowed)) {
+          showSnackBar("Schedule time cannot exceed today's end of day (11:59 PM).", "warning");
+          setIsFinalizing(false);
+          return;
+        }
+        formattedSchedule = finalSchedule.format('YYYY-MM-DD HH:mm:ss');
+      }
+
+      if (entryMethod === "BULK") {
+        // For Bulk, submittedBatchId actually holds the UUID. Create the batch NOW.
+        const [day, month, year] = postingDate.split("-");
+        const formattedBackendDate = `${day}/${month}/${year}`;
+
+        const response = await callApi("/JS/voucher/create-batch-from-cache", {
+          requestId: submittedBatchId,
+          postingDate: formattedBackendDate,
+          vid: selectedVoucher.vid,
+          commonBatchRemarks: "Voucher created successfully",
+          scheduledTime: formattedSchedule
+        }, "POST");
+
+        // SAFELY EXTRACT THE REAL ORACLE BATCH ID
+        finalDisplayBatchId = response?.[0]?.batchId || response?.batchId || (typeof response === 'string' ? response : "N/A");
+
+      } else {
+        // For Manual, the batch is already created, just update the schedule.
+        await callApi("/JS/voucher/update-schedule", {
+          batchId: submittedBatchId,
+          scheduledTime: formattedSchedule
+        }, "POST");
+      }
+
+      // SHOWS THE OFFICIAL SUBMISSION MESSAGE WITH THE CORRECT BATCH ID
+      showSnackBar(`Success! Your batch ${finalDisplayBatchId} is initialized and processing.`, "success");
+      handleResetWizard();
+
     } catch (error) {
       const serverMsg = error?.response?.data?.message
         || error?.response?.data?.error
         || (typeof error?.response?.data === 'string' ? error.response.data : null)
         || error?.message;
 
-      showSnackBar(serverMsg || "Failed to delete batch. It may have already been processed.", "error");
+      const errMsg = serverMsg || "Unable to finalize execution routing. Please try again.";
+      showSnackBar(errMsg, "error");
+    } finally {
+      setIsFinalizing(false);
+    }
+  };
+
+
+
+  const handleChangePage = (event, newPage) => {
+    setPage(newPage);
+  };
+
+  const handleChangeRowsPerPage = (event) => {
+    setRowsPerPage(parseInt(event.target.value, 10));
+    setPage(0);
+  };
+
+  const handleRowExpand = (id) => {
+    setExpandedRow(expandedRow === id ? null : id);
+  };
+  const handleBack = () => {
+    setActiveStep((prevStep) => prevStep - 1);
+  };
+
+  const filterRemarks = (val) => {
+    let filtered = val.replace(/[^a-zA-Z0-9 ]/g, ""); // Allow only alphanumeric and spaces
+    filtered = filtered.replace(/^\s+/, ""); // Remove leading spaces
+    filtered = filtered.replace(/\s{2,}/g, " "); // Replace multiple consecutive spaces with a single space
+    return filtered;
+  };
+
+
+  // 1. Common remarks can be empty. If filled, must be 2-30.
+  const isCommonRemarksValid = (val) => val.trim().length === 0 || (val.trim().length >= 2 && val.trim().length <= 30);
+
+  // 2. Row remarks are STRICTLY compulsory (2-30 chars).
+  const isRowRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+  const filterAndWarn = (val) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphanumeric, spaces, and / & ( ) , . - are allowed.";
+
+    // 1. Corrected Regex: Allows Alphanumeric, Spaces, and / & ( ) , . -
+    const invalidCharRegex = /[^a-zA-Z0-9 \/&(),.\-]/g;
+
+    if (invalidCharRegex.test(filtered)) {
+      hasError = true;
+      filtered = filtered.replace(invalidCharRegex, "");
+    }
+
+    // 2. Strip leading space and collapse double spaces
+    const beforeSpaceTrim = filtered;
+    filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+
+    if (beforeSpaceTrim !== filtered && !hasError) {
+      hasError = true;
+      msg = "Remark should not start with a space or contain consecutive spaces.";
+    }
+
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+
+    return filtered;
+  };
+
+  // Both Common Batch Remarks and Row Remarks are now strictly compulsory (2-30 chars)
+  const isRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+  const handleAddRow = () => {
+    const lastRow = rows[rows.length - 1];
+
+    if (
+      !lastRow.branch ||
+      !lastRow.currency ||
+      !lastRow.cgl ||
+      !lastRow.amount ||
+      !lastRow.txnType ||
+      !isRowRemarksValid(lastRow.remarks)
+    ) {
+      showSnackBar(
+        "Please fill all required fields (*) in the current row before adding a new one.",
+        "warning"
+      );
+      return;
+    }
+
+    const newRow = {
+      ...createNewRow(),
+      remarks: checked ? commonBatchRemarks : "",
+    };
+    setRows([...rows, newRow]);
+  };
+
+  const handleRemarksSync = (event) => {
+    const isChecked = event.target.checked;
+    setChecked(isChecked);
+
+    if (isChecked) {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: commonBatchRemarks,
+      }));
+      setRows(newRows);
+    } else {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: "",
+      }));
+      setRows(newRows);
+    }
+  };
+
+  const handleDeleteRow = (id) => {
+    if (rows.length > 1) {
+      setRows(rows.filter((row) => row.id !== id));
+      // Cleanup input tracking
+      const newBranchInputs = { ...branchInputValues };
+      delete newBranchInputs[id];
+      setBranchInputValues(newBranchInputs);
+      const newCglInputs = { ...cglInputValues };
+      delete newCglInputs[id];
+      setCglInputValues(newCglInputs);
+    } else {
+      showSnackBar("Cannot delete the first row.", "warning");
+    }
+  };
+
+  const handleRowChange = (id, field, value) => {
+    setRows((prevRows) =>
+      prevRows.map((row) => {
+        if (row.id === id) {
+          return { ...row, [field]: value };
+        }
+        return row;
+      })
+    );
+  };
+
+  const searchBranches = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query || query.trim().length < 3) {
+        setBranchSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
+      try {
+        const response = await callApi(
+          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setBranchSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("Branch search failed.", "error");
+        setBranchSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const searchCgls = useCallback(
+    debounce(async (query, rowId) => {
+      // Changed from === 0 to < 3 to enforce the minimum character limit
+      if (!query || query.trim().length < 3) {
+        setCglSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
+
+      try {
+        const response = await callApi(
+          `/JS/cgl-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setCglSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("CGL search failed.", "error");
+        setCglSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+
+  const isFormReadyToSubmit = rows.length >= 2 && rows.every(
+    (row) =>
+      row.branch &&
+      row.currency &&
+      row.cgl &&
+      row.amount &&
+      parseFloat(row.amount) > 0 &&
+      row.txnType &&
+      isRowRemarksValid(row.remarks)
+  );
+
+  const handleValidateClick = async () => {
+    if (!isCommonRemarksValid(commonBatchRemarks)) {
+      showSnackBar("Common Batch Remarks must be 2-30 characters if provided.", "error");
+      return;
+    }
+
+    const branchCurrencyTotals = new Map();
+    const branchEntryCheck = new Map();
+
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch || !row.currency || !row.cgl || !row.amount ||
+        parseFloat(row.amount) === 0 || !row.txnType || !isRowRemarksValid(row.remarks)
+      ) {
+        showSnackBar(
+          `Row ${index + 1} is incomplete or has a zero amount. Amount must be greater than 0, and remarks must be 2-30 characters.`,
+          "error"
+        );
+        return;
+      }
+
+      const branchCode = row.branch.code;
+      const currency = row.currency;
+
+      const cglNumber = String(row.cgl.cglNumber);
+      const isMemo = cglNumber.startsWith("5");
+      const type = isMemo ? "MEMO" : "NORMAL";
+
+      const [integerPart = "0", fractionalPart = "0"] = (row.amount || "0").split(".");
+      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
+      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
+
+      const compositeKey = `${branchCode}-${currency}-${type}`;
+
+      if (!branchCurrencyTotals.has(compositeKey)) {
+        branchCurrencyTotals.set(compositeKey, { totalDebit: 0n, totalCredit: 0n });
+      }
+      const currencyTotals = branchCurrencyTotals.get(compositeKey);
+
+      if (row.txnType === "Debit") {
+        currencyTotals.totalDebit += amountAsBigInt;
+      } else if (row.txnType === "Credit") {
+        currencyTotals.totalCredit += amountAsBigInt;
+      }
+
+      if (!branchEntryCheck.has(branchCode)) {
+        branchEntryCheck.set(branchCode, { hasDebit: false, hasCredit: false });
+      }
+      const branchCheck = branchEntryCheck.get(branchCode);
+
+      if (row.txnType === "Debit" && amountAsBigInt > 0n) branchCheck.hasDebit = true;
+      else if (row.txnType === "Credit" && amountAsBigInt > 0n) branchCheck.hasCredit = true;
+    }
+
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar("Branch must have at least one Debit and one Credit entry.", "error");
+        return;
+      }
+    }
+
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit } = totals;
+      if (totalDebit !== totalCredit) {
+        showSnackBar("Branch and Currency Debit/Credit Mismatch for Real/Memo CGL.", "error");
+        return;
+      }
+    }
+
+    // --- DIRECT SUBMIT DOWNSTREAM PROCESSING (MODAL BYPASSED) ---
+    setIsSubmitting(true);
+
+    const [day, month, year] = postingDate.split("-");
+    const formattedBackendDate = `${day}/${month}/${year}`;
+    const rowPayloads = [];
+
+    for (const row of rows) {
+      const finalAmount = row.txnType === "Credit" ? "-" + row.amount : row.amount;
+      rowPayloads.push({
+        branch: row.branch.code,
+        currency: row.currency,
+        cgl: row.cgl.cglNumber,
+        amount: finalAmount,
+        txnType: row.txnType,
+        productType: row.productCode,
+        remarks: row.remarks,
+        postingDate: formattedBackendDate
+      });
+    }
+
+    const finalPayload = {
+      vid: selectedVoucher?.vid,
+      scheduledTime: null,
+      commonBatchRemarks: commonBatchRemarks ? commonBatchRemarks.trim() : "Voucher created successfully",
+      rows: rowPayloads,
+    };
+
+    try {
+      const response = await callApi("/JS/voucher/create-batch", finalPayload, "POST");
+      const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
+      setSubmittedBatchId(newBatchId);
+
+
+      setRows([createNewRow()]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+      setBranchInputValues({});
+      setCglInputValues({});
+      setActiveStep(3); // Route forward automatically to Step 3
+    } catch (error) {
+      let errMsg = "Unable to submit the voucher request. Please try again.";
+      if (error?.response?.data && typeof error.response.data === 'string' && !error.response.data.startsWith("<")) {
+        errMsg = error.response.data;
+      } else if (error?.response?.data?.message) {
+        errMsg = error.response.data.message;
+      }
+      showSnackBar(errMsg, "error");
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  const SelectedVoucherCard = () => {
+    const [isDescExpanded, setIsDescExpanded] = useState(false);
 
-  const handleOpenViewModal = async (row) => {
-    setViewingBatchId(row.batchId);
-    setViewingBatchCreatorId(row.creatorId);
-    setViewingBatchState(row.currentStatus || "");
-    setViewingBatchRawStatus(row.batchStatus || "");
-    setViewingBatchRequestDate(row.requestDate);
-    setViewingBatchRequestCount(row.requestCount || 0);
-    setViewingBatchOrder(row.currentOrder);
-    setViewingBatchTimeSinceLastAction(row.timeSinceLastAction || "");
-    setIsViewModalOpen(true);
-    setIsFetchingSteps(true);
-    setIsFetchingVid(true);
+    if (!selectedVoucher) return null;
 
-    try {
-      const workflowCode = row.approvalWorkflow || "Workflow_3";
-      const [stepsData, summaryData, historyData] = await Promise.all([
-        callApi(`/JS/voucher/workflow/steps/${workflowCode}`, null, "GET"),
-        callApi(`/JS/voucher/batch-summary/${row.batchId}`, null, "GET"),
-        callApi(`/JS/voucher/workflow-history/${row.batchId}`, null, "GET"),
-      ]);
+    const desc = selectedVoucher.description || "No description provided.";
+    const isLongDesc = desc.length > 100 || desc.split(/\r?\n/).length > 2;
 
-      setDynamicSteps(Array.isArray(stepsData) ? stepsData : []);
-      setVidDetails(summaryData);
-      setWorkflowHistory(Array.isArray(historyData) ? historyData : []);
-    } catch (err) {
-      showSnackBar("Failed to load details.", "error");
-    } finally {
-      setIsFetchingSteps(false);
-      setIsFetchingVid(false);
-    }
-  };
-  const handleCloseViewModal = () => {
-    // 1. Force blur on whatever is currently focused (Close Icon or the Dialog itself)
-    if (document.activeElement instanceof HTMLElement) {
-      document.activeElement.blur();
-    }
+    return (
+      <Paper elevation={0} sx={jpStyles.svPaper}>
 
-    // 2. Set focus to the body so it doesn't try to find a button inside the closing modal
-    document.body.focus();
 
-    setTimeout(() => {
-      setIsViewModalOpen(false);
-      setViewingBatchId(null);
-      setIsDescExpanded(false);
-    }, 300);
-  };
-  const handleDetailPageChange = (event, newPage) => {
-    setDetailPage(newPage);
-    fetchDetailRows(viewingBatchId, newPage, detailRowsPerPage);
-  };
-  const handleDetailRowsPerPageChange = (event) => {
-    const newSize = parseInt(event.target.value, 10);
-    setDetailRowsPerPage(newSize);
-    setDetailPage(0);
-    fetchDetailRows(viewingBatchId, 0, newSize);
-  };
 
-  const handleCancelSelectedJournals = async () => {
-    if (selectedJournalPrefixes.length === 0) {
-      showSnackBar("Select at least one entry.", "warning");
-      return;
-    }
-    setIsPartialSubmitting(true);
-    try {
-      await callApi(
-        "/JS/voucher/my-requests/by-journal-list",
-        selectedJournalPrefixes,
-        "DELETE"
-      );
-      showSnackBar("Selected entries deleted successfully.", "success");
-      handleCloseViewModal();
-    } catch (error) {
-      showSnackBar("Failed to delete selection", "error");
-      setIsPartialSubmitting(false);
-    }
-  };
 
-  const handleSelectAllClick = (event) => {
-    if (event.target.checked)
-      setSelectedJournalPrefixes(batchDetails.map((g) => g[0].journalPrefix));
-    else setSelectedJournalPrefixes([]);
-  };
-  const handleRowCheckboxClick = (event, prefix) => {
-    if (event) event.stopPropagation();
-    const index = selectedJournalPrefixes.indexOf(prefix);
-    let newSelected = [];
-    if (index === -1) newSelected = [...selectedJournalPrefixes, prefix];
-    else newSelected = selectedJournalPrefixes.filter((p) => p !== prefix);
-    setSelectedJournalPrefixes(newSelected);
-  };
+        <Box sx={jpStyles.svHeaderBox}>
+          <Typography variant="subtitle1" fontWeight="bold" color="text.primary">
+            Voucher Request Details
+          </Typography>
+        </Box>
 
-  // Standardized normalization for matching user contexts safely
-  const isViewingSelfCreated =
-    currentUserId &&
-    viewingBatchCreatorId &&
-    String(currentUserId).trim().toUpperCase() === String(viewingBatchCreatorId).trim().toUpperCase();
-
-  // batch delete
-  const isBatchDeletable =
-    viewingBatchRawStatus === "P" &&
-    Number(viewingBatchOrder) === 2 &&
-    !isFetchingSteps &&
-    workflowHistory.length <= 1;
-
-  const columns = [
-    {
-      field: "batchId",
-      headerName: "Batch ID",
-      width: 120,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: false, // <--- ENABLED
-      filterable: true,         // <--- ENABLED
-      sortable: false,
-    },
-    {
-      field: "vid",
-      headerName: "VID",
-      width: 150,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: false, // <--- ENABLED
-      filterable: true,         // <--- ENABLED
-      sortable: false,
-    },
-    {
-      field: "currentStatus",
-      headerName: "Workflow Progress",
-      width: 440,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (params) => {
-        // --- NEW: CATCH DRAFT / PROCESSING STATE ---
-        if (params.row.batchStatus === 'S') {
-          return (
-            <Box sx={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "flex-start", pl: 2, height: "100%" }}>
-              <Chip
-                icon={<CircularProgress size={16} sx={{ color: 'primary.main' }} />}
-                label="Creating Batch..."
-                variant="outlined"
-                color="primary"
-                sx={{ fontWeight: 'bold', borderStyle: 'dashed' }}
-              />
-            </Box>
-          );
-        }
-
-        const state = params.value || "";
-        const workflow = params.row.approvalWorkflow;
-        const isRejected = params.row.currentStatus === "REJECTED" || params.row.batchStatus === "R";
-        const steps = workflowStepsMap[workflow] || [];
-        let activeStep = params.row.currentOrder ? params.row.currentOrder - 1 : 0;
-
-        if (!isRejected && (state === "POSTED" || state === "SCHEDULED" || state === "C" || state === "S" || params.row.currentStatus === "POSTED")) {
-          activeStep = steps.length;
-        }
-        if (activeStep === -1) activeStep = 0;
-
-        const escalationHours = params.row.escalationTime || 24;
-        const hoursPending = Math.abs(new Date() - new Date(params.row.requestDate)) / 36e5;
-        const isEscalated = !isRejected && activeStep < steps.length && hoursPending > escalationHours;
-
-        return (
-          <Box sx={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "flex-start", pl: 2, height: "100%" }}>
-            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={{ width: "100%", mt: 0.5 }}>
-              {steps.map((step, index) => {
-                const isCompleted = index < activeStep;
-                const isCurrent = index === activeStep;
-
-                let statusFlag = "PENDING";
-                if (isCompleted) statusFlag = "COMPLETED";
-                if (isCurrent && isRejected) statusFlag = "REJECTED";
-                else if (isCurrent && isEscalated) statusFlag = "ESCALATED";
-                else if (isCurrent) statusFlag = "ACTIVE";
-
-                const label = step?.designation || step?.state || "Unknown";
-
-                return (
-                  <Tooltip title={statusFlag === "ESCALATED" ? "Escalation Time lapsed - Attention Required" : label} key={`${label}-${index}`} arrow>
-                    <Step completed={isCompleted} active={isCurrent} sx={{ px: 0, opacity: isRejected && index > activeStep ? 0.3 : 1 }}>
-                      <StepLabel
-                        StepIconComponent={() => (
-                          <CustomWorkflowIcon
-                            statusFlag={statusFlag}
-                            iconLetter={label.charAt(0).toUpperCase()}
-                            label={label}
-                            isMini={true}
-                          />
-                        )}
-                        sx={{ p: 0, m: 0 }}
-                      />
-                    </Step>
-                  </Tooltip>
-                );
-              })}
-            </Stepper>
-          </Box>
-        );
-      },
-    },
-    {
-      field: "creatorId",
-      headerName: "Creator",
-      width: 300,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-
-      cellClassName: "creator-cell",
-
-      renderCell: (p) => {
-        const name = p.row.creatorName || p.value;
-        const id = p.value;
-
-        return (
-          <Stack
-            direction="row"
-            alignItems="center"
-            justifyContent="center"
-            spacing={1}
-            sx={{
-              width: "100%",
-              height: "100%",
-              overflow: "visible !important",
-              px: 1,
-            }}
-          >
-            <AccountCircleIcon sx={{ color: "text.secondary", fontSize: 20 }} />
-            <Typography
-              variant="body2"
-              sx={{
-                whiteSpace: "nowrap",
-                overflow: "visible !important",
-                textOverflow: "clip",
-                textAlign: "center",
-              }}
-            >
-              {name} <strong>({id})</strong>
+        <Grid container spacing={2}>
+          <Grid item size={12} sx={{ mb: 2 }}>
+            <Stack direction="row" spacing={8}>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>VID</Typography>
+                <Typography variant="body1" fontWeight="bold" color="primary">{selectedVoucher.vid}</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
+                <Typography variant="body1" fontWeight="500">{selectedVoucher.categoryName || "General"}</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Issue Categories</Typography>
+                <Box>
+                  {selectedVoucher.issueCategories ? selectedVoucher.issueCategories.split(",").map((cat, index) => (
+                    <Chip key={index} label={cat.trim()} size="small" sx={jpStyles.issueCategoryChip} />
+                  )) : <Typography variant="body2" color="text.secondary">N/A</Typography>}
+                </Box>
+              </Box>
+            </Stack>
+          </Grid>
+          <Grid item size={12}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+              Description
             </Typography>
-          </Stack>
-        );
-      },
-    },
-    {
-      field: "requestDate",
-      headerName: "Submitted On",
-      width: 200,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => formatDateTime(p.value),
-    },
 
-    {
-      field: "requestCount",
-      headerName: "No. of Entries",
-      width: 150,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-    },
-    {
-      field: "actions",
-      headerName: "Action",
-      width: 140,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (params) => {
-        const isDraft = params.row.batchStatus === 'S'; // NEW: Check if still compiling
+            <Box sx={{ position: "relative" }}>
+              {/* collapsedSize={44} perfectly frames about 2 lines of body2 text */}
+              <Collapse in={!isLongDesc || isDescExpanded} collapsedSize={20}>
+                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6, fontWeight: 400, color: "text.primary" }}>
+                  {desc}
+                </Typography>
+              </Collapse>
 
-        return (
-          <Tooltip title={isDraft ? "Data is currently being compiled. Please wait." : "View & actions"} arrow>
-            <span> {/* Required span to allow Tooltip to show over a disabled button */}
-              <Button
-                variant="contained"
-                size="small"
-                disabled={isDraft} // NEW: Locks the button
-                onClick={() => handleOpenViewModal(params.row)}
-                sx={{ textTransform: "none", borderRadius: 2, boxShadow: 0 }}
-              >
-                View & actions
-              </Button>
-            </span>
-          </Tooltip>
-        );
-      },
-    },
-  ];
+              {isLongDesc && (
+                <Box sx={{ display: "flex", justifyContent: "flex-start", mt: 0.5 }}>
+                  <Button
+                    size="small"
+                    disableRipple
+                    onClick={() => setIsDescExpanded(!isDescExpanded)}
+                    endIcon={isDescExpanded ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
+                    sx={{
+                      p: 0,
+                      minWidth: "auto",
+                      textTransform: "none",
+                      fontWeight: 600,
+                      color: "primary.main",
+                      "&:hover": { background: "transparent", textDecoration: "underline" }
+                    }}
+                  >
+                    {isDescExpanded ? "Read Less" : "Read More"}
+                  </Button>
+                </Box>
+              )}
+            </Box>
+          </Grid>
+        </Grid>
+      </Paper>
+    );
+  };
+
+  if (isPageLoading) {
+    return (
+      <Box sx={jpStyles.loadingBox}>
+        <CircularProgress size={60} />
+      </Box>
+    );
+  }
+  if (isEodRunning) {
+    return (
+      <Box sx={jpStyles.eodBox}>
+        <Paper elevation={4} sx={jpStyles.eodPaper}>
+          <Typography variant="h4" color="error" fontWeight="bold" gutterBottom>EOD is Currently Running</Typography>
+          <Typography variant="h6" color="text.secondary" sx={{ mt: 2 }}>Voucher Entry is temporarily disabled.</Typography>
+          <Typography variant="body1" color="text.secondary" sx={{ mt: 1 }}>Please wait until the End of Day process completes to post new transactions.</Typography>
+        </Paper>
+      </Box>
+    );
+  }
+
+
+
 
   return (
-    <Paper elevation={0}>
-      <Typography variant="h6" fontWeight="bold" gutterBottom color="primary.main" sx={{ ml: 6, mt: 2 }}>
-        Voucher Posting Status
-      </Typography>
-      <Box sx={styles.mainContainer}>
+    <Paper sx={jpStyles.mainPaper}>
+
+      {/* INTERNAL STEP 0: VOUCHER SELECTION TABLE */}
+      {activeStep === 0 && (
+        <Box>
+          <Typography variant="h6" fontWeight="bold" gutterBottom color="primary.main" sx={jpStyles.stepHeader}>
+            Select Voucher Id (VID)
+          </Typography>
 
 
-        <DataGrid
-          rows={rows}
-          columns={columns}
-          loading={loading}
-          getRowId={(row) => row.batchId}
-          disableRowSelectionOnClick
-          pageSizeOptions={[5, 10, 25, 50]} // <--- Added 50 here
-          disableColumnResize
-          rowHeight={52}
-          // --- NEW: SERVER SIDE PAGINATION PROPS ---
-          paginationMode="server"
-          rowCount={totalRowCount}
-          paginationModel={paginationModel}
-          onPaginationModelChange={setPaginationModel}
-          // -----------------------------------------
+          <Paper elevation={2} sx={jpStyles.tablePaper}>
+            <TableContainer sx={jpStyles.tableContainer}>
+              <Table size="medium" sx={jpStyles.table}>
+                <TableHead sx={jpStyles.tableHead}>
+                  <TableRow>
+                    <TableCell padding="checkbox" sx={{ width: '5%' }}></TableCell>
+                    <TableCell sx={{ fontWeight: 'bold', width: '20%' }}>VID</TableCell>
+                    <TableCell sx={{ fontWeight: 'bold', width: '25%' }}>Category</TableCell>
+                    <TableCell sx={{ fontWeight: 'bold', width: '25%' }}>Created By</TableCell>
+                    <TableCell sx={{ fontWeight: 'bold', width: '25%' }}>Created At</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {voucherList
+                    .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                    .map((row) => {
+                      // FIX: Using clean camelCase keys exactly as mapped by the backend RowMapper
+                      const rowId = row.id;
+                      const rowVid = row.vid;
+                      const rowCategory = row.categoryName || "General";
+                      const rowCreatorName = row.createdByName || "System";
+                      const rowCreatorId = row.createdBy || "N/A";
+                      const rowCreatedAt = row.createdAt;
+                      const rowDescription = row.description || "No description provided for this voucher configuration.";
+                      const rowIssueCategories = row.issueCategories;
 
-          slots={{
-            noRowsOverlay: CustomNoRowsOverlay,
-            toolbar: GridToolbar // <--- Adds the inbuilt filter/export toolbar
-          }}
-
-
-          sx={styles.dataGridContainer}
-        />
-        <Dialog
-          open={isModalOpen}
-          onClose={handleCloseModal}
-          fullWidth
-          maxWidth="sm"
-        >
-          <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
-            <DeleteSweepIcon sx={{ mr: 1, color: "error.main" }} /> Confirm Deletion
-          </DialogTitle>
-          <DialogContent>
-            <DialogContentText>
-              Are you sure you want to delete batch <strong>{selectedBatch?.batchId}</strong>? This item will be permanently deleted
-            </DialogContentText>
-          </DialogContent>
-          <DialogActions sx={{ p: 3, borderTop: "1px solid", borderColor: "divider" }}>
-            <Button onClick={handleCloseModal} disabled={isSubmitting}>Cancel</Button>
-            <Button
-              variant="contained"
-              color="error"
-              startIcon={isSubmitting ? <CircularProgress size={20} color="inherit" /> : <DeleteIcon />}
-              onClick={handleSubmitBatchCancel}
-              disabled={isSubmitting}
-            >
-              {isSubmitting ? "Deleting..." : "Confirm Delete"}
-            </Button>
-          </DialogActions>
-        </Dialog>
-
-
-        {/* --- WORKFLOW DETAILS MODAL --- */}
-        <Dialog
-          open={isViewModalOpen}
-          onClose={() => {
-            handleBlurAll(); // <--- KILL FOCUS WHEN CLICKING BACKDROP
-            handleCloseViewModal();
-          }}
-          fullWidth
-          maxWidth="lg"
-        >
-          <DialogTitle sx={styles.dialogTitle}>
-            <Typography variant="h6" fontWeight="bold">
-              Batch Workflow Details: {viewingBatchId}
-            </Typography>
-            <IconButton onClick={handleCloseViewModal}>
-              <CloseIcon />
-            </IconButton>
-          </DialogTitle>
-
-          <DialogContent dividers sx={{ p: 0, backgroundColor: "#f8fafc", height: '75vh', display: 'flex', flexDirection: 'column' }}>
-            <Box sx={{ display: "flex", flexDirection: "column", flexGrow: 1, overflowY: "auto" }}>
-
-              {/* ---  HEADER CARDS --- */}
-              <Box sx={{ p: 4, backgroundColor: "white", borderBottom: "1px solid", borderColor: "divider" }}>
-                {isFetchingVid ? (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress size={24} /></Box>
-                ) : vidDetails && vidDetails.VID ? (
-                  <Stack spacing={3} sx={{ width: '100%' }}>
-                    {/* SECTION 1: VOUCHER DETAILS */}
-                    <Paper elevation={0} sx={{ p: 3, borderRadius: 2, width: '100%', border: "1px solid", borderColor: "divider", display: 'flex', flexDirection: 'column' }}>
-                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
-                        Voucher Request ID : {vidDetails.VID}
-                      </Typography>
-                      <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Voucher Description</Typography>
-                      <Box sx={{ maxHeight: isDescExpanded ? 200 : 90, mb: "24px", overflowY: "auto", pr: 1, transition: "max-height 0.3s ease" }}>
-                        <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-                          {(vidDetails.DESCRIPTION || "").length > 100 && !isDescExpanded
-                            ? `${vidDetails.DESCRIPTION.substring(0, 100)}...`
-                            : (vidDetails.DESCRIPTION || "No description provided.")}
-
-                          {(vidDetails.DESCRIPTION || "").length > 100 && (
-                            <Typography
-                              component="span"
-                              color="primary"
-                              onClick={() => setIsDescExpanded(!isDescExpanded)}
-                              sx={{ cursor: "pointer", ml: 1, fontWeight: "bold", '&:hover': { textDecoration: 'underline' } }}
-                            >
-                              {isDescExpanded ? "Read Less" : "Read More"}
-                            </Typography>
-                          )}
-                        </Typography>
-                      </Box>
-                      <Grid item xs={12} sm={3} sx={{ mb: "24px" }}>
-                        <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
-                          Issue Categories
-                        </Typography>
-                        <Typography variant="body1" fontWeight="600" color="primary.main">
-                          {vidDetails.ISSUE_CATEGORIES || "N/A"}
-                        </Typography>
-                      </Grid>
-                      <Grid container spacing={3}>
-                        <Grid item xs={12} sm={4}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
-                          <Typography variant="body1" fontWeight="500">{vidDetails.CATEGORY_NAME}</Typography>
-                        </Grid>
-                        <Grid item xs={12} sm={4}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created By</Typography>
-                          <Stack direction="row" spacing={1} alignItems="center">
-                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
-                            <Typography variant="body1" fontWeight="500">
-                              {vidDetails.VID_CREATED_BY_NAME} <Typography component="span" variant="caption" color="text.secondary">({vidDetails.VID_CREATOR_ID})</Typography>
-                            </Typography>
-                          </Stack>
-                        </Grid>
-                        <Grid item xs={12} sm={4}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created At</Typography>
-                          <Typography variant="body1" fontWeight="500">
-                            {formatDateTime(vidDetails.VID_CREATED_AT)}
-                          </Typography>
-                        </Grid>
-                      </Grid>
-                    </Paper>
-
-                    {/* SECTION 2: BATCH DETAILS */}
-                    <Paper elevation={0} sx={{ p: 3, borderRadius: 2, width: '100%', border: "1px solid", borderColor: "divider", display: 'flex', flexDirection: 'column' }}>
-                      <Typography variant="subtitle1" fontWeight="bold" color="text.primary" gutterBottom sx={{ borderBottom: "1px solid", borderColor: "divider", pb: 1, mb: 2 }}>
-                        Voucher Details
-                      </Typography>
-                      <Grid container spacing={3} alignItems="center">
-                        <Grid item xs={12} sm={3}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created By</Typography>
-                          <Stack direction="row" spacing={1} alignItems="center">
-                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
-                            <Typography variant="body1" fontWeight="500">
-                              {vidDetails.BATCH_CREATED_BY_NAME} <Typography component="span" variant="caption" color="text.secondary">({vidDetails.BATCH_CREATOR_ID})</Typography>
-                            </Typography>
-                          </Stack>
-                        </Grid>
-                        <Grid item xs={12} sm={2}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Created At</Typography>
-                          <Typography variant="body1" fontWeight="500">
-                            {formatDateTime(vidDetails.BATCH_CREATED_AT)}
-                          </Typography>
-                        </Grid>
-                        <Grid item xs={12} sm={2}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>No. of Entries</Typography>
-                          <Typography variant="body1" fontWeight="600" color="primary.main">
-                            {viewingBatchRequestCount}
-                          </Typography>
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Is Execution Scheduled?</Typography>
-                          <Typography variant="body1" fontWeight="500" color={vidDetails.SCHEDULED_TIME ? "info.main" : "text.primary"}>
-                            {vidDetails.SCHEDULED_TIME ? (
-                              <>
-                                Yes ({formatDateTime(vidDetails.SCHEDULED_TIME)})
-                                {new Date(vidDetails.SCHEDULED_TIME) < new Date() && !["POSTED", "SCHEDULED", "APPROVED", "REJECTED", "C", "S"].includes(viewingBatchState) && (
-                                  <Typography component="span" color="error.main" fontWeight="bold" sx={{ ml: 1, fontSize: "0.75rem" }}>
-                                    (Execution time lapsed)
-                                  </Typography>
-                                )}
-                              </>
-                            ) : "No"}
-                          </Typography>
-                        </Grid>
-                        <Grid item xs={12} sm={2}>
-                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Download Voucher Batch</Typography>
-                          <Button
-                            variant="outlined"
-                            size="small"
-                            startIcon={<FileDownloadIcon />}
-                            onClick={handleDownloadExcel}
-                            disabled={!viewingBatchId}
-                            tabIndex={-1} // <--- ADD THIS
-                            onMouseDown={(e) => e.preventDefault()} // <--- ADD THIS: Prevents focus on click
+                      const isSelected = selectedVoucher?.id === rowId;
+                      const isExpanded = expandedRow === rowId;
+                      return (
+                        <React.Fragment key={row.id}>
+                          {/* MAIN ROW */}
+                          <TableRow
+                            hover
+                            onClick={() => {
+                              setSelectedVoucher(row);
+                              handleRowExpand(row.id);
+                            }}
                             sx={{
-                              borderColor: "#217346",
-                              color: "#217346",
-                              "&:hover": { backgroundColor: "#e8f5e9", borderColor: "#1e6b40" },
-                              // Completely nuke all focus states
-                              "&:focus, &.Mui-focusVisible, &:active": {
-                                outline: "none !important",
-                                boxShadow: "none !important",
-                                backgroundColor: "transparent !important",
-                                border: "1px solid #217346 !important"
-                              }
+                              cursor: 'pointer',
+                              backgroundColor: isSelected ? "action.selected" : "inherit",
+                              '& > *': { borderBottom: isExpanded ? 'none' : '1px solid rgba(224, 224, 224, 1)' }
                             }}
                           >
-                            Download Batch
-                          </Button>
-                        </Grid>
-                      </Grid>
-                    </Paper>
-                  </Stack>
-                ) : null}
-              </Box>
+                            <TableCell padding="checkbox">
+                              <Radio checked={isSelected} color="primary" />
+                            </TableCell>
+                            <TableCell sx={jpStyles.ellipsisCell}>
+                              {row.vid}
+                            </TableCell>
+                            <TableCell sx={jpStyles.ellipsisCell}>
+                              {row.categoryName || "General"}
+                            </TableCell>
+                            <TableCell sx={jpStyles.ellipsisCell}>
+                              {row.createdByName} <Typography component="span" variant="caption" color="text.secondary">({row.createdBy})</Typography>
+                            </TableCell>
+                            <TableCell sx={jpStyles.ellipsisCell}>
+                              {formatDateTime(row.createdAt)}
+                            </TableCell>                          </TableRow>
 
-              {/* --- HORIZONTAL TIMELINE --- */}
-              <Box sx={{ p: 4, flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-                <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
-                  Workflow Progress
-                </Typography>
-
-                {/* Removed the big red Alert block from here! */}
-
-                {isFetchingSteps ? (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
-                ) : dynamicSteps.length > 0 ? (
-                  <Stepper
-                    activeStep={
-                      (viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "C" || viewingBatchState === "S")
-                        ? dynamicSteps.length
-                        : viewingBatchOrder - 1
-                    }
-                    alternativeLabel
-                    connector={<BigConnector />}
-                  >
-                    {dynamicSteps.map((step, index) => {
-                      const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "C" || viewingBatchState === "S";
-                      const activeStepIndex = isFullyDone ? dynamicSteps.length : viewingBatchOrder - 1;
-
-                      const isCompleted = index < activeStepIndex;
-                      const isCurrent = index === activeStepIndex;
-
-                      let statusFlag = 'PENDING';
-                      if (isCompleted) statusFlag = 'COMPLETED';
-                      if (isCurrent && viewingBatchState === "REJECTED") statusFlag = 'REJECTED';
-                      else if (isCurrent) statusFlag = 'ACTIVE';
-
-                      // Grab the matching history item to identify who performed this step
-                      const historyItem = workflowHistory[index];
-                      const executorStr = historyItem ? `${historyItem.ACTION_USER_NAME || 'System'} (${historyItem.LAST_ACTION_BY})` : null;
-
-                      return (
-                        <Step key={step.state} completed={isCompleted} active={isCurrent} sx={{ opacity: viewingBatchState === "REJECTED" && index > activeStepIndex ? 0.3 : 1 }}>
-                          <StepLabel StepIconComponent={() => <BigWorkflowIcon statusFlag={statusFlag} label={step.designation} />}>
-
-                            <Chip
-                              label={getRoleDisplayName(step.role)}
-                              size="small"
-                              variant="outlined"
-                              color={isCurrent && statusFlag !== 'REJECTED' ? "primary" : "default"}
-                              sx={{ mt: 1, height: 22, fontSize: "0.65rem", fontWeight: "bold" }}
-                            />
-
-                            {/* // history showing */}
-
-                            {(isCompleted || (isCurrent && viewingBatchState === "REJECTED")) && (
-                              <Box>
-                                {/* 1. Show Who performed the action */}
-                                {historyItem && (
-                                  <Typography variant="caption" display="block" color="success.main" sx={{ mt: 0.5, fontWeight: "bold" }}>
-                                    {executorStr}
-                                  </Typography>
-                                )}
-
-                                {/* 2. SHOW THE PENDING DURATION FOR COMPLETED STAGES (Except for System Execution) */}
-                                {historyItem && historyItem.stageDuration && historyItem.LAST_ACTION_BY !== "SYSTEM" && (
-                                  <Typography variant="caption" display="block" color="text.secondary" sx={{ fontStyle: 'italic', fontSize: '0.65rem' }}>
-                                    Pending Duration: {historyItem.stageDuration}
-                                  </Typography>
-                                )}
-
-                              </Box>
-                            )}
-                            {isCurrent && viewingBatchState !== "REJECTED" && (
-                              <Typography
-                                variant="caption"
-                                display="block"
-                                color={statusFlag === 'ESCALATED' ? "warning.main" : "text.secondary"}
-                                fontWeight="bold"
-                                sx={{ mt: 0.5 }}
-                              >
-                                Pending Since: {viewingBatchTimeSinceLastAction || "0h 0m"}
-                              </Typography>
-                            )}
-
-
-                          </StepLabel>
-                        </Step>
+                          <TableRow sx={{ backgroundColor: "background.default" }}>
+                            {/* colSpan is now 5 to match the new column count */}
+                            <TableCell style={{ paddingBottom: 0, paddingTop: 0, borderBottom: isExpanded ? '1px solid rgba(224, 224, 224, 1)' : 'none' }} colSpan={5}>
+                              <Collapse in={isExpanded} timeout="auto" unmountOnExit>
+                                <Grid container sx={jpStyles.collapseGrid}>
+                                  <Grid item size={{ lg: 1.3, md: 1.5 }}>
+                                    <Typography variant="body2" color="text.secondary">
+                                      <strong>Description:</strong>
+                                    </Typography>
+                                  </Grid>
+                                  <Grid item size={{ lg: 10.7, md: 10.5 }}>
+                                    <Typography variant="body2" color="text.secondary">
+                                      {row.description || "No description provided for this voucher configuration."}
+                                    </Typography>
+                                  </Grid>
+                                  <Grid item size={{ lg: 1.3, md: 1.5 }}>
+                                    <Typography variant="body2" color="text.secondary">
+                                      <strong> Issue Categories: </strong>
+                                    </Typography>
+                                  </Grid>
+                                  <Grid item size={{ lg: 10.7, md: 10.5 }}>
+                                    <Box>
+                                      {row.issueCategories?.split(",")
+                                        .map((cat) => (
+                                          <Chip label={cat.trim()} sx={jpStyles.issueCategoryChip} />
+                                        ))}
+                                    </Box>
+                                  </Grid>
+                                  {/* </Box> */}
+                                </Grid>
+                              </Collapse>
+                            </TableCell>
+                          </TableRow>
+                        </React.Fragment>
                       );
                     })}
-                  </Stepper>
-                ) : (
-                  <Alert severity="info" sx={{ mt: 2 }}>Workflow configuration not found.</Alert>
-                )}
-              </Box>
+                  {voucherList.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={4} align="center" sx={{ py: 3 }}>
+                        No configurations found.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+            <TablePagination
+              rowsPerPageOptions={[5, 10, 25]}
+              component="div"
+              count={voucherList.length}
+              rowsPerPage={rowsPerPage}
+              page={page}
+              onPageChange={handleChangePage}
+              onRowsPerPageChange={handleChangeRowsPerPage}
+            />
+          </Paper>
 
-              {/* --- WORKFLOW HISTORY --- */}
-              <Box sx={{ p: 4, borderTop: "1px solid", borderColor: "divider" }}>
-                {isFetchingSteps ? (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', p: 2 }}><CircularProgress size={24} /></Box>
-                ) : (
-                  <>
-                    <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
-                      Workflow History ({workflowHistory.length})
-                    </Typography>
-                    <Stack spacing={2.5}>
-                       {workflowHistory.map((history, idx) => {
-                        const isSystem = history.LAST_ACTION_BY === "SYSTEM";
-                        const userName = history.ACTION_USER_NAME || (isSystem ? "Automated System" : "User");
-                        const initial = isSystem ? "S" : userName.charAt(0).toUpperCase();
-                        const isOverrideAction = history.LAST_ACTION?.toUpperCase().includes("OVERRIDE");
-                        const isExecutionFail = history.LAST_ACTION?.toUpperCase().includes("FAILED");
+          <Box sx={jpStyles.buttonRightAlign}>
+            <Button variant="contained" onClick={handleNext} disabled={!selectedVoucher} endIcon={<ArrowForwardIcon />} sx={{ px: 4 }}>
+              Next
+            </Button>
+          </Box>
+        </Box>
+      )
+      }
 
-                        // NEW: Strip out the text in parentheses for a cleaner Chip!
-                        const rawAction = history.LAST_ACTION || "System Action";
-                        const cleanAction = rawAction.replace(/\s*\(.*?\)\s*/g, '').trim();
+      {/* INTERNAL STEP 1: CHOOSE ENTRY METHOD */}
+      {
+        activeStep === 1 && (
+          <Box sx={jpStyles.methodContainer}>
 
-                        // Identify if this specific log action belongs to a submission or finalization step
-                        const isSubmission = rawAction.toUpperCase().includes("SUBMIT");
-                        const isFinalApproval = rawAction.toUpperCase().includes("FINAL") || rawAction.toUpperCase().includes("ACCEPT");
+            <Typography variant="h6" fontWeight="bold" gutterBottom color="primary.main" sx={{ mb: 2, textAlign: 'left' }}>
+              Select Posting Method
+            </Typography>
 
-                        return (
-                          <Box key={idx} sx={{ display: 'flex', gap: 2 }}>
-                            <Box>
-                              <Avatar sx={{ bgcolor: isSystem ? 'secondary.main' : 'primary.main', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>
-                                {initial}
-                              </Avatar>
-                            </Box>
-                            <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2.5, borderRadius: 2, border: "1px solid", borderColor: isExecutionFail ? "#d32f2f" : isSystem ? "#9c27b0" : "#e2e8f0", borderLeftWidth: isExecutionFail || isSystem ? "4px" : "1px", boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)" }}>
+            <Typography variant="h5" align="center" fontWeight="bold" gutterBottom sx={{ mt: 2 }}>
+              How would you like to create vouchers ?
+            </Typography>
+            <Typography variant="body1" align="center" color="text.secondary" sx={{ mb: 6 }}>
+              Selected VID : <b>{selectedVoucher?.vid}</b>
+            </Typography>
+            {/* Using Flexbox with fixed widths instead of dynamic Grids for perfect symmetry */}
+            <Box sx={jpStyles.cardsWrapper}>
 
-                              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
-                                <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
-                                  {userName} {isSystem ? "" : `(${history.LAST_ACTION_BY})`}
-                                </Typography>
-                                <Typography variant="caption" color="text.secondary">• {formatDateTime(history.LAST_ACTION_AT)}</Typography>
-                              </Box>
+              {/* MANUAL ENTRY CARD */}
+              <Card elevation={2} sx={jpStyles.methodCard}>
+                <CardActionArea onClick={() => handleMethodSelection("MANUAL")} sx={jpStyles.methodCardArea}>
+                  <EditNoteIcon color="primary" sx={jpStyles.manualIcon} />
+                  <Typography variant="h6" fontWeight="bold" gutterBottom>Manual Posting</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Manual Voucher Entry
+                  </Typography>
+                </CardActionArea>
+              </Card>
 
-                              <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5, flexWrap: "wrap", gap: 1 }}>
-                                {/* NEW: Use the 'cleanAction' variable here instead of the raw string */}
-                                <Chip
-                                  label={cleanAction}
-                                  size="small"
-                                  sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: isExecutionFail || rawAction.includes("Reject") ? "#fee2e2" : isSystem ? "#f3e8ff" : "#e0e7ff", color: isExecutionFail || rawAction.includes("Reject") ? "#991b1b" : isSystem ? "#7e22ce" : "#3730a3" }}
+              {/* EXCEL UPLOAD CARD */}
+              <Card elevation={2} sx={jpStyles.methodCard}>
+                <CardActionArea onClick={() => handleMethodSelection("BULK")} sx={jpStyles.methodCardArea}>
+                  {/* Standard Excel Green Hex Code */}
+                  <TableChartIcon sx={jpStyles.excelIcon} />
+                  <Typography variant="h6" fontWeight="bold" gutterBottom>Excel Upload</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Upload an Excel file (.xlsx or .xls) to process hundreds of voucher entries instantly.
+                  </Typography>
+                </CardActionArea>
+              </Card>
+
+            </Box>
+
+            <Box sx={jpStyles.backButtonBox}>
+              <Button variant="outlined" onClick={handleBack} startIcon={<ArrowBackIcon />}>
+                Previous
+              </Button>
+            </Box>
+          </Box>
+        )
+      }
+
+      {/* INTERNAL STEP 2: DATA ENTRY GRID */}
+      {
+        activeStep === 2 && entryMethod === "MANUAL" && (
+          <Box>
+
+            {/* 1. SCREEN TITLE MOVED HERE (Outside both cards) */}
+            <Typography variant="h6" fontWeight="bold" gutterBottom color="primary.main" sx={{ mb: 2 }}>
+              Voucher Entry
+            </Typography>
+            {/* Replaces the old basic header with the professional detailed card */}
+            <SelectedVoucherCard onBackClick={handleBack} showBackButton={true} />
+
+            <Box component={Paper} elevation={3} sx={jpStyles.dataEntryPaper}>
+
+
+              {/* ... EXISTING GRID START ... */}
+              <Grid item xs={12} md={12} sx={jpStyles.gridContainer}>
+                <Tooltip title="Enter batch-level remarks applied to multiple rows" placement="top-start">
+                  <TextField
+                    label="Common Batch Remarks"
+                    value={commonBatchRemarks}
+                    onChange={(e) => {
+                      const newValue = filterAndWarn(e.target.value); // Removed "alphanumeric_space"
+                      if (newValue.length <= 30) {
+                        setCommonBatchRemarks(newValue);
+                        if (checked) {
+                          setRows(rows.map((row) => ({ ...row, remarks: newValue })));
+                        }
+                      }
+                    }}
+                    fullWidth multiline rows={1} inputProps={{ maxLength: 30 }}
+                    error={commonBatchRemarks.length > 0 && !isCommonRemarksValid(commonBatchRemarks)}
+                    helperText="Allowed 2-30 chars: Alphanumeric, spaces, and / & ( ) , . -"
+                  />
+                </Tooltip>
+
+                <Box sx={jpStyles.checkboxBox}>
+                  <FormControlLabel
+                    control={<Checkbox checked={checked} onChange={handleRemarksSync} color="primary" disabled={commonBatchRemarks.length > 0 && !isRemarksValid(commonBatchRemarks)} />}
+                    label="Apply this remark to all below transactions"
+                  />
+                </Box>
+              </Grid>
+
+              <Box sx={{ mt: 2 }}>
+                {rows.map((row, index) => {
+                  // Universal Regex: Up to 16 digits, up to 4 decimal places
+                  const amountRegex = /^\d{0,16}(\.\d{0,4})?$/;
+
+                  return (
+                    <React.Fragment key={row.id}>
+                      <Grid container spacing={2} alignItems="flex-start">
+
+                        {/* Branch */}
+                        <Grid item size={{ xl: 1.5, lg: 2 }}>
+                          <Autocomplete
+                            autoHighlight
+                            // autoSelect REMOVED to prevent selection on click-away
+                            popupIcon={null}
+                            options={
+                              (branchInputValues[row.id] || "").length < 3
+                                ? []
+                                : (row.branch && !branchSearch.options.some((o) => o.code === row.branch.code)
+                                  ? [row.branch, ...branchSearch.options]
+                                  : branchSearch.options)
+                            }
+                            getOptionLabel={(option) => option && option.code ? `${option.code} - ${option.name}` : ""}
+                            slotProps={{
+                              popper: {
+                                placement: 'bottom-start',
+                                modifiers: [{ name: 'flip', enabled: false }, { name: 'preventOverflow', enabled: false }],
+                              },
+                            }}
+                            value={row.branch || null}
+                            onChange={(event, newValue) => handleRowChange(row.id, "branch", newValue)}
+                            inputValue={branchInputValues[row.id] || ""}
+                            onInputChange={(event, newInputValue, reason) => {
+                              if (reason === 'input') {
+                                const cleanInput = newInputValue.replace(BRANCH_REPLACE_REGEX, "").substring(0, 5);
+                                setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+
+                                let queryForSearch = cleanInput;
+                                // APPEND ZEROS: If they enter 1 or 2 digits, pad it to 5 digits for the search
+                                if (cleanInput.length > 0 && cleanInput.length <= 2) {
+                                  queryForSearch = cleanInput.padStart(5, '0');
+                                }
+
+                                searchBranches(queryForSearch, row.id);
+                              } else {
+                                setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Tab' && !row.branch && branchSearch.options?.length > 0) {
+                                handleRowChange(row.id, "branch", branchSearch.options[0]);
+                              }
+                            }}
+
+                            // --- ADD THIS BLOCK ---
+                            onBlur={() => {
+                              const typedValue = branchInputValues[row.id];
+                              if (!row.branch && typedValue && typedValue.length === 5) {
+                                const match = branchSearch.options.find(opt => opt.code === typedValue);
+                                if (match) {
+                                  handleRowChange(row.id, "branch", match);
+                                }
+                              }
+                            }}
+
+
+                            loading={branchSearch.loadingId === row.id}
+                            filterOptions={(x) => x}
+                            isOptionEqualToValue={(option, value) => option?.code === value?.code}
+                            noOptionsText={
+                              (branchInputValues[row.id] || "").length < 3
+                                ? "Enter 3 Digits to Search"
+                                : "No branches found"
+                            }
+
+                            renderInput={(params) => (
+                              <Tooltip title="Search by Branch Code" placement="top-start">
+                                <TextField
+                                  {...params}
+                                  label="Branch *"
+                                  placeholder="Select Branch"
+                                  InputLabelProps={{ shrink: true }}
+                                  inputProps={{ ...params.inputProps, style: { textOverflow: 'ellipsis', whiteSpace: 'nowrap', overflow: 'hidden' } }}
+                                  InputProps={{
+                                    ...params.InputProps,
+                                    endAdornment: (
+                                      <Box>
+                                        {branchSearch.loadingId === row.id ? (<CircularProgress color="inherit" size={20} />) : null}
+                                        {params.InputProps.endAdornment}
+                                      </Box>
+                                    )
+                                  }}
+                                  onPaste={(e) => { e.preventDefault(); showSnackBar("Pasting is not allowed here.", "warning"); }}
+                                  onCopy={(e) => e.preventDefault()}
                                 />
+                              </Tooltip>
+                            )}
+                          />
 
-                                {history.SCHEDULED_TIME ? (
-                                  <Chip
-                                    label={isOverrideAction ? `Schedule Overridden to: ${formatDateTime(history.SCHEDULED_TIME)}` : `Scheduled for: ${formatDateTime(history.SCHEDULED_TIME)}`}
-                                    size="small"
-                                    color={isOverrideAction ? "warning" : "info"}
-                                    variant="outlined"
-                                    sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }}
-                                  />
-                                ) : (
-                                  (isSubmission || isFinalApproval) && !isSystem && (
-                                    <Chip
-                                      label="Immediate Execution"
-                                      size="small"
-                                      color="default"
-                                      variant="outlined"
-                                      sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }}
-                                    />
-                                  )
-                                )}
-                              </Stack>
+                        </Grid>
 
-                              <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-                                {history.REMARKS || "Voucher Batch Created."}
-                              </Typography>
-                            </Box>
-                          </Box>
-                        );
-                      })}
-                    </Stack>
-                  </>
-                )}
+
+
+                        {/* Currency */}
+                        <Grid item size={{ xl: 1.5, lg: 2 }}>
+                          <Tooltip title=""  >
+                            <TextField
+                              select
+                              label="Currency *"
+                              value={row.currency || ""}
+                              fullWidth
+                              InputLabelProps={{ shrink: true }}
+                              onChange={(e) => {
+                                handleRowChange(row.id, "currency", e.target.value);
+                                handleRowChange(row.id, "amount", "");
+                              }}
+                              SelectProps={{
+                                displayEmpty: true,
+                                renderValue: (selected) => !selected ? <span style={{ color: 'gray', opacity: 0.8 }}>Currency</span> : selected,
+                                MenuProps: {
+                                  // The marginTop guarantees it clears the input box completely
+                                  PaperProps: { style: { maxHeight: 250, marginTop: '8px' } },
+                                  anchorOrigin: { vertical: "bottom", horizontal: "left" },
+                                  transformOrigin: { vertical: "top", horizontal: "left" }
+                                }
+                              }}
+                            >
+                              {currencyOptions.map((currency) => (
+                                <MenuItem key={currency} value={currency}>
+                                  {currency}
+                                </MenuItem>
+                              ))}
+                            </TextField>
+                          </Tooltip>
+                        </Grid>
+
+
+
+                        {/* CGL */}
+                        <Grid item size={{ xl: 2.3, lg: 3.1 }} >
+                          <Autocomplete
+                            autoHighlight
+                            // autoSelect REMOVED
+                            popupIcon={null}
+                            options={
+                              (cglInputValues[row.id] || "").length < 3
+                                ? []
+                                : (row.cgl && !cglSearch.options.some((o) => o.cglNumber === row.cgl.cglNumber)
+                                  ? [row.cgl, ...cglSearch.options]
+                                  : cglSearch.options)
+                            }
+                            slotProps={{
+                              popper: {
+                                placement: 'bottom-start',
+                                modifiers: [
+                                  { name: 'flip', enabled: false },
+                                  { name: 'preventOverflow', enabled: false }
+                                ],
+                              },
+                            }}
+                            getOptionLabel={(option) => option && option.cglNumber ? `${option.cglNumber} - ${option.description}` : ""}
+                            value={row.cgl || null}
+                            onChange={(event, newValue) => handleRowChange(row.id, "cgl", newValue)}
+                            inputValue={cglInputValues[row.id] || ""}
+                            onInputChange={(event, newInputValue, reason) => {
+                              if (reason === 'input') {
+                                const cleanInput = newInputValue.replace(CGL_REPLACE_REGEX, "").substring(0, 10);
+                                setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+                                searchCgls(cleanInput, row.id);
+                              } else {
+                                setCglInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
+                              }
+                            }}
+                            // --- ADDED INTERCEPTOR FOR TAB & ENTER KEY ---
+                            onKeyDown={(e) => {
+                              if ((e.key === 'Tab' || e.key === 'Enter') && !row.cgl && cglSearch.options?.length > 0) {
+                                // Automatically set the first suggestion when Tab or Enter is pressed
+                                handleRowChange(row.id, "cgl", cglSearch.options[0]);
+                              }
+                            }}
+                            // --- ADDED ONBLUR FOR CLICK-AWAY ---
+                            onBlur={() => {
+                              const typedValue = cglInputValues[row.id];
+                              if (!row.cgl && typedValue && typedValue.length === 10) {
+                                // If they typed exactly 10 digits, grab the exact match (or the first/only available option from the DB)
+                                const match = cglSearch.options.find(opt => String(opt.cglNumber) === typedValue) ||
+                                  (cglSearch.options.length > 0 ? cglSearch.options[0] : null);
+                                if (match) {
+                                  handleRowChange(row.id, "cgl", match);
+                                }
+                              }
+                            }}
+                            loading={cglSearch.loadingId === row.id}
+                            filterOptions={(x) => x}
+                            isOptionEqualToValue={(option, value) => option?.cglNumber === value?.cglNumber}
+                            noOptionsText={
+                              (cglInputValues[row.id] || "").length < 3
+                                ? "Enter 3 Digits to Search"
+                                : "CGL not found"
+                            }
+                            renderInput={(params) => (
+                              <Tooltip title="Search by CGL Number" placement="top-start">
+                                <TextField
+                                  {...params}
+                                  label="CGL *"
+                                  placeholder="CGL"
+                                  InputLabelProps={{ shrink: true }}
+                                  InputProps={{
+                                    ...params.InputProps,
+                                    endAdornment: (
+                                      <Box sx={jpStyles.memoChipBox}>
+                                        {row.cgl && String(row.cgl.cglNumber).startsWith("5") && (<Chip label="MEMO" size="small" color="warning" sx={jpStyles.memoChip} />)}
+                                        {cglSearch.loadingId === row.id ? <CircularProgress color="inherit" size={20} /> : null}
+                                        {params.InputProps.endAdornment}
+                                      </Box>
+                                    )
+                                  }}
+                                  onPaste={(e) => { e.preventDefault(); showSnackBar("Pasting is not allowed here.", "warning"); }}
+                                  onCopy={(e) => e.preventDefault()}
+                                />
+                              </Tooltip>
+                            )}
+                          />
+
+                        </Grid>
+
+
+                        {/* Amount */}
+                        <Grid item size={{ xl: 2, lg: 2.8 }}>
+                          <Tooltip title="" placement="top-start">
+                            <TextField
+                              label="Amount *"
+                              type="text"
+                              value={row.amount}
+                              InputLabelProps={{ shrink: true }}
+                              fullWidth
+                              placeholder="0.0000"
+                              inputProps={{ style: { textAlign: "right" } }}
+                              // Checks if input is not empty AND equals zero numerically
+                              error={row.amount !== "" && parseFloat(row.amount) === 0}
+                              onChange={(e) => {
+                                const rawVal = e.target.value;
+                                if (/[^0-9.]/.test(rawVal)) {
+                                  showSnackBar("Only numbers and decimal point are allowed.", "warning"); return;
+                                }
+                                if (rawVal === "" || /^\d{0,16}(\.\d{0,4})?$/.test(rawVal)) {
+                                  handleRowChange(row.id, "amount", rawVal);
+                                }
+                                else {
+                                  showSnackBar("Exceeded maximum digits or decimal places.", "warning");
+                                }
+                              }}
+
+                              onPaste={(e) => { e.preventDefault(); showSnackBar("Pasting is not allowed here.", "warning"); }}
+                              onCopy={(e) => e.preventDefault()}
+                            />
+                          </Tooltip>
+                          <Typography
+                            variant="caption"
+                            // Turns the caption red if the error state is triggered
+                            sx={{ ...jpStyles.captionText, color: (row.amount !== "" && parseFloat(row.amount) === 0) ? 'error.main' : 'text.secondary' }}
+                          >
+                            {(row.amount !== "" && parseFloat(row.amount) === 0) ? "Amount cannot be zero" : "Max 16 digits, 4 decimals"}
+                          </Typography>
+                        </Grid>
+
+
+                        {/* Txn Type */}
+                        <Grid item size={{ xl: 1, lg: 1.5 }}>
+                          <Tooltip title="" placement="top-start">
+                            <TextField
+                              select
+                              label="Type *"
+                              value={row.txnType}
+                              fullWidth
+                              InputLabelProps={{ shrink: true }}
+                              onChange={(e) => handleRowChange(row.id, "txnType", e.target.value)}
+                              onPaste={(e) => { e.preventDefault(); showSnackBar("Pasting is not allowed here.", "warning"); }}
+                              onCopy={(e) => e.preventDefault()}
+                              onKeyDown={(e) => {
+                                // Intercept keystrokes to auto-select
+                                const key = e.key.toLowerCase();
+                                if (key === 'd') {
+                                  e.preventDefault(); // Prevents standard browser behavior
+                                  handleRowChange(row.id, "txnType", "Debit");
+                                } else if (key === 'c') {
+                                  e.preventDefault();
+                                  handleRowChange(row.id, "txnType", "Credit");
+                                }
+                              }}
+                              SelectProps={{
+                                displayEmpty: true,
+                                renderValue: (selected) => !selected ? <span style={{ color: 'gray', opacity: 0.8 }}>Type</span> : selected,
+                                MenuProps: {
+                                  // The marginTop guarantees it clears the tooltip completely
+                                  PaperProps: { style: { maxHeight: 250, marginTop: '8px' } },
+                                  anchorOrigin: { vertical: "bottom", horizontal: "left" },
+                                  transformOrigin: { vertical: "top", horizontal: "left" }
+                                }
+                              }}
+                            >
+
+                              <MenuItem value="Debit">Debit</MenuItem>
+                              <MenuItem value="Credit">Credit</MenuItem>
+                            </TextField>
+                          </Tooltip>
+                        </Grid>
+
+
+
+                        {/* Remarks (Individual) */}
+                        <Grid item size={{ xl: 2.2, lg: 3.2 }}>
+                          <Tooltip title="" placement="top-start">
+                            <TextField
+                              label="Remarks *"
+                              value={row.remarks}
+                              InputLabelProps={{ shrink: true }}
+                              onPaste={(e) => { e.preventDefault(); showSnackBar("Pasting is not allowed here.", "warning"); }}
+                              onCopy={(e) => e.preventDefault()}
+                              placeholder="Enter remarks..."
+                              fullWidth
+                              inputProps={{ minLength: 2, maxLength: 30 }}
+                              disabled={checked}
+                              error={row.remarks.length > 0 && !isRowRemarksValid(row.remarks)}
+                              onChange={(e) => {
+                                const val = filterAndWarn(e.target.value);
+                                if (val.length <= 30) {
+                                  handleRowChange(row.id, "remarks", val);
+                                }
+                              }}
+                              helperText="Allowed 2-30 chars: Alphanumeric, spaces, and / & ( ) , . -"
+                            />
+                          </Tooltip>
+                        </Grid>
+                        {/* Product Code */}
+                        <Grid item
+                          // xs={12} md={2}
+                          size={{ xl: 1, lg: 1.5 }} >
+                          <Tooltip title="" placement="top-start">
+                            <TextField label="Product Code" value={row.productCode} InputLabelProps={{ shrink: true }} placeholder="Product Code.." fullWidth inputProps={{ maxLength: 8 }} onChange={(e) => { const rawVal = e.target.value; const cleanVal = rawVal.replace(/[^0-9]/g, ""); if (rawVal !== cleanVal) { showSnackBar("Only digits are allowed.", "warning"); } if (cleanVal.length <= 8) { handleRowChange(row.id, "productCode", cleanVal); } }} />
+                          </Tooltip>
+                          <Typography variant="caption" sx={jpStyles.captionText}>Max 8 digits</Typography>
+                        </Grid>
+
+                        {/* Delete Action */}
+                        <Grid item size={{ xl: 0.5, lg: 0.8 }} sx={{ textAlign: "center" }}>
+                          {rows.length > 1 && (
+                            <Tooltip title="Delete row" arrow>
+                              <IconButton
+                                onClick={() => handleDeleteRow(row.id)}
+                                aria-label="delete row"
+                                sx={jpStyles.deleteIconButton}
+                              >
+                                <DeleteIcon />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                        </Grid>
+                      </Grid>
+
+                      {index < rows.length - 1 && (<Box sx={jpStyles.rowDivider} />)}
+                    </React.Fragment>
+                  );
+                })}
+
+                {/* ACTION BUTTONS */}
+                <Box sx={jpStyles.actionButtonsWrapper}>
+
+                  <Button variant="outlined" startIcon={<ArrowBackIcon />} onClick={handleBack}>
+                    Previous
+                  </Button>
+                  <Box sx={{ display: "flex", gap: 2 }}>
+                    <Button variant="contained" startIcon={<AddIcon />} onClick={handleAddRow}>
+                      Add Row
+                    </Button>
+                    <Tooltip title={rows.length < 2 ? "Minimum 2 rows required" : "Submit batch"} placement="top">
+                      <span> {/* Span wrapper required for Tooltip when button is disabled */}
+                        <Button
+                          variant="contained"
+                          color="success"
+                          onClick={handleValidateClick}
+                          disabled={isSubmitting || !isCommonRemarksValid(commonBatchRemarks) || !isFormReadyToSubmit}
+                        >
+                          {isSubmitting ? <CircularProgress size={24} color="inherit" /> : "Validate"}
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  </Box>
+                </Box>
               </Box>
             </Box>
-          </DialogContent>
+          </Box>
+        )
+      }
 
-          {/* --- STICKY BOTTOM ACTION BAR (Where Delete lives now) --- */}
-          <DialogActions sx={{ p: 3, borderTop: "1px solid", borderColor: "divider", backgroundColor: "white", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <Box sx={{ flexGrow: 1 }}>
-              {/* Left aligned spacing element anchor */}
-            </Box>
-            <Stack direction="row" spacing={2} alignItems="center">
+      {/* EXTERNAL STEP 2: BULK UPLOAD EXCEL COMPONENT */}
+      {
+        activeStep === 2 && entryMethod === "BULK" && (
+          <JournalBulkUpload
+            selectedVoucher={selectedVoucher}
+            onBack={handleBack}
+            onReset={handleResetWizard}
+            // Triggered automatically when Bulk Excel completes
+            onSuccessSubmit={(batchId) => {
+              setSubmittedBatchId(batchId);
+              setActiveStep(3);
+            }}
+          />
+        )
+      }
 
-              {isViewingSelfCreated && isBatchDeletable && (
-                <Button
-                  variant="contained"
-                  color="error"
-                  startIcon={<DeleteIcon />}
-                  onClick={() => {
-                    setIsViewModalOpen(false); // Dismount detail modal view
-                    handleOpenModal({ batchId: viewingBatchId }); // Initialize confirmation dialog box stages
-                  }}
-                  sx={{ minWidth: 160, fontWeight: 'bold', py: 1 }}
-                >
-                  Cancel Voucher Batch
-                </Button>
-              )}
+      {/* NEW STEP 3: POST-SUBMISSION SUCCESS & SCHEDULING SCREEN */}
+      {
+        activeStep === 3 && (
+          <Box sx={{ p: 4, display: 'flex', justifyContent: 'center' }}>
+            <Paper elevation={3} sx={{ p: 4, borderRadius: 3, maxWidth: 650, width: '100%', textAlign: 'center' }}>
+              <Typography variant="h6" fontWeight="bold" color="text.primary" gutterBottom>
+                Set Execution Preference
+              </Typography>
+              <Typography variant="h5" fontWeight="bold" gutterBottom>
+                Your batch is validated and ready to submit.
+              </Typography>
 
-            </Stack>
-          </DialogActions>
-        </Dialog>
-      </Box>
-    </Paper>
+              <Divider sx={{ my: 3 }} />
+
+
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 4 }}>
+                Please select how you want this batch to be executed after the final approval.
+              </Typography>
+
+              {/* SELECTION CARDS */}
+              <Grid container spacing={3} sx={{ mb: 4, textAlign: 'left' }}>
+                <Grid item xs={12} sm={6}>
+                  <Box
+                    onClick={() => setRoutingChoice("IMMEDIATE")}
+                    sx={{
+                      p: 2.5, border: "2px solid", borderRadius: 2, cursor: "pointer", transition: "all 0.2s ease",
+                      borderColor: routingChoice === "IMMEDIATE" ? "primary.main" : "divider",
+                      backgroundColor: routingChoice === "IMMEDIATE" ? "primary.50" : "transparent",
+                      display: "flex", flexDirection: "column", alignItems: "center", gap: 1, textAlign: "center",
+                      "&:hover": { borderColor: routingChoice !== "IMMEDIATE" ? "primary.light" : "primary.main", transform: "translateY(-2px)", boxShadow: 2 }
+                    }}
+                  >
+                    <BoltIcon color={routingChoice === "IMMEDIATE" ? "primary" : "action"} sx={{ fontSize: 36 }} />
+                    <Typography variant="subtitle1" fontWeight="bold" color={routingChoice === "IMMEDIATE" ? "primary.main" : "text.primary"}>
+                      Execute Immediately
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Post automatically upon final approval
+                    </Typography>
+                  </Box>
+                </Grid>
+<Grid item xs={12} sm={6}>
+                  <Box
+                    onClick={() => {
+                      setRoutingChoice("SCHEDULE");
+                      setScheduledTime(dayjs().add(30, 'minute').startOf('minute'));
+                    }}
+                    sx={{
+                      p: 2.5, border: "2px solid", borderRadius: 2, cursor: "pointer", transition: "all 0.2s ease",
+                      borderColor: routingChoice === "SCHEDULE" ? "primary.main" : "divider",
+                      backgroundColor: routingChoice === "SCHEDULE" ? "primary.50" : "transparent",
+                      display: "flex", flexDirection: "column", alignItems: "center", gap: 1, textAlign: "center",
+                      "&:hover": { borderColor: routingChoice !== "SCHEDULE" ? "primary.light" : "primary.main", transform: "translateY(-2px)", boxShadow: 2 }
+                    }}
+                  >
+                    <ScheduleIcon color={routingChoice === "SCHEDULE" ? "primary" : "action"} sx={{ fontSize: 36 }} />
+                    <Typography variant="subtitle1" fontWeight="bold" color={routingChoice === "SCHEDULE" ? "primary.main" : "text.primary"}>
+                      Schedule Execution
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Delay posting to a future time today
+                    </Typography>
+                  </Box>
+                </Grid>
+              </Grid>
+
+              {/* SMOOTH COLLAPSE FOR TIMEPICKER */}
+              <Collapse in={routingChoice === "SCHEDULE"}>
+                <Box sx={{ p: 3, mb: 4, border: '1px solid', borderColor: 'divider', borderRadius: 2 }}>
+                  <Typography variant="subtitle2" fontWeight="bold" align="left" gutterBottom>
+                    Select Time
+                  </Typography>
+                  <LocalizationProvider dateAdapter={AdapterDayjs}>
+                    <TimePicker
+                      value={scheduledTime}
+                      onChange={(newValue) => setScheduledTime(newValue)}
+                      // --- THE FIX IS HERE ---
+                      // .startOf('minute') forces seconds to :00 so it perfectly matches the UI selection
+                      minTime={dayjs().add(30, 'minute').startOf('minute')}
+                      maxTime={dayjs().endOf('day')}
+                      timeSteps={{ minutes: 1 }}
+                      slotProps={{
+                        textField: {
+                          size: 'medium',
+                          fullWidth: true,
+                          sx: { caretColor: 'transparent' },
+                          helperText: "Execution must be scheduled at least 30 minutes from now, before 11:59 PM today.",
+                          onKeyDown: (e) => e.preventDefault(),
+                          onPaste: (e) => e.preventDefault(),
+                          inputProps: { readOnly: true }
+                        }
+                      }}
+                    />
+                  </LocalizationProvider>
+                </Box>
+              </Collapse>
+
+              {/* FINAL SUBMIT BUTTON */}
+              <Button
+                variant="contained"
+                size="large"
+                fullWidth
+                disabled={!routingChoice || (routingChoice === 'SCHEDULE' && !scheduledTime) || isFinalizing}
+                onClick={handleFinalizeRouting}
+                sx={{ py: 1.5, fontSize: '1.1rem', fontWeight: 'bold', borderRadius: 2 }}
+              >
+                {isFinalizing ? <CircularProgress size={28} color="inherit" /> : "Submit"}
+              </Button>
+
+            </Paper>
+          </Box>
+        )
+      }
+
+    </Paper >
+
   );
 }
+
+
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Box,
@@ -5926,8 +6055,4 @@ export default function VoucherAuthorization() {
     </Paper>
   );
 }
-
-
-
-
 
